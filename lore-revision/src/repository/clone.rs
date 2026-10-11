@@ -1766,10 +1766,12 @@ async fn ensure_parent_dir(
 
 /// Writes `node` to `repository_path`, or retains the file there when it holds the node.
 ///
-/// Returns the modified time entry of a file written or retained, and `None` for one a dry run
-/// would write or `ignore_existing` leaves in place. Counts the file as in flight, and holds
-/// `permit`, until it is done. Not an `async fn`, which would hold a second copy of its
-/// arguments.
+/// Returns the modified time entry of a file written, or retained with a time older than the
+/// operation's clock floor ([`InstanceOperationImpl::clock_floor`]), which a comparison reads before
+/// reading the file; `None`
+/// for any other retained file, one a dry run would write, or one `ignore_existing` leaves in
+/// place. Counts the file as in flight, and holds `permit`, until it is done. Not an `async fn`,
+/// which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
 fn clone_file(
     ctx: CloneContext,
@@ -1831,11 +1833,14 @@ fn clone_file(
                 lore_trace!("Retain {}", repository_path);
                 stats.complete.file_retain.fetch_add(1, Ordering::Relaxed);
                 stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
-                return Ok(Some(state::file_modified_time_entry(
-                    &repository,
-                    &repository_path,
-                    file_info.mtime(),
-                )));
+                let floor = operation.clock_floor(&repository).await;
+                return Ok((file_info.mtime() < floor).then(|| {
+                    state::file_modified_time_entry(
+                        &repository,
+                        &repository_path,
+                        file_info.mtime(),
+                    )
+                }));
             }
             if !force {
                 lore_error!(

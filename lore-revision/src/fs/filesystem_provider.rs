@@ -719,6 +719,8 @@ pub struct InstanceOperationImpl {
     finalized: AtomicBool,
     changed: AtomicBool,
     modified_times: RecordedModifiedTimes,
+    /// The filesystem clock, read once, the first time [`Self::clock_floor`] is asked.
+    clock_floor: tokio::sync::OnceCell<u64>,
 }
 
 impl InstanceOperationImpl {
@@ -728,7 +730,18 @@ impl InstanceOperationImpl {
             finalized: AtomicBool::new(false),
             changed: AtomicBool::new(false),
             modified_times: RecordedModifiedTimes::default(),
+            clock_floor: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// The filesystem clock of `repository`'s working copy as the operation first asked for it,
+    /// read then ([`crate::state::read_clock_floor`]): a file the operation reads after asking
+    /// may record its time only where it is older, so no write after the read shares it.
+    pub async fn clock_floor(&self, repository: &RepositoryContext) -> u64 {
+        *self
+            .clock_floor
+            .get_or_init(|| crate::state::read_clock_floor(repository))
+            .await
     }
 
     /// Collects that `path` holds the content of the node written there, for a caller that

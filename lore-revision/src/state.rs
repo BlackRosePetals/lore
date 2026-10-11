@@ -7076,37 +7076,45 @@ pub enum NodeComparison {
 /// caller asking once passes a fresh one.
 ///
 /// Reads no recorded modification time and records none: a recorded time speaks for the current
-/// revision's node, and this answers about any node.
-pub async fn file_matches_node(
+/// revision's node, and this answers about any node. Reads the operation's clock floor
+/// ([`InstanceOperationImpl::clock_floor`]) before reading the file, so a time recorded from what
+/// the read establishes is compared against a clock read before it.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn file_matches_node<'a>(
     repository: Arc<RepositoryContext>,
-    node: &Node,
+    node: &'a Node,
     file_size: u64,
-    file_path: &impl WalkPath,
-    operation: &InstanceOperationImpl,
-    established: &lore_storage::ContentHashes,
-) -> Result<NodeComparison, StateError> {
-    if file_size != node.size {
-        lore_trace!("File {file_path} size differs from node, differs");
-        return Ok(NodeComparison::Differs);
-    }
+    file_path: &'a impl WalkPath,
+    operation: &'a InstanceOperationImpl,
+    established: &'a lore_storage::ContentHashes,
+) -> impl Future<Output = Result<NodeComparison, StateError>> + 'a {
+    async move {
+        if file_size != node.size {
+            lore_trace!("File {file_path} size differs from node, differs");
+            return Ok(NodeComparison::Differs);
+        }
 
-    if let Some(settled) = established.decides(node.address, Some(node.size), file_size) {
-        lore_trace!("File {file_path} settled by an earlier comparison: {settled:?}");
-        return Ok(node_comparison(settled));
-    }
+        if let Some(settled) = established.decides(node.address, Some(node.size), file_size) {
+            lore_trace!("File {file_path} settled by an earlier comparison: {settled:?}");
+            return Ok(node_comparison(settled));
+        }
 
-    let comparison = operation
-        .file_holds_content(
-            repository,
-            &file_path.to_path(),
-            node.address,
-            node.size,
-            established,
-        )
-        .await
-        .forward_any::<StateError>("Failed to compare the file to the node")?;
-    lore_trace!("File {file_path} compared to stored content: {comparison:?}");
-    Ok(comparison)
+        operation.clock_floor(&repository).await;
+        let comparison = operation
+            .file_holds_content(
+                repository,
+                &file_path.to_path(),
+                node.address,
+                node.size,
+                established,
+            )
+            .await
+            .forward_any::<StateError>("Failed to compare the file to the node")?;
+        lore_trace!("File {file_path} compared to stored content: {comparison:?}");
+        Ok(comparison)
+    }
 }
 
 /// How a storage comparison reads as a node comparison.
@@ -7236,35 +7244,44 @@ pub async fn file_modification(
 /// `node_is_current` states that `node` is the one the current revision holds at this path,
 /// and gates both halves: a recorded time speaks for that node alone, so it can neither
 /// answer for any other node nor be written from a match against one. Recording here is what
-/// spares the next scan the hash check this one just paid for.
-#[allow(clippy::too_many_arguments)]
-pub async fn file_modified_against_node(
+/// spares the next scan the hash check this one just paid for. A time not older than the
+/// filesystem clock the operation read before reading the file is not recorded: a write after
+/// the read may share it ([`InstanceOperationImpl::clock_floor`]).
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+pub fn file_modified_against_node<'a>(
     repository: Arc<RepositoryContext>,
-    node: &Node,
+    node: &'a Node,
     file_mtime: u64,
     file_size: u64,
-    file_path: &impl WalkPath,
+    file_path: &'a impl WalkPath,
     node_is_current: bool,
-    operation: &InstanceOperationImpl,
-    established: &lore_storage::ContentHashes,
-) -> Result<FileModification, StateError> {
-    let modification = file_modification(
-        repository.clone(),
-        node,
-        file_mtime,
-        file_size,
-        file_path,
-        !node_is_current,
-        operation,
-        established,
-    )
-    .await?;
+    operation: &'a InstanceOperationImpl,
+    established: &'a lore_storage::ContentHashes,
+) -> impl Future<Output = Result<FileModification, StateError>> + 'a {
+    async move {
+        let modification = file_modification(
+            repository.clone(),
+            node,
+            file_mtime,
+            file_size,
+            file_path,
+            !node_is_current,
+            operation,
+            established,
+        )
+        .await?;
 
-    if node_is_current && matches!(modification, FileModification::UnmodifiedByHash) {
-        file_modified_time_store(repository, file_path, file_mtime).await;
+        if node_is_current
+            && matches!(modification, FileModification::UnmodifiedByHash)
+            && file_mtime < operation.clock_floor(&repository).await
+        {
+            file_modified_time_store(repository, file_path, file_mtime).await;
+        }
+
+        Ok(modification)
     }
-
-    Ok(modification)
 }
 
 /// Modified times collected by an operation, to be recorded once it has completed.
@@ -7274,16 +7291,44 @@ pub async fn file_modified_against_node(
 /// a time the next write can still share, so entries are collected and written at the end by
 /// [`store`](Self::store). An operation that leaves the current revision elsewhere calls
 /// [`discard`](Self::discard).
+///
+/// A collector made by [`below`](Self::below) collects no time it cannot tell apart from a later
+/// write: none not older than the filesystem clock read before reading any file whose time it
+/// collects.
 #[must_use]
-#[derive(Default)]
-pub struct RecordedModifiedTimes(Box<crossbeam::queue::SegQueue<(Hash, u64)>>);
+#[lore_macro::test_pub]
+pub struct RecordedModifiedTimes {
+    entries: Box<crossbeam::queue::SegQueue<(Hash, u64)>>,
+    /// Times at or after this are not collected.
+    floor: u64,
+}
+
+impl Default for RecordedModifiedTimes {
+    fn default() -> Self {
+        Self {
+            entries: Box::default(),
+            floor: u64::MAX,
+        }
+    }
+}
 
 impl RecordedModifiedTimes {
+    /// A collector of the times older than `floor`, the filesystem clock read before reading any
+    /// file whose time it collects ([`read_clock_floor`]).
+    pub fn below(floor: u64) -> Self {
+        Self {
+            entries: Box::default(),
+            floor,
+        }
+    }
+
     /// Collects the entry recording that `path` held `repository`'s current content at
-    /// `mtime`.
+    /// `mtime`, where the time is older than the collector's floor.
     pub fn record(&self, repository: &RepositoryContext, path: &RelativePath, mtime: u64) {
-        self.0
-            .push(file_modified_time_entry(repository, path, mtime));
+        if mtime < self.floor {
+            self.entries
+                .push(file_modified_time_entry(repository, path, mtime));
+        }
     }
 
     /// Writes the collected times into `repository`'s mutable store, one task per store group.
@@ -7292,14 +7337,15 @@ impl RecordedModifiedTimes {
     /// splitting the times by that byte lets every task run without ever contending with
     /// another.
     ///
-    /// Waits for the filesystem to stamp later than every time written, so that none of them
-    /// can be shared by a write that follows — bounded, so a filesystem that does not appear to
-    /// move on is left with times a following write can still share rather than being waited on
-    /// forever. See [`wait_until_settled`].
+    /// Without a floor, waits for the filesystem to stamp later than every time written, so that
+    /// none of them can be shared by a write that follows — bounded, so a filesystem that does not
+    /// appear to move on is left with times a following write can still share rather than being
+    /// waited on forever. See [`wait_until_settled`]. A collector with a floor holds only times
+    /// older than a stamp the filesystem has already given, so it has nothing to wait for.
     pub async fn store(&self, repository: Arc<RepositoryContext>) {
-        let mut times = Vec::with_capacity(self.0.len());
+        let mut times = Vec::with_capacity(self.entries.len());
         let mut mtime_max = 0;
-        while let Some((key, mtime)) = self.0.pop() {
+        while let Some((key, mtime)) = self.entries.pop() {
             mtime_max = mtime_max.max(mtime);
             times.push((key, mtime));
         }
@@ -7330,34 +7376,39 @@ impl RecordedModifiedTimes {
         }
         while tasks.join_next().await.is_some() {}
 
-        wait_until_settled(&repository, mtime_max).await;
+        if self.floor == u64::MAX {
+            wait_until_settled(&repository, mtime_max).await;
+        }
     }
 
     /// Collects an entry built by [`file_modified_time_entry`], for a caller that computed
-    /// the key where it had the path rather than where it records.
+    /// the key where it had the path rather than where it records, where its time is older than
+    /// the collector's floor.
     pub fn push(&self, entry: (Hash, u64)) {
-        self.0.push(entry);
+        if entry.1 < self.floor {
+            self.entries.push(entry);
+        }
     }
 
     /// Moves the times collected by `other` into this collector.
     pub fn absorb(&self, other: Self) {
-        while let Some(entry) = other.0.pop() {
-            self.0.push(entry);
+        while let Some(entry) = other.entries.pop() {
+            self.push(entry);
         }
     }
 
     /// Removes the times collected so far, leaving the collector empty.
     pub fn take(&self) -> Self {
         let taken = Self::default();
-        while let Some(entry) = self.0.pop() {
-            taken.0.push(entry);
+        while let Some(entry) = self.entries.pop() {
+            taken.entries.push(entry);
         }
         taken
     }
 
     /// Drops the times, for an operation that leaves the current revision elsewhere.
     pub fn discard(&self) {
-        while self.0.pop().is_some() {}
+        while self.entries.pop().is_some() {}
     }
 }
 
@@ -7375,6 +7426,7 @@ const MODIFIED_TIME_SETTLE_LIMIT: std::time::Duration = std::time::Duration::fro
 
 /// The path of the file stamped to read the working copy's clock, `None` when the working copy
 /// has no path to stamp.
+#[lore_macro::test_pub]
 fn modified_time_probe_path(repository: &RepositoryContext) -> Option<std::path::PathBuf> {
     Some(repository.dot_dir_path().ok()?.join(MODIFIED_TIME_PROBE))
 }
@@ -7398,6 +7450,17 @@ async fn stamp_probe(path: &std::path::Path) -> Option<u64> {
     Some(crate::util::fs::file_mtime(&metadata))
 }
 
+/// [`filesystem_stamp_now`], as the floor below which an operation records times: a file
+/// written from now on carries a time no older. 0 where the working copy cannot be stamped, and
+/// in a dry run, which records nothing: no time is older, so none is recorded.
+#[lore_macro::test_pub]
+pub(crate) async fn read_clock_floor(repository: &RepositoryContext) -> u64 {
+    if crate::runtime::try_execution_context().is_some_and(|context| context.globals().dry_run()) {
+        return 0;
+    }
+    filesystem_stamp_now(repository).await.unwrap_or(0)
+}
+
 /// The time the working copy's filesystem is currently stamping writes with.
 ///
 /// A file's modified time comes from a clock the filesystem advances on its own schedule and
@@ -7406,10 +7469,15 @@ async fn stamp_probe(path: &std::path::Path) -> Option<u64> {
 /// the file was written. Stamping a file and reading it back asks the filesystem instead, so
 /// the answer is on the scale the comparison needs.
 ///
+/// The probe is removed once read, so a stamp file is not left behind in the dot directory.
+///
 /// `None` when the working copy cannot be stamped, which leaves a caller no way to tell a
 /// settled time from one a further write can still share.
 pub async fn filesystem_stamp_now(repository: &RepositoryContext) -> Option<u64> {
-    stamp_probe(&modified_time_probe_path(repository)?).await
+    let path = modified_time_probe_path(repository)?;
+    let stamp = stamp_probe(&path).await;
+    let _ = lore_io::IoDriver::global().remove_file(&path).await;
+    stamp
 }
 
 /// Waits until the working copy's filesystem stamps later than `mtime_max`.

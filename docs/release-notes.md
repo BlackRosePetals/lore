@@ -43,6 +43,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- A file saved again within the filesystem clock tick it was last written in, at the same size, after a command such
+  as `lore commit` or `lore status --scan` read it, is no longer reported unchanged. The command recorded the file's
+  modified time even where a later write could carry the same one, and the next status trusted the time over the
+  content. Commands now record only times older than the filesystem clock they read before reading any file
 - Remote reads and uploads spread over every storage connection a command opens. They all went through one connection
   whatever `--max-connections` said
 - On Linux and macOS, two Lore services started at once no longer both run as the service. A service claims its

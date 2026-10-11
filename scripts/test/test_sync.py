@@ -1290,3 +1290,50 @@ def test_sync_remote_revision_merged_from_divergence_keeps_latest(new_lore_repo)
     after = other.branch_info("main")
     assert after.local_latest == merge_revision
     assert after.remote_latest == merge_revision
+
+
+@pytest.mark.smoke
+def test_sync_records_the_time_of_a_file_holding_the_incoming_content_only_before_its_clock(
+    new_lore_repo,
+):
+    """A sync that finds a file already holding the incoming content records its time only where
+    that time is older than the filesystem clock the sync read before reading the file: a write
+    after the read may share a later one. The scan after the sync answers for the older file by
+    its recorded time and reads the other."""
+    repo: Lore = new_lore_repo()
+    names = ("older.bin", "ahead.bin")
+    for name in names:
+        with repo.open_file(name, "w+b") as output_file:
+            output_file.write(os.urandom(4096))
+    repo.stage(scan=True)
+    repo.commit("First content")
+    repo.push()
+    first = repo.revision_info().signature
+
+    # The same size, so only the recorded time or the content can tell the files apart.
+    incoming = {name: os.urandom(4096) for name in names}
+    for name, content in incoming.items():
+        with repo.open_file(name, "w+b") as output_file:
+            output_file.write(content)
+    repo.stage(scan=True)
+    repo.commit("Second content")
+    repo.push()
+
+    repo.sync(first)
+    for name, content in incoming.items():
+        with repo.open_file(name, "w+b") as output_file:
+            output_file.write(content)
+    now = time.time()
+    os.utime(os.path.join(repo.path, "older.bin"), (now - 3600, now - 3600))
+    os.utime(os.path.join(repo.path, "ahead.bin"), (now + 3600, now + 3600))
+    repo.sync()
+
+    output = repo.status(scan=True, json=True)
+    assert [
+        entry for entry in parse_status_json(output) if to_posix(entry["path"]) in names
+    ] == [], "the files hold the synced content"
+    summary = parse_status_summary_json(output)
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert (summary["hashChecks"], summary["mtimeMatches"]) == (1, 1), (
+        f"the sync must record the older time and not the one ahead, got {summary}"
+    )

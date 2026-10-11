@@ -1605,10 +1605,11 @@ async fn commit_staged_revision(
     let tracker = immutable::commit_write_tracker(reporting.per_fragment);
 
     let work_tracker = tracker.clone();
-    let modified_times = Arc::new(RecordedModifiedTimes::default());
-    let collected = modified_times.clone();
     let operation = operation.clone();
     let work_result: Result<(Hash, Arc<RecordedModifiedTimes>), CommitError> = async move {
+        let collected = Arc::new(RecordedModifiedTimes::below(
+            operation.clock_floor(&repository).await,
+        ));
         // For each file in repository, create fragments if they don't already
         // exist. Also rehash directories affected by change and generate new
         // root hash.
@@ -1894,7 +1895,9 @@ pub(crate) async fn rehash_tree_in_operation(
     branch: BranchId,
 ) -> Result<Arc<RecordedModifiedTimes>, CommitError> {
     let tracker = Arc::new(lore_storage::write_tracker::WriteTracker::new());
-    let modified_times = Arc::new(RecordedModifiedTimes::default());
+    let modified_times = Arc::new(RecordedModifiedTimes::below(
+        crate::state::read_clock_floor(&repository).await,
+    ));
     let rehashed = with_operation(repository.file_system(), async |operation| {
         commit_files_and_rehash(
             operation,
@@ -2866,6 +2869,9 @@ async fn commit_link(
     lore_debug!("Committing link node {node_id} at {relative_path}");
 
     prune_dirty_for_commit(state.clone(), repository.clone()).await?;
+    let link_modified_times = Arc::new(RecordedModifiedTimes::below(
+        operation.clock_floor(&repository).await,
+    ));
 
     // Observed before any write, so the pointer write below compares against the
     // tip this commit was built on rather than one a racing committer published.
@@ -2879,7 +2885,6 @@ async fn commit_link(
     // success do we emit the event. `Ok(None)` signals the "unchanged link"
     // case — no new revision, no event.
     let work_tracker = link_tracker.clone();
-    let link_modified_times = Arc::new(RecordedModifiedTimes::default());
     let work_result: Result<Option<Hash>, CommitError> = {
         let repository = repository.clone();
         let state = state.clone();

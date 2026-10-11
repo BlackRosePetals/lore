@@ -567,6 +567,10 @@ async fn mode_is_the_working_tree_own(
 /// A caller that realizes every change it verified, which a merge does to build the staged state
 /// out of them, takes the change as this leaves it and disregards the answer. One that realizes
 /// only what the working copy still needs, which a sync does, drops the rest.
+///
+/// A file found to hold the incoming content has its time recorded where it is older than the
+/// operation's clock floor ([`InstanceOperationImpl::clock_floor`]), which a comparison reads
+/// before reading the file.
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_filesystem(
     change: &mut NodeChange,
@@ -655,11 +659,13 @@ pub async fn verify_filesystem(
                     )
                     .await?;
                 }
-                operation.record_modified_time(
-                    &change.from.mapping.repository,
-                    change.path(),
-                    modifications.info.mtime(),
-                );
+                if modifications.info.mtime() < operation.clock_floor(&repository).await {
+                    operation.record_modified_time(
+                        &change.from.mapping.repository,
+                        change.path(),
+                        modifications.info.mtime(),
+                    );
+                }
                 return Ok(false);
             }
             stats.file_retain.fetch_add(1, Ordering::Relaxed);
@@ -802,11 +808,13 @@ pub async fn verify_filesystem(
                     )
                     .await?;
                 }
-                operation.record_modified_time(
-                    &change.from.mapping.repository,
-                    change.path(),
-                    modifications.info.mtime(),
-                );
+                if modifications.info.mtime() < operation.clock_floor(&repository).await {
+                    operation.record_modified_time(
+                        &change.from.mapping.repository,
+                        change.path(),
+                        modifications.info.mtime(),
+                    );
+                }
 
                 return Ok(false);
             }

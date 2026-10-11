@@ -569,13 +569,14 @@ def test_link_unstage(new_lore_repo):
 
 
 def _staged_paths(repo: Lore) -> list[str]:
-    """Paths `status` reports as staged. It reports unstaged changes too, marked
-    with `flagStaged` false, so the flag is what separates the two."""
-    return [
+    """Paths `status` reports as staged, sorted, since its JSON output is the event
+    stream. It reports unstaged changes too, marked with `flagStaged` false, so the
+    flag is what separates the two."""
+    return sorted(
         entry["path"]
         for entry in parse_status_json(repo.status(json=True))
         if entry["flagStaged"]
-    ]
+    )
 
 
 @pytest.mark.smoke

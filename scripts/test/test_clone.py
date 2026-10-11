@@ -3,6 +3,7 @@
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -192,9 +193,47 @@ def test_reclone_over_existing_files_records_their_modified_times(new_lore_repo)
     clone: Lore = repo.clone()
 
     # Drop the repository metadata and keep the working files, so the re-clone finds every
-    # file present and identical.
+    # file present and identical. Their times are older than the clock the re-clone reads.
     shutil.rmtree(clone.dot_path(), ignore_errors=True)
+    older = time.time() - 3600
+    for index in range(file_count):
+        os.utime(os.path.join(clone.path, f"retained{index}.bin"), (older, older))
 
+    assert reclone_retained_scan(repo, clone, file_count) == (0, file_count), (
+        "the retained files must be answered by their recorded times"
+    )
+
+
+@pytest.mark.smoke
+def test_reclone_over_files_stamped_ahead_records_no_time(new_lore_repo):
+    """A clone that retains files whose times are not older than the filesystem clock it read
+    before reading them records none of them: a write after the read may share those times.
+    The scan after reads every file."""
+    repo: Lore = new_lore_repo()
+
+    file_count = 4
+    for index in range(file_count):
+        with repo.open_file(f"retained{index}.bin", "w+b") as f:
+            f.write(os.urandom(4096))
+    repo.stage(scan=True)
+    repo.commit("Base")
+    repo.push()
+
+    clone: Lore = repo.clone()
+    shutil.rmtree(clone.dot_path(), ignore_errors=True)
+    ahead = time.time() + 3600
+    for index in range(file_count):
+        os.utime(os.path.join(clone.path, f"retained{index}.bin"), (ahead, ahead))
+
+    assert reclone_retained_scan(repo, clone, file_count) == (file_count, 0), (
+        "the re-clone recorded times a later write could share"
+    )
+
+
+def reclone_retained_scan(repo: Lore, clone: Lore, file_count: int) -> tuple[int, int]:
+    """Clones `repo` again into `clone`'s directory, whose metadata the caller removed, checks
+    that every file was retained, and answers the hash checks and recorded-time matches of one
+    scan after. One scan only: a second would record whatever the first measured."""
     output = repo.run(["repository", "clone", repo.remote_path, clone.path], json=True)
     clone_end = parse_jsonl(output, "repositoryCloneEnd")
     assert clone_end, "clone must emit a repositoryCloneEnd event"
@@ -206,16 +245,10 @@ def test_reclone_over_existing_files_records_their_modified_times(new_lore_repo)
         f"no existing file should have been rewritten, got {count}"
     )
 
-    # One scan only: a second would record whatever the first measured, and so would report
-    # nothing left to measure even if the retain path had recorded nothing.
     scan = clone.status(scan=True, json=True, offline=True)
     assert not parse_status_json(scan), (
         "a re-clone over identical files leaves nothing changed"
     )
-
     summary = parse_status_summary_json(scan)
     assert summary is not None, "scan must emit a repositoryStatusSummary event"
-    assert summary["hashChecks"] == 0, (
-        f"the retained files must be answered by their recorded times, got {summary}"
-    )
-    assert summary["mtimeMatches"] == file_count, summary
+    return summary["hashChecks"], summary["mtimeMatches"]
