@@ -43,6 +43,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore`: when the Lore service starts, it logs and skips a registered shared store it cannot open or list, and an
+  instance whose external config it cannot read. One such store or instance left the service without its mount
+  manager, so no SWFS instance was mounted and none could be created
 - A file saved again within the filesystem clock tick it was last written in, at the same size, after a command such
   as `lore commit` or `lore status --scan` read it, is no longer reported unchanged. The command recorded the file's
   modified time even where a later write could carry the same one, and the next status trusted the time over the

@@ -5,7 +5,6 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use lore_base::error::InvalidPath;
 use lore_error_set::ForwardStrict;
-use lore_error_set::WrapInternal;
 use lore_error_set::error_set;
 
 use crate::fs::swfs::api_interface::SwfsInterface;
@@ -19,10 +18,12 @@ use crate::global::external_dir::external_dir_for_instance;
 use crate::instance::InstanceId;
 use crate::instance::list_instances;
 use crate::lore::RepositoryId;
+use crate::lore_warn;
 use crate::repository::DOT_LORE;
 use crate::repository::RepositoryConfig;
 use crate::repository::load_repository_config_from_dot_dir;
 use crate::shared_store::registry::SharedStoreRegistry;
+use crate::shared_store::registry::SharedStoreRegistryEntry;
 use crate::util::config::SaveableConfig;
 
 pub struct Mount {
@@ -41,49 +42,71 @@ pub struct MountManager {
 }
 
 impl MountManager {
-    async fn create_mounts_without_wait_for_ready()
-    -> Result<DashMap<MountPath, Mount>, MountManagerError> {
+    /// Mounts every SWFS instance of the stores in `entries`. A store that cannot be opened or
+    /// listed, and an instance whose config cannot be read, are logged and skipped rather than
+    /// stopping the rest.
+    #[lore_macro::test_pub]
+    async fn mounts_of_entries(
+        entries: &[SharedStoreRegistryEntry],
+    ) -> Result<DashMap<MountPath, Mount>, MountManagerError> {
         let mounted_paths = DashMap::new();
-        let registry = SharedStoreRegistry::load()
-            .await
-            .forward::<MountManagerError>("Unable to load shared store registry")?;
-        for entry in registry.entries() {
-            let entry_repository = entry
-                .create_null_repository_context()
+        for entry in entries {
+            let Ok(entry_repository) =
+                entry
+                    .create_null_repository_context()
+                    .await
+                    .inspect_err(|error| {
+                        lore_warn!("Unable to open shared store at {}: {error}", entry.path());
+                    })
+            else {
+                continue;
+            };
+            let Ok(instances) = list_instances(&entry_repository)
                 .await
-                .internal("Unable to create null context for entry")?;
-            for instance in &list_instances(&entry_repository)
-                .await
-                .internal("Unable to find instances for entry")?
-            {
-                if let Some(dot_lore) =
+                .inspect_err(|error| {
+                    lore_warn!(
+                        "Unable to list instances of shared store at {}: {error}",
+                        entry.path()
+                    );
+                })
+            else {
+                continue;
+            };
+            for instance in &instances {
+                let Some(dot_lore) =
                     check_for_external_lore_dir(instance.instance_id)
-                        .forward::<MountManagerError>("Unable to find .lore directory")?
-                {
-                    let config = load_repository_config_from_dot_dir(&dot_lore)
-                        .internal("Unable to load repository config")?;
-                    if config.is_swfs() {
-                        let mount_path =
-                            MountPath::new(Path::new(&instance.path))
-                                .forward::<MountManagerError>("Failed to make mount path")?;
-                        let mount = SwfsInterface::mount(
-                            MountResources::premount_instance(
-                                instance.instance_id,
-                                mount_path.clone(),
-                            )
+                        .forward::<MountManagerError>("Unable to find external .lore directory")?
+                else {
+                    continue;
+                };
+                let Ok(config) =
+                    load_repository_config_from_dot_dir(&dot_lore).inspect_err(|error| {
+                        lore_warn!(
+                            "Unable to load the repository config of instance {} at {}: {error}",
+                            instance.instance_id,
+                            instance.path
+                        );
+                    })
+                else {
+                    continue;
+                };
+                if config.is_swfs() {
+                    let mount_path = MountPath::new(Path::new(&instance.path))
+                        .forward::<MountManagerError>("Failed to make mount path")?;
+                    let mount = SwfsInterface::mount(
+                        MountResources::premount_instance(instance.instance_id, mount_path.clone())
                             .await
                             .forward::<MountManagerError>("Failed gathering premount resources")?,
-                        )
-                        .forward::<MountManagerError>("Failed to mount")?;
+                    )
+                    .forward::<MountManagerError>("Failed to mount")?;
 
-                        mounted_paths.insert(
-                            mount_path,
-                            Mount {
-                                instance_id: instance.instance_id,
-                                mount,
-                            },
-                        );
-                    }
+                    mounted_paths.insert(
+                        mount_path,
+                        Mount {
+                            instance_id: instance.instance_id,
+                            mount,
+                        },
+                    );
                 }
             }
         }
@@ -91,7 +114,10 @@ impl MountManager {
     }
 
     pub async fn initialize() -> Result<Arc<Self>, MountManagerError> {
-        let mounted_paths = Self::create_mounts_without_wait_for_ready().await?;
+        let registry = SharedStoreRegistry::load()
+            .await
+            .forward::<MountManagerError>("Unable to load shared store registry")?;
+        let mounted_paths = Self::mounts_of_entries(registry.entries()).await?;
         let lookup = DashMap::new();
         for mount in mounted_paths.iter() {
             mount

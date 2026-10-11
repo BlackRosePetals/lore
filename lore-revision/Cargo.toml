@@ -69,6 +69,7 @@ zerocopy = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
 
 [dev-dependencies]
+ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
 lore-revision = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true }
