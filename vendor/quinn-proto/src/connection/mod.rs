@@ -1545,7 +1545,8 @@ impl Connection {
                 )
             };
             let rtt = now.saturating_duration_since(self.spaces[space].largest_acked_packet_sent);
-            self.path.rtt.update(ack_delay, rtt);
+            // LORE: `now` is not upstream; BBR's windowed `min_rtt` stamps the sample with it.
+            self.path.rtt.update(ack_delay, rtt, now);
             if self.path.first_packet_after_rtt_sample.is_none() {
                 self.path.first_packet_after_rtt_sample =
                     Some((space, self.spaces[space].next_packet_number));

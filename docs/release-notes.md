@@ -43,6 +43,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- QUIC: BBR keeps the minimum RTT of the last 10 seconds, floored at 250 µs, in place of the lowest sample ever
+  seen, so one underestimated sample no longer reduces throughput for the rest of a connection
 - `lore`: when the Lore service starts, it logs and skips a registered shared store it cannot open or list, and an
   instance whose external config it cannot read. One such store or instance left the service without its mount
   manager, so no SWFS instance was mounted and none could be created

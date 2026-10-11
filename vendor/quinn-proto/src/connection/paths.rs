@@ -302,6 +302,11 @@ pub struct RttEstimator {
     /// LORE: not upstream. Re-apply this field, the `new` parameter that fills it and the clamp
     /// in `update` when re-vendoring.
     max: Duration,
+    /// When `latest` was taken, or `None` before the first sample.
+    ///
+    /// LORE: not upstream. Re-apply this field, the `now` parameter of `update` that fills it and
+    /// `latest` when re-vendoring.
+    latest_at: Option<Instant>,
 }
 
 impl RttEstimator {
@@ -312,6 +317,8 @@ impl RttEstimator {
             var: initial_rtt / 2,
             min: initial_rtt,
             max: max_rtt,
+            // LORE: not upstream.
+            latest_at: None,
         }
     }
 
@@ -333,16 +340,28 @@ impl RttEstimator {
         self.min
     }
 
+    /// The most recent RTT sample, before ack delay is subtracted, and when it was taken, or `None`
+    /// before the first.
+    ///
+    /// LORE: not upstream. Re-apply this accessor when re-vendoring; BBR's windowed `min_rtt`
+    /// reads it.
+    pub(crate) fn latest(&self) -> Option<(Duration, Instant)> {
+        self.latest_at.map(|at| (self.latest, at))
+    }
+
     // PTO computed as described in RFC9002#6.2.1
     pub(crate) fn pto_base(&self) -> Duration {
         self.get() + cmp::max(4 * self.var, TIMER_GRANULARITY)
     }
 
-    pub(crate) fn update(&mut self, ack_delay: Duration, rtt: Duration) {
+    // LORE: `now`, when the sample was taken, is not upstream.
+    pub(crate) fn update(&mut self, ack_delay: Duration, rtt: Duration, now: Instant) {
         // Clamp the raw sample to prevent poisoning from processing delays (e.g. tokio runtime
         // starvation causing packets to sit in the socket buffer unread for extended periods).
         let rtt = cmp::min(rtt, self.max);
         self.latest = rtt;
+        // LORE: not upstream.
+        self.latest_at = Some(now);
         // min_rtt ignores ack delay.
         self.min = cmp::min(self.min, self.latest);
         // Based on RFC6298.

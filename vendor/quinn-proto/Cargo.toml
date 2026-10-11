@@ -1,6 +1,6 @@
 # Vendored from crates.io quinn-proto 0.11.19 (MIT OR Apache-2.0, the quinn authors).
 #
-# Vendored to carry two additions the published crate does not have, both marked with a `LORE:`
+# Vendored to carry three additions the published crate does not have, each marked with a `LORE:`
 # comment at the site:
 #
 #   - `TransportConfig::max_rtt`, an upper bound applied to each RTT sample before it reaches the
@@ -9,10 +9,14 @@
 #     the idle timeout far enough that the connection cannot recover.
 #   - `TransportErrorCode::is_crypto`, which the client needs to tell a handshake failure apart
 #     from a transport failure and so decide whether reconnecting can succeed.
+#   - A windowed `min_rtt` in BBR, reading the new `RttEstimator::latest`, the latest sample and
+#     when it was taken, with a 250 µs floor on the value BBR sizes its window and gain cycle by. Upstream BBR copies the estimator's all-time
+#     minimum, and quinn stamps a whole receive batch with one time, so one RTT sample that comes
+#     out too small shrinks the window to tens of kilobytes for the rest of the connection.
 #
-# Both are used from production code, so dropping the `[patch.crates-io]` override in the
-# workspace root does not compile. The tree is otherwise the published crate, plus elided-lifetime
-# annotations.
+# The first two are used from production code, so dropping the `[patch.crates-io]` override in
+# the workspace root does not compile; it would also lose the third without a compile error. The
+# tree is otherwise the published crate, plus elided-lifetime annotations.
 #
 # To move to a new upstream release: unpack that version's crates.io tarball over this directory,
 # re-apply each `LORE:` site, and confirm none was silently lost by grepping for `LORE:` and

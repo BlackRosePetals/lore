@@ -46,6 +46,8 @@ pub struct Bbr {
     exit_probe_rtt_at: Option<Instant>,
     probe_rtt_last_started_at: Option<Instant>,
     min_rtt: Duration,
+    /// When the sample in `min_rtt` was taken. LORE: not upstream, see `on_ack`.
+    min_rtt_timestamp: Option<Instant>,
     exiting_quiescence: bool,
     pacing_rate: u64,
     max_acked_packet_number: u64,
@@ -87,6 +89,8 @@ impl Bbr {
             exit_probe_rtt_at: None,
             probe_rtt_last_started_at: None,
             min_rtt: Default::default(),
+            // LORE: not upstream.
+            min_rtt_timestamp: None,
             exiting_quiescence: false,
             pacing_rate: 0,
             max_acked_packet_number: 0,
@@ -158,9 +162,10 @@ impl Bbr {
 
     fn update_gain_cycle_phase(&mut self, now: Instant, in_flight: u64) {
         // In most cases, the cycle is advanced after an RTT passes.
+        // LORE: `bounded_min_rtt()`, where upstream read `self.min_rtt`.
         let mut should_advance_gain_cycling = self
             .last_cycle_start
-            .map(|last_cycle_start| now.duration_since(last_cycle_start) > self.min_rtt)
+            .map(|last_cycle_start| now.duration_since(last_cycle_start) > self.bounded_min_rtt())
             .unwrap_or(false);
         // If the pacing gain is above 1.0, the connection is trying to probe the
         // bandwidth by increasing the number of bytes in flight to at least
@@ -261,9 +266,17 @@ impl Bbr {
         self.exiting_quiescence = false;
     }
 
+    /// `min_rtt` as BBR sizes and times with it: never below `K_MIN_RTT_FLOOR`.
+    ///
+    /// LORE: not upstream. Re-apply this, its callers and `K_MIN_RTT_FLOOR` when re-vendoring.
+    fn bounded_min_rtt(&self) -> Duration {
+        self.min_rtt.max(K_MIN_RTT_FLOOR)
+    }
+
     fn get_target_cwnd(&self, gain: f32) -> u64 {
         let bw = self.max_bandwidth.get_estimate();
-        let bdp = self.min_rtt.as_micros() as u64 * bw;
+        // LORE: `bounded_min_rtt()`, where upstream read `self.min_rtt`.
+        let bdp = self.bounded_min_rtt().as_micros() as u64 * bw;
         let bdpf = bdp as f64;
         let cwnd = ((gain as f64 * bdpf) / 1_000_000f64) as u64;
         // BDP estimate will be zero if no bandwidth samples are available yet.
@@ -295,8 +308,9 @@ impl Bbr {
         // Pace at the rate of initial_window / RTT as soon as RTT measurements are
         // available.
         if self.pacing_rate == 0 && self.min_rtt.as_nanos() != 0 {
+            // LORE: `bounded_min_rtt()`, where upstream read `self.min_rtt`.
             self.pacing_rate =
-                BandwidthEstimation::bw_from_delta(self.init_cwnd, self.min_rtt).unwrap();
+                BandwidthEstimation::bw_from_delta(self.init_cwnd, self.bounded_min_rtt()).unwrap();
             return;
         }
 
@@ -408,8 +422,21 @@ impl Controller for Bbr {
         self.max_bandwidth
             .on_ack(now, sent, bytes, self.round_count, app_limited);
         self.acked_bytes += bytes;
-        if self.is_min_rtt_expired(now, app_limited) || self.min_rtt > rtt.min() {
-            self.min_rtt = rtt.min();
+        // LORE: not upstream. A windowed minimum of RTT samples, as in the BBR draft, in place of
+        // the estimator's all-time minimum, which keeps an underestimated sample forever. A sample
+        // equal to the minimum restamps it, as the draft's `<=` does, so a steady path keeps it.
+        // The stamp is when the sample was taken, not `now`: quinn records an ack's own sample
+        // after this call, so the sample here can predate an idle period. Re-apply this, the
+        // `min_rtt_timestamp` field and `K_MIN_RTT_WINDOW` when re-vendoring.
+        let Some((sample, taken_at)) = rtt.latest() else {
+            return;
+        };
+        let expired = self
+            .min_rtt_timestamp
+            .is_none_or(|at| now.saturating_duration_since(at) > K_MIN_RTT_WINDOW);
+        if expired || sample <= self.min_rtt {
+            self.min_rtt = sample;
+            self.min_rtt_timestamp = Some(taken_at);
         }
     }
 
@@ -647,5 +674,132 @@ const K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP: u8 = 3;
 // Do not allow initial congestion window to be greater than 200 packets.
 const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
+// LORE: not upstream. How long a min_rtt sample stands before a higher one replaces it.
+const K_MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
+// LORE: not upstream. The least min_rtt BBR sizes and times with. quinn's receive loop stamps a
+// whole batch of datagrams with one time, so on a sub-millisecond path an RTT sample can come out
+// far too small, even zero, and would shrink the window far below what the path carries. On a path
+// shorter than the floor, BBR keeps more in flight than the path needs, and the excess queues at
+// the sender: on a 100 µs, 5 Gbit/s path the median RTT rose from about 300 µs with no floor to
+// about 350 µs at 100 µs, 420 µs at 250 µs and 460 µs at 1 ms, while throughput rose by 2% at
+// 250 µs.
+const K_MIN_RTT_FLOOR: Duration = Duration::from_micros(250);
+
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
+
+// LORE: not upstream. Tests for the windowed min_rtt and its floor.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bbr() -> Bbr {
+        Bbr::new(Arc::new(BbrConfig::default()), 1200)
+    }
+
+    /// An estimator as a connection holds it: one for the connection's life, fed every sample.
+    fn estimator() -> RttEstimator {
+        RttEstimator::new(Duration::from_millis(333), Duration::from_secs(60))
+    }
+
+    /// Acks one packet at `now`, then records the ack's RTT `sample`, in the order
+    /// `Connection::on_ack_received` does: BBR sees a sample at the following ack.
+    fn ack(bbr: &mut Bbr, rtt: &mut RttEstimator, now: Instant, sample: Duration) {
+        bbr.on_ack(now, now, 1200, false, rtt);
+        rtt.update(Duration::ZERO, sample, now);
+    }
+
+    /// Acks one packet at `now` without a new RTT sample.
+    fn ack_without_sample(bbr: &mut Bbr, rtt: &RttEstimator, now: Instant) {
+        bbr.on_ack(now, now, 1200, false, rtt);
+    }
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn min_rtt_takes_a_lower_sample() {
+        let start = Instant::now();
+        let (mut bbr, mut rtt) = (bbr(), estimator());
+        ack(&mut bbr, &mut rtt, start, ms(50));
+        ack(&mut bbr, &mut rtt, start + ms(60), ms(20));
+        ack_without_sample(&mut bbr, &rtt, start + ms(61));
+        assert_eq!(bbr.min_rtt, ms(20));
+    }
+
+    #[test]
+    fn min_rtt_takes_a_first_sample_above_the_initial_estimate() {
+        let start = Instant::now();
+        let (mut bbr, mut rtt) = (bbr(), estimator());
+        ack_without_sample(&mut bbr, &rtt, start);
+        ack(&mut bbr, &mut rtt, start + ms(600), ms(600));
+        ack_without_sample(&mut bbr, &rtt, start + ms(601));
+        assert_eq!(bbr.min_rtt, ms(600));
+    }
+
+    #[test]
+    fn min_rtt_keeps_a_lower_value_within_the_window() {
+        let start = Instant::now();
+        let (mut bbr, mut rtt) = (bbr(), estimator());
+        ack(&mut bbr, &mut rtt, start, ms(20));
+        ack(&mut bbr, &mut rtt, start + K_MIN_RTT_WINDOW, ms(50));
+        ack_without_sample(&mut bbr, &rtt, start + K_MIN_RTT_WINDOW);
+        assert_eq!(bbr.min_rtt, ms(20));
+    }
+
+    #[test]
+    fn min_rtt_keeps_a_value_an_equal_sample_renewed() {
+        let start = Instant::now();
+        let (mut bbr, mut rtt) = (bbr(), estimator());
+        ack(&mut bbr, &mut rtt, start, ms(20));
+        ack(&mut bbr, &mut rtt, start + ms(5_000), ms(20));
+        ack(&mut bbr, &mut rtt, start + ms(5_001), ms(30));
+        ack(&mut bbr, &mut rtt, start + ms(10_100), ms(50));
+        ack_without_sample(&mut bbr, &rtt, start + ms(10_101));
+        assert_eq!(bbr.min_rtt, ms(20));
+    }
+
+    #[test]
+    fn min_rtt_forgets_an_underestimated_sample_when_the_window_expires() {
+        let start = Instant::now();
+        let (mut bbr, mut rtt) = (bbr(), estimator());
+        ack(&mut bbr, &mut rtt, start, ms(20));
+        ack(&mut bbr, &mut rtt, start + ms(1), Duration::from_micros(20));
+        ack(&mut bbr, &mut rtt, start + ms(2), ms(20));
+        assert_eq!(bbr.min_rtt, Duration::from_micros(20));
+        let after_window = start + ms(1) + K_MIN_RTT_WINDOW + ms(1);
+        ack(&mut bbr, &mut rtt, after_window, ms(20));
+        ack_without_sample(&mut bbr, &rtt, after_window + ms(1));
+        assert_eq!(bbr.min_rtt, ms(20));
+    }
+
+    #[test]
+    fn min_rtt_forgets_a_sample_taken_before_an_idle_period() {
+        let start = Instant::now();
+        let (mut bbr, mut rtt) = (bbr(), estimator());
+        ack(&mut bbr, &mut rtt, start, ms(20));
+        ack(&mut bbr, &mut rtt, start + ms(1), Duration::from_micros(20));
+        // The first ack after the idle period sees the sample taken before it.
+        let after_idle = start + ms(20_000);
+        ack(&mut bbr, &mut rtt, after_idle, ms(20));
+        ack_without_sample(&mut bbr, &rtt, after_idle + ms(1));
+        assert_eq!(bbr.min_rtt, ms(20));
+    }
+
+    #[test]
+    fn target_window_sizes_by_the_floor_when_min_rtt_is_below_it() {
+        let start = Instant::now();
+        let mut bbr = bbr();
+        // 1 MB sent and acked per millisecond: 1 GB/s.
+        bbr.on_sent(start, 1_000_000, 1);
+        bbr.on_sent(start + ms(1), 1_000_000, 2);
+        let mut rtt = estimator();
+        rtt.update(Duration::ZERO, Duration::from_micros(20), start);
+        bbr.on_ack(start + ms(2), start, 1_000_000, false, &rtt);
+        bbr.on_ack(start + ms(3), start + ms(1), 1_000_000, false, &rtt);
+        assert_eq!(bbr.max_bandwidth.get_estimate(), 1_000_000_000);
+        assert_eq!(bbr.min_rtt, Duration::from_micros(20));
+        assert_eq!(bbr.get_target_cwnd(1.0), 250_000);
+    }
+}
