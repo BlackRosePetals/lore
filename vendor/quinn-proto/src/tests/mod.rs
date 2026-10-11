@@ -4386,3 +4386,59 @@ fn preferred_address() {
     let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
     pair.connect();
 }
+
+// LORE: not upstream. Re-apply with `BbrConfig::max_window` when re-vendoring.
+/// A BBR `max_window` below one packet keeps BBR's minimum window, so the connection still
+/// completes its handshake and moves data.
+#[test]
+fn bbr_max_window_below_one_packet() {
+    let mut bbr = congestion::BbrConfig::default();
+    bbr.max_window(0);
+    connect_and_transfer_with_bbr(bbr);
+}
+
+// LORE: not upstream. Re-apply with `BbrConfig::max_window` when re-vendoring.
+/// A BBR `initial_window` below one packet, with `max_window` below one packet too, keeps BBR's
+/// minimum window, so the connection still completes its handshake and moves data.
+#[test]
+fn bbr_initial_window_below_one_packet() {
+    let mut bbr = congestion::BbrConfig::default();
+    bbr.initial_window(1).max_window(0);
+    connect_and_transfer_with_bbr(bbr);
+}
+
+// LORE: not upstream, for the two tests above.
+/// Connects with `bbr` at both ends, then sends many times the minimum window of four packets.
+fn connect_and_transfer_with_bbr(bbr: congestion::BbrConfig) {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(bbr));
+    let transport = Arc::new(transport);
+    let server = ServerConfig {
+        transport: transport.clone(),
+        ..server_config()
+    };
+    let mut client = client_config();
+    client.transport_config(transport);
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect_with(client);
+
+    let msg = vec![0xab; 100_000];
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s).write(&msg).unwrap(),
+        msg.len()
+    );
+    pair.client_send(client_ch, s).finish().unwrap();
+    pair.drive();
+
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Uni), Some(stream) if stream == s);
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    let mut received = 0;
+    while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+        received += chunk.bytes.len();
+    }
+    let _ = chunks.finalize();
+    assert_eq!(received, msg.len());
+}

@@ -65,7 +65,11 @@ pub struct Bbr {
 impl Bbr {
     /// Construct a state using the given `config` and current time `now`
     pub fn new(config: Arc<BbrConfig>, current_mtu: u16) -> Self {
-        let initial_window = config.initial_window;
+        // LORE: the initial window is floored at the minimum window, as `on_mtu_update` floors it,
+        // where upstream took the configured value as given. quinn holds back a packet that would
+        // fill the window, so a configured window of one packet or less stopped every send.
+        let min_cwnd = calculate_min_window(current_mtu as u64);
+        let initial_window = config.initial_window.max(min_cwnd);
         Self {
             config,
             current_mtu: current_mtu as u64,
@@ -84,7 +88,7 @@ impl Bbr {
             last_cycle_start: None,
             current_cycle_offset: 0,
             init_cwnd: initial_window,
-            min_cwnd: calculate_min_window(current_mtu as u64),
+            min_cwnd,
             prev_in_flight_count: 0,
             exit_probe_rtt_at: None,
             probe_rtt_last_started_at: None,
@@ -273,6 +277,15 @@ impl Bbr {
         self.min_rtt.max(K_MIN_RTT_FLOOR)
     }
 
+    /// `BbrConfig::max_window`, never below the minimum window. quinn holds back a packet that
+    /// would fill the window, so a cap of one packet or less would stop every send, the handshake
+    /// included.
+    ///
+    /// LORE: not upstream. Re-apply this with `BbrConfig::max_window` when re-vendoring.
+    fn bounded_max_window(&self) -> u64 {
+        self.config.max_window.max(self.min_cwnd)
+    }
+
     fn get_target_cwnd(&self, gain: f32) -> u64 {
         let bw = self.max_bandwidth.get_estimate();
         // LORE: `bounded_min_rtt()`, where upstream read `self.min_rtt`.
@@ -320,7 +333,13 @@ impl Bbr {
         }
     }
 
-    fn calculate_cwnd(&mut self, bytes_acked: u64, excess_acked: u64) {
+    // LORE: not upstream. Three changes bring this back to the Chromium sender it is ported from:
+    // STARTUP grows the window only while it is below the target, where upstream compared
+    // `cwnd_gain` with the target and so grew it on every ack; STARTUP leaves ack aggregation out of
+    // the target, as Chromium does by default, since with no bandwidth estimate yet every acked byte
+    // counts as excess; and the window is capped at `BbrConfig::max_window`, floored at the minimum
+    // window. Re-apply all three, the `max_window` setting and its tests when re-vendoring.
+    fn calculate_cwnd(&mut self, bytes_acked: u64) {
         if self.mode == Mode::ProbeRtt {
             return;
         }
@@ -328,17 +347,15 @@ impl Bbr {
         if self.is_at_full_bandwidth {
             // Add the max recently measured ack aggregation to CWND.
             target_window += self.ack_aggregation.max_ack_height.get();
-        } else {
-            // Add the most recent excess acked.  Because CWND never decreases in
-            // STARTUP, this will automatically create a very localized max filter.
-            target_window += excess_acked;
         }
+        // LORE: upstream added `excess_acked` to the target in STARTUP here.
         // Instead of immediately setting the target CWND as the new one, BBR grows
         // the CWND towards |target_window| by only increasing it |bytes_acked| at a
         // time.
+        // LORE: STARTUP tests `self.cwnd < target_window`, where upstream tested `self.cwnd_gain`.
         if self.is_at_full_bandwidth {
             self.cwnd = target_window.min(self.cwnd + bytes_acked);
-        } else if (self.cwnd_gain < target_window as f32) || (self.acked_bytes < self.init_cwnd) {
+        } else if self.cwnd < target_window || self.acked_bytes < self.init_cwnd {
             // If the connection is not yet out of startup phase, do not decrease
             // the window.
             self.cwnd += bytes_acked;
@@ -348,6 +365,8 @@ impl Bbr {
         if self.cwnd < self.min_cwnd {
             self.cwnd = self.min_cwnd;
         }
+        // LORE: the cap at `max_window`.
+        self.cwnd = self.cwnd.min(self.bounded_max_window());
     }
 
     fn calculate_recovery_window(&mut self, bytes_acked: u64, bytes_lost: u64, in_flight: u64) {
@@ -448,7 +467,9 @@ impl Controller for Bbr {
         largest_packet_num_acked: Option<u64>,
     ) {
         let bytes_acked = self.max_bandwidth.bytes_acked_this_window();
-        let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
+        // LORE: the excess this returns no longer reaches `calculate_cwnd`; the call still updates
+        // `max_ack_height`.
+        self.ack_aggregation.update_ack_aggregation_bytes(
             bytes_acked,
             now,
             self.round_count,
@@ -485,7 +506,8 @@ impl Controller for Bbr {
 
         // After the model is updated, recalculate the pacing rate and congestion window.
         self.calculate_pacing_rate();
-        self.calculate_cwnd(bytes_acked, excess_acked);
+        // LORE: upstream also passed `excess_acked`.
+        self.calculate_cwnd(bytes_acked);
         self.calculate_recovery_window(bytes_acked, self.loss_state.lost_bytes, in_flight);
 
         self.prev_in_flight_count = in_flight;
@@ -510,12 +532,16 @@ impl Controller for Bbr {
     }
 
     fn window(&self) -> u64 {
-        if self.mode == Mode::ProbeRtt {
-            return self.get_probe_rtt_cwnd();
+        // LORE: capped at `max_window` on every path, ProbeRTT and recovery included, where
+        // upstream returned each window as computed.
+        let window = if self.mode == Mode::ProbeRtt {
+            self.get_probe_rtt_cwnd()
         } else if self.recovery_state.in_recovery() && self.mode != Mode::Startup {
-            return self.cwnd.min(self.recovery_window);
-        }
-        self.cwnd
+            self.cwnd.min(self.recovery_window)
+        } else {
+            self.cwnd
+        };
+        window.min(self.bounded_max_window())
     }
 
     fn metrics(&self) -> ControllerMetrics {
@@ -531,7 +557,9 @@ impl Controller for Bbr {
     }
 
     fn initial_window(&self) -> u64 {
-        self.config.initial_window
+        // LORE: the floored initial window capped at `max_window`, where upstream returned the
+        // configured value; quinn sizes the pacer's first burst by this.
+        self.init_cwnd.min(self.bounded_max_window())
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
@@ -543,14 +571,28 @@ impl Controller for Bbr {
 #[derive(Debug, Clone)]
 pub struct BbrConfig {
     initial_window: u64,
+    /// LORE: not upstream, see [`BbrConfig::max_window`].
+    max_window: u64,
 }
 
 impl BbrConfig {
     /// Default limit on the amount of outstanding data in bytes.
     ///
     /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
+    ///
+    /// LORE: never below the minimum window of four packets, where upstream took it as given.
     pub fn initial_window(&mut self, value: u64) -> &mut Self {
         self.initial_window = value;
+        self
+    }
+
+    /// Upper bound on the congestion window in bytes, never below the minimum window of four
+    /// packets. Unbounded by default.
+    ///
+    /// LORE: not upstream. Re-apply this, the `max_window` field and its default when
+    /// re-vendoring.
+    pub fn max_window(&mut self, value: u64) -> &mut Self {
+        self.max_window = value;
         self
     }
 }
@@ -559,6 +601,8 @@ impl Default for BbrConfig {
     fn default() -> Self {
         Self {
             initial_window: K_MAX_INITIAL_CONGESTION_WINDOW * BASE_DATAGRAM_SIZE,
+            // LORE: not upstream.
+            max_window: u64::MAX,
         }
     }
 }
@@ -801,5 +845,102 @@ mod tests {
         assert_eq!(bbr.max_bandwidth.get_estimate(), 1_000_000_000);
         assert_eq!(bbr.min_rtt, Duration::from_micros(20));
         assert_eq!(bbr.get_target_cwnd(1.0), 250_000);
+    }
+
+    // LORE: the window bounds in `calculate_cwnd` and `BbrConfig::max_window`.
+
+    /// Runs a flow for `millis` ms: each millisecond one packet of as much of 500 KB as the window
+    /// allows is sent, and the previous one is acked, a 1 ms round trip.
+    fn run_flow(bbr: &mut Bbr, app_limited: bool, millis: u64) {
+        let start = Instant::now();
+        let mut rtt = estimator();
+        let mut previous: Option<(Instant, u64, u64)> = None;
+        for packet in 0..millis {
+            let now = start + ms(packet);
+            if let Some((sent, bytes, _)) = previous {
+                bbr.on_ack(now, sent, bytes, app_limited, &rtt);
+            }
+            let bytes = bbr.window().min(500_000);
+            bbr.on_sent(now, bytes, packet);
+            if let Some((_, _, acked)) = previous {
+                bbr.on_end_acks(now, bytes, app_limited, Some(acked));
+                rtt.update(Duration::ZERO, ms(1), now);
+            }
+            previous = Some((now, bytes, packet));
+        }
+    }
+
+    #[test]
+    fn app_limited_flow_keeps_the_initial_window() {
+        // A sender held back by flow control is app-limited on every ack, so it never has a
+        // bandwidth estimate and never leaves STARTUP.
+        let mut bbr = bbr();
+        run_flow(&mut bbr, true, 10_000);
+        assert_eq!(bbr.mode, Mode::Startup);
+        assert_eq!(bbr.max_bandwidth.get_estimate(), 0);
+        assert_eq!(bbr.window(), bbr.init_cwnd);
+    }
+
+    #[test]
+    fn window_stops_at_max_window() {
+        let mut config = BbrConfig::default();
+        config.max_window(300_000);
+        let mut bbr = Bbr::new(Arc::new(config), 1200);
+        run_flow(&mut bbr, false, 3_000);
+        assert_eq!(bbr.mode, Mode::ProbeBw);
+        assert!(bbr.get_target_cwnd(bbr.cwnd_gain) > 300_000);
+        assert_eq!(bbr.window(), 300_000);
+    }
+
+    fn bbr_with_max_window(max_window: u64) -> Bbr {
+        let mut config = BbrConfig::default();
+        config.max_window(max_window);
+        Bbr::new(Arc::new(config), 1200)
+    }
+
+    #[test]
+    fn initial_window_stops_at_max_window() {
+        let bbr = bbr_with_max_window(100_000);
+        assert!(bbr.init_cwnd > 100_000);
+        assert_eq!(bbr.initial_window(), 100_000);
+        assert_eq!(bbr.window(), 100_000);
+    }
+
+    #[test]
+    fn max_window_below_one_packet_keeps_the_minimum_window() {
+        let mut bbr = bbr_with_max_window(0);
+        assert_eq!(bbr.initial_window(), bbr.min_cwnd);
+        assert_eq!(bbr.window(), bbr.min_cwnd);
+        run_flow(&mut bbr, false, 1_000);
+        assert_eq!(bbr.window(), bbr.min_cwnd);
+    }
+
+    #[test]
+    fn initial_window_below_one_packet_keeps_the_minimum_window() {
+        let mut config = BbrConfig::default();
+        config.initial_window(1);
+        let bbr = Bbr::new(Arc::new(config.clone()), 1200);
+        assert_eq!(bbr.initial_window(), bbr.min_cwnd);
+        assert_eq!(bbr.window(), bbr.min_cwnd);
+        config.max_window(0);
+        let bbr = Bbr::new(Arc::new(config), 1200);
+        assert_eq!(bbr.initial_window(), bbr.min_cwnd);
+        assert_eq!(bbr.window(), bbr.min_cwnd);
+    }
+
+    #[test]
+    fn probe_rtt_window_stops_at_max_window() {
+        let start = Instant::now();
+        let mut bbr = bbr_with_max_window(100_000);
+        // 1 MB sent and acked per millisecond: 1 GB/s.
+        bbr.on_sent(start, 1_000_000, 1);
+        bbr.on_sent(start + ms(1), 1_000_000, 2);
+        let mut rtt = estimator();
+        rtt.update(Duration::ZERO, Duration::from_micros(20), start);
+        bbr.on_ack(start + ms(2), start, 1_000_000, false, &rtt);
+        bbr.on_ack(start + ms(3), start + ms(1), 1_000_000, false, &rtt);
+        bbr.mode = Mode::ProbeRtt;
+        assert!(bbr.get_probe_rtt_cwnd() > 100_000);
+        assert_eq!(bbr.window(), 100_000);
     }
 }

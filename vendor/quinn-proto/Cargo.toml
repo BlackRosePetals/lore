@@ -1,6 +1,6 @@
 # Vendored from crates.io quinn-proto 0.11.19 (MIT OR Apache-2.0, the quinn authors).
 #
-# Vendored to carry three additions the published crate does not have, each marked with a `LORE:`
+# Vendored to carry four additions the published crate does not have, each marked with a `LORE:`
 # comment at the site:
 #
 #   - `TransportConfig::max_rtt`, an upper bound applied to each RTT sample before it reaches the
@@ -10,13 +10,20 @@
 #   - `TransportErrorCode::is_crypto`, which the client needs to tell a handshake failure apart
 #     from a transport failure and so decide whether reconnecting can succeed.
 #   - A windowed `min_rtt` in BBR, reading the new `RttEstimator::latest`, the latest sample and
-#     when it was taken, with a 250 µs floor on the value BBR sizes its window and gain cycle by. Upstream BBR copies the estimator's all-time
-#     minimum, and quinn stamps a whole receive batch with one time, so one RTT sample that comes
-#     out too small shrinks the window to tens of kilobytes for the rest of the connection.
+#     when it was taken, with a 250 µs floor on the value BBR sizes its window and gain cycle by.
+#     Upstream BBR copies the estimator's all-time minimum, and quinn stamps a whole receive batch
+#     with one time, so one RTT sample that comes out too small shrinks the window to tens of
+#     kilobytes for the rest of the connection.
+#   - Bounds on BBR's window, as in the Chromium sender it is ported from: STARTUP grows the window
+#     only while it is below its target and leaves ack aggregation out of that target, and
+#     `BbrConfig::max_window` caps it, never below BBR's minimum window of four packets, which now
+#     floors the configured initial window too. Upstream grew the window on every ack in STARTUP,
+#     so a sender held back by flow control, which never leaves STARTUP, grew it without limit.
 #
-# The first two are used from production code, so dropping the `[patch.crates-io]` override in
-# the workspace root does not compile; it would also lose the third without a compile error. The
-# tree is otherwise the published crate, plus elided-lifetime annotations.
+# `max_rtt`, `is_crypto` and `max_window` are used from production code, so dropping the
+# `[patch.crates-io]` override in the workspace root does not compile; it would also lose the BBR
+# changes without a compile error. The tree is otherwise the published crate, plus elided-lifetime
+# annotations.
 #
 # To move to a new upstream release: unpack that version's crates.io tarball over this directory,
 # re-apply each `LORE:` site, and confirm none was silently lost by grepping for `LORE:` and

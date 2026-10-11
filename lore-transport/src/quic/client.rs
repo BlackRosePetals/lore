@@ -774,6 +774,9 @@ pub async fn connect(
                 if let Some(cwnd) = transport.initial_cwnd {
                     bbr.initial_window(cwnd);
                 }
+                // quinn never has more than the send window unacknowledged, so a larger
+                // congestion window would only raise the pacing rate.
+                bbr.max_window(send_window);
                 Arc::new(bbr)
             }
             CongestionAlgorithm::Cubic => {
