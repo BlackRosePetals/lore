@@ -293,6 +293,7 @@ class Lore:
         offline: bool = False,
         remote: bool = False,
         local: bool = False,
+        cache: bool = False,
         identity: str | None = None,
         identity_token: str | None = None,
         access_token: str | None = None,
@@ -327,6 +328,7 @@ class Lore:
             + (["--offline"] if offline else [])
             + (["--remote"] if remote else [])
             + (["--local"] if local else [])
+            + (["--cache"] if cache else [])
             + (["--identity", identity] if identity else [])
             + (["--identity-token", identity_token] if identity_token else [])
             + (["--access-token", access_token] if access_token else [])
@@ -2738,6 +2740,7 @@ class GlobalOptionsParseable(TypedDict, total=False):
     offline: bool
     remote: bool
     local: bool
+    cache: bool
     identity: str
     max_connections: int
     file_count_limit: int
@@ -2762,6 +2765,7 @@ class GlobalOptions(TypedDict, total=False):
     offline: bool
     remote: bool
     local: bool
+    cache: bool
     identity: str
     identity_token: str
     access_token: str

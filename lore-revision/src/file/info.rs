@@ -270,7 +270,9 @@ async fn info_path(
 
         if filtered {
             // We will be iterating the tree, cache the state fragments
-            let _ = state_current.cache_fragments(repository.clone()).await;
+            let _ = state_current
+                .cache_fragments(repository.clone(), false)
+                .await;
         }
 
         lore_debug!("Info local {local} and filtered {filtered}");

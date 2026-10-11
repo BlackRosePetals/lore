@@ -177,7 +177,7 @@ def test_file(new_lore_repo, lore_executable_path):
     clone.repository_verify()
 
     # Create a new clone
-    clone = repo.clone()
+    clone = repo.clone(offline=True)
 
     # Ensure we can commit offline directly after a clone
     with clone.open_file(large_file_path, "w+b") as output_file:

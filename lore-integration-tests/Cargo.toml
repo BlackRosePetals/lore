@@ -48,7 +48,7 @@ lore = { workspace = true }
 lore-base = { workspace = true }
 lore-storage = { workspace = true }
 lore-aws = { workspace = true }
-lore-revision = { workspace = true }
+lore-revision = { workspace = true, features = ["test-util"] }
 lore-hashicorp = { workspace = true }
 lore-proto = { workspace = true }
 uuid = { workspace = true }

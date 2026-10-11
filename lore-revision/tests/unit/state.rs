@@ -1824,8 +1824,8 @@ async fn a_deeply_nested_hierarchy_is_emitted_in_full() {
     );
 }
 
-/// A file metadata block's prefetch and load, and the deprecated name table's load, keep the
-/// fields of the tree they read rather than the tree, so none holds a tree across its read.
+/// A file metadata block's load and the deprecated name table's load keep the fields of the
+/// tree they read rather than the tree, so neither holds a tree across its read.
 #[tokio::test]
 async fn tree_readers_hold_its_fields_not_the_tree() {
     LORE_CONTEXT
@@ -1836,12 +1836,10 @@ async fn tree_readers_hold_its_fields_not_the_tree() {
 
             let list_read = immutable::read(repository.clone(), Address::default(), None, options);
             let name_table_read = NameTable::deserialize(repository.clone(), Hash::default());
-            let prefetch = state.block_file_metadata_cache(repository.clone(), 0);
             let load = state.block_file_metadata_load(repository.clone(), 0);
             let name_table = state.nametable_load(repository);
 
             for (what, future, read) in [
-                ("prefetch", size_of_val(&prefetch), size_of_val(&list_read)),
                 ("load", size_of_val(&load), size_of_val(&list_read)),
                 (
                     "name table load",

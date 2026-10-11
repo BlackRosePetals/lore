@@ -848,7 +848,7 @@ pub(crate) async fn sync(
     let cache_state = state_target.clone();
     let cache_task = Some(lore_spawn!(async move {
         // Ignore errors during caching
-        let _ = cache_state.cache_fragments(cache_repository).await;
+        let _ = cache_state.cache_fragments(cache_repository, false).await;
     }));
 
     let state_synced = state_target.clone();

@@ -3016,6 +3016,11 @@ mod block_single_flight {
                     reads.values().all(|&count| count == 1),
                     "the burst must read nothing twice, got {reads:?}"
                 );
+                assert!(
+                    !reads.contains_key(&seed.metadata_list)
+                        && !reads.contains_key(&seed.metadata_block),
+                    "a node block load reads no file metadata, got {reads:?}"
+                );
             }))
             .await
             .expect("Test task failed");

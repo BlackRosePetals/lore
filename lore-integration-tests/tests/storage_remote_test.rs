@@ -1480,20 +1480,103 @@ mod storage_remote_tests {
             .await
     }
 
+    /// A repository context for `repository_id` over `stores`, reaching the remote through
+    /// `remote`.
+    fn cache_test_context(
+        repository_id: lore_revision::lore::RepositoryId,
+        (immutable_store, mutable_store): (
+            Arc<dyn lore_storage::ImmutableStore>,
+            Arc<dyn lore_storage::MutableStore>,
+        ),
+        remote: Result<Arc<lore_transport::Connection>, lore_transport::ProtocolError>,
+    ) -> Arc<lore_revision::repository::RepositoryContext> {
+        Arc::new(lore_revision::repository::RepositoryContext::new(
+            lore_revision::repository::RepositoryContextCreationArgs {
+                paths: None,
+                immutable_store,
+                mutable_store,
+                id: repository_id,
+                instance_id: lore_revision::instance::InstanceId::default(),
+                remote,
+                filter: Arc::new(lore_revision::filter::Filter::default()),
+                filesystem_provider: None,
+            },
+        ))
+    }
+
+    /// A server and the repositories a `State::cache_fragments` test works through: one over the
+    /// server's own stores, with no remote, where the test builds its state, and a client over
+    /// in-memory stores connected to the server, which caches nothing it reads by itself.
+    struct CacheTest {
+        server: TestServer,
+        repository_id: lore_revision::lore::RepositoryId,
+        server_repository: Arc<lore_revision::repository::RepositoryContext>,
+        client_stores: (
+            Arc<dyn lore_storage::ImmutableStore>,
+            Arc<dyn lore_storage::MutableStore>,
+        ),
+        client_repository: Arc<lore_revision::repository::RepositoryContext>,
+    }
+
+    impl CacheTest {
+        async fn start(
+            transport: Transport,
+            repository_id: lore_revision::lore::RepositoryId,
+        ) -> Result<Self, Box<dyn Error>> {
+            let server = start_server(transport).await;
+            let server_repository = cache_test_context(
+                repository_id,
+                (
+                    server.backend_immutable.clone(),
+                    server.backend_mutable.clone(),
+                ),
+                Err(lore_transport::ProtocolError::from(
+                    lore_base::error::NoRemote,
+                )),
+            );
+            let client_stores = lore_revision::repository::create_client_memory_stores().await?;
+            let remote = lore_transport::connection::connect(
+                server.url.as_str(),
+                "cache-test",
+                repository_id,
+                1,
+                "",
+                "",
+            )
+            .await?;
+            let client_repository =
+                cache_test_context(repository_id, client_stores.clone(), Ok(remote));
+            client_repository.set_disable_cache(true);
+            Ok(Self {
+                server,
+                repository_id,
+                server_repository,
+                client_stores,
+                client_repository,
+            })
+        }
+
+        /// A repository over the client's stores, with no remote.
+        fn offline(&self) -> Arc<lore_revision::repository::RepositoryContext> {
+            cache_test_context(
+                self.repository_id,
+                self.client_stores.clone(),
+                Err(lore_transport::ProtocolError::from(
+                    lore_base::error::NoRemote,
+                )),
+            )
+        }
+    }
+
     /// `State::cache_fragments` retains the state and tree records even when their fragments
     /// lack `PayloadLocalCachePriority`, so both can be read without a remote.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn state_fragment_cache_makes_historical_state_available_offline() -> TestResult {
-        use lore_base::error::NoRemote;
         use lore_base::types::Address;
         use lore_base::types::fragment_flags::FragmentFlags;
-        use lore_revision::filter::Filter;
-        use lore_revision::instance::InstanceId;
         use lore_revision::lore::RepositoryId;
         use lore_revision::node::Node;
         use lore_revision::node::ROOT_NODE;
-        use lore_revision::repository::RepositoryContext;
-        use lore_revision::repository::RepositoryContextCreationArgs;
         use lore_revision::repository::RepositoryWriteToken;
         use lore_revision::state::State;
         use lore_storage::hash::hash_string;
@@ -1502,26 +1585,8 @@ mod storage_remote_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 for transport in TRANSPORTS {
-                    let server = start_server(transport).await;
                     let repository_id = RepositoryId::from([0xd2u8; 16]);
-                    let context = |immutable_store, mutable_store, remote| {
-                        Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-                            paths: None,
-                            immutable_store,
-                            mutable_store,
-                            id: repository_id,
-                            instance_id: InstanceId::default(),
-                            remote,
-                            filter: Arc::new(Filter::default()),
-                            filesystem_provider: None,
-                        }))
-                    };
-
-                    let server_repository = context(
-                        server.backend_immutable.clone(),
-                        server.backend_mutable.clone(),
-                        Err(lore_transport::ProtocolError::from(NoRemote)),
-                    );
+                    let test = CacheTest::start(transport, repository_id).await?;
                     let write_token = RepositoryWriteToken::acquire(std::path::Path::new(
                         "historical-state-cache-test",
                     ))
@@ -1532,54 +1597,208 @@ mod storage_remote_tests {
                         ..Default::default()
                     };
                     state
-                        .node_add(server_repository.clone(), ROOT_NODE, node, "held")
+                        .node_add(test.server_repository.clone(), ROOT_NODE, node, "held")
                         .await?;
-                    let revision = state.serialize(server_repository, &write_token).await?;
+                    let revision = state
+                        .serialize(test.server_repository.clone(), &write_token)
+                        .await?;
 
                     for hash in [revision, state.tree_hash()] {
                         let address = Address::zero_context_hash(hash);
-                        let (mut fragment, payload) = server
+                        let (mut fragment, payload) = test
+                            .server
                             .backend_immutable
                             .clone()
                             .get(repository_id, address)
                             .await?
                             .into_payload()?;
                         fragment.flags &= !FragmentFlags::PayloadLocalCachePriority;
-                        server
+                        test.server
                             .backend_immutable
                             .clone()
                             .put(repository_id, address, fragment, Some(payload), true)
                             .await?;
                     }
 
-                    let (client_immutable, client_mutable) =
-                        lore_revision::repository::create_client_memory_stores().await?;
-                    let remote = lore_transport::connection::connect(
-                        server.url.as_str(),
-                        "historical-state-cache-test",
-                        repository_id,
-                        1,
-                        "",
-                        "",
-                    )
-                    .await?;
-                    let client_repository =
-                        context(client_immutable.clone(), client_mutable.clone(), Ok(remote));
-                    client_repository.set_disable_cache(true);
-                    State::deserialize(client_repository.clone(), revision)
+                    State::deserialize(test.client_repository.clone(), revision)
                         .await?
-                        .cache_fragments(client_repository)
+                        .cache_fragments(test.client_repository.clone(), false)
                         .await?;
 
-                    let offline_repository = context(
-                        client_immutable,
-                        client_mutable,
-                        Err(lore_transport::ProtocolError::from(NoRemote)),
-                    );
-                    State::deserialize(offline_repository.clone(), revision)
+                    let offline = test.offline();
+                    State::deserialize(offline.clone(), revision)
                         .await?
-                        .tree(offline_repository)
+                        .tree(offline)
                         .await?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// `State::cache_file_metadata` caches every file metadata block and the metadata its slots
+    /// name, so each reads without a remote: with a batch of one, which caches the metadata of
+    /// each block in turn while the next is read, and with one batch for all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_metadata_cache_makes_file_metadata_available_offline() -> TestResult {
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::metadata::Metadata;
+        use lore_revision::node::Node;
+        use lore_revision::node::NodeFileMetadata;
+        use lore_revision::node::NodeFileMetadataBlock;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::node::node_to_file_metadata;
+        use lore_revision::repository::RepositoryWriteToken;
+        use lore_revision::state::State;
+        use lore_storage::hash::hash_string;
+
+        let execution = setup_execution("storage-remote-file-metadata-cache".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for (transport, batch) in TRANSPORTS
+                    .into_iter()
+                    .flat_map(|transport| [(transport, 1), (transport, 16_384)])
+                {
+                    let test =
+                        CacheTest::start(transport, RepositoryId::from([0xd3u8; 16])).await?;
+                    let write_token = RepositoryWriteToken::acquire(std::path::Path::new(
+                        "file-metadata-cache-test",
+                    ))
+                    .await;
+                    let state = State::new();
+                    let mut described = Vec::new();
+                    for index in 0..1200 {
+                        let name = format!("file{index}");
+                        let node = Node {
+                            name_hash: hash_string(&name),
+                            ..Default::default()
+                        };
+                        let node = state
+                            .node_add(test.server_repository.clone(), ROOT_NODE, node, &name)
+                            .await?;
+                        if [0, 600, 1100].contains(&index) {
+                            described.push(node);
+                        }
+                    }
+
+                    let mut expected = Vec::new();
+                    for (index, &node) in described.iter().enumerate() {
+                        let mut metadata = Metadata::new();
+                        metadata.set_string("index", &index.to_string())?;
+                        let hash = metadata.serialize(test.server_repository.clone()).await?;
+                        let metadata_node = node_to_file_metadata(node);
+                        let block_index = NodeFileMetadataBlock::index(metadata_node);
+                        let block = state
+                            .block_file_metadata(test.server_repository.clone(), block_index)
+                            .await?;
+                        {
+                            let mut writer = block.write();
+                            writer.node(NodeFileMetadata::index(metadata_node)).metadata = hash;
+                            writer.mark_dirty();
+                        }
+                        state.block_file_metadata_modified(block, block_index);
+                        expected.push((block_index, NodeFileMetadata::index(metadata_node), index));
+                    }
+                    assert_eq!(
+                        expected[0].0 + 2,
+                        expected[2].0,
+                        "the metadata spans three blocks"
+                    );
+                    state.mark_dirty();
+                    let revision = state
+                        .serialize(test.server_repository.clone(), &write_token)
+                        .await?;
+
+                    let client_state =
+                        State::deserialize(test.client_repository.clone(), revision).await?;
+                    client_state
+                        .cache_fragments(test.client_repository.clone(), false)
+                        .await?;
+                    client_state
+                        .cache_file_metadata(&test.client_repository, batch)
+                        .await?;
+
+                    let offline = test.offline();
+                    let offline_state = State::deserialize(offline.clone(), revision).await?;
+                    for (block_index, node_index, index) in expected {
+                        let hash = offline_state
+                            .block_file_metadata(offline.clone(), block_index)
+                            .await?
+                            .read()
+                            .node_block()
+                            .node[node_index]
+                            .metadata;
+                        let metadata = Metadata::deserialize(offline.clone(), hash).await?;
+                        assert_eq!(metadata.get_string("index")?, index.to_string());
+                    }
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// With `file_metadata`, `State::cache_fragments` fails when the remote lacks metadata a file
+    /// metadata block names. Without it, caching disregards the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_metadata_cache_fails_on_metadata_the_remote_lacks() -> TestResult {
+        use lore_base::types::Hash;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::node::Node;
+        use lore_revision::node::NodeFileMetadata;
+        use lore_revision::node::NodeFileMetadataBlock;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::node::node_to_file_metadata;
+        use lore_revision::repository::RepositoryWriteToken;
+        use lore_revision::state::State;
+        use lore_storage::hash::hash_string;
+
+        let execution = setup_execution("storage-remote-file-metadata-cache-failure".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let test =
+                        CacheTest::start(transport, RepositoryId::from([0xd4u8; 16])).await?;
+                    let write_token = RepositoryWriteToken::acquire(std::path::Path::new(
+                        "file-metadata-cache-failure-test",
+                    ))
+                    .await;
+                    let state = State::new();
+                    let node = Node {
+                        name_hash: hash_string("described"),
+                        ..Default::default()
+                    };
+                    let node = state
+                        .node_add(test.server_repository.clone(), ROOT_NODE, node, "described")
+                        .await?;
+                    let metadata_node = node_to_file_metadata(node);
+                    let block_index = NodeFileMetadataBlock::index(metadata_node);
+                    let block = state
+                        .block_file_metadata(test.server_repository.clone(), block_index)
+                        .await?;
+                    {
+                        let mut writer = block.write();
+                        writer.node(NodeFileMetadata::index(metadata_node)).metadata =
+                            Hash::from_u64(9);
+                        writer.mark_dirty();
+                    }
+                    state.block_file_metadata_modified(block, block_index);
+                    state.mark_dirty();
+                    let revision = state
+                        .serialize(test.server_repository.clone(), &write_token)
+                        .await?;
+
+                    let client_state =
+                        State::deserialize(test.client_repository.clone(), revision).await?;
+                    client_state
+                        .cache_fragments(test.client_repository.clone(), false)
+                        .await?;
+                    assert!(
+                        client_state
+                            .cache_fragments(test.client_repository.clone(), true)
+                            .await
+                            .is_err(),
+                        "metadata the remote lacks fails the file metadata cache"
+                    );
                 }
                 Ok(())
             })

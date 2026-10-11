@@ -13,6 +13,7 @@ use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
+use tokio::task::JoinError;
 use tokio::task::JoinSet;
 use zerocopy::FromZeros;
 
@@ -656,6 +657,10 @@ pub fn file_matches(
 // Cache and query helpers
 // ---------------------------------------------------------------------------
 
+/// Fetches every fragment at `address` the local store lacks from the remote and stores it, then
+/// the subfragments of fragmented ones when `cache_fragmented` is set. Once connected, every
+/// fragment that can be cached is, and the answer is the failure to connect, the first failure to
+/// query, fetch or store a fragment, or else how many were fetched.
 pub async fn cache(
     repository: Arc<RepositoryContext>,
     address: Vec<Address>,
@@ -679,9 +684,7 @@ pub async fn cache(
     cache_through(repository, remote_storage, address, cache_fragmented).await
 }
 
-/// [`cache`] once connected: fetches every fragment at `address` the local store lacks
-/// through `remote_storage` and stores it, then the subfragments of fragmented ones when
-/// `cache_fragmented` is set.
+/// [`cache`] once connected, fetching through `remote_storage`.
 ///
 /// A function of its own because its batches live across several awaits: kept in [`cache`]
 /// they would take space in its future while the remote is connected as well.
@@ -705,6 +708,7 @@ async fn cache_through(
     let start = Instant::now();
     let mut total_store_count = 0;
     let mut total_query_count = 0;
+    let mut failure = None;
 
     while !query_address.is_empty() {
         let query_count = query_address.count::<Address>();
@@ -744,14 +748,26 @@ async fn cache_through(
         let mut additional_address = Vec::with_capacity(query_count);
 
         let mut process_fetch =
-            |result: Result<Result<(Address, Fragment, Bytes), ProtocolError>, _>,
-             store_tasks: &mut JoinSet<Result<(), StoreError>>| {
-                // Cache is best effort, ignore errors
-                let Ok(result) = result else {
-                    return;
-                };
-                let Ok((address, fragment, mut buffer)) = result else {
-                    return;
+            |result: Result<Result<(Address, Fragment, Bytes), ProtocolError>, JoinError>,
+             store_tasks: &mut JoinSet<Result<(), StoreError>>,
+             failure: &mut Option<Box<ImmutableError>>| {
+                let (address, fragment, mut buffer) = match result {
+                    Ok(Ok(fetched)) => fetched,
+                    Ok(Err(error)) => {
+                        failure.get_or_insert_with(|| {
+                            Box::new(error.forward("fetching fragment to cache"))
+                        });
+                        return;
+                    }
+                    Err(error) => {
+                        failure.get_or_insert_with(|| {
+                            Box::new(ImmutableError::internal_with_context(
+                                error,
+                                "fetching fragment to cache",
+                            ))
+                        });
+                        return;
+                    }
                 };
 
                 // If the data is fragmented and we should cache subfragments, queue additional fragments
@@ -777,41 +793,57 @@ async fn cache_through(
             };
 
         while let Some(result) = query_tasks.join_next().await {
-            if let Ok(Ok((address, matches))) = result
-                && address.count::<Address>() == matches.len()
-            {
-                let address = address.as_type_slice::<Address>();
-                for (index, resolved) in matches.iter().enumerate() {
-                    if resolved.match_made != StoreMatch::MatchNone {
-                        continue;
-                    }
-
-                    fetch_count += 1;
-
-                    let remote_storage = remote_storage.clone();
-                    let address = address[index];
-                    lore_spawn!(fetch_tasks, async move {
-                        remote_storage
-                            .get(&address)
-                            .await
-                            .map(|(fragment, buffer)| (address, fragment, buffer))
+            let (address, matches) = match result {
+                Ok(Ok(queried)) => queried,
+                Ok(Err(error)) => {
+                    failure.get_or_insert_with(|| {
+                        Box::new(error.forward("querying fragments to cache"))
                     });
+                    continue;
+                }
+                Err(error) => {
+                    failure.get_or_insert_with(|| {
+                        Box::new(ImmutableError::internal_with_context(
+                            error,
+                            "querying fragments to cache",
+                        ))
+                    });
+                    continue;
+                }
+            };
+            let address = address.as_type_slice::<Address>();
+            for (index, resolved) in matches.iter().enumerate() {
+                if resolved.match_made != StoreMatch::MatchNone {
+                    continue;
+                }
 
+                fetch_count += 1;
+
+                let remote_storage = remote_storage.clone();
+                let address = address[index];
+                lore_spawn!(fetch_tasks, async move {
+                    remote_storage
+                        .get(&address)
+                        .await
+                        .map(|(fragment, buffer)| (address, fragment, buffer))
+                });
+
+                {
+                    while let Some(result) = fetch_tasks.try_join_next() {
+                        process_fetch(result, &mut store_tasks, &mut failure);
+                    }
+
+                    while fetch_tasks.len() > MAX_REQUEST_COUNT
+                        && let Some(result) = fetch_tasks.join_next().await
                     {
-                        while let Some(result) = fetch_tasks.try_join_next() {
-                            process_fetch(result, &mut store_tasks);
-                        }
-
-                        while fetch_tasks.len() > MAX_REQUEST_COUNT
-                            && let Some(result) = fetch_tasks.join_next().await
-                        {
-                            process_fetch(result, &mut store_tasks);
-                        }
+                        process_fetch(result, &mut store_tasks, &mut failure);
                     }
+                }
 
-                    while store_tasks.len() > MAX_REQUEST_COUNT {
-                        let _ = store_tasks.join_next().await;
-                    }
+                while store_tasks.len() > MAX_REQUEST_COUNT
+                    && let Some(result) = store_tasks.join_next().await
+                {
+                    keep_store_failure(&mut failure, result);
                 }
             }
         }
@@ -822,10 +854,12 @@ async fn cache_through(
             );
         }
         while let Some(result) = fetch_tasks.join_next().await {
-            process_fetch(result, &mut store_tasks);
+            process_fetch(result, &mut store_tasks, &mut failure);
 
-            while store_tasks.len() > MAX_REQUEST_COUNT {
-                let _ = store_tasks.join_next().await;
+            while store_tasks.len() > MAX_REQUEST_COUNT
+                && let Some(result) = store_tasks.join_next().await
+            {
+                keep_store_failure(&mut failure, result);
             }
         }
 
@@ -835,7 +869,9 @@ async fn cache_through(
                 store_tasks.len(),
             );
         }
-        while store_tasks.join_next().await.is_some() {}
+        while let Some(result) = store_tasks.join_next().await {
+            keep_store_failure(&mut failure, result);
+        }
 
         total_store_count += fetch_count;
 
@@ -853,7 +889,28 @@ async fn cache_through(
         start.elapsed().as_secs_f64()
     );
 
-    Ok(total_store_count)
+    failure.map_or(Ok(total_store_count), |failure| Err(*failure))
+}
+
+/// Keeps the failure of a [`cache_through`] store task in `failure`, unless it holds an earlier one.
+fn keep_store_failure(
+    failure: &mut Option<Box<ImmutableError>>,
+    result: Result<Result<(), StoreError>, JoinError>,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            failure.get_or_insert_with(|| Box::new(error.forward("storing cached fragment")));
+        }
+        Err(error) => {
+            failure.get_or_insert_with(|| {
+                Box::new(ImmutableError::internal_with_context(
+                    error,
+                    "storing cached fragment",
+                ))
+            });
+        }
+    }
 }
 
 pub async fn is_stored_local(repository: Arc<RepositoryContext>, address: Address) -> bool {

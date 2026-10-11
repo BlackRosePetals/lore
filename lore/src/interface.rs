@@ -3999,6 +3999,12 @@ pub type LoreRepositoryCloneArgs = crate::repository::LoreRepositoryCloneArgs;
 
 /// Clone a remote repository to a local path.
 ///
+/// A clone needs the remote, so the `offline` global argument does not keep it from connecting: it
+/// prepares the clone for working offline instead. With `offline` or `cache`, a clone that writes
+/// its files caches every file metadata block of the cloned revision and the metadata they name,
+/// so calls reading file metadata work without the remote, and fails if it cannot. A bare clone
+/// writes no files and reads them from the remote when a call needs them.
+///
 /// # Events
 ///
 /// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.

@@ -600,7 +600,7 @@ def test_sync_far_behind_through_local_merge_tip(new_lore_repo):
 
     # A second clone races ahead with > MAX_DIVERGENT_HISTORY_LENGTH
     # linear commits on main.
-    clone = repo.clone()
+    clone = repo.clone(offline=True)
     bulk_file = "bulk.txt"
     for i in range(_FAR_BEHIND_REMOTE_COMMITS):
         with clone.open_file(bulk_file, "w+") as f:
@@ -647,7 +647,7 @@ def test_sync_far_behind_with_local_merge_tip_and_remote_merges(new_lore_repo):
     repo.push()
 
     # Clone races ahead with cycles of linear commits + merges.
-    clone = repo.clone()
+    clone = repo.clone(offline=True)
     bulk_file = "bulk.txt"
     remote_side_file = "remote-side.txt"
 

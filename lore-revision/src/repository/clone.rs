@@ -323,6 +323,10 @@ pub struct CloneOptions {
     pub dependency_recursive: bool,
     /// Maximum dependency traversal depth. 0 means unlimited.
     pub dependency_depth_limit: u32,
+    /// Where the clone writes its files, cache every file metadata block of the cloned revision
+    /// and the metadata they name, so commands reading file metadata work without the remote, and
+    /// fail the clone if that fails.
+    pub cache_file_metadata: bool,
 }
 
 pub struct CloneWorkItem {
@@ -1340,8 +1344,11 @@ async fn clone_materialize(
 
         let cache_repository = repository.clone();
         let cache_state = state.clone();
+        let cache_file_metadata = options.cache_file_metadata;
         cache_task = Some(lore_spawn!(async move {
-            let _ = cache_state.cache_fragments(cache_repository).await;
+            cache_state
+                .cache_fragments(cache_repository, cache_file_metadata)
+                .await
         }));
 
         clone_result = clone_in_path(ctx).await;
@@ -1353,7 +1360,14 @@ async fn clone_materialize(
     .send();
 
     if let Some(task) = cache_task {
-        let _ = task.await;
+        let cached = task.await;
+        if options.cache_file_metadata {
+            clone_result = clone_result.and_then(|()| {
+                cached
+                    .internal("Caching the cloned state")?
+                    .forward("Failed to cache file metadata for working offline")
+            });
+        }
     }
 
     crate::instance::store_current_anchor_branch(&repository, branch_id)

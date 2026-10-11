@@ -46,7 +46,7 @@ pub(crate) async fn dump(
     })
     .send();
 
-    let _ = state.cache_fragments(repository.clone()).await;
+    let _ = state.cache_fragments(repository.clone(), false).await;
 
     let dump_result = state::dump::dump(state, repository.clone(), path, max_depth)
         .await

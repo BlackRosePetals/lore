@@ -252,3 +252,21 @@ def reclone_retained_scan(repo: Lore, clone: Lore, file_count: int) -> tuple[int
     summary = parse_status_summary_json(scan)
     assert summary is not None, "scan must emit a repositoryStatusSummary event"
     return summary["hashChecks"], summary["mtimeMatches"]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("flag", ["offline", "cache"])
+def test_clone_keeps_file_metadata_for_offline_use(new_lore_repo, flag):
+    """A clone given `--offline` or `--cache` keeps every file metadata block of the cloned
+    revision and the metadata they name, so reading a file's metadata works offline after it."""
+    repo: Lore = new_lore_repo()
+    with repo.open_file("described.txt", "w+") as f:
+        f.write("described\n")
+    repo.stage("described.txt")
+    repo.file_metadata_set("described.txt", ["color", "blue"])
+    repo.commit("Base")
+    repo.push()
+
+    clone: Lore = repo.clone(**{flag: True})
+
+    assert "blue" in clone.file_metadata_get("described.txt", "color", offline=True)
