@@ -43,6 +43,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- QUIC: the client requests a 512 KiB UDP receive buffer, which Linux allocates as 1 MiB. Linux caps the request at
+  `net.core.rmem_max`; set it to `524288` or more for the full buffer
 - QUIC: BBR's congestion window no longer grows without limit while flow control holds back the sender, and is
   capped at the connection's send window
 - QUIC: BBR keeps the minimum RTT of the last 10 seconds, floored at 250 µs, in place of the lowest sample ever

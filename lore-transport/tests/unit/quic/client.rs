@@ -296,3 +296,39 @@ async fn happy_eyeballs_bounds_in_flight_attempts() {
 
     task.abort();
 }
+
+fn receive_buffer_size(socket: &std::net::UdpSocket) -> usize {
+    socket2::SockRef::from(socket)
+        .recv_buffer_size()
+        .expect("socket receive buffer size should be readable")
+}
+
+fn bound_socket_with_receive_buffer(bytes: usize) -> std::net::UdpSocket {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+    socket2::SockRef::from(&socket)
+        .set_recv_buffer_size(bytes)
+        .expect("receive buffer size should be settable");
+    socket
+}
+
+#[test]
+fn raise_receive_buffer_grows_a_smaller_buffer() {
+    let socket = bound_socket_with_receive_buffer(64 * 1024);
+    let before = receive_buffer_size(&socket);
+
+    raise_receive_buffer(&socket, RECEIVE_BUFFER_BYTES);
+
+    assert!(receive_buffer_size(&socket) > before);
+}
+
+#[test]
+fn raise_receive_buffer_keeps_a_larger_buffer() {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+    let before = receive_buffer_size(&socket);
+
+    // Asking for less than the buffer holds would shrink it, so an unchanged size shows the
+    // request was not made.
+    raise_receive_buffer(&socket, before / 4);
+
+    assert_eq!(receive_buffer_size(&socket), before);
+}
