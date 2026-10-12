@@ -513,8 +513,10 @@ mod tests {
     /// actual `bucket_count` (not a hard-coded `BUCKET_COUNT`) and leaves the store consistent.
     /// We force three groups to levels 1, 32, and 256 by setting `bucket_count` directly, populate
     /// each, then exercise (a) `flush`, (b) `evict_oldest`, and (c) `compact` — the last
-    /// dispatches to `compact_packfiles` → `compact_group_packfiles` → `evict_group_sized`,
-    /// covering the four maintenance ops the plan named.
+    /// dispatches to `compact_packfiles` → `compact_group_packfiles` → `evict_group_sized`.
+    /// Two of each group's fragments are durable, so compaction run step by step over every
+    /// group evicts them and rewrites each forced group's packfile down to its three local
+    /// fragments.
     #[tokio::test]
     async fn mixed_level_maintenance_is_consistent() {
         let store_path = temp_dir();
@@ -537,7 +539,7 @@ mod tests {
         // under that group's level. This validates `bucket_index_for` consistency.
         let mut rng = StdRng::seed_from_u64(0xCAFE);
         for &group_idx in &[0usize, 1usize, 100usize] {
-            for _ in 0..5 {
+            for index in 0..5 {
                 let mut hash = make_hash(&mut rng);
                 hash.data_mut()[0] = group_idx as u8;
                 // Force key.data()[1] = 0 so it routes to bucket 0 under any level.
@@ -548,7 +550,11 @@ mod tests {
                 };
                 let payload = bytes::Bytes::from_static(b"test payload data");
                 let fragment = lore_storage::Fragment {
-                    flags: 0,
+                    flags: if index < 2 {
+                        lore_storage::FragmentFlags::PayloadStoredDurable.bits()
+                    } else {
+                        0
+                    },
                     size_payload: payload.len() as u32,
                     size_content: payload.len() as u64,
                 };
@@ -572,12 +578,25 @@ mod tests {
         // evict_oldest with generous capacity: no actual eviction, but the bucket-iteration path runs at every level.
         let _evicted = store.evict_oldest(1_000_000_000, None).await;
 
-        // compact with small max_size: forces compact_packfiles → compact_group_packfiles → evict_group_sized to iterate per-group bucket arrays at the actual bucket_count. We don't care whether it evicts anything; we only care that all three paths complete without error or panic at every group level.
-        let _compact_step = store_dyn
-            .clone()
-            .compact(1, None, false, None)
-            .await
-            .expect("compact must complete without error at mixed bucket levels");
+        let mut at = None;
+        for _ in 0..=lore_storage::local::immutable_store::GROUP_COUNT {
+            at = store_dyn
+                .clone()
+                .compact(1, at, false, None)
+                .await
+                .expect("compact must complete without error at mixed bucket levels");
+            if at.is_none() {
+                break;
+            }
+        }
+        assert_eq!(at, None, "compaction finishes within one step per group");
+        for &group_idx in &[0usize, 1usize, 100usize] {
+            assert_eq!(
+                store.group[group_idx].packstore.total_size().await.unwrap(),
+                3 * b"test payload data".len(),
+                "group {group_idx} is rewritten down to its three local fragments"
+            );
+        }
 
         // Maintenance ops never alter bucket_count (only fan-out does). All three forced levels survive.
         assert_eq!(store.group[0].bucket_count.load(Ordering::Relaxed), 1);

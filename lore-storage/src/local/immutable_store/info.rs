@@ -113,6 +113,7 @@ pub async fn write_info_file(info: &ImmutableStoreInfo, path: &Path) -> std::io:
                 .create(true)
                 .truncate(true),
             ImmutableStoreInfoSegment(segment),
+            true,
         )
         .await?;
     Ok(())

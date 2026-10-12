@@ -1459,6 +1459,10 @@ impl ImmutableStore for CompositeStore {
         self.local.store().compact_resume_at().await
     }
 
+    async fn load_index(self: Arc<Self>) -> Result<(), StoreError> {
+        self.local.store().load_index().await
+    }
+
     async fn stop_gc(self: Arc<Self>, terminate: bool) {
         // Collected before awaiting so no replica lock is held across the drain, then driven
         // together so every target is asked to stop on the first poll rather than each

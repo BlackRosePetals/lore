@@ -550,6 +550,12 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// Return the current resume point for compaction
     async fn compact_resume_at(self: Arc<Self>) -> Option<usize>;
 
+    /// Load every part of the index the store otherwise loads on demand. The default loads
+    /// nothing.
+    async fn load_index(self: Arc<Self>) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// Stop eviction and compaction, returning once the passes in flight have given up.
     /// With `terminate` the stop stays raised and the store never collects again; without
     /// it the stop is lifted before returning, since a store is shared by path and a caller

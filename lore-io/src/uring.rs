@@ -552,9 +552,10 @@ impl UringDriver {
         temporary_path: PathBuf,
         final_path: PathBuf,
         buffers: B,
+        durable: bool,
     ) -> std::io::Result<()> {
         PsyncDriver
-            .write_file_segments_atomic(options, temporary_path, final_path, buffers)
+            .write_file_segments_atomic(options, temporary_path, final_path, buffers, durable)
             .await
     }
 

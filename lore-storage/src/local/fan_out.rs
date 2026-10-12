@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -153,14 +154,15 @@ pub async fn read_level_marker(group_path: &Path) -> std::io::Result<Option<usiz
 /// # Arguments
 /// * `group_path` — the per-group directory. Must already exist.
 /// * `level` — the bucket count to record. Should be a value from `LEVEL_LADDER`.
-/// * `sync_data` — when true, fsync the file before returning.
+/// * `sync_data` — when true, sync the file before it replaces the marker, and its directory
+///   after.
 ///
 /// # Returns
 /// * `Ok(())` on success.
-/// * `Err(io::Error)` for any I/O failure during file creation, write, or fsync.
+/// * `Err(io::Error)` for any I/O failure during file creation, write, sync or rename.
 ///
 /// # Invariants
-/// * Existing marker file (if any) is truncated and rewritten — this is a full overwrite.
+/// * The marker is replaced whole, see [`write_level_header_file`].
 /// * `level` is cast to u32; must fit (always true for ladder values ≤ 256).
 pub async fn write_level_marker(
     group_path: &Path,
@@ -302,11 +304,18 @@ pub async fn commit_if_initial_level(
     }
 }
 
+/// Whether `name` names a committed bucket file, `index_<bb>`, rather than a `.new` twin or a
+/// temporary file.
+pub(crate) fn is_bucket_file_name(name: &str) -> bool {
+    name.len() == BUCKET_FILENAME_LEN && name.starts_with(BUCKET_FILENAME_PREFIX)
+}
+
 /// Whether `group_path` holds at least one committed bucket file.
 ///
 /// A group is serialized as a whole, so this separates a group that has been written
 /// from one that has not. `.new` twins are ignored: they belong to a fan-out commit
-/// that never reached its commit point and record no committed layout.
+/// that never reached its commit point and record no committed layout. Temporary files
+/// are ignored too: they belong to a write that never reached its rename.
 ///
 /// # Returns
 /// * `true` when the directory holds a file named `index_<bb>`.
@@ -323,7 +332,7 @@ pub(crate) async fn group_has_buckets(group_path: &Path) -> bool {
         let Some(name) = entry.file_name.to_str() else {
             continue;
         };
-        if name.starts_with(BUCKET_FILENAME_PREFIX) && !name.ends_with(BUCKET_NEW_SUFFIX) {
+        if is_bucket_file_name(name) {
             return true;
         }
     }
@@ -432,8 +441,9 @@ impl lore_io::StableBufList for LevelHeaderSegment {
     }
 }
 
-/// Write a level-header file (marker or pending) to an explicit path. Shared format helper;
-/// one backend dispatch covering create, write and (when `sync_data`) sync-all.
+/// Write a level-header file (marker or pending) to a temporary file renamed over `path`, so that
+/// a process stopped during the write leaves the file it last wrote, or none. With `sync_data`,
+/// the file is synced before the rename and its directory after.
 async fn write_level_header_file(
     path: &Path,
     level: usize,
@@ -448,7 +458,8 @@ async fn write_level_header_file(
     let mut segment = Box::new([0u8; size_of::<LevelMarkerHeader>()]);
     segment.copy_from_slice(header.as_bytes());
     lore_io::IoDriver::global()
-        .write_file_segments(
+        .write_file_segments_atomic(
+            temporary_path(path),
             path,
             &lore_io::OpenOptions::new()
                 .write(true)
@@ -457,8 +468,26 @@ async fn write_level_header_file(
             LevelHeaderSegment(segment),
             sync_data,
         )
-        .await?;
-    Ok(())
+        .await
+}
+
+/// The file a write of `path` goes to before it is renamed over `path`: `path` with `.tmp`
+/// appended, so that the temporary file of `index_<bb>.new` is `index_<bb>.new.tmp` and does not
+/// collide with that of `index_<bb>`.
+pub(crate) fn temporary_path(path: &Path) -> PathBuf {
+    let mut temporary = std::ffi::OsString::with_capacity(path.as_os_str().len() + 4);
+    temporary.push(path.as_os_str());
+    temporary.push(".tmp");
+    PathBuf::from(temporary)
+}
+
+/// Mark `buckets` dirty again after a fan-out commit that failed once their `.new` files were
+/// written, so that the next flush writes them again rather than leaving their entries only in
+/// those files.
+pub(crate) fn mark_uncommitted_dirty(dirty: &[AtomicBool], buckets: &[usize]) {
+    for &bucket in buckets {
+        dirty[bucket].store(true, Ordering::Relaxed);
+    }
 }
 
 /// Recover from a possibly-interrupted fan-out commit in `group_path`.
@@ -475,8 +504,8 @@ async fn write_level_header_file(
 /// # Returns
 /// * `Ok(None)` if no recovery was needed (no `level.pending` present).
 /// * `Ok(Some(level))` if recovery rolled forward to `level`.
-/// * `Err(io::Error)` if recovery encountered an I/O error it could not work around. Individual
-///   `.new` rename failures are logged but do not abort the routine — the next open retries.
+/// * `Err(io::Error)` if recovery encountered an I/O error, such as a `.new` rename that failed.
+///   `level.pending` is then kept, so that the next open retries.
 pub async fn recover_level_transition(
     group_path: &Path,
     sync_data: bool,
@@ -504,6 +533,7 @@ pub async fn recover_level_transition(
                     new_path.display(),
                     final_path.display()
                 );
+                return Err(err);
             }
         }
     }

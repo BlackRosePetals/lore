@@ -67,7 +67,8 @@ pub async fn evictor(
     lore_base::lore_debug!("Store evictor exiting");
 }
 
-/// Compactor task: enforces max size at regular intervals.
+/// Compactor task: enforces max size at regular intervals. A step that fails is reported and
+/// ends the pass, and the next interval resumes past the groups it covered.
 pub async fn compactor(
     store: Weak<dyn ImmutableStore>,
     max_size: usize,
@@ -111,8 +112,8 @@ pub async fn compactor(
                     lore_base::lore_debug!("Store compactor finished");
                 }
                 Err(err) => {
+                    at = None;
                     lore_base::lore_warn!("Store compactor failed: {err}");
-                    break;
                 }
             }
         }
@@ -120,7 +121,8 @@ pub async fn compactor(
     lore_base::lore_debug!("Store compactor exiting");
 }
 
-/// Run compaction and eviction in a single pass.
+/// Run eviction, then compaction, in a single pass, so that compaction reclaims the payloads of the
+/// entries eviction removes.
 pub async fn gc(
     store: Arc<dyn ImmutableStore>,
     max_size: usize,
@@ -128,11 +130,17 @@ pub async fn gc(
     sync_data: bool,
     sink: Option<GcEventSinkRef>,
 ) {
-    let mut at = store.clone().compact_resume_at().await;
+    if max_capacity > 0 {
+        let _ = store
+            .clone()
+            .evict(max_capacity, sync_data, sink.clone())
+            .await;
+        lore_base::lore_debug!("Store evictor done");
+    }
 
     if max_size > 0 {
+        let mut at = store.clone().compact_resume_at().await;
         loop {
-            let store = store.clone();
             match store
                 .clone()
                 .compact(max_size, at, sync_data, sink.clone())
@@ -156,11 +164,6 @@ pub async fn gc(
             }
         }
         lore_base::lore_debug!("Store compactor done");
-    }
-
-    if max_capacity > 0 {
-        let _ = store.evict(max_capacity, sync_data, sink).await;
-        lore_base::lore_debug!("Store evictor done");
     }
 }
 

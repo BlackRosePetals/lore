@@ -97,3 +97,53 @@ def assert_all_index_entries_reachable(repo) -> None:
         f"local store at {store_root} holds entries stranded by a fan-out level change:\n"
         + "\n".join(findings)
     )
+
+
+def _torn_file(path: str, name: str) -> str | None:
+    """Why the bucket or level file at `path` cannot be one a whole write left, or None."""
+    size = os.path.getsize(path)
+    if name in (_MARKER_FILENAME, _MARKER_FILENAME + ".pending"):
+        return None if size == _HEADER_SIZE else f"{size} bytes, not {_HEADER_SIZE}"
+    if size < _HEADER_SIZE:
+        return f"{size} bytes, shorter than its header"
+    with open(path, "rb") as handle:
+        _version, _unused, count, _unused_two = struct.unpack(
+            "<IIII", handle.read(_HEADER_SIZE)
+        )
+    entries_size = size - _HEADER_SIZE - 4 * count
+    if count == 0:
+        return None if entries_size == 0 else f"{size} bytes for no entries"
+    if (
+        entries_size <= 0
+        or entries_size % count != 0
+        or entries_size // count <= _HASH_SIZE
+    ):
+        return f"{size} bytes for {count} entries"
+    return None
+
+
+def torn_index_files(store_root: str) -> list[str]:
+    """Describe every bucket and level file under `store_root`'s `index/` that a write cut short
+    could have left: a bucket file shorter than its header and the entries its header counts,
+    or a level file that is not one whole header. A missing `index/` is a finding too."""
+    index_root = os.path.join(store_root, "index")
+    if not os.path.isdir(index_root):
+        return [f"{index_root} is missing"]
+    findings = []
+    for group in sorted(os.listdir(index_root)):
+        group_dir = os.path.join(index_root, group)
+        if not os.path.isdir(group_dir):
+            continue
+        for name in sorted(os.listdir(group_dir)):
+            is_bucket = (
+                name.startswith(_BUCKET_PREFIX) and len(name) == len(_BUCKET_PREFIX) + 2
+            )
+            if not is_bucket and name not in (
+                _MARKER_FILENAME,
+                _MARKER_FILENAME + ".pending",
+            ):
+                continue
+            reason = _torn_file(os.path.join(group_dir, name), name)
+            if reason:
+                findings.append(f"{group}/{name}: {reason}")
+    return findings

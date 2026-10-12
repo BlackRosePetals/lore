@@ -274,6 +274,27 @@ async fn write_level_marker_overwrites_existing() {
     assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(64));
 }
 
+/// A marker write without syncing replaces the marker's file rather than rewriting it, so that a
+/// process stopped during the write leaves the marker it last wrote, as a hard link to it shows.
+#[tokio::test]
+async fn an_unsynced_marker_write_replaces_the_file() {
+    let dir = temp_group_dir();
+    let marker = dir.path().join(MARKER_FILENAME);
+    write_level_marker(dir.path(), 1, false).await.unwrap();
+    let written = std::fs::read(&marker).unwrap();
+    let link = dir.path().join("last_written");
+    std::fs::hard_link(&marker, &link).unwrap();
+
+    write_level_marker(dir.path(), 64, false).await.unwrap();
+
+    assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(64));
+    assert_eq!(
+        std::fs::read(&link).unwrap(),
+        written,
+        "the marker last written is left whole"
+    );
+}
+
 #[tokio::test]
 async fn marker_file_is_exactly_16_bytes() {
     let dir = temp_group_dir();
@@ -374,6 +395,22 @@ fn every_path_formatter_agrees_with_hex_formatting() {
     }
 }
 
+/// A `.new` file recovery cannot rename keeps `level.pending`, so that the next open retries
+/// rather than committing a level whose bucket file is missing.
+#[tokio::test]
+async fn recovery_keeps_the_pending_level_when_a_rename_fails() {
+    let dir = temp_group_dir();
+    write_level_pending(dir.path(), 32, false).await.unwrap();
+    std::fs::write(bucket_new_path(dir.path(), 0), b"twin").unwrap();
+    std::fs::create_dir(bucket_path(dir.path(), 0)).unwrap();
+    std::fs::write(bucket_path(dir.path(), 0).join("blocker"), b"x").unwrap();
+
+    assert!(recover_level_transition(dir.path(), false).await.is_err());
+
+    assert_eq!(read_level_pending(dir.path()).await.unwrap(), Some(32));
+    assert_eq!(read_level_marker(dir.path()).await.unwrap(), None);
+}
+
 #[tokio::test]
 async fn group_has_buckets_missing_directory_is_false() {
     let dir = temp_group_dir();
@@ -400,6 +437,17 @@ async fn group_has_buckets_uncommitted_new_twins_alone_are_false() {
     for bb in 0..4 {
         std::fs::write(bucket_new_path(dir.path(), bb), [bb as u8; 8]).unwrap();
     }
+    assert!(!group_has_buckets(dir.path()).await);
+}
+
+/// A temporary file a bucket write left behind, stopped before its rename, records no committed
+/// layout.
+#[tokio::test]
+async fn group_has_buckets_temporary_files_alone_are_false() {
+    let dir = temp_group_dir();
+    let mut temporary = bucket_path(dir.path(), 0x37).into_os_string();
+    temporary.push(".tmp");
+    std::fs::write(temporary, b"partial").unwrap();
     assert!(!group_has_buckets(dir.path()).await);
 }
 

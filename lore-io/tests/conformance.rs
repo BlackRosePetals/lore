@@ -904,6 +904,7 @@ async fn write_file_segments_atomic_replaces_target() {
                 dir.child("data"),
                 &OpenOptions::new().write(true).create(true).truncate(true),
                 segments,
+                true,
             )
             .await
             .unwrap();
@@ -956,6 +957,7 @@ async fn segments_are_released_before_the_call_returns() {
                     data: data.clone(),
                     released: Arc::clone(&released),
                 },
+                true,
             )
             .await
             .unwrap();

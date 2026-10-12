@@ -296,11 +296,11 @@ impl IoDriver {
         Ok((IoFile::new(self.clone(), Arc::new(file)), metadata, head))
     }
 
-    /// The storage layer's atomic durable whole-file write as a single
-    /// backend dispatch: creates `temporary_path` (per `options`), writes
-    /// the gathered contents of all segments, syncs file data and
-    /// metadata, renames over `final_path`, and best-effort syncs the
-    /// parent directory.
+    /// The storage layer's atomic whole-file write as a single backend
+    /// dispatch: creates `temporary_path` (per `options`), writes the
+    /// gathered contents of all segments, with `durable` syncs file data
+    /// and metadata, renames over `final_path`, and with `durable`
+    /// best-effort syncs the parent directory.
     ///
     /// On error the temporary file may be left behind; callers own its
     /// cleanup.
@@ -316,6 +316,7 @@ impl IoDriver {
         final_path: impl AsRef<Path>,
         options: &OpenOptions,
         buffers: B,
+        durable: bool,
     ) -> std::io::Result<()> {
         let std_options = options.to_std();
         let temporary_path = temporary_path.as_ref().to_path_buf();
@@ -323,19 +324,37 @@ impl IoDriver {
         match &*self.inner {
             DriverInner::Psync(driver) => {
                 driver
-                    .write_file_segments_atomic(std_options, temporary_path, final_path, buffers)
+                    .write_file_segments_atomic(
+                        std_options,
+                        temporary_path,
+                        final_path,
+                        buffers,
+                        durable,
+                    )
                     .await
             }
             #[cfg(target_os = "linux")]
             DriverInner::Uring(driver) => {
                 driver
-                    .write_file_segments_atomic(std_options, temporary_path, final_path, buffers)
+                    .write_file_segments_atomic(
+                        std_options,
+                        temporary_path,
+                        final_path,
+                        buffers,
+                        durable,
+                    )
                     .await
             }
             #[cfg(target_family = "windows")]
             DriverInner::Iocp(driver) => {
                 driver
-                    .write_file_segments_atomic(std_options, temporary_path, final_path, buffers)
+                    .write_file_segments_atomic(
+                        std_options,
+                        temporary_path,
+                        final_path,
+                        buffers,
+                        durable,
+                    )
                     .await
             }
         }

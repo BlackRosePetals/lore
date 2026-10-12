@@ -3702,6 +3702,8 @@ pub fn repository_remote(repository_path: impl AsRef<str>) -> Result<String, Rep
     Ok(config.remote_url.unwrap_or_default())
 }
 
+/// Run a full eviction and compaction pass over the repository's store with the caps in its
+/// configuration, with the whole index loaded for eviction.
 pub async fn gc(repository: Arc<RepositoryContext>) -> Result<(), RepositoryError> {
     let dot_path = repository.dot_dir_path()?;
     let config_path = dot_path.join(CONFIG);
@@ -3711,14 +3713,21 @@ pub async fn gc(repository: Arc<RepositoryContext>) -> Result<(), RepositoryErro
 
     let sync_data = crate::runtime::try_execution_context()
         .is_some_and(|context| context.globals().sync_data());
+    let max_size = config_store
+        .map(|config| config.max_size.unwrap_or_default())
+        .unwrap_or_default();
+    let max_capacity = config_store
+        .map(|config| config.max_capacity.unwrap_or_default())
+        .unwrap_or_default();
+    if max_capacity > 0
+        && let Err(err) = repository.immutable_store().load_index().await
+    {
+        lore_warn!("Garbage collection could not load the whole store index: {err}");
+    }
     crate::store::gc(
         repository.immutable_store(),
-        config_store
-            .map(|config| config.max_capacity.unwrap_or_default())
-            .unwrap_or_default(),
-        config_store
-            .map(|config| config.max_size.unwrap_or_default())
-            .unwrap_or_default(),
+        max_size,
+        max_capacity,
         sync_data,
         gc_event_sink(),
     )

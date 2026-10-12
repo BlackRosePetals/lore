@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +29,14 @@ mod info;
 mod oodle_migration;
 
 use lore_storage::local::immutable_store::*;
+
+use crate::store_fixture::assert_payloads_read_back;
+use crate::store_fixture::compact_group_toward;
+use crate::store_fixture::group_entries;
+use crate::store_fixture::payloads_in_one_group;
+use crate::store_fixture::payloads_of_size_in_one_group;
+use crate::store_fixture::put_payload;
+use crate::store_fixture::try_compact_group_toward;
 
 fn write_bucket_file(path: &Path, version: u32) {
     let entry = ImmutableStoreEntry::default();
@@ -985,12 +994,10 @@ async fn store_initializes_group_bucket_count_from_settings_level_256() {
     }
 }
 
-/// The compaction resume point is decided by what the group work reports, not by the
-/// stop flag read after it: a group that gave up has packfiles left to rewrite, and
-/// advancing past it would leave them for a pass that never comes. Both answers are
-/// driven through a real sweep, so a stray report inside the packfile loop is caught.
+/// A group compacted to the end reports complete, so the resume point moves past it, and is
+/// rewritten down to its non-durable payloads.
 #[tokio::test]
-async fn group_compaction_reports_whether_it_finished() {
+async fn group_compaction_reports_a_finished_group_complete() {
     use lore_storage::immutable_store::ImmutableStore;
 
     let dir = lore_base::test_util::TempDir::new("is_stop_report_");
@@ -1000,75 +1007,993 @@ async fn group_compaction_reports_whether_it_finished() {
             .unwrap();
 
     let partition = Partition::from([0x0cu8; 16]);
-    for index in 0u8..8 {
-        let payload = vec![index; 4096];
-        let address = Address {
-            hash: lore_storage::hash::hash_slice(&payload),
-            context: Context::from([index; 16]),
-        };
-        let fragment = Fragment {
-            // Non-durable, so eviction is forbidden to reclaim it and the packfile
-            // sweep has payloads to move.
-            flags: 0,
-            size_payload: payload.len() as u32,
-            size_content: payload.len() as u64,
-        };
-        store
-            .clone()
-            .put(
-                partition,
-                address,
-                fragment,
-                Some(Bytes::from(payload)),
-                false,
-            )
-            .await
-            .unwrap();
+    let (group_index, payloads) = payloads_in_one_group(8);
+    for (index, payload) in payloads.iter().enumerate() {
+        put_payload(
+            &store,
+            partition,
+            Context::default(),
+            payload,
+            index % 2 == 0,
+        )
+        .await;
     }
     store.clone().flush(true).await.unwrap();
 
-    // Compaction runs per group and the hash decides which one the payloads landed in.
-    let (group_index, _bucket_index) = populated_bucket(&store).await;
-
-    // A target below what the group holds drives the sweep and the truncate, rather
-    // than breaking on the size check before either runs.
-    let completed = store
-        .clone()
-        .compact_group_packfiles(
-            group_index,
-            store.path.clone(),
-            1,
-            true,
-            false,
-            CompactionInstruments::default(),
-            None,
-        )
-        .await
-        .unwrap();
     assert!(
-        completed,
+        compact_group(&store, group_index).await,
         "a group that ran to the end must report complete"
     );
+    assert_eq!(
+        store.group[group_index]
+            .packstore
+            .total_size()
+            .await
+            .unwrap(),
+        4 * 4096,
+        "the sweep must have rewritten the group down to its non-durable payloads"
+    );
+}
 
-    let _stopped = GcStopRequest::raise(&store.stop_requests, false);
+/// Whether each entry still points at a payload, by whether it is durable.
+fn payload_kept_by_durability(entries: &[ImmutableStoreEntry]) -> Vec<(bool, bool)> {
+    let durable = FragmentFlags::PayloadStoredDurable.bits();
+    let mut kept: Vec<(bool, bool)> = entries
+        .iter()
+        .map(|entry| (entry.data.flags & durable != 0, entry.data.pack_file != 0))
+        .collect();
+    kept.sort_unstable();
+    kept
+}
 
-    let completed = store
-        .clone()
-        .compact_group_packfiles(
-            group_index,
-            store.path.clone(),
-            1,
-            true,
-            false,
-            CompactionInstruments::default(),
-            None,
-        )
+/// Local payloads count toward a group's size target although they are never evicted, so a
+/// group they alone keep over the target loses every durable payload and keeps every local one:
+/// 8 KiB of durable payloads, under the 12 KiB target alone, beside 16 KiB of local ones.
+#[tokio::test]
+async fn size_eviction_counts_local_payloads_toward_the_target() {
+    let dir = lore_base::test_util::TempDir::new("is_evict_local_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
         .await
         .unwrap();
+
+    let partition = Partition::from([0x0eu8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(6);
+    for (index, payload) in payloads.iter().enumerate() {
+        put_payload(&store, partition, Context::default(), payload, index < 2).await;
+    }
+
+    let evicted = store
+        .clone()
+        .evict_group_sized(group_index, 3 * 4096, store.path.clone(), true, false)
+        .await;
+
+    assert_eq!(evicted, (2, 2 * 4096), "both durable payloads are evicted");
+    let local = FragmentFlags::PayloadStoredLocal.bits();
     assert!(
-        !completed,
-        "a stopped group must report incomplete so the caller holds the resume point"
+        group_entries(&store, group_index)
+            .await
+            .iter()
+            .all(|entry| (entry.data.pack_file != 0) == (entry.data.flags & local != 0)),
+        "an entry claims a local payload exactly when it holds one"
     );
+    assert_eq!(
+        payload_kept_by_durability(&group_entries(&store, group_index).await),
+        [(false, true); 4]
+            .into_iter()
+            .chain([(true, false); 2])
+            .collect::<Vec<_>>(),
+        "every local payload is kept"
+    );
+}
+
+/// Each bucket is held to its own share of the group's target: a bucket over its share loses its
+/// durable payloads, while one within its share keeps them, though the group is over its target.
+/// The group holds 160 KiB over a 128 KiB target, a share of 4 KiB in each of 32 buckets.
+#[tokio::test]
+async fn size_eviction_leaves_a_bucket_within_its_share() {
+    use lore_storage::local::fan_out::bucket_index_for;
+
+    const BUCKET_COUNT: usize = 32;
+
+    let store = LocalImmutableStore::new(
+        None,
+        ImmutableStoreSettings {
+            initial_fan_out_level: BUCKET_COUNT,
+            ..client_settings()
+        },
+    )
+    .await
+    .unwrap();
+
+    let partition = Partition::from([0x18u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(40);
+    let mut by_bucket: HashMap<usize, Vec<&Vec<u8>>> = HashMap::new();
+    for payload in &payloads {
+        let bucket_index = bucket_index_for(&hash::hash_slice(payload), BUCKET_COUNT);
+        by_bucket.entry(bucket_index).or_default().push(payload);
+    }
+    let over = *by_bucket
+        .iter()
+        .find(|(_, payloads)| payloads.len() > 1)
+        .expect("a bucket holds two payloads")
+        .0;
+    let within = *by_bucket
+        .iter()
+        .find(|(_, payloads)| payloads.len() == 1)
+        .expect("a bucket holds one payload")
+        .0;
+    for (bucket_index, payloads) in &by_bucket {
+        for (index, payload) in payloads.iter().enumerate() {
+            let durable = (*bucket_index == over || *bucket_index == within) && index == 0;
+            put_payload(&store, partition, Context::default(), payload, durable).await;
+        }
+    }
+
+    let evicted = store
+        .clone()
+        .evict_group_sized(group_index, BUCKET_COUNT * 4096, None, true, false)
+        .await;
+
+    assert_eq!(evicted, (1, 4096), "only the bucket over its share evicts");
+    let kept_in = |bucket_index: usize, entries: &[ImmutableStoreEntry]| {
+        payload_kept_by_durability(
+            &entries
+                .iter()
+                .filter(|entry| bucket_index_for(&entry.address.hash, BUCKET_COUNT) == bucket_index)
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+    };
+    let entries = group_entries(&store, group_index).await;
+    assert_eq!(
+        kept_in(within, &entries),
+        vec![(true, true)],
+        "the bucket within its share keeps its durable payload"
+    );
+    assert!(
+        kept_in(over, &entries).contains(&(true, false)),
+        "the bucket over its share evicts its durable payload"
+    );
+}
+
+/// A bucket with nothing it may evict is left unmarked, so it is not written again, though its
+/// group evicts from another bucket. The target equals the durable payloads' size, and both
+/// buckets exceed their share. The store is in memory, where no write after eviction clears the
+/// marks.
+#[tokio::test]
+async fn size_eviction_leaves_a_bucket_with_nothing_evictable_clean() {
+    use lore_storage::local::fan_out::bucket_index_for;
+
+    const BUCKET_COUNT: usize = 32;
+    const PAYLOAD_SIZE: usize = 64;
+
+    let store = LocalImmutableStore::new(
+        None,
+        ImmutableStoreSettings {
+            initial_fan_out_level: BUCKET_COUNT,
+            ..client_settings()
+        },
+    )
+    .await
+    .unwrap();
+
+    let partition = Partition::from([0x1au8; 16]);
+    let (group_index, payloads) = payloads_of_size_in_one_group(8 * BUCKET_COUNT, PAYLOAD_SIZE);
+    let mut by_bucket: HashMap<usize, Vec<&Vec<u8>>> = HashMap::new();
+    for payload in &payloads {
+        let bucket_index = bucket_index_for(&hash::hash_slice(payload), BUCKET_COUNT);
+        by_bucket.entry(bucket_index).or_default().push(payload);
+    }
+    let (&durable_bucket, durable_payloads) = by_bucket
+        .iter()
+        .max_by_key(|(_, payloads)| payloads.len())
+        .unwrap();
+    let (&local_bucket, local_payloads) = by_bucket
+        .iter()
+        .find(|(bucket_index, _)| **bucket_index != durable_bucket)
+        .unwrap();
+    for payload in durable_payloads {
+        put_payload(&store, partition, Context::default(), payload, true).await;
+    }
+    for payload in local_payloads {
+        put_payload(&store, partition, Context::default(), payload, false).await;
+    }
+    let group = &store.group[group_index];
+    for dirty in &group.dirty {
+        dirty.store(false, atomic::Ordering::Relaxed);
+    }
+
+    let target_size = durable_payloads.len() * PAYLOAD_SIZE;
+    assert!(local_payloads.len() * PAYLOAD_SIZE > target_size / BUCKET_COUNT);
+    let (evicted, _) = store
+        .clone()
+        .evict_group_sized(group_index, target_size, None, true, false)
+        .await;
+
+    assert!(evicted > 0, "the bucket of durable payloads evicts");
+    assert!(group.dirty[durable_bucket].load(atomic::Ordering::Relaxed));
+    assert!(
+        !group.dirty[local_bucket].load(atomic::Ordering::Relaxed),
+        "the bucket of local payloads is not marked for writing"
+    );
+}
+
+/// Local fragments count toward a bucket's capacity target although they are never evicted, so
+/// a bucket they alone keep over the target loses its durable fragments. A capacity of 732 gives
+/// each of the 256 single-bucket groups a target of 2 fragments: above the one durable fragment,
+/// below the four in all.
+#[tokio::test]
+async fn capacity_eviction_counts_local_fragments_toward_the_target() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let store = LocalImmutableStore::new(None, client_settings())
+        .await
+        .unwrap();
+
+    let partition = Partition::from([0x14u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    for (index, payload) in payloads.iter().enumerate() {
+        put_payload(&store, partition, Context::default(), payload, index == 0).await;
+    }
+
+    let evicted = store.clone().evict(732, false, None).await.unwrap();
+
+    assert_eq!(evicted, 1, "the durable fragment is evicted");
+    assert_eq!(
+        payload_kept_by_durability(&group_entries(&store, group_index).await),
+        vec![(false, true); 3],
+        "every local fragment is kept"
+    );
+}
+
+/// A bucket over its capacity target with nothing it may evict starts no eviction, so a store
+/// that local fragments alone keep over the target reports no eviction to the command. The
+/// target is 2 fragments per bucket, under the four local fragments.
+#[tokio::test]
+async fn capacity_eviction_with_nothing_evictable_reports_nothing() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    #[derive(Default)]
+    struct EvictionSink {
+        begins: AtomicUsize,
+    }
+
+    impl lore_storage::gc_event::GcEventSink for EvictionSink {
+        fn eviction_begin(&self, _target_fragments: u64) {
+            self.begins.fetch_add(1, atomic::Ordering::Relaxed);
+        }
+        fn eviction_progress(&self, _evicted: u64) {}
+        fn eviction_end(&self, _total_evicted: u64) {}
+        fn compaction_begin(&self, _target_bytes: u64) {}
+        fn compaction_progress(&self, _compacted_bytes: u64) {}
+        fn compaction_end(&self, _total_compacted_bytes: u64) {}
+    }
+
+    let store = LocalImmutableStore::new(None, client_settings())
+        .await
+        .unwrap();
+
+    let partition = Partition::from([0x16u8; 16]);
+    let (_group_index, payloads) = payloads_in_one_group(4);
+    for payload in &payloads {
+        put_payload(&store, partition, Context::default(), payload, false).await;
+    }
+
+    let sink = Arc::new(EvictionSink::default());
+    let evicted = store
+        .clone()
+        .evict(732, false, Some(sink.clone()))
+        .await
+        .unwrap();
+
+    assert_eq!(evicted, 0);
+    assert_eq!(
+        sink.begins.load(atomic::Ordering::Relaxed),
+        0,
+        "no eviction is announced"
+    );
+}
+
+/// The packfile and offset each entry points at, by hash.
+fn payload_locations(entries: &[ImmutableStoreEntry]) -> Vec<(Hash, u32, u32)> {
+    entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.address.hash,
+                entry.data.pack_file,
+                entry.data.pack_offset,
+            )
+        })
+        .collect()
+}
+
+/// Compact `group_index` of a client `store` towards a target of one byte, so that the size
+/// never ends the sweep. Returns whether the group was left complete.
+async fn compact_group(store: &Arc<LocalImmutableStore>, group_index: usize) -> bool {
+    compact_group_toward(store, group_index, 1, true).await
+}
+
+/// Rewriting packfiles whose payloads are all still referenced reclaims nothing, so
+/// compaction leaves them in place however far the group is over its target. A rewrite copies
+/// payloads in hash order, so payloads stored in reverse hash order move under any rewrite, even
+/// one that ends in the packfile it started from.
+#[tokio::test]
+async fn compaction_leaves_a_fully_referenced_group_in_place() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_skip_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+
+    let partition = Partition::from([0x10u8; 16]);
+    let (group_index, mut payloads) = payloads_in_one_group(4);
+    payloads.sort_unstable_by_key(|payload| std::cmp::Reverse(hash::hash_slice(payload)));
+    for payload in &payloads {
+        put_payload(&store, partition, Context::default(), payload, false).await;
+    }
+    store.clone().flush(true).await.unwrap();
+
+    let group = &store.group[group_index];
+    assert_eq!(group.packstore.sizes().await.unwrap(), vec![4 * 4096]);
+    let stored_at = payload_locations(&group_entries(&store, group_index).await);
+
+    assert!(
+        compact_group(&store, group_index).await,
+        "a group with nothing to reclaim is complete"
+    );
+    assert_eq!(
+        payload_locations(&group_entries(&store, group_index).await),
+        stored_at,
+        "the packfile is not rewritten"
+    );
+}
+
+/// A packfile holding payloads that eviction orphaned is rewritten once, down to the payloads
+/// still referenced, which read back afterwards. Packfile 1 stops taking writes for its rewrite,
+/// so its payloads move to a new packfile 2, which is fully referenced and not copied back.
+#[tokio::test]
+async fn compaction_rewrites_a_packfile_with_orphaned_payloads() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_orphaned_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+
+    let partition = Partition::from([0x12u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    let mut local = vec![];
+    for (index, payload) in payloads.iter().enumerate() {
+        let durable = index < 2;
+        let address = put_payload(&store, partition, Context::default(), payload, durable).await;
+        if !durable {
+            local.push((address, payload.clone()));
+        }
+    }
+    store.clone().flush(true).await.unwrap();
+
+    assert!(compact_group(&store, group_index).await);
+    assert_eq!(
+        store.group[group_index]
+            .packstore
+            .total_size()
+            .await
+            .unwrap(),
+        2 * 4096,
+        "the durable payloads eviction orphaned are reclaimed"
+    );
+    assert!(
+        group_entries(&store, group_index)
+            .await
+            .iter()
+            .filter(|entry| entry.data.pack_file != 0)
+            .all(|entry| entry.data.pack_file == 2),
+        "the rewritten payloads are copied once"
+    );
+    assert_payloads_read_back(&store, partition, local).await;
+}
+
+/// Store one durable and `local` non-durable payloads of 4 KiB in one group, in reverse hash
+/// order so that any rewrite moves them, and compact it once eviction has orphaned the durable
+/// one. Returns the group's packfile bytes, and whether the local payloads stayed where they were
+/// stored.
+async fn compact_with_one_orphan(dir_prefix: &str, local: usize) -> (usize, bool) {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new(dir_prefix);
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+
+    let partition = Partition::from([0x1eu8; 16]);
+    let (group_index, mut payloads) = payloads_in_one_group(1 + local);
+    payloads.sort_unstable_by_key(|payload| std::cmp::Reverse(hash::hash_slice(payload)));
+    for (index, payload) in payloads.iter().enumerate() {
+        put_payload(&store, partition, Context::default(), payload, index == 0).await;
+    }
+    store.clone().flush(true).await.unwrap();
+
+    let durable = FragmentFlags::PayloadStoredDurable.bits();
+    let local_locations = |entries: Vec<ImmutableStoreEntry>| {
+        payload_locations(
+            &entries
+                .into_iter()
+                .filter(|entry| entry.data.flags & durable == 0)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let stored_at = local_locations(group_entries(&store, group_index).await);
+
+    assert!(compact_group(&store, group_index).await);
+    (
+        store.group[group_index]
+            .packstore
+            .total_size()
+            .await
+            .unwrap(),
+        local_locations(group_entries(&store, group_index).await) == stored_at,
+    )
+}
+
+/// One orphaned payload in eleven is under the share of unreferenced bytes that makes a rewrite
+/// worth its copying, so compaction leaves the group's packfile in place.
+#[tokio::test]
+async fn compaction_leaves_a_group_below_the_unreferenced_threshold() {
+    let (stored_size, in_place) = compact_with_one_orphan("is_compact_below_", 10).await;
+
+    assert!(in_place, "the packfile is not rewritten");
+    assert_eq!(
+        stored_size,
+        11 * 4096,
+        "the orphaned payload is not reclaimed"
+    );
+}
+
+/// One orphaned payload in ten is the share of unreferenced bytes that makes a rewrite worth its
+/// copying, so compaction reclaims it.
+#[tokio::test]
+async fn compaction_rewrites_a_group_at_the_unreferenced_threshold() {
+    let (stored_size, in_place) = compact_with_one_orphan("is_compact_at_", 9).await;
+
+    assert!(!in_place, "the packfile is rewritten");
+    assert_eq!(stored_size, 9 * 4096, "the orphaned payload is reclaimed");
+}
+
+/// A store over `dir` holding the payloads of `layout[n]` in packfile `n + 1` of their group, each
+/// durable as its flag says, each packfile closed to writes to open the next, reopened as a later
+/// process finds it: every packfile under the size limit takes writes. Returns the store and the
+/// address of each payload.
+async fn store_in_packfiles(
+    dir: &Path,
+    partition: Partition,
+    layout: &[Vec<(&Vec<u8>, bool)>],
+) -> (Arc<LocalImmutableStore>, Vec<Address>) {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let mut addresses = vec![];
+    {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        let mut group_index = 0;
+        for (index, payloads) in layout.iter().enumerate() {
+            if index > 0 {
+                store.group[group_index]
+                    .packstore
+                    .stop_writes(&[index as u32])
+                    .await
+                    .unwrap();
+            }
+            for (payload, durable) in payloads {
+                group_index = hash::hash_slice(payload).data()[0] as usize;
+                addresses.push(
+                    put_payload(&store, partition, Context::default(), payload, *durable).await,
+                );
+            }
+        }
+        store.clone().flush(true).await.unwrap();
+    }
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    store.deserialize_all_buckets().await.unwrap();
+    (store, addresses)
+}
+
+/// The packfile an entry for `address` points at.
+fn packfile_of(entries: &[ImmutableStoreEntry], address: Address) -> u32 {
+    entries
+        .iter()
+        .find(|entry| entry.address == address)
+        .expect("an entry for the address")
+        .data
+        .pack_file
+}
+
+/// Compaction closes every packfile it rewrites before rewriting any, so a payload it copies
+/// lands in a packfile it leaves alone and is copied once. Copied into packfile 2, packfile 1's
+/// payload would be copied again when packfile 2 is rewritten.
+#[tokio::test]
+async fn compaction_copies_each_payload_once() {
+    let dir = lore_base::test_util::TempDir::new("is_compact_once_");
+    let partition = Partition::from([0x22u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    let (store, addresses) = store_in_packfiles(
+        dir.as_ref(),
+        partition,
+        &[
+            vec![(&payloads[0], true), (&payloads[1], false)],
+            vec![(&payloads[2], true), (&payloads[3], false)],
+        ],
+    )
+    .await;
+
+    assert!(compact_group(&store, group_index).await);
+
+    assert_eq!(
+        packfile_of(&group_entries(&store, group_index).await, addresses[1]),
+        3,
+        "packfile 1's payload is copied into a packfile the pass leaves alone"
+    );
+    assert_eq!(
+        store.group[group_index]
+            .packstore
+            .total_size()
+            .await
+            .unwrap(),
+        2 * 4096
+    );
+}
+
+/// However many packfiles a group has, compaction rewrites only those holding unreferenced bytes:
+/// every orphaned payload is reclaimed, and a fully referenced packfile keeps its payloads where
+/// they are. The odd packfiles hold a durable payload for eviction to orphan, the even ones only
+/// local payloads.
+#[tokio::test]
+async fn compaction_rewrites_only_the_packfiles_with_orphans() {
+    const PACKFILE_COUNT: usize = 5;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_many_");
+    let partition = Partition::from([0x20u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(2 * PACKFILE_COUNT);
+    let layout: Vec<_> = payloads
+        .chunks(2)
+        .enumerate()
+        .map(|(index, pair)| vec![(&pair[0], index % 2 == 0), (&pair[1], false)])
+        .collect();
+    let (store, addresses) = store_in_packfiles(dir.as_ref(), partition, &layout).await;
+    let group = &store.group[group_index];
+    assert_eq!(
+        group.packstore.sizes().await.unwrap(),
+        vec![2 * 4096; PACKFILE_COUNT]
+    );
+    let untouched_at: Vec<_> = group_entries(&store, group_index)
+        .await
+        .into_iter()
+        .filter(|entry| entry.data.pack_file % 2 == 0)
+        .map(|entry| (entry.address, entry.data.pack_file, entry.data.pack_offset))
+        .collect();
+
+    assert!(compact_group(&store, group_index).await);
+
+    let entries = group_entries(&store, group_index).await;
+    for location in &untouched_at {
+        assert!(
+            entries.iter().any(|entry| {
+                (entry.address, entry.data.pack_file, entry.data.pack_offset) == *location
+            }),
+            "a payload of a fully referenced packfile stays where it is"
+        );
+    }
+    let local: Vec<_> = layout
+        .iter()
+        .flatten()
+        .zip(&addresses)
+        .filter(|((_, durable), _)| !durable)
+        .collect();
+    assert_eq!(
+        group.packstore.total_size().await.unwrap(),
+        local.len() * 4096,
+        "every orphaned payload is reclaimed"
+    );
+    assert_payloads_read_back(
+        &store,
+        partition,
+        local
+            .into_iter()
+            .map(|((payload, _), address)| (*address, (*payload).clone())),
+    )
+    .await;
+}
+
+/// A stop can cut eviction short, so a group compacted with a stop pending is reported
+/// incomplete, which keeps the resume point at it, whatever its packfiles hold.
+#[tokio::test]
+async fn compaction_with_a_stop_pending_reports_incomplete() {
+    let dir = lore_base::test_util::TempDir::new("is_compact_stopped_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+
+    let partition = Partition::from([0x24u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    for (index, payload) in payloads.iter().enumerate() {
+        put_payload(&store, partition, Context::default(), payload, index < 2).await;
+    }
+
+    let _stopped = GcStopRequest::raise(&store.stop_requests, false);
+    assert!(!compact_group(&store, group_index).await);
+}
+
+/// A pass that ends before rewriting a packfile it closed, here because the group fell below its
+/// target, opens that packfile to writes again. Both durable payloads are evicted first. Of
+/// 16 KiB over a 13 KiB target, rewriting packfile 1 leaves 12 KiB. With packfile 1 then closed,
+/// packfile 2 is the lowest that takes writes.
+#[tokio::test]
+async fn compaction_reopens_the_packfiles_it_does_not_rewrite() {
+    let dir = lore_base::test_util::TempDir::new("is_compact_reopen_");
+    let partition = Partition::from([0x26u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(5);
+    let (store, _) = store_in_packfiles(
+        dir.as_ref(),
+        partition,
+        &[
+            vec![(&payloads[0], true), (&payloads[1], false)],
+            vec![(&payloads[2], true), (&payloads[3], false)],
+        ],
+    )
+    .await;
+
+    store
+        .clone()
+        .evict_group_sized(group_index, 1, store.path.clone(), true, false)
+        .await;
+    assert!(compact_group_toward(&store, group_index, 13 * 1024, true).await);
+
+    let packstore = &store.group[group_index].packstore;
+    packstore.stop_writes(&[1]).await.unwrap();
+    let address = put_payload(&store, partition, Context::default(), &payloads[4], false).await;
+    assert_eq!(
+        packfile_of(&group_entries(&store, group_index).await, address),
+        2,
+        "packfile 2, left unrewritten, takes writes again"
+    );
+}
+
+/// Passes over a group that keeps taking batches of durable and local payloads keep its number
+/// of packfiles bounded: writes fill the lowest packfile, so a pass finds orphaned payloads in
+/// one packfile and copies them into another it leaves alone.
+#[tokio::test]
+async fn repeated_compaction_keeps_the_packfile_count_bounded() {
+    const BATCH: usize = 16;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_bounded_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+
+    let partition = Partition::from([0x28u8; 16]);
+    let (group_index, payloads) = payloads_of_size_in_one_group(10 * BATCH, 256);
+    for (round, batch) in payloads.chunks(BATCH).enumerate() {
+        for (index, payload) in batch.iter().enumerate() {
+            put_payload(
+                &store,
+                partition,
+                Context::default(),
+                payload,
+                index % 4 < 2,
+            )
+            .await;
+        }
+        assert!(compact_group(&store, group_index).await);
+        let count = store.group[group_index]
+            .packstore
+            .sizes()
+            .await
+            .unwrap()
+            .len();
+        assert!(count <= 2, "round {round} leaves {count} packfiles");
+    }
+}
+
+/// A bucket that fails to load holds none of its entries, so compaction leaves its group alone
+/// rather than truncate the payloads only that bucket references. A bucket file from a newer
+/// format stands in for the real one, which is set aside and then restored.
+#[tokio::test]
+async fn compaction_skips_a_group_with_a_bucket_that_failed_to_load() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_unloaded_");
+    let partition = Partition::from([0x2au8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    let mut addresses = vec![];
+    {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        for (index, payload) in payloads.iter().enumerate() {
+            addresses
+                .push(put_payload(&store, partition, Context::default(), payload, index < 2).await);
+        }
+        store.clone().flush(true).await.unwrap();
+    }
+
+    let bucket_path = format_bucket_path(&dir.path().join("immutable"), group_index, 0);
+    let aside = dir.path().join("bucket-aside");
+    std::fs::rename(&bucket_path, &aside).unwrap();
+    write_bucket_file(&bucket_path, 100);
+    {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        assert!(store.deserialize_all_buckets().await.is_err());
+
+        assert!(
+            compact_group(&store, group_index).await,
+            "the group is left for a later process"
+        );
+        assert_eq!(
+            store.group[group_index].packstore.sizes().await.unwrap(),
+            vec![4 * 4096],
+            "the packfile is not rewritten"
+        );
+    }
+
+    std::fs::rename(&aside, &bucket_path).unwrap();
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(&store, partition, addresses.into_iter().zip(payloads)).await;
+}
+
+/// A reopened store loads its index on demand, and eviction sees only the entries loaded.
+/// Loading the whole index lets it see every entry. The target is 2 fragments per bucket, under
+/// the four durable fragments.
+#[tokio::test]
+async fn loading_the_index_lets_eviction_see_every_entry() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_load_index_");
+    let partition = Partition::from([0x2cu8; 16]);
+    let (_group_index, payloads) = payloads_in_one_group(4);
+    {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        for payload in &payloads {
+            put_payload(&store, partition, Context::default(), payload, true).await;
+        }
+        store.clone().flush(true).await.unwrap();
+    }
+
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.clone().evict(732, false, None).await.unwrap(),
+        0,
+        "no bucket is loaded to evict from"
+    );
+
+    store.clone().load_index().await.unwrap();
+    assert!(
+        store.clone().evict(732, false, None).await.unwrap() > 0,
+        "the loaded bucket is evicted from"
+    );
+}
+
+/// A payload that a local entry also holds is not evicted, though a durable entry holding it
+/// sorts first: evicting the durable entry would free nothing.
+#[tokio::test]
+async fn size_eviction_leaves_a_payload_a_local_entry_holds() {
+    let store = LocalImmutableStore::new(None, client_settings())
+        .await
+        .unwrap();
+
+    let partition = Partition::from([0x2eu8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(2);
+    put_payload(
+        &store,
+        partition,
+        Context::from([0x01u8; 16]),
+        &payloads[0],
+        true,
+    )
+    .await;
+    put_payload(
+        &store,
+        partition,
+        Context::from([0x02u8; 16]),
+        &payloads[0],
+        false,
+    )
+    .await;
+    put_payload(&store, partition, Context::default(), &payloads[1], false).await;
+
+    assert_eq!(
+        store
+            .clone()
+            .evict_group_sized(group_index, 1, None, true, false)
+            .await,
+        (0, 0)
+    );
+    assert!(
+        group_entries(&store, group_index)
+            .await
+            .iter()
+            .all(|entry| entry.data.pack_file != 0),
+        "every entry keeps its payload"
+    );
+}
+
+/// A server store, which protects no payload, evicts every payload of a group compacted toward
+/// one byte and reclaims all of its packfile bytes.
+#[tokio::test]
+async fn server_compaction_reclaims_the_evicted_payloads() {
+    let dir = lore_base::test_util::TempDir::new("is_compact_server_");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            protect_local_fragment: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let partition = Partition::from([0x30u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    for payload in &payloads {
+        put_payload(&store, partition, Context::default(), payload, false).await;
+    }
+
+    assert!(compact_group_toward(&store, group_index, 1, false).await);
+    assert_eq!(
+        store.group[group_index].packstore.sizes().await.unwrap(),
+        vec![0]
+    );
+}
+
+/// Loading the index reports a bucket that fails to load on every call, not only the first.
+#[tokio::test]
+async fn loading_the_index_reports_a_failed_load_each_time() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_load_failed_");
+    let (group_index, payloads) = payloads_in_one_group(1);
+    {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        put_payload(
+            &store,
+            Partition::from([0x32u8; 16]),
+            Context::default(),
+            &payloads[0],
+            false,
+        )
+        .await;
+        store.clone().flush(true).await.unwrap();
+    }
+    write_bucket_file(
+        &format_bucket_path(&dir.path().join("immutable"), group_index, 0),
+        100,
+    );
+
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert!(store.clone().load_index().await.is_err());
+    assert!(store.clone().load_index().await.is_err());
+}
+
+/// A packfile compaction cannot empty, because a payload in it cannot be copied, is kept, with
+/// the entry still pointing into it, while the payloads copied out of it read back.
+#[tokio::test]
+async fn compaction_keeps_a_packfile_it_cannot_empty() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_kept_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+
+    let partition = Partition::from([0x34u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    let mut local = vec![];
+    for (index, payload) in payloads.iter().enumerate() {
+        let address = put_payload(&store, partition, Context::default(), payload, index < 2).await;
+        if index >= 2 {
+            local.push((address, payload.clone()));
+        }
+    }
+    store.clone().flush(true).await.unwrap();
+
+    let mut unreadable_hash = [0xffu8; 32];
+    unreadable_hash[0] = group_index as u8;
+    let unreadable = ImmutableData {
+        flags: FragmentFlags::PayloadStoredLocal.bits(),
+        size_payload: 64,
+        size_content: 64,
+        pack_offset: 1 << 20,
+        pack_file: 1,
+        last_access: 0,
+    };
+    {
+        let mut bucket = store.group[group_index].bucket(0).write().await;
+        let index = bucket.entry.len() as u32;
+        bucket.entry.push(ImmutableStoreEntry {
+            address: Address {
+                hash: Hash::from(unreadable_hash),
+                context: Context::default(),
+            },
+            partition,
+            data: unreadable,
+        });
+        bucket.sorted_index.push(index);
+    }
+
+    assert!(compact_group(&store, group_index).await);
+
+    assert_eq!(
+        store.group[group_index].packstore.sizes().await.unwrap()[0],
+        4 * 4096,
+        "the packfile is not truncated"
+    );
+    assert!(
+        group_entries(&store, group_index)
+            .await
+            .iter()
+            .any(|entry| entry.data == unreadable),
+        "the entry still points into it"
+    );
+    assert_payloads_read_back(&store, partition, local).await;
+}
+
+/// A payload two entries share counts once toward what a packfile references, as a rewrite
+/// copies it once, so an orphan beside it is still reclaimed. Counted per entry, the shared
+/// payload would make up for the orphaned durable one.
+#[tokio::test]
+async fn compaction_counts_a_shared_payload_once() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_shared_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+
+    let partition = Partition::from([0x1cu8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(3);
+    let shared = &payloads[0];
+    let mut local = vec![];
+    for context in [Context::from([0x01u8; 16]), Context::from([0x02u8; 16])] {
+        let address = put_payload(&store, partition, context, shared, false).await;
+        local.push((address, shared.clone()));
+    }
+    let address = put_payload(&store, partition, Context::default(), &payloads[1], false).await;
+    local.push((address, payloads[1].clone()));
+    put_payload(&store, partition, Context::default(), &payloads[2], true).await;
+    store.clone().flush(true).await.unwrap();
+
+    assert_eq!(
+        store.group[group_index].packstore.sizes().await.unwrap()[0],
+        3 * 4096,
+        "the two entries share one payload"
+    );
+
+    assert!(compact_group(&store, group_index).await);
+    assert_eq!(
+        store.group[group_index]
+            .packstore
+            .total_size()
+            .await
+            .unwrap(),
+        2 * 4096,
+        "the orphaned durable payload is reclaimed"
+    );
+    assert_payloads_read_back(&store, partition, local).await;
 }
 
 /// A step that commits to work reports one begin and owes exactly one end; a call that
@@ -1231,7 +2156,7 @@ async fn populated_bucket(store: &Arc<LocalImmutableStore>) -> (usize, usize) {
 }
 
 /// Store one fragment in `store`, set its last-access stamp to `stamp`, and clear the dirty
-/// flag of the bucket it landed in. Answers that bucket and the address naming the entry.
+/// flag of the bucket it landed in. Returns that bucket and the address naming the entry.
 async fn backdated_fragment(
     store: &Arc<LocalImmutableStore>,
     stamp: u64,
@@ -1271,7 +2196,7 @@ async fn backdated_fragment(
     ((group_index, bucket_index), partition, address)
 }
 
-/// Resolve one backdated fragment in an in-memory store. Answers the stamp its entry carries
+/// Resolve one backdated fragment in an in-memory store. Returns the stamp its entry carries
 /// afterward and whether the resolve marked the bucket for rewrite.
 async fn resolve_one_fragment(atime: bool, stamp: u64) -> (u64, bool) {
     use lore_storage::immutable_store::ImmutableStore;
@@ -1873,6 +2798,40 @@ async fn verifying_an_entry_with_no_payload_reports_it_and_heals_the_wedge() {
         after.match_made,
         StoreMatch::MatchNone,
         "the entry survived healing, so the address stays wedged"
+    );
+}
+
+/// A flush without syncing replaces a bucket's file rather than rewriting it, so that a process
+/// stopped during the write leaves the file it last wrote, as a hard link to that file shows.
+#[tokio::test]
+async fn an_unsynced_flush_replaces_the_bucket_file() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_unsynced_replace_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x5au8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(2);
+    let bucket_path = format_bucket_path(&dir.join("immutable"), group_index, 0);
+    put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+    store.clone().flush(false).await.unwrap();
+    let written = std::fs::read(&bucket_path).unwrap();
+    let link = dir.join("last_written");
+    std::fs::hard_link(&bucket_path, &link).unwrap();
+
+    put_payload(&store, partition, Context::default(), &payloads[1], false).await;
+    store.clone().flush(false).await.unwrap();
+
+    assert_eq!(
+        std::fs::read(&link).unwrap(),
+        written,
+        "the file last written is left whole"
+    );
+    assert_ne!(
+        std::fs::read(&bucket_path).unwrap(),
+        written,
+        "the bucket's file holds the new write"
     );
 }
 
@@ -2677,4 +3636,558 @@ mod copy_source {
             .await
             .expect("the source a match named must be one copy resolves");
     }
+}
+
+/// Set the last access of each entry of the group for which `stamp` names one.
+async fn stamp_entries(
+    store: &LocalImmutableStore,
+    group_index: usize,
+    stamp: impl Fn(&ImmutableStoreEntry) -> Option<u64>,
+) {
+    let group = &store.group[group_index];
+    for bucket_index in 0..group.bucket_count.load(atomic::Ordering::Relaxed) {
+        let Some(bucket) = group.try_bucket(bucket_index) else {
+            continue;
+        };
+        for entry in bucket.write().await.entry.iter_mut() {
+            if let Some(last_access) = stamp(entry) {
+                entry.data.last_access = last_access;
+            }
+        }
+    }
+}
+
+/// Size eviction takes the least recently accessed payloads first, each ranked by the newest
+/// access among the entries holding it, and stops once the bucket is below its share: of five
+/// payloads, the two accessed longest ago go, and the one an old entry shares with a recent one
+/// stays.
+#[tokio::test]
+async fn size_eviction_takes_the_least_recently_accessed_payloads_first() {
+    let store = LocalImmutableStore::new(None, client_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x41u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(5);
+    assert_eq!(
+        store.group[group_index]
+            .bucket_count
+            .load(atomic::Ordering::Relaxed),
+        1
+    );
+    let mut addresses = vec![];
+    for payload in &payloads {
+        addresses.push(put_payload(&store, partition, Context::default(), payload, true).await);
+    }
+    let recent = put_payload(
+        &store,
+        partition,
+        Context::from([0x02u8; 16]),
+        &payloads[4],
+        true,
+    )
+    .await;
+    stamp_entries(&store, group_index, |entry| {
+        if entry.address == recent {
+            return Some(50);
+        }
+        addresses
+            .iter()
+            .position(|address| *address == entry.address)
+            .map(|index| [10, 20, 30, 40, 5][index])
+    })
+    .await;
+
+    assert_eq!(
+        store
+            .clone()
+            .evict_group_sized(group_index, 14_000, None, true, false)
+            .await,
+        (2, 2 * 4096)
+    );
+
+    let entries = group_entries(&store, group_index).await;
+    let holds_payload = |address: Address| {
+        entries
+            .iter()
+            .any(|entry| entry.address == address && entry.data.pack_file != 0)
+    };
+    assert!(!holds_payload(addresses[0]) && !holds_payload(addresses[1]));
+    assert!(addresses[2..].iter().all(|address| holds_payload(*address)));
+    assert!(holds_payload(recent));
+}
+
+/// Size eviction takes a payload only from the entries it may take it from, so a local entry
+/// keeps the payload it shares with a durable one even where an index out of order lists
+/// another entry between the two.
+#[tokio::test]
+async fn size_eviction_keeps_a_local_payload_the_index_lists_apart() {
+    let store = LocalImmutableStore::new(None, client_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x42u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(2);
+    let durable = put_payload(
+        &store,
+        partition,
+        Context::from([0x01u8; 16]),
+        &payloads[0],
+        true,
+    )
+    .await;
+    let other = put_payload(&store, partition, Context::default(), &payloads[1], false).await;
+    let local = put_payload(
+        &store,
+        partition,
+        Context::from([0x02u8; 16]),
+        &payloads[0],
+        false,
+    )
+    .await;
+    {
+        let mut bucket = store.group[group_index].bucket(0).write().await;
+        let position = |address: Address| {
+            bucket
+                .entry
+                .iter()
+                .position(|entry| entry.address == address)
+                .unwrap() as u32
+        };
+        let order = [position(durable), position(other), position(local)];
+        bucket.sorted_index = Default::default();
+        for index in order {
+            bucket.sorted_index.push(index);
+        }
+    }
+
+    store
+        .clone()
+        .evict_group_sized(group_index, 1, None, true, false)
+        .await;
+
+    let entries = group_entries(&store, group_index).await;
+    let local_entry = entries.iter().find(|entry| entry.address == local).unwrap();
+    assert_ne!(
+        local_entry.data.pack_file, 0,
+        "the local entry keeps its payload"
+    );
+    assert_ne!(
+        local_entry.data.flags & FragmentFlags::PayloadStoredLocal.bits(),
+        0
+    );
+}
+
+/// Compaction copies every payload of a packfile it can, past one it cannot copy, and goes on
+/// to rewrite the next packfile: the packfile with the payload it cannot copy is kept, the
+/// local payload in it moves, and the next packfile is truncated.
+#[tokio::test]
+async fn compaction_continues_past_a_payload_it_cannot_copy() {
+    let dir = lore_base::test_util::TempDir::new("is_compact_past_failure_");
+    let partition = Partition::from([0x43u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(5);
+    let layout = vec![
+        vec![
+            (&payloads[0], true),
+            (&payloads[1], true),
+            (&payloads[2], false),
+        ],
+        vec![(&payloads[3], true), (&payloads[4], false)],
+    ];
+    let (store, addresses) = store_in_packfiles(dir.as_ref(), partition, &layout).await;
+    let mut unreadable_hash = [0u8; 32];
+    unreadable_hash[0] = group_index as u8;
+    {
+        let mut bucket = store.group[group_index].bucket(0).write().await;
+        let index = bucket.entry.len() as u32;
+        bucket.entry.push(ImmutableStoreEntry {
+            address: Address {
+                hash: Hash::from(unreadable_hash),
+                context: Context::default(),
+            },
+            partition,
+            data: ImmutableData {
+                flags: FragmentFlags::PayloadStoredLocal.bits(),
+                size_payload: 7000,
+                size_content: 7000,
+                pack_offset: 6000,
+                pack_file: 1,
+                last_access: 0,
+            },
+        });
+        bucket.sorted_index.push(index);
+    }
+
+    assert!(compact_group(&store, group_index).await);
+
+    let sizes = store.group[group_index].packstore.sizes().await.unwrap();
+    assert_eq!(sizes[0], 3 * 4096, "the packfile it cannot empty is kept");
+    assert_eq!(sizes[1], 0, "the next packfile is truncated");
+    let entries = group_entries(&store, group_index).await;
+    assert_ne!(
+        packfile_of(&entries, addresses[2]),
+        1,
+        "the local payload moves"
+    );
+    assert_payloads_read_back(
+        &store,
+        partition,
+        [
+            (addresses[2], payloads[2].clone()),
+            (addresses[4], payloads[4].clone()),
+        ],
+    )
+    .await;
+}
+
+/// Compaction sweeps every bucket of a fanned-out group: the local payloads in each read back
+/// from their copies, and the durable payloads it evicts are reclaimed.
+#[tokio::test]
+async fn compaction_rewrites_a_packfile_spread_over_many_buckets() {
+    use lore_storage::immutable_store::ImmutableStore;
+    use lore_storage::local::fan_out::bucket_index_for;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_buckets_");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            initial_fan_out_level: 32,
+            ..client_settings()
+        },
+    )
+    .await
+    .unwrap();
+    let partition = Partition::from([0x44u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(16);
+    let mut local = vec![];
+    for (index, payload) in payloads.iter().enumerate() {
+        let address = put_payload(
+            &store,
+            partition,
+            Context::default(),
+            payload,
+            index % 2 == 0,
+        )
+        .await;
+        if index % 2 == 1 {
+            local.push((address, payload.clone()));
+        }
+    }
+    store.clone().flush(true).await.unwrap();
+    store.deserialize_all_buckets().await.unwrap();
+    assert_eq!(
+        store.group[group_index]
+            .bucket_count
+            .load(atomic::Ordering::Relaxed),
+        32
+    );
+    let mut buckets: Vec<_> = local
+        .iter()
+        .map(|(address, _)| bucket_index_for(&address.hash, 32))
+        .collect();
+    buckets.dedup();
+    assert!(buckets.len() > 1, "the local payloads span buckets");
+
+    assert!(compact_group(&store, group_index).await);
+
+    assert_eq!(
+        store.group[group_index]
+            .packstore
+            .total_size()
+            .await
+            .unwrap(),
+        local.len() * 4096
+    );
+    assert_payloads_read_back(&store, partition, local).await;
+}
+
+/// A bucket write that fails leaves the bucket dirty for the next flush, and no temporary file.
+#[tokio::test]
+async fn a_failed_bucket_write_leaves_the_bucket_dirty() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_failed_write_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x45u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(2);
+    put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+    store.clone().flush(false).await.unwrap();
+    let bucket_path = format_bucket_path(&dir.join("immutable"), group_index, 0);
+    std::fs::remove_file(&bucket_path).unwrap();
+    std::fs::create_dir(&bucket_path).unwrap();
+    std::fs::write(bucket_path.join("blocker"), b"x").unwrap();
+
+    put_payload(&store, partition, Context::default(), &payloads[1], false).await;
+    let _ = store.clone().flush(false).await;
+
+    assert!(store.group[group_index].dirty[0].load(atomic::Ordering::Relaxed));
+    let mut temporary = bucket_path.into_os_string();
+    temporary.push(".tmp");
+    assert!(!Path::new(&temporary).exists());
+}
+
+/// A fan-out commit that fails once a bucket's `.new` file is written leaves the bucket dirty,
+/// so that the next flush writes it again, and its payload reads back once the store reopens.
+#[tokio::test]
+async fn a_failed_fan_out_commit_leaves_its_buckets_dirty() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_failed_commit_");
+    let partition = Partition::from([0x46u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+    let pending = format_bucket_path(&dir.join("immutable"), group_index, 0)
+        .with_file_name(lore_storage::local::fan_out::LEVEL_PENDING_FILENAME);
+    let address = {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        let address = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::write(pending.join("blocker"), b"x").unwrap();
+
+        assert!(store.clone().flush(false).await.is_err());
+        assert!(store.group[group_index].dirty[0].load(atomic::Ordering::Relaxed));
+
+        std::fs::remove_dir_all(&pending).unwrap();
+        store.clone().flush(false).await.unwrap();
+        address
+    };
+
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(&store, partition, [(address, payloads[0].clone())]).await;
+}
+
+/// A group whose buckets are laid out for a fan-out that no commit recorded on disk is neither
+/// evicted nor rewritten.
+#[tokio::test]
+async fn compaction_skips_a_group_whose_fan_out_is_not_committed() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_uncommitted_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x47u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    for (index, payload) in payloads.iter().enumerate() {
+        put_payload(&store, partition, Context::default(), payload, index < 2).await;
+    }
+    store.clone().flush(true).await.unwrap();
+    store.deserialize_all_buckets().await.unwrap();
+    let group = &store.group[group_index];
+    group.committed_level.store(32, atomic::Ordering::Relaxed);
+
+    assert!(compact_group(&store, group_index).await);
+
+    assert_eq!(group.packstore.sizes().await.unwrap(), vec![4 * 4096]);
+    assert!(
+        group_entries(&store, group_index)
+            .await
+            .iter()
+            .all(|entry| entry.data.pack_file != 0),
+        "nothing is evicted"
+    );
+}
+
+/// A packfile is kept when a bucket file cannot be written after its payloads are copied, the
+/// error is returned, and the copies reach disk with the next flush, so that every payload reads
+/// back once the store reopens.
+#[tokio::test]
+async fn compaction_keeps_a_packfile_when_a_bucket_write_fails() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_write_fails_");
+    let partition = Partition::from([0x48u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    let bucket_path = format_bucket_path(&dir.join("immutable"), group_index, 0);
+    let mut local = vec![];
+    {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        for (index, payload) in payloads.iter().enumerate() {
+            let address =
+                put_payload(&store, partition, Context::default(), payload, index < 2).await;
+            if index >= 2 {
+                local.push((address, payload.clone()));
+            }
+        }
+        store.clone().flush(true).await.unwrap();
+        std::fs::remove_file(&bucket_path).unwrap();
+        std::fs::create_dir(&bucket_path).unwrap();
+        std::fs::write(bucket_path.join("blocker"), b"x").unwrap();
+
+        let failed = try_compact_group_toward(&store, group_index, 1, true).await;
+        assert!(failed.is_err(), "the failed bucket write is returned");
+
+        assert_eq!(
+            store.group[group_index].packstore.sizes().await.unwrap()[0],
+            4 * 4096,
+            "the packfile is not truncated"
+        );
+        std::fs::remove_dir_all(&bucket_path).unwrap();
+        store.clone().flush(true).await.unwrap();
+    }
+
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(&store, partition, local).await;
+}
+
+/// A rewrite that fails to write a bucket file ends the compaction pass and returns the error:
+/// the next packfile is neither copied nor truncated.
+#[tokio::test]
+async fn a_failed_rewrite_ends_the_compaction_pass() {
+    let dir = lore_base::test_util::TempDir::new("is_compact_failure_ends_");
+    let partition = Partition::from([0x4au8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    let layout = vec![
+        vec![(&payloads[0], true), (&payloads[1], false)],
+        vec![(&payloads[2], true), (&payloads[3], false)],
+    ];
+    let (store, _) = store_in_packfiles(dir.as_ref(), partition, &layout).await;
+    let bucket_path = format_bucket_path(&dir.join("immutable"), group_index, 0);
+    std::fs::remove_file(&bucket_path).unwrap();
+    std::fs::create_dir(&bucket_path).unwrap();
+    std::fs::write(bucket_path.join("blocker"), b"x").unwrap();
+
+    let failed = try_compact_group_toward(&store, group_index, 1, true).await;
+    assert!(failed.is_err(), "the failed bucket write is returned");
+
+    assert_eq!(
+        store.group[group_index].packstore.sizes().await.unwrap(),
+        vec![2 * 4096, 2 * 4096, 4096],
+        "only the first packfile's local payload is copied"
+    );
+}
+
+/// While a group's fan-out is not committed on disk, a delayed flush writes none of its bucket
+/// files, which are laid out for the committed level, and leaves the buckets dirty, so that the
+/// next flush commits the fan-out and every payload reads back once the store reopens.
+#[tokio::test]
+async fn no_bucket_file_is_written_while_a_fan_out_is_uncommitted() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_uncommitted_fan_out_");
+    let settings = || ImmutableStoreSettings {
+        fan_out_threshold: 2,
+        ..client_settings()
+    };
+    let partition = Partition::from([0x4bu8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    let bucket_path = format_bucket_path(&dir.join("immutable"), group_index, 0);
+    let pending = bucket_path.with_file_name(lore_storage::local::fan_out::LEVEL_PENDING_FILENAME);
+    let mut addresses = vec![];
+    {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+            .await
+            .unwrap();
+        for payload in &payloads[..2] {
+            addresses
+                .push(put_payload(&store, partition, Context::default(), payload, false).await);
+        }
+        store.clone().flush(false).await.unwrap();
+        let committed = std::fs::read(&bucket_path).unwrap();
+        for payload in &payloads[2..] {
+            addresses
+                .push(put_payload(&store, partition, Context::default(), payload, false).await);
+        }
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::write(pending.join("blocker"), b"x").unwrap();
+        assert!(store.clone().flush(false).await.is_err());
+        let group = &store.group[group_index];
+        assert_ne!(
+            group.bucket_count.load(atomic::Ordering::Relaxed),
+            group.committed_level.load(atomic::Ordering::Relaxed),
+            "the group fanned out without committing"
+        );
+
+        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+
+        assert_eq!(std::fs::read(&bucket_path).unwrap(), committed);
+        assert!(!format_bucket_path(&dir.join("immutable"), group_index, 1).exists());
+        assert!(group.dirty[0].load(atomic::Ordering::Relaxed));
+        std::fs::remove_dir_all(&pending).unwrap();
+        store.clone().flush(false).await.unwrap();
+    }
+
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(&store, partition, addresses.into_iter().zip(payloads)).await;
+}
+
+/// A group whose packfiles fail to load is left out of compaction while the groups after it
+/// load and compact, and its payloads read back once its packfiles can be read again.
+#[tokio::test]
+async fn compaction_goes_on_past_a_group_whose_packfiles_fail_to_load() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    use crate::store_fixture::payloads_in_two_groups;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_unloadable_");
+    let partition = Partition::from([0x49u8; 16]);
+    let [mut first, mut second] = payloads_in_two_groups(4);
+    if first.0 > second.0 {
+        std::mem::swap(&mut first, &mut second);
+    }
+    let ((failing, failing_payloads), (loading, loading_payloads)) = (first, second);
+    let mut failing_local = vec![];
+    {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        for (group_payloads, local) in [
+            (&failing_payloads, Some(&mut failing_local)),
+            (&loading_payloads, None),
+        ] {
+            let mut local = local;
+            for (index, payload) in group_payloads.iter().enumerate() {
+                let address =
+                    put_payload(&store, partition, Context::default(), payload, index < 2).await;
+                if index >= 2
+                    && let Some(local) = local.as_mut()
+                {
+                    local.push((address, payload.clone()));
+                }
+            }
+        }
+        store.clone().flush(true).await.unwrap();
+    }
+    let pack = dir
+        .join("immutable")
+        .join("index")
+        .join(format!("{failing:02x}"))
+        .join("pack");
+    let packfile = pack.join("1");
+    let aside = pack.join("1.aside");
+    std::fs::rename(&packfile, &aside).unwrap();
+    std::fs::create_dir(&packfile).unwrap();
+    std::fs::write(pack.join("2"), b"").unwrap();
+
+    {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        assert!(store.clone().load_index().await.is_err());
+        assert!(compact_group(&store, failing).await);
+        assert!(compact_group(&store, loading).await);
+        assert_eq!(
+            store.group[loading].packstore.total_size().await.unwrap(),
+            2 * 4096,
+            "the group that loads is compacted"
+        );
+    }
+
+    std::fs::remove_dir(&packfile).unwrap();
+    std::fs::rename(&aside, &packfile).unwrap();
+    std::fs::remove_file(pack.join("2")).unwrap();
+    assert_eq!(std::fs::metadata(&packfile).unwrap().len(), 4 * 4096);
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(&store, partition, failing_local).await;
 }

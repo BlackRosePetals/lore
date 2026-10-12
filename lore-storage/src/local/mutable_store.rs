@@ -159,8 +159,8 @@ pub struct MutableStoreGroup {
     /// Without it, two overlapping flushes each read `committed_level` before either
     /// has finished and can take *different* paths — one the two-phase commit (write
     /// `index_<bb>.new`, then rename it over the live file), the other the regular
-    /// in-place write. The rename then publishes its older `.new` snapshot over the
-    /// newer in-place write, silently discarding it: the losing write still returns
+    /// write. The rename then publishes its older `.new` snapshot over the newer
+    /// regular write, silently discarding it: the losing write still returns
     /// `Ok`, and the clobbered file even inherits the `.new` file's older mtime.
     /// Note that locking the rename alone would not be enough — the
     /// published snapshot is taken before the rename, so the two paths have to be
@@ -184,6 +184,15 @@ impl MutableStoreGroup {
     #[inline]
     pub fn try_bucket(&self, idx: usize) -> Option<&Arc<RwLock<MutableStoreBucket>>> {
         self.bucket[idx].get()
+    }
+
+    /// Whether the group fanned out to a layout that no commit recorded on disk, as after a
+    /// fan-out commit that failed. Its bucket files are in the committed layout, and writing a
+    /// bucket as it is in memory would mix the two. Read under the flush lock, which every change
+    /// to either count holds.
+    fn fan_out_uncommitted(&self) -> bool {
+        let committed = self.committed_level.load(atomic::Ordering::Relaxed);
+        committed != 0 && committed != self.bucket_count.load(atomic::Ordering::Relaxed)
     }
 }
 
@@ -230,9 +239,21 @@ struct MutableStoreHeader {
 
 /// Classification of a failed bucket parse. A `FutureVersion` file must propagate untouched;
 /// deleting it would destroy data written by a newer binary. A `Corrupt` file is safe to reset.
+/// An `Unreadable` file is left as it is.
 enum DeserializeFileError {
     FutureVersion(u32),
     Corrupt(String),
+    Unreadable(io::Error),
+}
+
+/// The error for a failed read of a bucket file's contents: a file shorter than its header says
+/// is corrupt, and any other failure, such as a transient I/O error, leaves the file unread.
+fn bucket_read_error(err: io::Error, what: &str) -> DeserializeFileError {
+    if err.kind() == ErrorKind::UnexpectedEof {
+        DeserializeFileError::Corrupt(format!("{what}: {err}"))
+    } else {
+        DeserializeFileError::Unreadable(err)
+    }
 }
 
 /// Final-destination segments for a bucket read: one vectored operation
@@ -330,6 +351,9 @@ impl MutableStoreBucket {
             Err(DeserializeFileError::Corrupt(reason)) => {
                 Self::recover_corrupt_bucket(&path, reason, latest_version).await
             }
+            Err(DeserializeFileError::Unreadable(err)) => Err(
+                LocalMutableStoreError::internal_with_context(err, "reading mutable store bucket"),
+            ),
         }
     }
 
@@ -398,7 +422,7 @@ impl MutableStoreBucket {
         let segments = file
             .read_exact_vectored_at(segments, header_size as u64)
             .await
-            .map_err(|err| DeserializeFileError::Corrupt(format!("read bucket data: {err}")))?;
+            .map_err(|err| bucket_read_error(err, "read bucket data"))?;
 
         Ok((segments.sorted_index, segments.entry, header.version))
     }
@@ -463,6 +487,9 @@ impl MutableStoreBucket {
         Ok(())
     }
 
+    /// Write the bucket to a temporary file renamed over `path`, so that a process stopped during
+    /// the write leaves the file it last wrote. With `sync_data`, the file is synced before the
+    /// rename and its directory after.
     async fn serialize_files(
         bucket: OwnedRwLockReadGuard<MutableStoreBucket, MutableStoreBucket>,
         group: Arc<MutableStoreGroup>,
@@ -470,22 +497,9 @@ impl MutableStoreBucket {
         path: PathBuf,
         sync_data: bool,
     ) -> Result<(), LocalMutableStoreError> {
-        // Append `.tmp` rather than replacing the extension, so a fan-out-commit path like `index_<bb>.new` becomes `index_<bb>.new.tmp`. set_extension would clobber `.new` to `.tmp`, colliding with the regular flush path's tmp file.
-        let temporary_path = if sync_data {
-            let mut p = path.as_os_str().to_owned();
-            p.push(".tmp");
-            PathBuf::from(p)
-        } else {
-            path.clone()
-        };
-        let mut temporary_guard = if sync_data {
-            Some(SerializeFailureGuard::new(
-                &group.dirty[bucket_index],
-                &temporary_path,
-            ))
-        } else {
-            None
-        };
+        let temporary_path = crate::local::fan_out::temporary_path(&path);
+        let mut temporary_guard =
+            SerializeFailureGuard::new(&group.dirty[bucket_index], &temporary_path);
 
         if let Some(parent_path) = temporary_path.parent()
             && !parent_path.exists()
@@ -519,19 +533,11 @@ impl MutableStoreBucket {
             .write(true)
             .create(true)
             .truncate(true);
-        if let Some(mut guard) = temporary_guard.take() {
-            lore_io::IoDriver::global()
-                .write_file_segments_atomic(&temporary_path, &path, &file_options, segments)
-                .await
-                .internal("writing mutable store bucket")?;
-
-            guard.success();
-        } else {
-            lore_io::IoDriver::global()
-                .write_file_segments(&path, &file_options, segments, false)
-                .await
-                .internal("writing mutable store bucket")?;
-        }
+        lore_io::IoDriver::global()
+            .write_file_segments_atomic(&temporary_path, &path, &file_options, segments, sync_data)
+            .await
+            .internal("writing mutable store bucket")?;
+        temporary_guard.success();
 
         Ok(())
     }
@@ -551,6 +557,12 @@ impl MutableStoreBucket {
 
         // Ensure only one serialization/deserialization of this bucket is happening at any given time
         let _lock = bucket.serialize_lock.clone().lock_owned().await;
+
+        if group.fan_out_uncommitted() {
+            return Err(LocalMutableStoreError::internal(
+                "Bucket left dirty for the uncommitted fan-out of its group",
+            ));
+        }
 
         // Atomically flip dirty from true to false; if it was already false another flush
         // task has already claimed this bucket.
@@ -574,8 +586,8 @@ impl MutableStoreBucket {
     /// dirty=true while we hold it, so any post-release write will correctly re-set dirty and
     /// be picked up by the next flush, matching the regular `serialize` path's semantics.
     ///
-    /// Reuses `serialize_files` internally; with `sync_data = true`, the path becomes
-    /// `index_<bb>.new.tmp` → atomic rename → `index_<bb>.new`.
+    /// Reuses `serialize_files` internally, so the bucket goes to `index_<bb>.new.tmp` and is
+    /// renamed to `index_<bb>.new`.
     pub async fn serialize_to_new(
         bucket: OwnedRwLockReadGuard<MutableStoreBucket, MutableStoreBucket>,
         group: Arc<MutableStoreGroup>,
@@ -1000,12 +1012,12 @@ impl LocalMutableStore {
         let authoritative = self.authoritative;
 
         for (group_index, group) in self.group.iter().enumerate() {
-            // Lock-free scan: skip entire group if nothing is dirty.
+            // Lock-free scan: skip entire group if nothing is dirty and no fan-out awaits its commit.
             let any_dirty = group
                 .dirty
                 .iter()
                 .any(|flag| flag.load(atomic::Ordering::Relaxed));
-            if !any_dirty {
+            if !any_dirty && !group.fan_out_uncommitted() {
                 continue;
             }
 
@@ -1208,6 +1220,8 @@ impl LocalMutableStore {
                             group
                                 .committed_level
                                 .store(active_buckets, atomic::Ordering::Relaxed);
+                        } else {
+                            crate::local::fan_out::mark_uncommitted_dirty(&group.dirty, &wrote_new);
                         }
                     }
                 } else if first_err.is_none() {

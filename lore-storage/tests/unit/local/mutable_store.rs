@@ -539,6 +539,72 @@ async fn store_recovers_from_zero_filled_bucket_and_remains_usable() {
     assert_eq!(reloaded, value, "bucket must be usable after recovery");
 }
 
+/// A flush without syncing replaces a bucket's file rather than rewriting it, so that a process
+/// stopped during the write leaves the file it last wrote, as a hard link to that file shows.
+#[tokio::test]
+async fn an_unsynced_flush_replaces_the_bucket_file() {
+    use lore_storage::mutable_store::MutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("ms_unsynced_replace_");
+    let store: Arc<dyn MutableStore> = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            MutableStoreSettings {
+                initial_fan_out_level: 1,
+                ..Default::default()
+            },
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let partition = Partition::default();
+    let key = |index: u8| {
+        let mut key = Hash::default();
+        key.data_mut()[0] = 0x21;
+        key.data_mut()[1] = index;
+        key
+    };
+    let bucket_path = format_bucket_path(&dir.path().join("mutable"), 0x21, 0);
+    store
+        .clone()
+        .store(
+            partition,
+            key(1),
+            Hash::from_u64(1),
+            KeyType::BranchMetadata,
+        )
+        .await
+        .unwrap();
+    store.clone().flush(false).await.unwrap();
+    let written = std::fs::read(&bucket_path).unwrap();
+    let link = dir.path().join("last_written");
+    std::fs::hard_link(&bucket_path, &link).unwrap();
+
+    store
+        .clone()
+        .store(
+            partition,
+            key(2),
+            Hash::from_u64(2),
+            KeyType::BranchMetadata,
+        )
+        .await
+        .unwrap();
+    store.clone().flush(false).await.unwrap();
+
+    assert_eq!(
+        std::fs::read(&link).unwrap(),
+        written,
+        "the file last written is left whole"
+    );
+    assert_ne!(
+        std::fs::read(&bucket_path).unwrap(),
+        written,
+        "the bucket's file holds the new write"
+    );
+}
+
 #[tokio::test]
 async fn local_mutable_store_satisfies_conformance_battery() {
     let store = lore_storage::local::mutable_store::create(

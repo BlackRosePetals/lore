@@ -257,6 +257,7 @@ impl PsyncDriver {
         temporary_path: PathBuf,
         final_path: PathBuf,
         buffers: B,
+        durable: bool,
     ) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || {
@@ -277,14 +278,18 @@ impl PsyncDriver {
                 // here: the sync and the rename below touch the page cache and the directory,
                 // never the caller's memory.
                 drop(buffers);
-                file.sync_all()?;
+                if durable {
+                    file.sync_all()?;
+                }
                 drop(file);
                 std::fs::rename(&temporary_path, &final_path)?;
                 // Directory sync is best-effort: the rename is already
                 // durable in content, and a lost directory entry after a
                 // crash reproduces the pre-write state the caller already
                 // handles.
-                let _ = sync_parent_dir(&final_path);
+                if durable {
+                    let _ = sync_parent_dir(&final_path);
+                }
                 Ok(())
             })
             .await

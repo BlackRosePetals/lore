@@ -1671,8 +1671,7 @@ async fn mark_stored_durable(repository: &Arc<RepositoryContext>, address: Addre
 /// Mark the local entries for addresses the peer already holds durable.
 ///
 /// `ExistFullMatch` establishes the same fact an upload does. An entry that never records it is
-/// pinned against eviction, excluded from the store's size and capacity totals, and re-queried on
-/// every subsequent push.
+/// pinned against eviction and re-queried on every subsequent push.
 #[lore_macro::test_pub]
 async fn mark_present_durable(repository: &Arc<RepositoryContext>, present: Vec<Address>) {
     const MAX_PARALLEL_MARK: usize = 1000;

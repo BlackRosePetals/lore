@@ -452,7 +452,7 @@ Each mode reads its settings from a matching sub-table. The `local` mode uses `[
 | `path` | derived `<temp>/lore-server` | both | Filesystem location for the store. When empty, the server derives a path under the system temporary directory at startup (ephemeral — see [Zero-config defaults](#zero-config-defaults)). |
 | `flush_delay_seconds` | `10` | both | Seconds between background flushes to disk. |
 | `max_capacity` | none | immutable | Maximum number of entries before eviction. |
-| `max_size` | none | immutable | Maximum total store size in bytes before background compaction reclaims space. |
+| `max_size` | none | immutable | Maximum total store size in bytes before background compaction reclaims space. Compaction rewrites a group's packfiles only once at least 10% of their bytes are no longer referenced. |
 | `eviction_delay` | none | immutable | Interval in milliseconds between eviction passes. Defaults to 10 s when unset. |
 | `compaction_delay` | none | immutable | Interval in milliseconds between compaction passes. Defaults to 24 h when unset. |
 | `target_capacity_percentage` | `70` | immutable | Capacity-utilization target (percent) that eviction reclaims down to. Applies only when `max_capacity` is set; 0 or ≥100 is treated as `70`. |

@@ -12,7 +12,6 @@ pub mod oodle_migration;
 use std::backtrace::Backtrace;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
 use std::io::ErrorKind;
@@ -101,6 +100,10 @@ pub const BUCKET_COUNT: usize = 256;
 pub const DEFAULT_FLUSH_DELAY_SECONDS: u64 = 5;
 
 const DOT_COMPACT: &str = "compact";
+
+/// Compaction rewrites a group's packfiles only once at least this percentage of their bytes is
+/// unreferenced. A rewrite copies every referenced byte to reclaim the rest.
+const COMPACTION_MIN_UNREFERENCED_PERCENTAGE: usize = 10;
 
 /// Head bytes requested by the composite bucket open: one pool buffer
 /// class, covering fan-out-threshold-sized buckets (~100 KiB) entirely so
@@ -214,6 +217,59 @@ pub struct ImmutableStoreBucket {
     serialize_lock: Arc<Mutex<()>>,
 }
 
+/// Where a payload is stored: its packfile, and its offset in that packfile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PayloadLocation {
+    pack_file: u32,
+    pack_offset: u32,
+}
+
+impl PayloadLocation {
+    /// Where the payload of an entry holding `data` is stored.
+    fn of(data: &ImmutableData) -> Self {
+        Self {
+            pack_file: data.pack_file,
+            pack_offset: data.pack_offset,
+        }
+    }
+}
+
+/// A payload of a bucket: the hash of its content, where it is stored, its size, whether eviction
+/// may take it from every entry holding it, and the newest last access among those entries.
+struct BucketPayload {
+    hash: Hash,
+    location: PayloadLocation,
+    size: u32,
+    evictable: bool,
+    last_access: u64,
+}
+
+/// Payload bytes a bucket stores, and the bytes of the payloads eviction may take.
+#[derive(Clone, Copy, Debug, Default)]
+struct BucketSizes {
+    stored: usize,
+    evictable: usize,
+}
+
+/// What size eviction took from a bucket: the entries that lost their payload, the payloads
+/// evicted, and their size in bytes.
+#[derive(Clone, Copy, Debug, Default)]
+struct BucketEviction {
+    entries: usize,
+    payloads: usize,
+    bytes: usize,
+}
+
+/// What compaction did with a packfile it rewrote.
+enum Rewrite {
+    /// Truncated, after copying this many bytes out of it.
+    Truncated(usize),
+    /// Kept, as an entry may still point into it, such as at a payload that could not be copied.
+    Referenced,
+    /// Kept, as the group fanned out during the rewrite.
+    Interrupted,
+}
+
 impl ImmutableStoreBucket {
     fn clone_for_compaction(&self) -> (Vec<ImmutableStoreEntry>, Vec<u32>) {
         (self.entry.to_vec(), self.sorted_index.to_vec())
@@ -256,9 +312,9 @@ pub struct ImmutableStoreGroup {
     /// compactor, the packfile upgrade) takes it only around its own bucket write.
     ///
     /// Without it, an overlapping flush can observe a half-finished level transition
-    /// and take the regular in-place path while a two-phase commit is still pending.
-    /// The commit's later `rename` of `index_<bb>.new` then publishes its older
-    /// snapshot over the newer in-place write, discarding it. The losing write still
+    /// and take the regular path while a two-phase commit is still pending. The
+    /// commit's later `rename` of `index_<bb>.new` then publishes its older snapshot
+    /// over the newer regular write, discarding it. The losing write still
     /// returns `Ok`, and the clobbered file inherits the `.new` file's older mtime.
     /// Locking the rename alone would not help: the snapshot it publishes is taken
     /// before the rename, so the two paths must not interleave at all.
@@ -474,9 +530,7 @@ fn detect_any_older_immutable_bucket(index_path: &Path) -> bool {
         for file in files.flatten() {
             let name = file.file_name();
             let name_str = name.to_str().unwrap_or("");
-            if !name_str.starts_with(crate::local::fan_out::BUCKET_FILENAME_PREFIX)
-                || name_str.ends_with(crate::local::fan_out::BUCKET_NEW_SUFFIX)
-            {
+            if !crate::local::fan_out::is_bucket_file_name(name_str) {
                 continue;
             }
             if let Ok(mut f) = std::fs::File::open(file.path()) {
@@ -498,6 +552,17 @@ fn detect_any_older_immutable_bucket(index_path: &Path) -> bool {
 enum DeserializeFileError {
     FutureVersion(u32),
     Corrupt(String),
+    Unreadable(io::Error),
+}
+
+/// The error for a failed read of a bucket file's contents: a file shorter than its header says
+/// is corrupt, and any other failure, such as a transient I/O error, leaves the file unread.
+fn bucket_read_error(err: io::Error, what: &str) -> DeserializeFileError {
+    if err.kind() == ErrorKind::UnexpectedEof {
+        DeserializeFileError::Corrupt(format!("{what}: {err}"))
+    } else {
+        DeserializeFileError::Unreadable(err)
+    }
 }
 
 /// Final-destination segments for a bucket read: one vectored operation
@@ -609,9 +674,9 @@ impl ImmutableStoreBucket {
             }
         };
 
-        // Recover from corruption (crash mid-flush leaves a half-written file) by
-        // resetting the bucket. Future-version sentinels propagate untouched — the file
-        // was written by a newer binary and deleting it would destroy newer-format data.
+        // Recover from corruption by resetting the bucket. Future-version sentinels and
+        // unreadable files propagate untouched — deleting a file a newer binary wrote, or one a
+        // transient error kept from being read, would destroy its entries.
         match Self::deserialize_file_content(&path, &file, metadata.len() as usize, &head).await {
             Ok(result) => Ok(result),
             Err(DeserializeFileError::FutureVersion(version)) => {
@@ -624,6 +689,12 @@ impl ImmutableStoreBucket {
             }
             Err(DeserializeFileError::Corrupt(reason)) => {
                 Self::recover_corrupt_bucket(&path, reason).await
+            }
+            Err(DeserializeFileError::Unreadable(err)) => {
+                Err(LocalImmutableStoreError::internal_with_context(
+                    err,
+                    "Failed to read storage bucket",
+                ))
             }
         }
     }
@@ -725,7 +796,7 @@ impl ImmutableStoreBucket {
             let segments = file
                 .read_exact_vectored_at(segments, header_size as u64)
                 .await
-                .map_err(|err| DeserializeFileError::Corrupt(format!("read bucket data: {err}")))?;
+                .map_err(|err| bucket_read_error(err, "read bucket data"))?;
             return Ok((
                 segments.sorted_index,
                 segments.entry,
@@ -741,7 +812,7 @@ impl ImmutableStoreBucket {
             remainder = file
                 .read_exact_at(file_size - header_size, header_size as u64)
                 .await
-                .map_err(|err| DeserializeFileError::Corrupt(format!("read bucket data: {err}")))?;
+                .map_err(|err| bucket_read_error(err, "read bucket data"))?;
             &remainder
         };
         let sorted_index = GrowVec::read_from(&mut reader, expected_count)
@@ -799,6 +870,9 @@ impl ImmutableStoreBucket {
         Ok((GrowVec::new(), GrowVec::new(), false, false))
     }
 
+    /// Write the bucket to a temporary file renamed over `path`, so that a process stopped during
+    /// the write leaves the file it last wrote. With `sync_data`, the file is synced before the
+    /// rename and its directory after.
     async fn serialize_files(
         bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
         group: Arc<ImmutableStoreGroup>,
@@ -806,22 +880,9 @@ impl ImmutableStoreBucket {
         path: PathBuf,
         sync_data: bool,
     ) -> Result<(), LocalImmutableStoreError> {
-        // Append `.tmp` rather than replacing the extension, so a fan-out-commit path like `index_<bb>.new` becomes `index_<bb>.new.tmp`. set_extension would clobber `.new` to `.tmp`, colliding with the regular flush path's tmp file.
-        let temporary_path = if sync_data {
-            let mut p = path.as_os_str().to_owned();
-            p.push(".tmp");
-            PathBuf::from(p)
-        } else {
-            path.clone()
-        };
-        let mut temporary_guard = if sync_data {
-            Some(SerializeFailureGuard::new(
-                &group.dirty[bucket_index],
-                &temporary_path,
-            ))
-        } else {
-            None
-        };
+        let temporary_path = crate::local::fan_out::temporary_path(&path);
+        let mut temporary_guard =
+            SerializeFailureGuard::new(&group.dirty[bucket_index], &temporary_path);
 
         if let Some(parent_path) = temporary_path.parent()
             && !parent_path.exists()
@@ -856,19 +917,11 @@ impl ImmutableStoreBucket {
             .write(true)
             .create(true)
             .truncate(true);
-        if let Some(mut guard) = temporary_guard.take() {
-            lore_io::IoDriver::global()
-                .write_file_segments_atomic(&temporary_path, &path, &file_options, segments)
-                .await
-                .internal("Failed to serialize storage bucket")?;
-
-            guard.success();
-        } else {
-            lore_io::IoDriver::global()
-                .write_file_segments(&path, &file_options, segments, false)
-                .await
-                .internal("Failed to serialize storage bucket")?;
-        }
+        lore_io::IoDriver::global()
+            .write_file_segments_atomic(&temporary_path, &path, &file_options, segments, sync_data)
+            .await
+            .internal("Failed to serialize storage bucket")?;
+        temporary_guard.success();
 
         Ok(())
     }
@@ -929,6 +982,12 @@ impl ImmutableStoreBucket {
         // Ensure only one serialization/deserialization of this bucket is happening at any given time
         let _lock = bucket.serialize_lock.clone().lock_owned().await;
 
+        if group.fan_out_uncommitted() {
+            return Err(LocalImmutableStoreError::internal(
+                "Bucket left dirty for the uncommitted fan-out of its group",
+            ));
+        }
+
         // Atomically flip dirty from true to false; if it was already false another flush
         // task has already claimed this bucket.
         if !group.dirty[bucket_index].swap(false, atomic::Ordering::Acquire) {
@@ -976,8 +1035,19 @@ impl ImmutableStoreBucket {
 }
 
 impl ImmutableStoreGroup {
-    async fn flush_packstore(&self, sync_data: bool) {
-        self.packstore.flush_all(sync_data).await;
+    async fn flush_packstore(&self, sync_data: bool) -> Result<(), LocalImmutableStoreError> {
+        self.packstore.flush_all(sync_data).await.map_err(|err| {
+            LocalImmutableStoreError::internal_with_context(err, "Failed syncing packfiles")
+        })
+    }
+
+    /// Whether the group fanned out to a layout that no commit recorded on disk, as after a
+    /// fan-out commit that failed. Its bucket files are in the committed layout, and writing a
+    /// bucket as it is in memory would mix the two. Read under the flush lock, which every change
+    /// to either count holds.
+    fn fan_out_uncommitted(&self) -> bool {
+        let committed = self.committed_level.load(atomic::Ordering::Relaxed);
+        committed != 0 && committed != self.bucket_count.load(atomic::Ordering::Relaxed)
     }
 
     #[lore_macro::test_pub]
@@ -1467,15 +1537,15 @@ impl LocalImmutableStore {
         let mut tasks = JoinSet::new();
         if let Some(path) = self.path.as_ref() {
             for (group_index, group) in self.group.iter().enumerate() {
-                final_result = final_result.and(
-                    group
-                        .packstore
-                        .resume()
-                        .await
-                        .forward("Failed to deserialize storage bucket"),
-                );
-                if final_result.is_err() {
-                    break;
+                let resumed = group
+                    .packstore
+                    .resume()
+                    .await
+                    .forward("Failed to deserialize storage bucket");
+                let resumed_ok = resumed.is_ok();
+                final_result = final_result.and(resumed);
+                if !resumed_ok {
+                    continue;
                 }
                 while let Some(result) = tasks.try_join_next() {
                     final_result = final_result.and(
@@ -1518,7 +1588,9 @@ impl LocalImmutableStore {
             );
         }
 
-        self.deserialized_all.store(true, atomic::Ordering::Relaxed);
+        if final_result.is_ok() {
+            self.deserialized_all.store(true, atomic::Ordering::Relaxed);
+        }
 
         if VALIDATE_COMPACTION && final_result.is_ok() {
             // Verify the store integrity
@@ -2239,6 +2311,13 @@ impl LocalImmutableStore {
         }
     }
 
+    /// Evict the least recently accessed payloads of each bucket over its share of `target_size`,
+    /// an equal part per bucket, until it is below its share or has nothing left to evict. Runs
+    /// only when the group stores at least `target_size` bytes and holds a payload it may evict.
+    /// A protected local payload counts toward the size but is never evicted. Each bucket that
+    /// evicts is written when the store has a `path`. A stop request, or a fan-out of the group,
+    /// ends the pass. Returns how many payloads were evicted and their size in bytes.
+    #[lore_macro::test_pub]
     async fn evict_group_sized(
         self: Arc<Self>,
         group_index: usize,
@@ -2247,57 +2326,20 @@ impl LocalImmutableStore {
         protect_local_fragment: bool,
         sync_data: bool,
     ) -> (usize, usize) {
-        let mut total_stored_count = 0;
-        let mut total_stored_size = 0usize;
-
         let group = &self.group[group_index];
         let bucket_count = group.bucket_count.load(atomic::Ordering::Relaxed);
-        let mut bucket_stored_size = Vec::with_capacity(bucket_count);
-        for bucket_index in 0..bucket_count {
-            if self.gc_stop_requested() {
-                return (0, 0);
-            }
-            // Uninit slot is empty: push 0 to keep `bucket_stored_size` indexed by
-            // bucket_index for the second pass below.
-            let Some(bucket_ref) = group.try_bucket(bucket_index) else {
-                bucket_stored_size.push(0);
-                continue;
-            };
-            let bucket = bucket_ref.read().await;
-            let bucket_size = bucket.entry.len();
-
-            let mut payloads = HashSet::with_capacity(bucket_size / 4);
-            let mut stored_size = 0;
-            let mut stored_count = 0;
-            for index in 0..bucket_size {
-                let entry = &bucket.entry[index];
-                if entry.data.pack_file == 0 {
-                    continue;
-                }
-
-                if protect_local_fragment
-                    && entry.data.flags & FragmentFlags::PayloadStoredDurable == 0
-                {
-                    continue;
-                }
-
-                let key = (entry.data.pack_file, entry.data.pack_offset);
-                if !payloads.contains(&key) {
-                    stored_size += entry.data.size_payload as usize;
-                    stored_count += 1;
-
-                    payloads.insert(key);
-                }
-            }
-
-            bucket_stored_size.push(stored_size);
-            total_stored_size += stored_size;
-            total_stored_count += stored_count;
-        }
-
-        if total_stored_size < target_size {
+        let (mut run, mut candidates, mut evicted) = (vec![], vec![], vec![]);
+        let Some(bucket_sizes) = self
+            .bucket_payload_sizes(group, bucket_count, protect_local_fragment, &mut run)
+            .await
+        else {
+            return (0, 0);
+        };
+        let total_stored_size: usize = bucket_sizes.iter().map(|sizes| sizes.stored).sum();
+        let total_evictable_size: usize = bucket_sizes.iter().map(|sizes| sizes.evictable).sum();
+        if total_stored_size < target_size || total_evictable_size == 0 {
             lore_base::lore_debug!(
-                "Size eviction for group {group_index} skipped, currently {total_stored_size} bytes, target {target_size}"
+                "Size eviction for group {group_index} skipped, currently {total_stored_size} bytes, {total_evictable_size} evictable, target {target_size}"
             );
             return (0, 0);
         }
@@ -2312,8 +2354,7 @@ impl LocalImmutableStore {
         );
 
         let mut serialize_tasks = JoinSet::new();
-        let bucket_count = group.bucket_count.load(atomic::Ordering::Relaxed);
-        for bucket_index in 0..bucket_count {
+        for (bucket_index, sizes) in bucket_sizes.iter().enumerate() {
             while serialize_tasks.try_join_next().is_some() {}
 
             if self.gc_stop_requested() {
@@ -2322,112 +2363,48 @@ impl LocalImmutableStore {
                 );
                 break;
             }
+            if group.bucket_count.load(atomic::Ordering::Relaxed) != bucket_count {
+                lore_base::lore_debug!(
+                    "Size eviction for group {group_index} stopping at bucket {bucket_index}, the group fanned out"
+                );
+                break;
+            }
 
+            if sizes.stored <= bucket_target_size || sizes.evictable == 0 {
+                continue;
+            }
             let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
                 continue;
             };
-            let bucket_stored_size = bucket_stored_size[bucket_index];
-            let mut entry: Vec<((u32, u32), (u32, u64))> = {
-                let bucket = bucket.read().await;
 
-                // Grab only the newest timestamp for each hash with payload
-                let mut stored_payloads = HashMap::with_capacity(bucket.sorted_index.len());
-                for entry in bucket.entry.iter() {
-                    if entry.data.pack_file == 0 {
-                        continue;
-                    }
+            let stored_size = Self::eviction_candidates(
+                &*bucket.read().await,
+                protect_local_fragment,
+                &mut run,
+                &mut candidates,
+            );
+            let cutoff = Self::eviction_cutoff(&mut candidates, stored_size, bucket_target_size);
 
-                    // Clients cannot evict fragments only stored locally
-                    if protect_local_fragment {
-                        let stored_durable =
-                            entry.data.flags & FragmentFlags::PayloadStoredDurable != 0;
-                        if !stored_durable {
-                            continue;
-                        }
-                    }
-
-                    let key = (entry.data.pack_file, entry.data.pack_offset);
-                    let last_access = Self::load_last_access(&entry.data);
-                    stored_payloads
-                        .entry(key)
-                        .and_modify(|item: &mut (u32, u64)| item.1 = last_access)
-                        .or_insert((entry.data.size_payload, last_access));
-                }
-                stored_payloads.drain().collect()
-            };
-
-            entry.sort_unstable_by_key(|left| left.1);
-
-            let mut evicted_payloads = HashSet::with_capacity(entry.len() / 4);
-            let mut estimated_evicted_size = 0;
-            let mut cutoff_point = u64::MAX;
-            for ((pack_file, pack_offset), (size_payload, last_access)) in entry.iter() {
-                let key = (*pack_file, *pack_offset);
-                if evicted_payloads.contains(&key) {
-                    continue;
-                }
-
-                evicted_payloads.insert(key);
-
-                estimated_evicted_size += *size_payload as usize;
-                if bucket_stored_size.saturating_sub(estimated_evicted_size) < bucket_target_size {
-                    cutoff_point = *last_access;
-                    break;
-                }
-            }
-
-            drop(entry);
-
-            evicted_payloads.clear();
-
-            let mut evicted_count = 0;
-            let mut evicted_payload_count = 0;
-            let mut evicted_payload_size = 0;
-            {
-                let mut bucket_lock = bucket.write().await;
-                let bucket = &mut *bucket_lock;
-                let (entry, sorted_index) = (&mut bucket.entry, &bucket.sorted_index);
-                for index in sorted_index.iter() {
-                    let index = *index as usize;
-                    let entry = &mut entry[index];
-
-                    if entry.data.pack_file == 0 {
-                        continue;
-                    }
-                    // Protected fragments are absent from the candidate set, so the
-                    // cutoff (which stays u64::MAX for an all-non-durable bucket) must
-                    // not be applied to them.
-                    if protect_local_fragment
-                        && entry.data.flags & FragmentFlags::PayloadStoredDurable == 0
-                    {
-                        continue;
-                    }
-                    if entry.data.last_access > cutoff_point {
-                        continue;
-                    }
-
-                    let key = (entry.data.pack_file, entry.data.pack_offset);
-
-                    entry.data.pack_file = 0;
-                    entry.data.pack_offset = 0;
-                    evicted_count += 1;
-
-                    if !evicted_payloads.contains(&key) {
-                        evicted_payload_count += 1;
-                        evicted_payload_size += entry.data.size_payload as usize;
-                        evicted_payloads.insert(key);
-                    }
-                }
-
-                group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-            }
-
-            lore_base::lore_trace!(
-                "Size eviction for group {group_index} evicted {evicted_payload_count} payloads from {evicted_count} of {bucket_count} entries"
+            let bucket_eviction = Self::evict_accessed_by(
+                &mut *bucket.write().await,
+                cutoff,
+                protect_local_fragment,
+                &mut run,
+                &mut evicted,
             );
 
-            total_evicted_size += evicted_payload_size;
-            total_evicted_count += evicted_payload_count;
+            lore_base::lore_trace!(
+                "Size eviction for group {group_index} bucket {bucket_index} evicted {} payloads from {} entries",
+                bucket_eviction.payloads,
+                bucket_eviction.entries
+            );
+            if bucket_eviction.entries == 0 {
+                continue;
+            }
+            group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+
+            total_evicted_size += bucket_eviction.bytes;
+            total_evicted_count += bucket_eviction.payloads;
 
             if let Some(path) = path.as_ref() {
                 let path = path.clone();
@@ -2468,13 +2445,163 @@ impl LocalImmutableStore {
 
         if total_evicted_count > 0 {
             lore_base::lore_debug!(
-                "Size evicted for group {group_index} with {total_evicted_count} of {total_stored_count} payloads, {total_evicted_size} of {total_stored_size} bytes orphaned in pack store"
+                "Size evicted for group {group_index} with {total_evicted_count} payloads, {total_evicted_size} of {total_stored_size} bytes orphaned in pack store"
             );
         } else {
             lore_base::lore_debug!("Size eviction for group {group_index} did not evict anything");
         }
 
         (total_evicted_count, total_evicted_size)
+    }
+
+    /// Stored and evictable payload bytes of each of the group's first `bucket_count` buckets,
+    /// or `None` once garbage collection is asked to stop. `run` is as for
+    /// [`Self::visit_payloads`].
+    async fn bucket_payload_sizes(
+        &self,
+        group: &ImmutableStoreGroup,
+        bucket_count: usize,
+        protect_local_fragment: bool,
+        run: &mut Vec<BucketPayload>,
+    ) -> Option<Vec<BucketSizes>> {
+        let mut sizes = Vec::with_capacity(bucket_count);
+        for bucket_index in 0..bucket_count {
+            if self.gc_stop_requested() {
+                return None;
+            }
+            let mut bucket_sizes = BucketSizes::default();
+            if let Some(bucket) = group.try_bucket(bucket_index) {
+                Self::visit_payloads(
+                    &*bucket.read().await,
+                    protect_local_fragment,
+                    run,
+                    |payload| {
+                        bucket_sizes.stored += payload.size as usize;
+                        if payload.evictable {
+                            bucket_sizes.evictable += payload.size as usize;
+                        }
+                    },
+                );
+            }
+            sizes.push(bucket_sizes);
+        }
+        Some(sizes)
+    }
+
+    /// Call `visit` once for each payload of the bucket. Entries sort by hash, and the entries
+    /// holding one payload share its hash, so `run` gathers the payloads of one hash at a time.
+    fn visit_payloads(
+        bucket: &ImmutableStoreBucket,
+        protect_local_fragment: bool,
+        run: &mut Vec<BucketPayload>,
+        mut visit: impl FnMut(&BucketPayload),
+    ) {
+        run.clear();
+        let mut hash = None;
+        for index in bucket.sorted_index.iter() {
+            let entry = &bucket.entry[*index as usize];
+            if entry.data.pack_file == 0 {
+                continue;
+            }
+            if hash != Some(entry.address.hash) {
+                run.iter().for_each(&mut visit);
+                run.clear();
+                hash = Some(entry.address.hash);
+            }
+            let location = PayloadLocation::of(&entry.data);
+            let evictable = Self::evictable(&entry.data, protect_local_fragment);
+            let last_access = Self::load_last_access(&entry.data);
+            match run.iter_mut().find(|payload| payload.location == location) {
+                Some(payload) => {
+                    payload.evictable &= evictable;
+                    payload.last_access = payload.last_access.max(last_access);
+                }
+                None => run.push(BucketPayload {
+                    hash: entry.address.hash,
+                    location,
+                    size: entry.data.size_payload,
+                    evictable,
+                    last_access,
+                }),
+            }
+        }
+        run.iter().for_each(&mut visit);
+    }
+
+    /// Fill `candidates` with the size and newest last access of each payload of the bucket that
+    /// eviction may take, and return the bytes of every payload the bucket stores.
+    fn eviction_candidates(
+        bucket: &ImmutableStoreBucket,
+        protect_local_fragment: bool,
+        run: &mut Vec<BucketPayload>,
+        candidates: &mut Vec<(u32, u64)>,
+    ) -> usize {
+        candidates.clear();
+        let mut stored_size = 0;
+        Self::visit_payloads(bucket, protect_local_fragment, run, |payload| {
+            stored_size += payload.size as usize;
+            if payload.evictable {
+                candidates.push((payload.size, payload.last_access));
+            }
+        });
+        stored_size
+    }
+
+    /// Sort `candidates`, each a payload's size and newest last access, oldest first, and return
+    /// the last access up to which evicting them brings a bucket of `stored_size` bytes below
+    /// `share`, or `u64::MAX` when evicting all of them does not.
+    fn eviction_cutoff(candidates: &mut [(u32, u64)], stored_size: usize, share: usize) -> u64 {
+        candidates.sort_unstable_by_key(|candidate| candidate.1);
+        let mut evicted_size = 0;
+        for (size, last_access) in candidates.iter() {
+            evicted_size += *size as usize;
+            if stored_size.saturating_sub(evicted_size) < share {
+                return *last_access;
+            }
+        }
+        u64::MAX
+    }
+
+    /// Evict each payload of the bucket that eviction may remove and that was last accessed at or
+    /// before `cutoff`, dropping it from every entry holding it, which then no longer claims a
+    /// local payload. Only an entry eviction may take loses it, so a protected entry keeps its
+    /// payload even where the index does not keep the entries of a hash together. `evicted` is a
+    /// buffer for the hash and location of each payload evicted.
+    fn evict_accessed_by(
+        bucket: &mut ImmutableStoreBucket,
+        cutoff: u64,
+        protect_local_fragment: bool,
+        run: &mut Vec<BucketPayload>,
+        evicted: &mut Vec<(Hash, PayloadLocation)>,
+    ) -> BucketEviction {
+        evicted.clear();
+        let mut eviction = BucketEviction::default();
+        Self::visit_payloads(bucket, protect_local_fragment, run, |payload| {
+            if payload.evictable && payload.last_access <= cutoff {
+                evicted.push((payload.hash, payload.location));
+                eviction.payloads += 1;
+                eviction.bytes += payload.size as usize;
+            }
+        });
+        if evicted.is_empty() {
+            return eviction;
+        }
+        evicted.sort_unstable();
+
+        for entry in bucket.entry.iter_mut() {
+            if entry.data.pack_file != 0
+                && Self::evictable(&entry.data, protect_local_fragment)
+                && evicted
+                    .binary_search(&(entry.address.hash, PayloadLocation::of(&entry.data)))
+                    .is_ok()
+            {
+                entry.data.pack_file = 0;
+                entry.data.pack_offset = 0;
+                entry.data.flags &= !FragmentFlags::PayloadStoredLocal.bits();
+                eviction.entries += 1;
+            }
+        }
+        eviction
     }
 
     pub async fn evict_oldest(
@@ -2523,22 +2650,15 @@ impl LocalImmutableStore {
                     let Some(bucket_ref) = group.try_bucket(bucket_index) else {
                         continue;
                     };
-                    let entry_count = {
-                        let bucket = bucket_ref.read().await;
-                        if protect_local_fragment {
-                            bucket
-                                .entry
-                                .iter()
-                                .filter(|entry| {
-                                    entry.data.flags & FragmentFlags::PayloadStoredDurable != 0
-                                })
-                                .count()
-                        } else {
-                            bucket.entry.len()
-                        }
-                    };
+                    let bucket = bucket_ref.read().await;
+                    let entry_count = bucket.entry.len();
                     total_count += entry_count;
-                    if entry_count > target_capacity {
+                    if entry_count > target_capacity
+                        && bucket
+                            .entry
+                            .iter()
+                            .any(|entry| Self::evictable(&entry.data, protect_local_fragment))
+                    {
                         buckets.push(bucket_index);
                     }
                 }
@@ -2592,6 +2712,15 @@ impl LocalImmutableStore {
         evict_count
     }
 
+    /// Whether eviction may take an entry holding `data`, or its payload: any entry, or with
+    /// `protect_local_fragment` only one whose payload is stored durably.
+    fn evictable(data: &ImmutableData, protect_local_fragment: bool) -> bool {
+        !protect_local_fragment || data.flags & FragmentFlags::PayloadStoredDurable != 0
+    }
+
+    /// Remove the bucket's least recently accessed entries until it holds no more than
+    /// `target_capacity`, or no entry that can be evicted is left. Returns how many it removed.
+    /// A protected entry counts toward the capacity but is never removed.
     pub async fn evict_oldest_bucket(
         bucket: Arc<RwLock<ImmutableStoreBucket>>,
         dirty: &AtomicBool,
@@ -2601,26 +2730,14 @@ impl LocalImmutableStore {
         let cutoff_point = {
             let bucket = bucket.read().await;
 
-            // Non-durable fragments are protected: excluded from the count and never evicted.
-            let evictable_count = if protect_local_fragment {
-                bucket
-                    .entry
-                    .iter()
-                    .filter(|entry| entry.data.flags & FragmentFlags::PayloadStoredDurable != 0)
-                    .count()
-            } else {
-                bucket.entry.len()
-            };
-            if evictable_count <= target_capacity {
+            let to_evict = bucket.entry.len().saturating_sub(target_capacity);
+            if to_evict == 0 {
                 return 0;
             }
-            let to_evict = evictable_count - target_capacity;
 
             let mut heap: BinaryHeap<u64> = BinaryHeap::with_capacity(to_evict);
             for entry in bucket.entry.iter() {
-                if protect_local_fragment
-                    && entry.data.flags & FragmentFlags::PayloadStoredDurable == 0
-                {
+                if !Self::evictable(&entry.data, protect_local_fragment) {
                     continue;
                 }
                 let key = Self::load_last_access(&entry.data);
@@ -2632,7 +2749,10 @@ impl LocalImmutableStore {
                 }
             }
 
-            *heap.peek().unwrap()
+            let Some(cutoff_point) = heap.peek() else {
+                return 0;
+            };
+            *cutoff_point
         };
 
         // Build new arrays with the remaining items
@@ -2645,9 +2765,7 @@ impl LocalImmutableStore {
             let index = *index as usize;
 
             let data = &bucket.entry[index].data;
-            let protected =
-                protect_local_fragment && data.flags & FragmentFlags::PayloadStoredDurable == 0;
-            if !protected && data.last_access <= cutoff_point {
+            if Self::evictable(data, protect_local_fragment) && data.last_access <= cutoff_point {
                 continue;
             }
 
@@ -2657,6 +2775,9 @@ impl LocalImmutableStore {
         }
 
         let evict_count = bucket.entry.len() - entry.len();
+        if evict_count == 0 {
+            return 0;
+        }
 
         bucket.sorted_index = sorted_index;
         bucket.entry = entry;
@@ -2666,6 +2787,12 @@ impl LocalImmutableStore {
         evict_count
     }
 
+    /// Run a compaction step over the next `compaction_parallel_groups` groups from `at`, or
+    /// start a pass when `at` is `None` and the store holds at least `max_size` bytes. Returns
+    /// the group the next step starts at, or `None` when there is no step left to take. A step
+    /// in which a group stopped with work left returns the group it started at, so that a later
+    /// step repeats it. Every bucket is loaded first, and [`Self::compact_group_packfiles`]
+    /// leaves out a group with a bucket that failed to load.
     #[lore_macro::test_pub]
     async fn compact_packfiles(
         self: Arc<Self>,
@@ -2779,8 +2906,6 @@ impl LocalImmutableStore {
             final_result = final_result.and(group_result.map(|_| ()));
         }
 
-        // A group that stopped still has packfiles to rewrite, so `group_index` is where a
-        // later pass picks up rather than what this step reached.
         if !completed {
             lore_base::lore_debug!(
                 "Packstore compactor stopped during group {group_index}, leaving resume point"
@@ -2825,11 +2950,26 @@ impl LocalImmutableStore {
         }
     }
 
-    /// Rewrite the group's packfiles into fewer, denser ones, one packfile at a time.
+    /// Evict the group toward `target_size`, then rewrite the packfiles
+    /// [`Self::reclaimable_packfiles`] names, one at a time, with [`Self::rewrite_packfile`].
+    /// They are closed to writes before any is rewritten, so each referenced payload is copied
+    /// once, into a packfile the pass does not rewrite. A stop request ends the pass only between
+    /// packfiles, so that a packfile's sweep, once started, reaches its truncate rather than
+    /// starting over on the next pass. A packfile kept for an entry still pointing into it lets
+    /// the pass go on to the next; a rewrite that fails or that a fan-out interrupts ends the
+    /// pass, as the next would fail alike or sweep a stale layout. Those the pass ends before
+    /// rewriting, and those it keeps, take writes again. An in-memory store is evicted but not
+    /// rewritten.
     ///
-    /// Returns whether the group was left complete. `false` means a stop request ended
-    /// the pass with packfiles still to rewrite, and the caller must hold the compaction
-    /// resume point so a later pass repeats this group.
+    /// Returns whether the group was left complete, or the error that ended a rewrite. `false`
+    /// means a stop request or a fan-out ended the pass with work left, eviction included, and
+    /// the caller must hold the compaction resume point so a later pass repeats this group. An
+    /// error leaves the group to the next full pass, so that a group that keeps failing does not
+    /// hold back the groups after it. A group with a bucket that failed to
+    /// load is left alone and reported complete, so that the pass moves on: that bucket holds
+    /// none of its entries, so the payloads only it references would look unreferenced. So is a
+    /// group whose buckets are laid out for a fan-out not yet committed on disk, see
+    /// [`ImmutableStoreGroup::fan_out_uncommitted`].
     #[lore_macro::test_pub]
     #[allow(clippy::too_many_arguments)]
     async fn compact_group_packfiles(
@@ -2842,6 +2982,19 @@ impl LocalImmutableStore {
         instruments: CompactionInstruments,
         sink: Option<crate::gc_event::GcEventSinkRef>,
     ) -> Result<bool, StoreError> {
+        if path.is_some() && !Self::group_loaded(&self.group[group_index]).await {
+            lore_base::lore_warn!(
+                "Packstore compactor skipping group {group_index}, a bucket of it failed to load"
+            );
+            return Ok(true);
+        }
+        if path.is_some() && self.group[group_index].fan_out_uncommitted() {
+            lore_base::lore_warn!(
+                "Packstore compactor skipping group {group_index}, its fan-out is not committed"
+            );
+            return Ok(true);
+        }
+
         let (evicted_count, evicted_size) = self
             .clone()
             .evict_group_sized(
@@ -2870,114 +3023,86 @@ impl LocalImmutableStore {
             .group_evicted_size
             .record(evicted_size as u64, &labels);
 
-        let mut packfile = 1;
+        if self.gc_stop_requested() {
+            return Ok(false);
+        }
+        let Some(path) = path.as_ref() else {
+            return Ok(true);
+        };
+        let group = &self.group[group_index];
+        let Some(mut reclaimable) =
+            Self::reclaimable_packfiles(group, group_index, target_size).await
+        else {
+            return Ok(true);
+        };
+        let original_sizes = match group.packstore.stop_writes(&reclaimable).await {
+            Ok(sizes) => sizes,
+            Err(err) => {
+                lore_base::lore_warn!(
+                    "Packstore compactor skipping group {group_index}, its packfiles could not be closed: {err}"
+                );
+                return Ok(true);
+            }
+        };
+
         let mut group_reclaimed: u64 = 0;
         let mut completed = true;
-        loop {
-            // A packfile is the unit of compaction work. Its bucket sweep must reach the
-            // truncate below: buckets already rewritten point at the new packfile while
-            // the rest still point at this one, so abandoning a sweep part way would
-            // leave payloads that are still referenced in a packfile about to be dropped.
+        let mut failure = None;
+        let mut unprocessed = reclaimable.len();
+        let mut kept = vec![];
+        for (position, (&packfile, &original_size)) in
+            reclaimable.iter().zip(&original_sizes).enumerate()
+        {
             if self.gc_stop_requested() {
                 lore_base::lore_debug!(
                     "Packstore compactor stopping group {group_index} before packfile {packfile}"
                 );
                 completed = false;
+                unprocessed = position;
                 break;
             }
 
-            let group = &self.group[group_index];
             if let Ok(current_size) = group.packstore.total_size().await
                 && current_size < target_size
             {
                 lore_base::lore_debug!(
                     "Packstore compactor complete group {group_index}, current size {current_size} below target size {target_size}"
                 );
+                unprocessed = position;
                 break;
             }
-            let Ok(original_size) = group.packstore.stop_write(packfile).await else {
-                lore_base::lore_debug!(
-                    "Packstore compactor complete group {group_index}, no more packfiles"
-                );
-                break;
-            };
 
             lore_base::lore_debug!(
                 "Packstore compactor running on group {group_index} packfile {packfile} size {original_size}"
             );
-
-            let mut compacted_size = 0;
-            let active_buckets = self.group[group_index]
-                .bucket_count
-                .load(atomic::Ordering::Relaxed);
-            for bucket_index in 0..active_buckets {
-                lore_base::lore_trace!(
-                    "Packstore compactor running on group {group_index} bucket {bucket_index} packfile {packfile} size {original_size}"
-                );
-                compacted_size += self
-                    .clone()
-                    .compact_bucket_packfile(group_index, bucket_index, packfile, sync_data)
-                    .await;
-
-                if let Some(path) = path.as_ref() {
-                    lore_base::lore_trace!(
-                        "Packstore compactor serializing group {group_index} bucket {bucket_index}"
-                    );
-                    let bucket = group.bucket(bucket_index).clone();
-                    // Narrow scope on purpose: this fn already called
-                    // evict_group_sized above, which takes the same lock.
-                    let _flush_guard = group.flush_lock.clone().lock_owned().await;
-                    let bucket = bucket.read_owned().await;
-                    let _ = ImmutableStoreBucket::serialize(
-                        bucket,
-                        group.clone(),
-                        path.as_ref(),
-                        group_index,
-                        bucket_index,
-                        sync_data,
-                    )
-                    .await;
+            match self.rewrite_packfile(group_index, path, packfile).await {
+                Ok(Rewrite::Truncated(compacted_size)) => {
+                    instruments
+                        .group_final_total_size
+                        .record(compacted_size as u64, &labels);
+                    group_reclaimed += (original_size as u64).saturating_sub(compacted_size as u64);
                 }
-
-                if VALIDATE_COMPACTION
-                    && let Err(err) = self
-                        .group_verify_store(group_index, Some(bucket_index))
-                        .await
-                {
-                    lore_base::lore_warn!(
-                        "Packstore compactor verification failed after a bucket pass: {err}"
+                Ok(Rewrite::Referenced) => kept.push(packfile),
+                Ok(Rewrite::Interrupted) => {
+                    lore_base::lore_debug!(
+                        "Packstore compactor stopping group {group_index} at packfile {packfile}, the group fanned out"
                     );
+                    kept.push(packfile);
+                    unprocessed = position + 1;
+                    completed = false;
+                    break;
+                }
+                Err(err) => {
+                    kept.push(packfile);
+                    unprocessed = position + 1;
+                    failure = Some(err);
+                    break;
                 }
             }
-
-            if let Some(path) = path.as_ref() {
-                let flush_guard = group.flush_lock.clone().lock_owned().await;
-                crate::local::fan_out::commit_if_initial_level(
-                    &flush_guard,
-                    &group.committed_level,
-                    &group.bucket_count,
-                    path.as_ref(),
-                    group_index,
-                    sync_data,
-                )
-                .await;
-            }
-
-            lore_base::lore_debug!(
-                "Packstore compactor group {group_index} truncating packfile {packfile}"
-            );
-            let _ = group.packstore.truncate(packfile).await;
-
-            lore_base::lore_debug!(
-                "Packstore compactor finished group {group_index} packfile {packfile}, {original_size} -> {compacted_size} bytes"
-            );
-            instruments
-                .group_final_total_size
-                .record(compacted_size as u64, &labels);
-
-            group_reclaimed += (original_size as u64).saturating_sub(compacted_size as u64);
-            packfile += 1;
         }
+        let mut reopened = reclaimable.split_off(unprocessed);
+        reopened.extend(kept);
+        group.packstore.restart_writes(&reopened).await;
 
         if group_reclaimed > 0 {
             if let Some(sink) = &sink {
@@ -2987,7 +3112,10 @@ impl LocalImmutableStore {
                 .fetch_add(group_reclaimed, atomic::Ordering::Relaxed);
         }
 
-        Ok(completed)
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(completed),
+        }
     }
 
     pub async fn group_verify_store(
@@ -3112,169 +3240,282 @@ impl LocalImmutableStore {
         Ok(())
     }
 
-    pub async fn compact_bucket_packfile(
-        self: Arc<Self>,
-        group_index: usize,
-        bucket_index: usize,
-        packfile: u32,
-        sync_data: bool,
-    ) -> usize {
-        let group = &self.group[group_index];
-        Self::compact_bucket_packfile_impl(group, group_index, bucket_index, packfile, sync_data)
-            .await
+    /// Whether every bucket of the group is loaded.
+    async fn group_loaded(group: &ImmutableStoreGroup) -> bool {
+        for bucket_index in 0..group.bucket_count.load(atomic::Ordering::Relaxed) {
+            let Some(bucket) = group.try_bucket(bucket_index) else {
+                return false;
+            };
+            if !bucket.read().await.deserialized {
+                return false;
+            }
+        }
+        true
     }
 
-    pub async fn compact_bucket_packfile_impl(
+    /// The packfiles of the group that hold unreferenced bytes, when the group stores at least
+    /// `target_size` bytes and at least [`COMPACTION_MIN_UNREFERENCED_PERCENTAGE`] of them are
+    /// unreferenced, and `None` otherwise, or when the sizes cannot be read. The packfile sizes
+    /// are read before the referenced bytes, as [`Self::referenced_sizes`] requires.
+    async fn reclaimable_packfiles(
+        group: &ImmutableStoreGroup,
+        group_index: usize,
+        target_size: usize,
+    ) -> Option<Vec<u32>> {
+        let sizes = match group.packstore.sizes().await {
+            Ok(sizes) => sizes,
+            Err(err) => {
+                lore_base::lore_warn!(
+                    "Packstore compactor skipping group {group_index}, its packfile sizes could not be read: {err}"
+                );
+                return None;
+            }
+        };
+        let stored_size: usize = sizes.iter().sum();
+        if stored_size < target_size {
+            lore_base::lore_debug!(
+                "Packstore compactor complete group {group_index}, current size {stored_size} below target size {target_size}"
+            );
+            return None;
+        }
+
+        let referenced = Self::referenced_sizes(group, sizes.len()).await;
+        let mut unreferenced_size = 0;
+        let mut reclaimable = vec![];
+        for (index, (size, referenced)) in sizes.iter().zip(&referenced).enumerate() {
+            if referenced < size {
+                unreferenced_size += size - referenced;
+                reclaimable.push(index as u32 + 1);
+            }
+        }
+        if unreferenced_size == 0
+            || unreferenced_size * 100 < stored_size * COMPACTION_MIN_UNREFERENCED_PERCENTAGE
+        {
+            lore_base::lore_debug!(
+                "Packstore compactor skipping group {group_index}, {unreferenced_size} of {stored_size} bytes in {} packfiles unreferenced",
+                sizes.len()
+            );
+            return None;
+        }
+        Some(reclaimable)
+    }
+
+    /// Bytes that the group's entries reference in each of its first `packfile_count`
+    /// packfiles, the packfile with id `n` at index `n - 1`, each payload counted once, as
+    /// [`Self::compact_bucket_packfile`] copies it.
+    ///
+    /// A store writes a payload and inserts its entry under one bucket write lock. With the
+    /// packfile sizes read before this, a payload stored meanwhile is counted here whenever a size
+    /// includes it, so a fully referenced packfile never looks reclaimable. A fan-out during the
+    /// scan can leave entries uncounted, which costs a rewrite that reclaims nothing.
+    async fn referenced_sizes(group: &ImmutableStoreGroup, packfile_count: usize) -> Vec<usize> {
+        let mut referenced = vec![0; packfile_count];
+        let mut run = vec![];
+        let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+        for bucket_index in 0..active_buckets {
+            let Some(bucket) = group.try_bucket(bucket_index) else {
+                continue;
+            };
+            Self::visit_payloads(&*bucket.read().await, false, &mut run, |payload| {
+                if let Some(size) = referenced.get_mut(payload.location.pack_file as usize - 1) {
+                    *size += payload.size as usize;
+                }
+            });
+        }
+        referenced
+    }
+
+    /// Rewrite the payloads every bucket of the group holds in `packfile` into packfiles taking
+    /// writes, see [`Self::compact_bucket_packfile`], and truncate `packfile` once nothing can
+    /// point into it: every copy and bucket file write succeeded, no bucket kept an entry in it,
+    /// and the bucket count did not change, which a fan-out moving entries out of the sweep
+    /// would. Every bucket file is written durably first, whatever `sync_data` the store uses,
+    /// after the group's packfiles are synced, so that no index file left on disk points into
+    /// the truncated packfile or at payload bytes not yet stored. A fan-out, or a failed bucket
+    /// write, sync or truncate, which is returned, ends the rewrite, and the buckets it moved stay
+    /// dirty for the next flush.
+    async fn rewrite_packfile(
+        self: &Arc<Self>,
+        group_index: usize,
+        path: &Arc<PathBuf>,
+        packfile: u32,
+    ) -> Result<Rewrite, StoreError> {
+        let group = &self.group[group_index];
+        let bucket_count = group.bucket_count.load(atomic::Ordering::Relaxed);
+        let mut compacted_size = 0;
+        let mut referenced = false;
+        for bucket_index in 0..bucket_count {
+            let (copied_size, bucket_referenced) =
+                Self::compact_bucket_packfile(group, group_index, bucket_index, packfile).await;
+            compacted_size += copied_size;
+            referenced |= bucket_referenced;
+
+            let bucket = group.bucket(bucket_index).clone();
+            let _flush_guard = group.flush_lock.clone().lock_owned().await;
+            if group.bucket_count.load(atomic::Ordering::Relaxed) != bucket_count {
+                return Ok(Rewrite::Interrupted);
+            }
+            let bucket = bucket.read_owned().await;
+            group
+                .flush_packstore(true)
+                .await
+                .forward_with::<StoreError, _>(|| {
+                    format!("Failed syncing group {group_index} packfiles")
+                })?;
+            group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+            ImmutableStoreBucket::serialize(
+                bucket,
+                group.clone(),
+                path.as_ref(),
+                group_index,
+                bucket_index,
+                true,
+            )
+            .await
+            .forward_with::<StoreError, _>(|| {
+                format!("Failed writing group {group_index} bucket {bucket_index}")
+            })?;
+
+            if VALIDATE_COMPACTION
+                && let Err(err) = self
+                    .group_verify_store(group_index, Some(bucket_index))
+                    .await
+            {
+                lore_base::lore_warn!(
+                    "Packstore compactor verification failed after a bucket pass: {err}"
+                );
+            }
+        }
+
+        let flush_guard = group.flush_lock.clone().lock_owned().await;
+        crate::local::fan_out::commit_if_initial_level(
+            &flush_guard,
+            &group.committed_level,
+            &group.bucket_count,
+            path.as_ref(),
+            group_index,
+            true,
+        )
+        .await;
+        let fanned_out = group.bucket_count.load(atomic::Ordering::Relaxed) != bucket_count;
+        drop(flush_guard);
+
+        if fanned_out {
+            return Ok(Rewrite::Interrupted);
+        }
+        if referenced {
+            lore_base::lore_warn!(
+                "Packstore compactor keeping group {group_index} packfile {packfile}, an entry may still point into it"
+            );
+            return Ok(Rewrite::Referenced);
+        }
+        lore_base::lore_debug!(
+            "Packstore compactor group {group_index} truncating packfile {packfile}"
+        );
+        group
+            .packstore
+            .truncate(packfile)
+            .await
+            .forward_with::<StoreError, _>(|| {
+                format!("Failed truncating group {group_index} packfile {packfile}")
+            })?;
+        Ok(Rewrite::Truncated(compacted_size))
+    }
+
+    /// Copy each payload bucket `bucket_index` holds in `packfile` once, synced, into packfiles
+    /// taking writes, and point the entries at its location, with its size, to the copy,
+    /// changing only their packfile and offset. The entries are re-pointed in the live bucket, so
+    /// an entry added since the copies were taken that deduplicates to a copied location is
+    /// re-pointed too. A payload that cannot be copied is left where it is. Returns the bytes
+    /// copied, and whether an entry of the bucket still points into `packfile`, as when a copy
+    /// failed.
+    pub async fn compact_bucket_packfile(
         group: &ImmutableStoreGroup,
         group_index: usize,
         bucket_index: usize,
         packfile: u32,
-        sync_data: bool,
-    ) -> usize {
-        let mut packfiles_to_flush = vec![];
+    ) -> (usize, bool) {
+        let mut locations: Vec<(u32, u32)> = group
+            .bucket(bucket_index)
+            .read()
+            .await
+            .entry
+            .iter()
+            .filter(|entry| entry.data.pack_file == packfile)
+            .map(|entry| (entry.data.pack_offset, entry.data.size_payload))
+            .collect();
+        if locations.is_empty() {
+            return (0, false);
+        }
+        locations.sort_unstable();
+        locations.dedup();
 
-        let (entry, sorted_index) = {
-            let lock = group.bucket(bucket_index).read().await;
-            lock.clone_for_compaction()
-        };
+        let mut copies: Vec<(u32, u32, crate::PackStoreRef)> = Vec::with_capacity(locations.len());
+        let mut copied_size = 0;
+        for &(offset, size) in &locations {
+            match Self::copy_payload(group, packfile, offset, size).await {
+                Ok(copy) => {
+                    debug_assert!(
+                        copy.id != packfile,
+                        "Compaction wrote data to same packfile being repacked"
+                    );
+                    copies.push((offset, size, copy));
+                    copied_size += size as usize;
+                }
+                Err(err) => {
+                    lore_base::lore_warn!(
+                        "Packstore compactor could not copy group {group_index} packfile {packfile} offset {offset}: {err}"
+                    );
+                }
+            }
+        }
+        drop(locations);
+        if copies.is_empty() {
+            return (copied_size, true);
+        }
 
-        let mut compacted_size = 0;
-        let mut last_hash = Hash::default();
-        let mut rewritten = Vec::with_capacity(entry.len());
+        let mut flushed = Vec::with_capacity(1);
+        for (_, _, copy) in &copies {
+            if !flushed.contains(&copy.id) {
+                if group.packstore.flush(copy.id, true).await.is_err() {
+                    return (copied_size, true);
+                }
+                flushed.push(copy.id);
+            }
+        }
 
-        for index in sorted_index.iter() {
-            let mut entry = entry[*index as usize];
+        let mut referenced = false;
+        let mut bucket = group.bucket(bucket_index).write().await;
+        for entry in bucket.entry.iter_mut() {
             if entry.data.pack_file != packfile {
                 continue;
             }
-
-            if entry.address.hash == last_hash {
-                lore_base::lore_trace!("Entry {entry:?} reuse rewritten data for hash");
-                continue;
-            }
-
-            lore_base::lore_trace!("Entry {entry:?} repacking");
-
-            match group
-                .packstore
-                .load(
-                    entry.data.pack_file,
-                    entry.data.pack_offset,
-                    entry.data.size_payload,
-                )
-                .await
-            {
-                Ok(payload) => {
-                    lore_base::lore_trace!("Entry loaded {} bytes payload", payload.len());
-
-                    match group.packstore.store(payload).await {
-                        Ok(packref) => {
-                            debug_assert!(
-                                packref.id != packfile,
-                                "Compaction wrote data to same packfile being repacked"
-                            );
-                            lore_base::lore_trace!("Entry stored in new packref {packref:?}");
-
-                            entry.data.pack_file = packref.id;
-                            entry.data.pack_offset = packref.offset;
-
-                            last_hash = entry.address.hash;
-
-                            rewritten.push(entry);
-
-                            compacted_size += entry.data.size_payload as usize;
-
-                            if !packfiles_to_flush.contains(&packref.id) {
-                                packfiles_to_flush.push(packref.id);
-                            }
-                        }
-                        Err(err) => {
-                            debug_assert!(false, "Failed to store data for compaction: {err}");
-                            lore_base::lore_warn!("Failed to store data for compaction: {err}");
-                        }
-                    }
+            match copies.binary_search_by_key(&entry.data.pack_offset, |(offset, _, _)| *offset) {
+                Ok(position) if copies[position].1 == entry.data.size_payload => {
+                    entry.data.pack_file = copies[position].2.id;
+                    entry.data.pack_offset = copies[position].2.offset;
                 }
-                Err(err) => {
-                    debug_assert!(
-                        false,
-                        "Failed to load data for compaction: packfile {} offset {} payload size {}: {err}",
-                        entry.data.pack_file, entry.data.pack_offset, entry.data.size_payload
-                    );
-                    lore_base::lore_warn!(
-                        "Failed to load data for compaction: packfile {} offset {} payload size {}: {err}",
-                        entry.data.pack_file,
-                        entry.data.pack_offset,
-                        entry.data.size_payload
-                    );
-                }
+                _ => referenced = true,
             }
         }
+        group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
 
         lore_base::lore_trace!(
-            "Packstore compactor rewrote {} of {} fragments from group {} bucket {} packfile {} into {} packfiles",
-            rewritten.len(),
-            sorted_index.len(),
-            group_index,
-            bucket_index,
-            packfile,
-            packfiles_to_flush.len()
+            "Packstore compactor group {group_index} bucket {bucket_index} packfile {packfile} rewrote {} payloads, {copied_size} bytes",
+            copies.len()
         );
+        (copied_size, referenced)
+    }
 
-        for packfile in packfiles_to_flush {
-            lore_base::lore_trace!(
-                "Packstore compactor group {group_index} bucket {bucket_index} flushing packfile {packfile}"
-            );
-            let _ = group.packstore.flush(packfile, sync_data).await;
-        }
-
-        // Now write back the updated entries
-        lore_base::lore_trace!(
-            "Packstore compactor group {group_index} bucket {bucket_index} reinserting rewritten entries"
-        );
-        if !rewritten.is_empty() {
-            let mut bucket_lock = group.bucket(bucket_index).write().await;
-            let bucket = &mut *bucket_lock;
-            let (entry, sorted_index) = (&mut bucket.entry, &bucket.sorted_index);
-
-            let mut match_index = 0;
-            for rewritten in rewritten.iter() {
-                while match_index < sorted_index.len() {
-                    let entry = &mut entry[sorted_index[match_index] as usize];
-                    match entry.address.hash.cmp(&rewritten.address.hash) {
-                        Ordering::Less => {
-                            if entry.data.pack_file == packfile {
-                                entry.data.pack_file = 0;
-                                entry.data.pack_offset = 0;
-                            }
-                            match_index += 1;
-                        }
-                        Ordering::Equal => {
-                            entry.data.assign_deduplicated_payload(rewritten.data);
-                            match_index += 1;
-                        }
-                        Ordering::Greater => {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            debug_assert!(
-                !bucket
-                    .entry
-                    .iter()
-                    .any(|entry| entry.data.pack_file == packfile),
-                "Entry remains in group {group_index} bucket {bucket_index} referencing packfile {packfile}"
-            );
-
-            group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-        }
-
-        lore_base::lore_trace!(
-            "Packstore compactor group {group_index} bucket {bucket_index} packfile {packfile} rewrite complete, {compacted_size} bytes rewritten"
-        );
-
-        compacted_size
+    /// Copy the `size` bytes at `offset` in `packfile` into a packfile taking writes.
+    async fn copy_payload(
+        group: &ImmutableStoreGroup,
+        packfile: u32,
+        offset: u32,
+        size: u32,
+    ) -> Result<crate::PackStoreRef, crate::packstore::PackfileError> {
+        let payload = group.packstore.load(packfile, offset, size).await?;
+        group.packstore.store(payload).await
     }
 
     pub async fn packstore_total_size(&self) -> usize {
@@ -3355,7 +3596,7 @@ impl LocalImmutableStore {
                 .dirty
                 .iter()
                 .any(|flag| flag.load(atomic::Ordering::Relaxed));
-            if !any_dirty {
+            if !any_dirty && !group.fan_out_uncommitted() {
                 continue;
             }
 
@@ -3944,6 +4185,12 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             }
         )
         .into()
+    }
+
+    async fn load_index(self: Arc<Self>) -> Result<(), StoreError> {
+        self.deserialize_all_buckets()
+            .await
+            .forward::<StoreError>("loading the store's index")
     }
 
     async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
@@ -4750,7 +4997,7 @@ pub(crate) async fn flush_locked_group(
         // The packstore flush below is unconditional for `sync_data`, so it
         // still has to run on this path.
         if sync_data {
-            group.flush_packstore(sync_data).await;
+            return group.flush_packstore(sync_data).await;
         }
         return Ok(());
     }
@@ -4772,9 +5019,12 @@ pub(crate) async fn flush_locked_group(
         == ImmutableStoreVersion::LazyFanOut as u32;
     let needs_two_phase_commit = fan_out_aware && committed_level != active_buckets;
 
-    // Always flush the packstore once per group when sync_data is set, regardless of which serialize path runs below.
-    if sync_data {
-        group.flush_packstore(sync_data).await;
+    // Always flush the packstore once per group when sync_data is set, regardless of which serialize path runs below. A failed sync writes no bucket, so that no index points at payload bytes not synced.
+    if sync_data
+        && let Err(err) = group.flush_packstore(sync_data).await
+        && first_err.is_none()
+    {
+        first_err = Some(err);
     }
 
     if needs_two_phase_commit && first_err.is_none() {
@@ -4920,6 +5170,8 @@ pub(crate) async fn flush_locked_group(
                 group
                     .committed_level
                     .store(active_buckets, atomic::Ordering::Relaxed);
+            } else {
+                crate::local::fan_out::mark_uncommitted_dirty(&group.dirty, &wrote_new);
             }
         }
     } else if first_err.is_none() {
