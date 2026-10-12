@@ -34,6 +34,7 @@ use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
+use crate::fs::hold;
 use crate::immutable;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
@@ -548,6 +549,10 @@ pub fn commit_boxed(
 ///
 /// The working tree is written to only where a commit resolves a staged merge conflict, which
 /// removes the copies that merge left beside the file.
+///
+/// A provider that holds its state is handed each revision the instance's repository commits
+/// ([`InstanceOperation::committed`]), and is refused a commit of a link alone or of a layer,
+/// which would make a revision current that it is not handed.
 #[lore_macro::test_pub]
 pub(crate) async fn commit_with_metadata(
     repository: Arc<RepositoryContext>,
@@ -576,6 +581,15 @@ async fn commit_with_metadata_in_operation(
     values: LoreArray<LoreString>,
     formats: LoreArray<LoreMetadataType>,
 ) -> Result<Hash, CommitError> {
+    if operation.holds_state() {
+        if options.link.is_some() {
+            return Err(hold::refused("commit a link alone").into());
+        }
+        if options.layer.is_some() {
+            return Err(hold::refused("commit a layer").into());
+        }
+    }
+
     let reporting = CommitReporting::from_globals();
     let _stats_report = reporting.report();
 
@@ -646,6 +660,13 @@ async fn commit_staged_with_layers(
         if !layer.staged.is_zero() && layer.staged != layer.current {
             layer_staged = true;
         }
+    }
+    if operation.holds_state()
+        && layers.iter().any(|layer| {
+            !layer.staged.is_zero() && (globals.force() || layer.staged != layer.current)
+        })
+    {
+        return Err(hold::refused("commit a layer").into());
     }
 
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
@@ -766,6 +787,7 @@ async fn commit_staged_with_layers(
             signature,
             current_branch,
             token,
+            Some(operation),
         )
         .await?;
 
@@ -1261,6 +1283,7 @@ async fn commit_link_only(
         link_signature,
         link_branch,
         &token,
+        None,
     )
     .await?;
 
@@ -1367,6 +1390,7 @@ async fn commit_link_only(
             child_signature,
             level.branch,
             &token,
+            None,
         )
         .await?;
 
@@ -1452,13 +1476,19 @@ async fn build_commit_metadata(
     .await
 }
 
-/// Stores branch latest, deletes staged anchor, updates last sync if merge,
-/// and emits the revision commit event.
+/// Stores branch latest, deletes staged anchor, updates last sync if merge, and emits the revision
+/// commit event.
 ///
 /// `branch_previous` is what the pointer write compares against, so it must be
 /// the tip observed for `branch`, not the revision the caller built on: a prior
 /// link commit can advance the branch without committing the parent, which
 /// leaves that pin stale.
+///
+/// `reconciling` is the operation the commit read its files through, `None` for a link's own
+/// commit, which makes no revision of the instance current. Outside a dry run, where its provider
+/// holds its state, it is handed `state_staged` as stored once the revision is current
+/// ([`hand_over_committed`]), before it is reused as the staged anchor.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_commit(
     repository: Arc<RepositoryContext>,
     state_current: &Arc<State>,
@@ -1467,6 +1497,7 @@ async fn finalize_commit(
     signature: Hash,
     branch: BranchId,
     token: &RepositoryWriteToken,
+    reconciling: Option<&InstanceOperationImpl>,
 ) -> Result<(), CommitError> {
     let dry_run = execution_context().globals().dry_run();
 
@@ -1478,6 +1509,14 @@ async fn finalize_commit(
             branch,
         )
         .await?;
+        if let Some(operation) = reconciling
+            && operation.holds_state()
+            && let Err(error) = hand_over_committed(&repository, operation, state_staged).await
+        {
+            lore_warn!(
+                "The filesystem provider did not take revision {signature} as committed: {error}"
+            );
+        }
 
         // Check if any dirty-only nodes remain in the staged state.
         // If so, preserve them in a new staged anchor re-parented to the new revision.
@@ -1522,6 +1561,24 @@ async fn finalize_commit(
     .send();
 
     Ok(())
+}
+
+/// Hands `committed` to `operation`, whose provider holds its state, once the stores are flushed
+/// ([`InstanceOperation::committed`]). The provider may then drop the copies it kept of the files
+/// the commit read, which only a revision on disk replaces after a crash.
+async fn hand_over_committed(
+    repository: &Arc<RepositoryContext>,
+    operation: &InstanceOperationImpl,
+    committed: &Arc<State>,
+) -> Result<(), CommitError> {
+    repository
+        .flush(execution_context().globals().sync_data())
+        .await
+        .forward_any::<CommitError>("flushing the commit")?;
+    operation
+        .committed(repository.clone(), committed.clone())
+        .await
+        .forward::<CommitError>("handing the provider the committed revision")
 }
 
 /// Where a layer's commit starts: the node its configured source path names in the state being

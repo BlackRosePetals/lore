@@ -28,6 +28,7 @@ use crate::fs::swfs::filesystem::SwfsOperation;
 use crate::hash::hash_string;
 use crate::lore::Address;
 use crate::lore::Context;
+use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_trace;
 use crate::node::Node;
@@ -755,6 +756,30 @@ pub trait InstanceOperation: Send + Sync {
                 }))
         }
     }
+
+    /// Takes `committed`, the revision a commit of the instance's repository stored, made current
+    /// and flushed, as the revision the working tree stands at, from the files read through this
+    /// operation. [`InstanceOperationImpl`] passes it on only where the provider holds its state in
+    /// a `State` ([`FilesystemProvider::holds_state`]), outside a dry run, and counts it as a change.
+    /// A failure is logged as a warning and the commit stands. Such a provider is refused a commit
+    /// of a link alone or of a layer, which would make a revision current that it is not handed.
+    ///
+    /// `committed` is the State the commit stored, not a copy. Holding on to it past the call is
+    /// not recommended: the commit may go on to modify it, reusing it as the staged anchor of the
+    /// local changes it left uncommitted.
+    ///
+    /// # Implementation notes
+    ///
+    /// - **`OsFilesystem`**, **`SWFS`**: nothing, the default.
+    /// - A provider that holds its state serves each file the commit read from `committed` rather
+    ///   than from the copy it kept.
+    fn committed(
+        &self,
+        _repository: Arc<RepositoryContext>,
+        _committed: Arc<State>,
+    ) -> impl Future<Output = Result<(), FsError>> + Send {
+        async { Ok(()) }
+    }
 }
 
 /// Implements `InstanceOperation` by wrapping all other types implementing it and forwarding method
@@ -1141,6 +1166,29 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Swfs(this) => this.infer_is_conflicted(path).await,
         }
     }
+
+    async fn committed(
+        &self,
+        repository: Arc<RepositoryContext>,
+        committed: Arc<State>,
+    ) -> Result<(), FsError> {
+        if !self.holds_state || execution_context().globals().dry_run() {
+            return Ok(());
+        }
+        self.record_change();
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => {
+                this.committed(repository, committed).await
+            }
+            StaticDispatchInstanceOperation::Os(this) => {
+                this.committed(repository, committed).await
+            }
+            StaticDispatchInstanceOperation::Swfs(this) => {
+                this.committed(repository, committed).await
+            }
+        }
+    }
 }
 
 /// The operation behind [`StaticDispatchInstanceOperation::Test`], which the crate's tests
@@ -1155,6 +1203,7 @@ pub mod test_util {
     use lore_base::error::FileNotFound;
     use lore_base::error::LocalModifications;
     use lore_base::types::Fragment;
+    use lore_error_set::prelude::*;
     use parking_lot::Mutex;
 
     use crate::fs::filesystem_provider::DirectoryListing;
@@ -1178,8 +1227,12 @@ pub mod test_util {
     /// Each `hold_state` call recorded as `(target revision, options)`.
     pub type HoldCalls = Arc<Mutex<Vec<(Hash, HoldOptions)>>>;
 
-    /// Answers the reads and the directory create these tests make, and records each finalize
-    /// and hold. Every other member panics.
+    /// Each `committed` call recorded as `(revision handed over, current revision at the call,
+    /// whether the State handed over holds no staged or dirty node)`.
+    pub type CommittedCalls = Arc<Mutex<Vec<(Hash, Hash, bool)>>>;
+
+    /// Answers the reads and the directory create these tests make, and records each finalize,
+    /// `committed` call and hold. Every other member panics.
     pub struct TestOperation {
         pub file_info_count: Arc<AtomicUsize>,
         pub holds_name_count: Arc<AtomicUsize>,
@@ -1193,6 +1246,11 @@ pub mod test_util {
         /// Whether the provider holds no file at any path.
         pub content_source_missing: bool,
         pub hold_calls: HoldCalls,
+        pub committed_calls: CommittedCalls,
+        /// Whether each `committed` call fails.
+        pub committed_fails: bool,
+        /// The operation file information and content are read through, where given.
+        pub reads: Option<crate::fs::os::OsOperation>,
         /// Whether each hold is refused for local changes.
         pub hold_refuses: bool,
         /// Paths whose scan fails, as one over a working tree that cannot be read does.
@@ -1273,11 +1331,14 @@ pub mod test_util {
             ChangeStream::nothing()
         }
 
-        /// Counts the lookup and reports what the provider was told to hold — what a caller
-        /// acts on without needing content behind it.
-        async fn file_info(&self, _path: &RelativePath) -> Result<FileInfo, FsError> {
+        /// Counts the lookup, and reports what the directory it reads from holds where given and
+        /// otherwise what the provider was told to hold.
+        async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
             self.file_info_count.fetch_add(1, Ordering::AcqRel);
-            Ok(self.held())
+            match &self.reads {
+                Some(reads) => reads.file_info(path).await,
+                None => Ok(self.held()),
+            }
         }
 
         /// Reports what the provider was told to hold, without counting: the lookup counts
@@ -1310,8 +1371,9 @@ pub mod test_util {
             panic!("Test operation unimplemented except finalize")
         }
 
-        /// Reports no file where the provider was told it holds none, fails where it was told it
-        /// cannot name content, and panics otherwise.
+        /// The file under the directory the provider reads from. Reports no file where the
+        /// provider was told it holds none, fails where it was told it cannot name content, and
+        /// panics where it reads from no directory.
         async fn content_source(
             &self,
             path: &RelativePath,
@@ -1325,7 +1387,10 @@ pub mod test_util {
             if self.content_source_fails {
                 return Err(FsError::internal("Content source failed"));
             }
-            panic!("Test operation unimplemented except finalize")
+            match &self.reads {
+                Some(reads) => reads.content_source(path).await,
+                None => panic!("Test operation unimplemented except finalize"),
+            }
         }
 
         async fn file_holds_content(
@@ -1395,6 +1460,29 @@ pub mod test_util {
             _destination_path: &RelativePath,
         ) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
+        }
+
+        /// Records the revision it was given, the current revision at the call and whether the
+        /// State is clean, and fails where the provider was told to.
+        async fn committed(
+            &self,
+            repository: Arc<RepositoryContext>,
+            committed: Arc<State>,
+        ) -> Result<(), FsError> {
+            let (current, _) = crate::instance::load_current_anchor(&repository)
+                .await
+                .forward_any::<FsError>("loading the current anchor")?;
+            let staged_or_dirty = committed
+                .node_has_staged_or_dirty_children(repository, crate::node::ROOT_NODE)
+                .await
+                .forward_any::<FsError>("reading the committed State")?;
+            self.committed_calls
+                .lock()
+                .push((committed.revision(), current, !staged_or_dirty));
+            if self.committed_fails {
+                return Err(FsError::internal("Taking the committed revision failed"));
+            }
+            Ok(())
         }
     }
 }

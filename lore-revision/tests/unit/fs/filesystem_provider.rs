@@ -21,10 +21,12 @@ use lore_revision::fs::filesystem_provider::InstanceOperation;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::filesystem_provider::StaticDispatchInstanceOperation;
 use lore_revision::fs::filesystem_provider::create_empty_directory;
+use lore_revision::fs::filesystem_provider::test_util::CommittedCalls;
 use lore_revision::fs::filesystem_provider::test_util::HoldCalls;
 use lore_revision::fs::filesystem_provider::test_util::TestOperation;
 use lore_revision::fs::filesystem_provider::with_operation;
 use lore_revision::fs::filesystem_provider::with_operation_if;
+use lore_revision::fs::os::OsFilesystem;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::NodeID;
 use lore_revision::repository::RepositoryContext;
@@ -43,11 +45,15 @@ pub struct TestFilesystemProvider {
     pub names_folding_count: Arc<AtomicUsize>,
     pub finalize_events: Arc<Mutex<Vec<bool>>>,
     pub hold_calls: HoldCalls,
+    pub committed_calls: CommittedCalls,
+    /// The directory file information and content are read from, where given.
+    reads: Option<OsFilesystem>,
     /// Paths whose scan fails.
     pub failing_scans: Arc<Mutex<Vec<String>>>,
     /// Paths whose scan finds the named node stale.
     pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
     finalize_fails: bool,
+    committed_fails: bool,
     write_fails: bool,
     content_source_fails: bool,
     content_source_missing: bool,
@@ -107,6 +113,32 @@ impl TestFilesystemProvider {
         Self {
             holds_state: true,
             ..Self::new()
+        }
+    }
+
+    /// A provider whose operations read file information and content from the directory
+    /// `root`.
+    pub fn reading(root: &Path) -> TestFilesystemProvider {
+        Self {
+            reads: Some(OsFilesystem::new(root)),
+            ..Self::new()
+        }
+    }
+
+    /// A provider holding its state whose operations read from `root`, as [`Self::reading`]'s do.
+    pub fn holding_state_reading(root: &Path) -> TestFilesystemProvider {
+        Self {
+            holds_state: true,
+            ..Self::reading(root)
+        }
+    }
+
+    /// A provider holding its state, reading from `root`, whose operations report each
+    /// `committed` call failed.
+    pub fn holding_state_failing_committed(root: &Path) -> TestFilesystemProvider {
+        Self {
+            committed_fails: true,
+            ..Self::holding_state_reading(root)
         }
     }
 
@@ -173,6 +205,9 @@ impl FilesystemProvider for TestFilesystemProvider {
                 content_source_missing: self.content_source_missing,
                 holds_paths: self.holds_paths,
                 hold_calls: self.hold_calls.clone(),
+                committed_calls: self.committed_calls.clone(),
+                committed_fails: self.committed_fails,
+                reads: self.reads.as_ref().map(OsFilesystem::begin_operation),
                 hold_refuses: self.hold_refuses,
                 failing_scans: self.failing_scans.clone(),
                 stale_on_scan: self.stale_on_scan.clone(),

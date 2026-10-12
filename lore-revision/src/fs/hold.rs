@@ -492,6 +492,7 @@ async fn side_at(
 }
 
 /// The refusal of what a provider holding whole revisions cannot do, `what` phrased as a verb.
+#[lore_macro::test_pub]
 pub(crate) fn refused(what: &str) -> InvalidArguments {
     InvalidArguments {
         reason: format!("Unable to {what} on a provider that holds whole revisions"),
