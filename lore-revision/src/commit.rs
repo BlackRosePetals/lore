@@ -16,6 +16,7 @@ use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 use zerocopy::FromBytes;
@@ -1888,13 +1889,7 @@ pub(crate) async fn commit_files_and_rehash(
         })
     };
 
-    let (producer_result, consumer_result) = tokio::join!(producer, consumer);
-    producer_result
-        .internal("Recursion task failed")
-        .map_err(CommitError::from)??;
-    consumer_result
-        .internal("Recursion task failed")
-        .map_err(CommitError::from)??;
+    join_commit_tasks(producer, consumer).await?;
 
     commit_discard_subnodes(
         repository.clone(),
@@ -2506,6 +2501,25 @@ fn collect_commit_task(
     }
 }
 
+/// Waits for a commit's discovery task and the task fragmenting the files it finds, and reports a
+/// failure to fragment a file ahead of a failure in discovery. Discovery fails once fragmenting
+/// stops taking files, so its error is then a result of the failure to fragment.
+#[lore_macro::test_pub]
+async fn join_commit_tasks(
+    discovery: JoinHandle<Result<(), CommitError>>,
+    fragmenting: JoinHandle<Result<(), CommitError>>,
+) -> Result<(), CommitError> {
+    let (discovery, fragmenting) = tokio::join!(discovery, fragmenting);
+    let discovery = discovery
+        .internal("Recursion task failed")
+        .map_err(CommitError::from)?;
+    let fragmenting = fragmenting
+        .internal("Recursion task failed")
+        .map_err(CommitError::from)?;
+    fragmenting?;
+    discovery
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn commit_execute(
     operation: Arc<InstanceOperationImpl>,
@@ -3015,13 +3029,7 @@ async fn commit_link(
                 })
             };
 
-            let (producer_result, consumer_result) = tokio::join!(producer, consumer);
-            producer_result
-                .internal("Recursion task failed")
-                .map_err(CommitError::from)??;
-            consumer_result
-                .internal("Recursion task failed")
-                .map_err(CommitError::from)??;
+            join_commit_tasks(producer, consumer).await?;
 
             commit_discard_subnodes(
                 repository.clone(),

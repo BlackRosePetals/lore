@@ -48,6 +48,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of
+  `Recursion task failed`
 - `lore clone` reports the error that stopped it, such as a file it failed to fetch or write, in place of
   `Recursion task failed`. A clone that fails no longer prints `Clone complete`, and the C API sends
   `LORE_EVENT_REPOSITORY_CLONE_END` only for a clone that succeeded, as documented. A consumer reads the outcome of a
