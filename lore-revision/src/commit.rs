@@ -2599,8 +2599,9 @@ async fn info_before_fragmenting(
     Ok(info)
 }
 
-/// Commits one file node, recording the modified time it read the file at. A view-excluded
-/// path records nothing: its content is taken from the staged node rather than disk.
+/// Commits one file node, recording the modified time it read the file at and telling the
+/// operation what it stored ([`InstanceOperation::stored`]). A view-excluded path records and
+/// tells nothing: its content is taken from the staged node rather than disk.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -2701,13 +2702,10 @@ fn commit_file(
             })?;
 
             stats.file_read(size_content);
+            let mode = info.mode(node.mode);
+            operation.stored(&relative_path, address, size_content, mode);
 
-            (
-                address,
-                size_content,
-                info.mode(node.mode),
-                Some(info.mtime()),
-            )
+            (address, size_content, mode, Some(info.mtime()))
         };
 
         let modified = util::fs::mode_changed(node.mode, mode)

@@ -23,6 +23,7 @@ use lore_revision::fs::filesystem_provider::StaticDispatchInstanceOperation;
 use lore_revision::fs::filesystem_provider::create_empty_directory;
 use lore_revision::fs::filesystem_provider::test_util::CommittedCalls;
 use lore_revision::fs::filesystem_provider::test_util::HoldCalls;
+use lore_revision::fs::filesystem_provider::test_util::StoredCalls;
 use lore_revision::fs::filesystem_provider::test_util::TestOperation;
 use lore_revision::fs::filesystem_provider::with_operation;
 use lore_revision::fs::filesystem_provider::with_operation_if;
@@ -45,6 +46,7 @@ pub struct TestFilesystemProvider {
     pub names_folding_count: Arc<AtomicUsize>,
     pub finalize_events: Arc<Mutex<Vec<bool>>>,
     pub hold_calls: HoldCalls,
+    pub stored_calls: StoredCalls,
     pub committed_calls: CommittedCalls,
     /// The directory file information and content are read from, where given.
     reads: Option<OsFilesystem>,
@@ -205,6 +207,7 @@ impl FilesystemProvider for TestFilesystemProvider {
                 content_source_missing: self.content_source_missing,
                 holds_paths: self.holds_paths,
                 hold_calls: self.hold_calls.clone(),
+                stored_calls: self.stored_calls.clone(),
                 committed_calls: self.committed_calls.clone(),
                 committed_fails: self.committed_fails,
                 reads: self.reads.as_ref().map(OsFilesystem::begin_operation),

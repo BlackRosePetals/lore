@@ -759,6 +759,21 @@ pub trait InstanceOperation: Send + Sync {
         }
     }
 
+    /// Takes that a commit of the instance's repository stored the content read at `path` through
+    /// this operation as `address`, `size` bytes long, with `mode`. The commit tells it of each
+    /// file it reads from the working tree, before it hands over the revision holding them
+    /// ([`committed`](Self::committed)), and of no view-excluded file, whose content it takes
+    /// from the staged node. A dry run, and a commit that fails, tells of the content it stored
+    /// and hands nothing over. [`InstanceOperationImpl`] passes it on only where the provider
+    /// holds its state in a `State` ([`FilesystemProvider::holds_state`]).
+    ///
+    /// # Implementation notes
+    ///
+    /// - **`OsFilesystem`**, **`SWFS`**: nothing, the default.
+    /// - A provider that holds its state keeps what each file it served was stored as, which
+    ///   `committed` serves the file from without resolving its path again.
+    fn stored(&self, _path: &RelativePath, _address: Address, _size: u64, _mode: u16) {}
+
     /// Takes `committed`, the revision a commit of the instance's repository stored, made current
     /// and flushed, as the revision the working tree stands at, from the files read through this
     /// operation. [`InstanceOperationImpl`] passes it on only where the provider holds its state in
@@ -1169,6 +1184,18 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
+    fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16) {
+        if !self.holds_state {
+            return;
+        }
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.stored(path, address, size, mode),
+            StaticDispatchInstanceOperation::Os(this) => this.stored(path, address, size, mode),
+            StaticDispatchInstanceOperation::Swfs(this) => this.stored(path, address, size, mode),
+        }
+    }
+
     async fn committed(
         &self,
         repository: Arc<RepositoryContext>,
@@ -1233,8 +1260,12 @@ pub mod test_util {
     /// whether the State handed over holds no staged or dirty node)`.
     pub type CommittedCalls = Arc<Mutex<Vec<(Hash, Hash, bool)>>>;
 
+    /// Each `stored` call recorded as `(path, address, size, mode, whether a revision had been
+    /// handed over before the call)`.
+    pub type StoredCalls = Arc<Mutex<Vec<(String, Address, u64, u16, bool)>>>;
+
     /// Answers the reads and the directory create these tests make, and records each finalize,
-    /// `committed` call and hold. Every other member panics.
+    /// `stored` and `committed` call and hold. Every other member panics.
     pub struct TestOperation {
         pub file_info_count: Arc<AtomicUsize>,
         pub holds_name_count: Arc<AtomicUsize>,
@@ -1248,6 +1279,7 @@ pub mod test_util {
         /// Whether the provider holds no file at any path.
         pub content_source_missing: bool,
         pub hold_calls: HoldCalls,
+        pub stored_calls: StoredCalls,
         pub committed_calls: CommittedCalls,
         /// Whether each `committed` call fails.
         pub committed_fails: bool,
@@ -1462,6 +1494,18 @@ pub mod test_util {
             _destination_path: &RelativePath,
         ) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
+        }
+
+        /// Records what was stored, and whether a revision had been handed over before.
+        fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16) {
+            let handed_over = !self.committed_calls.lock().is_empty();
+            self.stored_calls.lock().push((
+                path.as_str().to_owned(),
+                address,
+                size,
+                mode,
+                handed_over,
+            ));
         }
 
         /// Records the revision it was given, the current revision at the call and whether the

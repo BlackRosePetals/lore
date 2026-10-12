@@ -13,6 +13,7 @@ use lore_base::runtime::runtime;
 use lore_base::types::Hash;
 use lore_revision::branch;
 use lore_revision::commit::*;
+use lore_revision::filter::Filter;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::FsError;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
@@ -27,6 +28,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
+use lore_revision::state::State;
 use serde::Serialize;
 
 use crate::fs::filesystem_provider::TestFilesystemProvider;
@@ -139,7 +141,8 @@ async fn a_failed_hand_over_leaves_the_commit_standing() {
     assert_eq!(current, signature, "The failed hand-over undid the commit");
 }
 
-/// A provider that does not hold its state is handed no revision: its working tree is the files.
+/// A provider that does not hold its state is told of no content stored and handed no revision:
+/// its working tree is the files.
 #[tokio::test]
 async fn a_provider_not_holding_its_state_is_handed_nothing() {
     let dir = lore_base::test_util::TempDir::new("lore-commit-test-");
@@ -147,7 +150,78 @@ async fn a_provider_not_holding_its_state_is_handed_nothing() {
 
     commit_then_dry_run(&dir, filesystem.clone()).await;
 
+    assert!(filesystem.stored_calls.lock().is_empty());
     assert!(filesystem.committed_calls.lock().is_empty());
+}
+
+/// The operation a commit read its files through, on a provider holding its state, is told what
+/// each file was stored as, the address, size and mode the revision records, before the revision
+/// is handed over. A view-excluded file, whose content the commit takes from the staged node, is
+/// not told of.
+#[tokio::test]
+async fn the_operation_is_told_what_each_file_in_view_was_stored_as_before_the_hand_over() {
+    let dir = lore_base::test_util::TempDir::new("lore-commit-test-");
+    let filesystem = Arc::new(TestFilesystemProvider::holding_state_reading(dir.path()));
+    std::fs::write(dir.path().join("one.txt"), b"one").expect("write file");
+    std::fs::write(dir.path().join("excluded.txt"), b"one").expect("write file");
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Making test stores");
+    let root = dir.to_path_buf();
+    let committed = filesystem.clone();
+    let mut filter = Filter::default();
+    filter
+        .view
+        .add_exclusion("excluded.txt")
+        .expect("A view line");
+
+    let (signature, node) = runtime()
+        .spawn(LORE_CONTEXT.scope(execution, async move {
+            let (fixture, committing) = committing_repository(
+                &root,
+                immutable_store,
+                mutable_store,
+                committed,
+                Arc::new(filter),
+            )
+            .await;
+            stage_working_tree(&fixture, &root).await;
+            commit_staged(&fixture.repository, &fixture.token, test_commit())
+                .await
+                .expect("Committing through the OS filesystem");
+
+            std::fs::write(root.join("one.txt"), b"two!").expect("rewrite file");
+            std::fs::write(root.join("excluded.txt"), b"two!").expect("rewrite file");
+            stage_working_tree(&fixture, &root).await;
+            let signature = commit_staged(&committing, &fixture.token, test_commit())
+                .await
+                .expect("Committing");
+            let node = State::deserialize(committing.clone(), signature)
+                .await
+                .expect("The committed State")
+                .find_node(committing, "one.txt")
+                .await
+                .expect("The committed file");
+            (signature, node)
+        }))
+        .await
+        .expect("Test task failed");
+
+    assert_eq!(
+        *filesystem.stored_calls.lock(),
+        [(
+            String::from("one.txt"),
+            node.address,
+            node.size,
+            node.mode,
+            false
+        )],
+        "The commit told of other content than the revision records, of the view-excluded file, \
+         or after the hand-over"
+    );
+    assert_eq!(
+        *filesystem.committed_calls.lock(),
+        [(signature, signature, true)]
+    );
 }
 
 /// A commit of a link alone or of a layer is refused on a provider holding its state, which would
@@ -207,8 +281,14 @@ async fn a_commit_carrying_a_staged_layer_is_refused_on_a_provider_holding_its_s
 
     let (signature, refused, current) = runtime()
         .spawn(LORE_CONTEXT.scope(execution, async move {
-            let (fixture, committing) =
-                committing_repository(&root, immutable_store, mutable_store, committed).await;
+            let (fixture, committing) = committing_repository(
+                &root,
+                immutable_store,
+                mutable_store,
+                committed,
+                Arc::default(),
+            )
+            .await;
             stage_working_tree(&fixture, &root).await;
             let signature = commit_staged(&committing, &fixture.token, test_commit())
                 .await
@@ -268,8 +348,14 @@ async fn commit_then_dry_run(
 
     runtime()
         .spawn(LORE_CONTEXT.scope(execution, async move {
-            let (fixture, committing) =
-                committing_repository(&root, immutable_store, mutable_store, filesystem).await;
+            let (fixture, committing) = committing_repository(
+                &root,
+                immutable_store,
+                mutable_store,
+                filesystem,
+                Arc::default(),
+            )
+            .await;
 
             stage_working_tree(&fixture, &root).await;
             let signature = commit_staged(&committing, &fixture.token, test_commit())
@@ -371,7 +457,7 @@ async fn counting_repository(
 }
 
 /// A repository created at `root` as [`counting_repository`] makes it, which stages, and a context
-/// of the same repository over `filesystem`, which commits.
+/// of the same repository over `filesystem`, under `filter`, which commits.
 ///
 /// Call from inside a `LORE_CONTEXT` scope.
 async fn committing_repository(
@@ -379,6 +465,7 @@ async fn committing_repository(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     filesystem: Arc<TestFilesystemProvider>,
+    filter: Arc<Filter>,
 ) -> (CountingRepository, Arc<RepositoryContext>) {
     let fixture = counting_repository(root, immutable_store.clone(), mutable_store.clone()).await;
     let committing = Arc::new(
@@ -387,7 +474,8 @@ async fn committing_repository(
                 .with_path(root)
                 .with_id(fixture.repository.id)
                 .with_instance_id(fixture.repository.instance_id)
-                .with_filesystem_provider(filesystem),
+                .with_filesystem_provider(filesystem)
+                .with_filter(filter),
         )
         .with_write_token(fixture.token.share()),
     );
