@@ -749,6 +749,84 @@ async fn forward_cursor_resolves_within_open_latest_band_when_no_step_key_covers
     .await;
 }
 
+/// Serialize a revision chained onto `parent_self` without pushing it, as a client stores a
+/// revision it has not pushed.
+async fn serialize_unpushed_revision(
+    repository: &Arc<RepositoryContext>,
+    branch_id: BranchId,
+    parent_self: Hash,
+    revision_number: u64,
+) -> Hash {
+    let mut metadata = Metadata::new();
+    metadata.set_branch(branch_id).expect("set branch");
+    let metadata_hash = metadata
+        .serialize(repository.clone())
+        .await
+        .expect("serialize metadata");
+
+    let state = State::new();
+    state.set_parent_self(parent_self);
+    state.set_revision_number(revision_number);
+    state.set_metadata_hash(metadata_hash);
+    state
+        .serialize(repository.clone(), &get_write_token())
+        .await
+        .expect("serialize unpushed state")
+}
+
+/// A page starting at a revision numbered above the branch's latest, which the branch does not
+/// reach, lists it and its history with no forward cursor, as `acceleration` resolves it.
+async fn page_above_latest_has_no_forward_cursor(
+    acceleration: lore_server::grpc::server::RevisionListAcceleration,
+) {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let (branch_id, signatures) = create_branch_with_history(&repository_context, 5).await;
+        let unpushed =
+            serialize_unpushed_revision(&repository_context, branch_id, signatures[0], 6).await;
+
+        let response = handler(
+            make_request_signature(repository, unpushed),
+            immutable_store,
+            mutable_store,
+            DEFAULT_HISTORY_STEP_SIZE,
+            acceleration,
+            &make_instruments(),
+        )
+        .await
+        .expect("Request failed");
+        let inner = response.into_inner();
+        assert_eq!(inner.items[0].number, 6);
+        assert!(inner.signature_forward.is_none());
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn page_above_latest_has_no_forward_cursor_from_the_latest_band() {
+    page_above_latest_has_no_forward_cursor(
+        lore_server::grpc::server::RevisionListAcceleration::default(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn page_above_latest_has_no_forward_cursor_from_an_unverified_gap() {
+    page_above_latest_has_no_forward_cursor(lore_server::grpc::server::RevisionListAcceleration {
+        step_keys: false,
+        list_cache: false,
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn unknown_signature_returns_not_found() {
     let repository = random::<RepositoryId>();

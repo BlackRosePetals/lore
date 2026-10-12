@@ -681,9 +681,11 @@ enum ForwardAnchor {
     /// `first_number`'s own was proven empty, so its band — at most
     /// `history_step_size` revisions — is guaranteed to hold the target.
     Sealed { anchor: Hash, boundary: u64 },
-    /// No boundary above `first_number` is sealed at all: the target
-    /// lives in the branch's latest revision's own (always-open) band,
-    /// likewise bounded to `history_step_size` revisions.
+    /// No boundary above `first_number` is sealed at all: the target, if
+    /// any, lives in the branch's latest revision's own (always-open)
+    /// band, likewise bounded to `history_step_size` revisions. The latest
+    /// revision is not numbered above `first_number` when the branch does
+    /// not reach the revision numbered `first_number`.
     LatestBand { anchor: Hash },
     /// A boundary somewhere in the search could not be read, so `Empty`'s
     /// monotonicity no longer covers the boundaries below it and the gap
@@ -692,9 +694,10 @@ enum ForwardAnchor {
     /// the search went on to prove `Found`, which is not necessarily the
     /// lowest sealed boundary there is: narrowing past an unreadable
     /// boundary skips whatever lies beneath it. Where the search proved
-    /// none, `anchor` is the branch's latest revision. Either way it is
-    /// numbered above `first_number`, and the descent walks every
-    /// revision between the two, so how low it sits sets the cost.
+    /// none, `anchor` is the branch's latest revision, numbered above
+    /// `first_number` unless the branch does not reach that revision. The
+    /// descent walks every revision between the two, so how low `anchor`
+    /// sits sets the cost.
     UnverifiedGap { anchor: Hash },
 }
 
@@ -771,9 +774,9 @@ async fn forward_anchor(
         latest_state.revision_number().div_ceil(history_step_size) * history_step_size;
 
     if latest_boundary <= first_boundary {
-        // `latest` is numbered above `first_number` and at or below
-        // `first_boundary`, itself at most one step above `first_number`:
-        // both sit in the same band whatever the probe above reported.
+        // `latest` is at or below `first_boundary`, itself at most one step
+        // above `first_number`: any target sits in latest's band whatever the
+        // probe above reported.
         return Ok(ForwardAnchor::LatestBand { anchor: latest });
     }
 
@@ -827,7 +830,9 @@ async fn forward_anchor(
 }
 
 /// Descends from a [`ForwardAnchor::Sealed`] or [`ForwardAnchor::LatestBand`]
-/// anchor to the lowest revision numbered strictly above `first_number`.
+/// anchor to the lowest revision numbered strictly above `first_number`, or
+/// `None` when the anchor is not numbered above it, as the branch's latest
+/// revision is not for a revision the branch does not reach.
 /// `anchor_boundary`, when set, is the sealed step boundary `anchor` was
 /// read from; when `list_cache_enabled`, the persisted list-cache blob for
 /// that band is tried first (one blob read) before falling back to a
@@ -843,7 +848,7 @@ async fn forward_target(
     first_number: u64,
     history_step_size: u64,
     list_cache_enabled: bool,
-) -> Result<Hash, Status> {
+) -> Result<Option<Hash>, Status> {
     if list_cache_enabled
         && let Some(boundary) = anchor_boundary
         && let Some(cached) =
@@ -857,7 +862,7 @@ async fn forward_target(
             .rev()
             .find(|item| item.number > first_number)
     {
-        return Ok(item.signature);
+        return Ok(Some(item.signature));
     }
 
     let max_items = history_step_size as usize + 1;
@@ -877,13 +882,12 @@ async fn forward_target(
         .into_iter()
         .rev()
         .find(|item| item.number > first_number)
-        .expect("anchor's own item always has number > first_number")
-        .signature)
+        .map(|item| item.signature))
 }
 
 /// Walks `parent_self` from `anchor` down to the lowest revision numbered
 /// strictly above `first_number`, without assuming the gap fits in one
-/// band. When `step_keys` acceleration is enabled, writes the
+/// band, or `None` when `anchor` is not numbered above it. When `step_keys` acceleration is enabled, writes the
 /// step-boundary skip pointer for every boundary the walk crosses, so a
 /// request that pays this walk's cost once leaves the fast path in place
 /// for later requests instead of leaving every subsequent lookup to
@@ -909,14 +913,12 @@ async fn descend_unverified_gap(
     first_number: u64,
     history_step_size: u64,
     step_keys_enabled: bool,
-) -> Result<Hash, Status> {
+) -> Result<Option<Hash>, Status> {
     let mut hash = anchor;
     let mut prev_state: Option<Arc<state::State>> = None;
     // Invariant: `last_above` is the most recently visited hash whose
-    // number was confirmed `> first_number` — initially `anchor` itself,
-    // per the caller's guarantee that every `ForwardAnchor` variant is
-    // numbered above `first_number`.
-    let mut last_above = anchor;
+    // number was confirmed `> first_number`, if any.
+    let mut last_above = None;
     let mut hops: u64 = 0;
     let mut sealed: u64 = 0;
 
@@ -971,7 +973,7 @@ async fn descend_unverified_gap(
             );
             return Ok(last_above);
         }
-        last_above = hash;
+        last_above = Some(hash);
         hash = current_state.parent_self();
         prev_state = Some(current_state);
     }
@@ -983,8 +985,10 @@ async fn descend_unverified_gap(
 /// one numbered above items[0]; this walks the skip-pointer chain
 /// upward from the current page to find it, rather than assuming
 /// `items[0].number + 1` exists (a merge or fast-forward can leave
-/// numbering gaps). Returns `Ok(None)` only when items[0] is genuinely
-/// the branch's latest revision.
+/// numbering gaps). Returns `Ok(None)` when no revision of the branch is
+/// numbered above items[0]: items[0] is the branch's latest revision, or
+/// one numbered above it that the branch does not reach, such as a
+/// revision a client stored but has not pushed.
 async fn forward_cursor(
     repository: &Arc<RepositoryContext>,
     walked: &Walked,
@@ -1029,8 +1033,7 @@ async fn forward_cursor(
             history_step_size,
             false,
         )
-        .await
-        .map(Some);
+        .await;
     }
 
     debug!({BRANCH} = %branch, first_number, "forward_cursor - find forward anchor");
@@ -1087,5 +1090,5 @@ async fn forward_cursor(
             .await?
         }
     };
-    Ok(Some(target))
+    Ok(target)
 }

@@ -48,6 +48,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `loreserver`: a revision list starting at a revision numbered above the branch's latest, such as one a client hasn't
+  pushed, returns no forward cursor in place of stopping the server
 - QUIC: the client requests a 512 KiB UDP receive buffer, which Linux allocates as 1 MiB. Linux caps the request at
   `net.core.rmem_max`; set it to `524288` or more for the full buffer
 - QUIC: BBR's congestion window no longer grows without limit while flow control holds back the sender, and is
