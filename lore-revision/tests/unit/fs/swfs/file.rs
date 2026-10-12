@@ -25,3 +25,17 @@ fn swfs_file_sizing() {
         assert_eq!(*(*file_b).path.offset(1), '\0' as c_char);
     }
 }
+
+#[test]
+fn set_times_stamps_a_directory_entry() {
+    // A directory carries no time of its own, so the entry starts at zero
+    // and there is nothing to tell a stamped time apart from the default.
+    let mut file = SwfsFile::new(CString::new("dir").unwrap(), &FileInfo::Directory, None).unwrap();
+    assert_eq!(file.file().finfo.time_create, 0);
+    assert_eq!(file.file().finfo.time_write, 0);
+
+    file.set_times(133_000_000_000_000_000);
+
+    assert_eq!(file.file().finfo.time_create, 133_000_000_000_000_000);
+    assert_eq!(file.file().finfo.time_write, 133_000_000_000_000_000);
+}

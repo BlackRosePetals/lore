@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use dashmap::DashSet;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_error_set::WrapInternal;
@@ -21,6 +22,8 @@ use crate::fs::os::OsFilesystem;
 use crate::fs::os::OsOperation;
 use crate::fs::swfs::api_interface::SwfsInterface;
 use crate::fs::swfs::mount_resources::SwfsExecutionToken;
+use crate::fs::swfs::paths::RelativePathKey;
+use crate::fs::swfs::state::tracked_file_info;
 use crate::immutable;
 use crate::node::Node;
 use crate::repository::RepositoryContext;
@@ -52,10 +55,14 @@ impl SwfsFilesystem {
 
     #[allow(clippy::unused_async)]
     pub async fn begin_operation(&self) -> Result<SwfsOperation, FsError> {
-        self.mount.freeze().internal("Freezing SWFS file system")?;
+        self.mount
+            .freeze(SwfsExecutionToken {})
+            .await
+            .internal("Freezing SWFS file system")?;
         Ok(SwfsOperation {
             mount: self.mount.clone(),
             _repo_path: self.repo_path.clone(),
+            touched_nodes: Default::default(),
             os: OsFilesystem::begin_operation(&self.os),
         })
     }
@@ -76,17 +83,31 @@ impl FilesystemProvider for SwfsFilesystem {
 pub struct SwfsOperation {
     mount: Arc<SwfsInterface>,
     _repo_path: PathBuf,
+    /// Paths this operation has written or removed, for thaw to describe to SWFS. Whether a path
+    /// was added or deleted makes no difference to that, so they share the set.
+    touched_nodes: DashSet<RelativePathKey>,
     os: OsOperation,
 }
 
 impl SwfsOperation {
+    /// Notes that this operation wrote or removed `path`, so thaw describes it to SWFS. The root is
+    /// never written as such.
+    fn record_written(&self, path: &RelativePath) {
+        if !path.is_empty() {
+            self.touched_nodes.insert(RelativePathKey(path.clone()));
+        }
+    }
+
     /// Thaws the frozen filesystem, clearing the write cache where the operation wrote.
     pub(crate) async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
         let token = SwfsExecutionToken {};
-        self.mount
-            .thaw(token, changes_made)
-            .await
-            .internal("Thawing SWFS file system")?;
+        let result = self
+            .mount
+            .thaw(token, changes_made, &self.touched_nodes)
+            .await;
+        // Whatever the outcome, none of these writes are pending any longer.
+        self.touched_nodes.clear();
+        result.internal("Thawing SWFS file system")?;
         Ok(())
     }
 }
@@ -101,42 +122,94 @@ macro_rules! fake_with_os {
 
 impl InstanceOperation for SwfsOperation {
     async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
-        Ok(self
-            .mount
-            .resources()
-            .get_file_info(SwfsExecutionToken {}, path)
+        let resources = self.mount.resources();
+        let Some(state) = resources.current_read_state() else {
+            return Ok(if path.is_empty() {
+                FileInfo::Directory
+            } else {
+                FileInfo::NotExist
+            });
+        };
+        let info = tracked_file_info(resources.repository(), &state, path)
             .await
-            .internal("Getting node's file info")?)
+            .internal("Unable to find file node")?;
+        Ok(info)
     }
 
-    async fn make_executable(
+    async fn make_executable(&self, path: &RelativePath, _executable: bool) -> Result<(), FsError> {
+        self.record_written(path);
+        Ok(())
+    }
+
+    async fn create_dir_all(&self, path: &RelativePath) -> Result<(), FsError> {
+        self.record_written(path);
+        Ok(())
+    }
+
+    async fn write_file(&self, path: &RelativePath, _contents: Bytes) -> Result<(), FsError> {
+        self.record_written(path);
+        Ok(())
+    }
+
+    async fn remove_recursive(&self, path: &RelativePath) -> Result<(), FsError> {
+        self.record_written(path);
+        Ok(())
+    }
+
+    async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
+        self.os.remove(path).await?;
+        self.record_written(path);
+        Ok(())
+    }
+
+    async fn rename(&self, from: &RelativePath, to: &RelativePath) -> Result<(), FsError> {
+        self.os.rename(from, to).await?;
+        self.record_written(from);
+        self.record_written(to);
+        Ok(())
+    }
+
+    async fn copy_file(
         &self,
-        _path: &RelativePath,
-        _executable: bool,
+        source_path: &RelativePath,
+        destination_path: &RelativePath,
     ) -> Result<(), FsError> {
+        self.os.copy_file(source_path, destination_path).await?;
+        self.record_written(destination_path);
         Ok(())
     }
 
-    async fn create_dir_all(&self, _path: &RelativePath) -> Result<(), FsError> {
-        Ok(())
-    }
+    async fn write_node(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: &Node,
+        path: &RelativePath,
+    ) -> Result<FileInfo, FsError> {
+        let options = immutable::read_options_from_repository(&repository);
+        immutable::read(repository, node.address, None, options)
+            .await
+            .internal("Failed to cache file contents")?;
 
-    fake_with_os!(write_file, (), path: &RelativePath, contents: Bytes);
-
-    async fn remove_recursive(&self, _path: &RelativePath) -> Result<(), FsError> {
-        Ok(())
+        self.record_written(path);
+        Ok(if node.is_directory() {
+            FileInfo::Directory
+        } else {
+            FileInfo::from_node_and_mtime(node, 0)
+        })
     }
 
     async fn set_file_to_immutable_store_contents(
         &self,
         repository: Arc<RepositoryContext>,
         address: Address,
-        _path: &RelativePath,
+        path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
         let options = immutable::read_options_from_repository(&repository);
         immutable::read(repository, address, None, options)
             .await
             .internal("Failed to cache file contents")?;
+
+        self.record_written(path);
         Ok((Fragment::default(), None))
     }
 
@@ -147,21 +220,9 @@ impl InstanceOperation for SwfsOperation {
         self.os.changes_from_filesystem_to_state(diff)
     }
 
-    fake_with_os!(rename, (),
-        _from: &RelativePath,
-        _to: &RelativePath,
-    );
-
-    fake_with_os!(remove, (), _path: &RelativePath,);
-
     // A file the revision does not track is written to disk rather than to the mount, which
     // holds no node to answer for it.
     fake_with_os!(untracked_file_info, FileInfo, _path: &RelativePath,);
-
-    fake_with_os!(copy_file, (),
-        _source_path: &RelativePath,
-        _destination_path: &RelativePath,
-    );
 
     async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
         self.os.holds_name_exactly(path).await
@@ -169,14 +230,9 @@ impl InstanceOperation for SwfsOperation {
 
     fake_with_os!(read_directory, DirectoryListing, _path: &RelativePath,);
 
-    fake_with_os!(write_node, FileInfo,
-        repository: Arc<RepositoryContext>,
-        node: &Node,
-        path: &RelativePath);
-
     fake_with_os!(content_source, lore_storage::ContentSource<'static>, path: &RelativePath);
 
-    fake_with_os!( file_holds_content, NodeComparison,
+    fake_with_os!(file_holds_content, NodeComparison,
         repository: Arc<RepositoryContext>,
         path: &RelativePath,
         previous: Address,

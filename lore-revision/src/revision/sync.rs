@@ -29,6 +29,7 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::fs::hold;
+use crate::fs::realize::realize_state;
 use crate::history;
 use crate::interface::LoreBranchLocation;
 use crate::interface::LoreError;
@@ -869,87 +870,94 @@ pub(crate) async fn sync(
     }));
 
     let state_synced = state_target.clone();
-    let result = sync_realize(
-        repository_current.clone(),
-        repository.clone(),
-        state_current,
-        state_target,
-        options.clone(),
-    )
-    .await;
-
-    // Make sure caching has finished
-    if let Some(task) = cache_task {
-        let _ = task.await;
-    }
-
-    // Safe to handle error when cache task has finished
-    let modified_times = result?;
-
-    if !layers.is_empty() {
-        Box::pin(sync_layers(
-            repository_current,
+    with_operation::<_, SyncError, _>(repository_current.file_system(), async |operation| {
+        Box::pin(realize_state(
+            repository_current.clone(),
             repository.clone(),
-            token,
-            layers,
+            operation.clone(),
+            state_current,
+            state_target,
             options.clone(),
         ))
         .await?;
-    }
 
-    if !execution_context().globals().dry_run() {
-        // If the target revision is taken on a different branch, update the
-        // current branch. This allows sync to transparently switch branches.
-        let synced_branch = match requested_branch.filter(|branch| !branch.is_zero()) {
-            Some(branch) => branch,
-            None => state_synced
-                .revision_metadata(repository.clone())
-                .await
-                .ok()
-                .map(|m| m.branch)
-                .filter(|b| !b.is_zero())
-                .unwrap_or(anchor_branch),
-        };
-        if synced_branch != anchor_branch {
-            // The revision the current branch was created at belongs to the
-            // branch it was created from, and the current branch holds it too,
-            // so it is no reason on its own to leave. Naming that branch resolves
-            // the revision onto it instead, which never reaches here.
-            let is_branch_point = branch::metadata(repository.clone(), anchor_branch)
-                .await
-                .ok()
-                .map(|m| branch::stack(&m))
-                .is_some_and(|stack| stack.first().is_some_and(|bp| bp.revision == revision));
-            if !is_branch_point {
-                // Warn if another instance has the target branch checked out
-                crate::instance::warn_branch_multiple_instance(&repository, synced_branch).await;
+        // Make sure caching has finished
+        if let Some(task) = cache_task {
+            let _ = task.await;
+        }
 
-                crate::instance::store_current_anchor_branch(&repository, synced_branch)
+        // Safe to handle error when cache task has finished
+        let modified_times = operation.take_modified_times();
+
+        if !layers.is_empty() {
+            Box::pin(sync_layers(
+                repository_current,
+                repository.clone(),
+                token,
+                layers,
+                options.clone(),
+            ))
+            .await?;
+        }
+
+        if !execution_context().globals().dry_run() {
+            // If the target revision is taken on a different branch, update the
+            // current branch. This allows sync to transparently switch branches.
+            let synced_branch = match requested_branch.filter(|branch| !branch.is_zero()) {
+                Some(branch) => branch,
+                None => state_synced
+                    .revision_metadata(repository.clone())
                     .await
-                    .forward::<SyncError>("Failed to serialize current revision anchor")?;
+                    .ok()
+                    .map(|m| m.branch)
+                    .filter(|b| !b.is_zero())
+                    .unwrap_or(anchor_branch),
+            };
+            if synced_branch != anchor_branch {
+                // The revision the current branch was created at belongs to the
+                // branch it was created from, and the current branch holds it too,
+                // so it is no reason on its own to leave. Naming that branch resolves
+                // the revision onto it instead, which never reaches here.
+                let is_branch_point = branch::metadata(repository.clone(), anchor_branch)
+                    .await
+                    .ok()
+                    .map(|m| branch::stack(&m))
+                    .is_some_and(|stack| stack.first().is_some_and(|bp| bp.revision == revision));
+                if !is_branch_point {
+                    // Warn if another instance has the target branch checked out
+                    crate::instance::warn_branch_multiple_instance(&repository, synced_branch)
+                        .await;
+
+                    crate::instance::store_current_anchor_branch(&repository, synced_branch)
+                        .await
+                        .forward::<SyncError>("Failed to serialize current revision anchor")?;
+                }
+            }
+            crate::instance::store_current_anchor(&repository, revision)
+                .await
+                .forward::<SyncError>("Failed to serialize current revision anchor")?;
+
+            modified_times.store(repository.clone()).await;
+
+            state::rebase_staged_anchor(repository.clone(), revision, force && !view_change)
+                .await
+                .forward::<SyncError>("Failed to rebase staged anchor")?;
+
+            if view_change {
+                sync_store_view(&repository).await?;
+            }
+
+            // Set the local branch LATEST to match remote if we synced to that
+            // If we synced to a local revision keep the branch LATEST to not lose
+            // any local history when going backwards
+            if location == LoreBranchLocation::Remote {
+                sync_store_branch_latest(repository.clone(), target_branch, revision).await?;
             }
         }
-        crate::instance::store_current_anchor(&repository, revision)
-            .await
-            .forward::<SyncError>("Failed to serialize current revision anchor")?;
 
-        modified_times.store(repository.clone()).await;
-
-        state::rebase_staged_anchor(repository.clone(), revision, force && !view_change)
-            .await
-            .forward::<SyncError>("Failed to rebase staged anchor")?;
-
-        if view_change {
-            sync_store_view(&repository).await?;
-        }
-
-        // Set the local branch LATEST to match remote if we synced to that
-        // If we synced to a local revision keep the branch LATEST to not lose
-        // any local history when going backwards
-        if location == LoreBranchLocation::Remote {
-            sync_store_branch_latest(repository.clone(), target_branch, revision).await?;
-        }
-    }
+        Ok(())
+    })
+    .await?;
 
     LoreEvent::RevisionSyncRevision(LoreRevisionSyncRevisionEventData {
         branch: target_branch,
@@ -1252,35 +1260,6 @@ async fn shim_with_operation<T>(
         Ok((result, operation.take_modified_times()))
     })
     .await
-}
-
-/// Realizes `state_target` over the working copy, returning the modified times of the files
-/// it wrote for the caller to store once the target revision is the current one.
-///
-/// `repository_current` is the context the working copy stands under, which is `repository` itself
-/// for a sync that carries the tree between revisions under one view.
-async fn sync_realize(
-    repository_current: Arc<RepositoryContext>,
-    repository: Arc<RepositoryContext>,
-    state_current: Arc<State>,
-    state_target: Arc<State>,
-    options: SyncOptions,
-) -> Result<RecordedModifiedTimes, SyncError> {
-    let (result, modified_times) =
-        shim_with_operation(repository.file_system(), async |operation| {
-            Box::pin(crate::fs::realize::realize_state(
-                repository_current,
-                repository,
-                operation,
-                state_current,
-                state_target,
-                options,
-            ))
-            .await
-        })
-        .await?;
-    result?;
-    Ok(modified_times)
 }
 
 #[derive(Clone)]

@@ -1,4 +1,6 @@
 use std::ffi::CString;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -10,11 +12,32 @@ use lore_error_set::error_set;
 use crate::fs::swfs::mount_resources::SwfsWorkError;
 use crate::util::path::RelativePath;
 
+#[derive(Clone)]
+pub struct RelativePathKey(pub RelativePath);
+
+impl Hash for RelativePathKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.as_str().hash(state);
+    }
+}
+
+impl PartialEq<Self> for RelativePathKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+
+impl Eq for RelativePathKey {}
+
 /// A path provided by SWFS. Always starts with a leading `\` character that represents the root
 /// mount directory
 pub struct SwfsPath<'a>(pub &'a str);
 
 impl SwfsPath<'_> {
+    pub fn is_root(&self) -> bool {
+        self.0 == "/" || self.0 == "\\"
+    }
+
     pub fn relative_path_string(&self) -> Result<&str, SwfsWorkError> {
         // SWFS may provide paths with or without leading backslash
         Ok(self.0.strip_prefix("\\").unwrap_or(self.0))
@@ -25,6 +48,11 @@ impl SwfsPath<'_> {
             RelativePath::new_from_initial_path(self.relative_path_string()?)
                 .forward::<SwfsWorkError>("Parsing relative path from SWFS")?,
         ))
+    }
+
+    pub fn c_string_from_relative_path(path: &RelativePath) -> Result<CString, SwfsWorkError> {
+        let result = format!("/{}", path.as_str());
+        Ok(CString::new(result).internal("Path contained a null byte")?)
     }
 }
 

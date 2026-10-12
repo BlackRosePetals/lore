@@ -7,18 +7,14 @@ import platform
 import shutil
 import signal
 import subprocess
-import tempfile
-import typing
-import uuid
-
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 from time import monotonic, sleep
 
 import pytest
-
 from cleanup_util import remove_tree
-from lore import Lore, lore_test_env
 from lore_server import (
     _get_shared_tmp_dir,
     _get_worker_id,
@@ -39,6 +35,8 @@ from service_util import (
     service_supported,
     stop_lore_service,
 )
+
+from lore import Lore, lore_test_env
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +133,22 @@ def pytest_addoption(parser):
             "Off by default: the suite writes about ten gigabytes per session, "
             "so it is removed as it goes. Turn this on to inspect the state a "
             "failing test left behind, including the server log."
+        ),
+    )
+    parser.addoption(
+        "--swfs",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the tests that mount a repository through SWFS. Off by "
+            "default, because mounting needs two things the harness cannot "
+            "arrange for itself: a client built with `--features swfs` "
+            "against SWFS_LIB_DIR, and the epicvfs filesystem driver started, "
+            "which takes an elevated session. Neither is visible from the "
+            "outside -- the binary reports no feature list -- and a run "
+            "without them does not fail, it hangs: the SWFS library parks the "
+            "service process when it cannot reach the driver, so the client "
+            "waiting on it blocks until the per-test timeout kills the worker."
         ),
     )
 
@@ -307,7 +321,7 @@ def _wait_for_service_ready(service_process, log_path: Path, timeout=30):
     pytest.fail("Timed out waiting for Lore background service to accept connections")
 
 
-class TrackedServices(object):
+class TrackedServices:
     def __init__(
         self,
         lore_executable_path: str,
@@ -317,7 +331,7 @@ class TrackedServices(object):
         self.lore_executable_path = lore_executable_path
         self.lore_subprocess_env = lore_subprocess_env
         self.global_dir_name = global_dir_name
-        self.service_processes: typing.Dict[str | None, subprocess.Popen | None] = {}
+        self.service_processes: dict[str | None, subprocess.Popen | None] = {}
 
     def start(self, directory: str | None = None):
         """Starts the service, optionally with a chosen working directory. The service

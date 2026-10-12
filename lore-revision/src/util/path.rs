@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::borrow::Cow;
 use std::fmt::Display;
+use std::hash::Hash;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;

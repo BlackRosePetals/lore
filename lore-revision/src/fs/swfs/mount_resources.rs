@@ -100,13 +100,28 @@ pub enum SwfsWorkError {
     MissingIdentity,
 }
 
+#[derive(Debug, Default)]
+struct InternalState {
+    repository_state: Option<Arc<State>>,
+}
+
+impl InternalState {
+    pub fn set_repository_state(&mut self, repository_state: Option<Arc<State>>) {
+        self.repository_state = repository_state;
+    }
+
+    pub fn current_read_state(&self) -> Option<Arc<State>> {
+        self.repository_state.clone()
+    }
+}
+
 /// Everything that defines a SWFS-mounted repository, excluding the result of the actual mount
 /// itself.
 #[derive(Debug)]
 pub struct MountResources {
     global_args: LoreGlobalArgs,
     repository: Arc<RepositoryContext>,
-    state: RwLock<Option<Arc<State>>>,
+    internal_state: RwLock<InternalState>,
     _instance_id: InstanceId,
     _name: String,
     pub name_nul_terminated: CString,
@@ -216,7 +231,7 @@ impl MountResources {
                 ..execution.globals().clone()
             },
             repository,
-            state: RwLock::new(None),
+            internal_state: RwLock::default(),
             _instance_id: instance_id,
             name_nul_terminated: CString::new(name.as_str())
                 .internal("Nul terminating mount name")?,
@@ -257,13 +272,17 @@ impl MountResources {
         LORE_CONTEXT.scope(execution_context, f).await
     }
 
-    fn current_state(&self) -> Result<Option<Arc<State>>, SwfsWorkError> {
-        Ok(self.state.read().clone())
+    pub fn repository(&self) -> Arc<RepositoryContext> {
+        self.repository.clone()
+    }
+
+    pub fn current_read_state(&self) -> Option<Arc<State>> {
+        self.internal_state.read().current_read_state()
     }
 
     pub async fn update_state(&self, _token: SwfsExecutionToken) -> Result<(), SwfsWorkError> {
         let current_anchor = load_current_anchor(&self.repository).await;
-        *self.state.write() = match current_anchor {
+        let new_state = match current_anchor {
             Ok((current_revision, _)) => Some(
                 state::State::deserialize(self.repository.clone(), current_revision)
                     .await
@@ -271,6 +290,7 @@ impl MountResources {
             ),
             Err(_) => None,
         };
+        self.internal_state.write().set_repository_state(new_state);
         Ok(())
     }
 
@@ -279,8 +299,12 @@ impl MountResources {
         _token: SwfsExecutionToken,
         path: &RelativePath,
     ) -> Result<FileInfo, SwfsWorkError> {
-        let Some(state) = self.current_state()? else {
-            return Ok(FileInfo::NotExist);
+        let Some(state) = self.current_read_state() else {
+            return if path.is_empty() {
+                Ok(FileInfo::Directory)
+            } else {
+                Err(SwfsWorkError::internal("Node does not exist"))
+            };
         };
         let node = state
             .find_node(self.repository.clone(), path.as_str())
@@ -301,9 +325,12 @@ impl MountResources {
         file_range: Range<usize>,
         output_bytes: &mut [u8],
     ) -> Result<(usize, FileInfo), SwfsWorkError> {
-        let Some(state) = self.current_state()? else {
-            crate::lore_debug!("SWFS read_file: no state available");
-            return Ok((0, FileInfo::NotExist));
+        let Some(state) = self.current_read_state() else {
+            return if swfs_path.is_root() {
+                Ok((0, FileInfo::Directory))
+            } else {
+                Err(SwfsWorkError::internal("Node does not exist"))
+            };
         };
         let node_path = swfs_path.node_path()?;
         crate::lore_trace!(
@@ -350,10 +377,9 @@ impl MountResources {
         _token: SwfsExecutionToken,
         swfs_path: SwfsPath<'_>,
     ) -> Result<SwfsFileArray, SwfsWorkError> {
-        let Some(state) = self.current_state()? else {
-            return Ok(SwfsFileArray::empty());
+        let Some(state) = self.current_read_state() else {
+            return Ok(SwfsFileArray::new(Vec::new()));
         };
-
         let node_path = swfs_path.node_path()?;
         let directory_node_id = if swfs_path.0 == "\\" {
             ROOT_NODE

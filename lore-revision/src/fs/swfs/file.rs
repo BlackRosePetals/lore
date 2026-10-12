@@ -5,6 +5,7 @@ use crate::fs::swfs::api_interface::SwfsInterfaceError;
 use crate::fs::swfs::api_interface::swfs_api::SWFSFInfo;
 use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
 use crate::fs::swfs::api_interface::swfs_api::swfs_u16;
+use crate::fs::swfs::api_interface::swfs_api::swfs_u64;
 
 pub struct SwfsFileArray {
     files: Box<[SwfsFile]>,
@@ -20,7 +21,8 @@ impl SwfsFileArray {
             files: files.into_boxed_slice(),
         };
         for i in 1..this.files.len() {
-            this.files[i - 1].file.next = std::ptr::from_ref(this.files[i].file()) as *mut SWFSFile;
+            let next_ptr = std::ptr::from_mut(&mut this.files[i].file);
+            this.files[i - 1].file.next = next_ptr;
         }
         this
     }
@@ -39,6 +41,8 @@ impl SwfsFileArray {
 pub struct SwfsFile {
     file: SWFSFile,
 }
+
+unsafe impl Send for SwfsFile {}
 
 impl Drop for SwfsFile {
     fn drop(&mut self) {
@@ -78,5 +82,18 @@ impl SwfsFile {
 
     pub fn file(&self) -> &SWFSFile {
         &self.file
+    }
+
+    /// Stamps the create and write times SWFS reports for this entry.
+    ///
+    /// For callers whose [`FileInfo`] carries no time of its own:
+    /// [`FileInfo::Directory`] holds none, so a directory entry built from one
+    /// reports zero for both, and a caller that knows the time has nowhere to
+    /// put it. Takes the value already in SWFS's own units rather than a
+    /// `FileInfo`, because a caller reading the clock gets the platform's file
+    /// time, not the Unix milliseconds a `FileInfo` holds.
+    pub fn set_times(&mut self, time: swfs_u64) {
+        self.file.finfo.time_create = time;
+        self.file.finfo.time_write = time;
     }
 }

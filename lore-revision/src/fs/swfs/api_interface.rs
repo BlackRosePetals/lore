@@ -7,11 +7,13 @@ pub mod swfs_api;
 
 use std::sync::Arc;
 
+use dashmap::DashSet;
 use lore_error_set::error_set;
 use swfs_api::SWFSHandle;
 
 use crate::fs::swfs::mount_resources::MountResources;
 use crate::fs::swfs::mount_resources::SwfsExecutionToken;
+use crate::fs::swfs::paths::RelativePathKey;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct WrappedHandle(#[allow(unused)] SWFSHandle);
@@ -69,7 +71,8 @@ impl SwfsInterface {
         &self.resources
     }
 
-    pub fn freeze(&self) -> Result<(), SwfsInterfaceError> {
+    #[allow(clippy::unused_async)]
+    pub async fn freeze(&self, _token: SwfsExecutionToken) -> Result<(), SwfsInterfaceError> {
         Err(Self::no_swfs_error())
     }
     #[allow(clippy::unused_async)]
@@ -77,6 +80,7 @@ impl SwfsInterface {
         &self,
         _token: SwfsExecutionToken,
         _apply_changes: bool,
+        _written_paths: &DashSet<RelativePathKey>,
     ) -> Result<(), SwfsInterfaceError> {
         Err(Self::no_swfs_error())
     }
@@ -97,7 +101,6 @@ impl SwfsInterface {
 #[cfg(feature = "swfs")]
 mod swfs_impl {
     use std::ffi::CStr;
-    use std::ffi::CString;
     use std::ffi::c_char;
     use std::ffi::c_int;
     use std::ffi::c_void;
@@ -105,29 +108,29 @@ mod swfs_impl {
 
     use lore_base::log::LoreLogLevel;
     use lore_error_set::ForwardStrict;
-    use lore_error_set::WrapInternal;
     use tokio::task::yield_now;
 
     use super::*;
     use crate::event::LoreErrorDetail;
-    use crate::fs::filesystem_provider::FileInfo;
     use crate::fs::swfs::api_interface::swfs_api::SWFSCallbacks;
     use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
     use crate::fs::swfs::api_interface::swfs_api::SWFSHandle;
     use crate::fs::swfs::api_interface::swfs_api::SWFSInit;
     use crate::fs::swfs::api_interface::swfs_api::SWFSResult_Enum;
     use crate::fs::swfs::api_interface::swfs_api::swfs_u64;
+    use crate::fs::swfs::api_interface::swfs_api::swfs_ubyte;
     use crate::fs::swfs::api_interface::swfs_api::swfsClose;
     use crate::fs::swfs::api_interface::swfs_api::swfsFillDirAddFiles;
     use crate::fs::swfs::api_interface::swfs_api::swfsFreeze;
     use crate::fs::swfs::api_interface::swfs_api::swfsInit;
     use crate::fs::swfs::api_interface::swfs_api::swfsIsBusy;
     use crate::fs::swfs::api_interface::swfs_api::swfsThaw;
-    use crate::fs::swfs::file::SwfsFile;
+    use crate::fs::swfs::file::SwfsFileArray;
     use crate::fs::swfs::mount_manager_state::MountManagerState;
     use crate::fs::swfs::mount_resources::MountResources;
     use crate::fs::swfs::mount_resources::SwfsWorkError;
     use crate::fs::swfs::paths::SwfsPath;
+    use crate::fs::swfs::state::written_files;
     use crate::service_state::ServiceStateImpl;
 
     impl SwfsInterface {
@@ -135,13 +138,15 @@ mod swfs_impl {
             &self.resources
         }
 
-        pub fn freeze(&self) -> Result<(), SwfsInterfaceError> {
-            let handle = self.handle()?.handle();
-            let root_path = CString::new("\\").internal("Making CString from root directory")?;
-            if unsafe { swfsFreeze(handle, root_path.as_ptr(), 1) } {
+        pub async fn freeze(&self, token: SwfsExecutionToken) -> Result<(), SwfsWorkError> {
+            let handle = self
+                .handle()
+                .forward::<SwfsWorkError>("Unable to freeze")?
+                .handle();
+            if unsafe { swfsFreeze(handle, Some(swfs_freeze_callback), std::ptr::null_mut()) } {
                 Ok(())
             } else {
-                Err(SwfsInterfaceError::internal("Failed to freeze"))
+                Err(SwfsWorkError::internal("Failed to freeze"))
             }
         }
 
@@ -149,9 +154,8 @@ mod swfs_impl {
             &self,
             token: SwfsExecutionToken,
             apply_changes: bool,
+            written_paths: &DashSet<RelativePathKey>,
         ) -> Result<(), SwfsWorkError> {
-            self.resources.update_state(token).await?;
-
             let file_time: u64;
             #[cfg(target_os = "windows")]
             {
@@ -169,21 +173,30 @@ mod swfs_impl {
                 file_time = 0;
             }
 
+            // The written nodes are described as the state after this operation holds them.
+            self.resources.update_state(token).await?;
+            let state = self.resources.current_read_state().ok_or_else(|| {
+                SwfsWorkError::internal("Describing written nodes with no repository state")
+            })?;
+            let mut files = Vec::new();
+            written_files(
+                &mut files,
+                self.resources.repository(),
+                state,
+                written_paths,
+                file_time,
+            )
+            .await?;
+            let files = SwfsFileArray::new(files);
             let handle = self
                 .handle()
                 .forward::<SwfsWorkError>("Getting SWFS handle for thaw")?
                 .handle();
-            let root_file = SwfsFile::new(
-                CString::new("\\").internal("Unable to make CString from root file")?,
-                &FileInfo::Directory,
-                None,
-            )
-            .forward::<SwfsWorkError>("Making file info")?;
             if unsafe {
                 swfsThaw(
                     handle,
                     if apply_changes {
-                        std::ptr::from_ref(&root_file.file())
+                        files.array_ptr()
                     } else {
                         std::ptr::null_mut()
                     },
@@ -304,6 +317,20 @@ mod swfs_impl {
         fn notify_move(&self, _old_file: *mut SWFSFile, _new_file: *mut SWFSFile) {}
         fn notify_delete(&self, _file: *mut SWFSFile) {}
 
+        fn freeze_callback(
+            &self,
+            user_data: *mut ::std::os::raw::c_void,
+            start_buff: *mut swfs_ubyte,
+            num_bytes: usize,
+            out_num_buff_bytes: *mut usize,
+        ) -> *mut swfs_ubyte {
+            // `start_buff` is an array of `SWFSFile` objects. By default, all files are frozen.
+            // Setting the `mod_flag` will cause that file to not be frozen.
+            // It would be optimal to only freeze the necessary files, but simply letting all freeze
+            // is a correct implementation for the moment.
+            std::ptr::null_mut()
+        }
+
         fn handle_swfs_error(
             error_code: SWFSResult_Enum,
             source_filename: *const c_char,
@@ -394,6 +421,7 @@ mod swfs_impl {
     handle_redirect!(swfs_c_notify_create, notify_create, (file: *mut SWFSFile));
     handle_redirect!(swfs_c_notify_move, notify_move, (old_file: *mut SWFSFile, new_file: *mut SWFSFile));
     handle_redirect!(swfs_c_notify_delete, notify_delete, (file: *mut SWFSFile));
+    handle_redirect!(swfs_freeze_callback, freeze_callback, (user_data: *mut ::std::os::raw::c_void, start_buff: *mut swfs_ubyte, num_bytes: usize, out_num_buff_bytes: *mut usize) -> *mut swfs_ubyte);
 
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn swfs_c_error_callback(

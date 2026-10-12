@@ -24,6 +24,8 @@ pub const SWFSResult_Enum_SWFSResult_FirstError: SWFSResult_Enum = -2147483648;
 pub const SWFSResult_Enum_SWFSResult_FileNotFound: SWFSResult_Enum = -2147483647;
 pub const SWFSResult_Enum_SWFSResult_BufferNotAligned: SWFSResult_Enum = -2147483646;
 pub const SWFSResult_Enum_SWFSResult_BufferTooSmall: SWFSResult_Enum = -2147483645;
+pub const SWFSResult_Enum_SWFSResult_VirtualFileReadFailed: SWFSResult_Enum = -2147483644;
+pub const SWFSResult_Enum_SWFSResult_ThawPathConflict: SWFSResult_Enum = -2147483643;
 pub type SWFSResult_Enum = ::std::os::raw::c_int;
 pub const SWFSNodeModFlag_NewNode: swfs_u16 = 1;
 pub const SWFSNodeModFlag_ChangeFlags: swfs_u16 = 2;
@@ -41,6 +43,7 @@ pub const SWFSNodeModFlag_Hydrate: swfs_u16 = 4096;
 pub const SWFSNodeModFlag_BlockReserve: swfs_u16 = 8192;
 pub const SWFSNodeModFlag_BlockAlloc: swfs_u16 = 16384;
 pub const SWFSNodeModFlag_ChangedWhileFrozen: swfs_u16 = 32768;
+pub const SWFSNodeModFlag_DontFreeze: swfs_u16 = 32768;
 pub const SWFSLogFlag_EventWrite: swfs_u32 = 1;
 pub const SWFSLogFlag_EventRead: swfs_u32 = 2;
 pub const SWFSLogFlag_ModifyNode: swfs_u32 = 4;
@@ -92,20 +95,6 @@ const _: () = {
     ["Offset of field: SWFSFile::mod_flags"][::std::mem::offset_of!(SWFSFile, mod_flags) - 44usize];
     ["Offset of field: SWFSFile::next"][::std::mem::offset_of!(SWFSFile, next) - 48usize];
 };
-pub const SWFSInstallResult_Enum_SWFSInstallResult_Success: SWFSInstallResult_Enum = 0;
-pub const SWFSInstallResult_Enum_SWFSInstallResult_NoChange: SWFSInstallResult_Enum = 1;
-pub const SWFSInstallResult_Enum_SWFSInstallResult_InvalidArgs: SWFSInstallResult_Enum = -1;
-pub const SWFSInstallResult_Enum_SWFSInstallResult_InvalidPath: SWFSInstallResult_Enum = -2;
-pub const SWFSInstallResult_Enum_SWFSInstallResult_CopyFile: SWFSInstallResult_Enum = -3;
-pub const SWFSInstallResult_Enum_SWFSInstallResult_OpenSCManager: SWFSInstallResult_Enum = -4;
-pub const SWFSInstallResult_Enum_SWFSInstallResult_ChangeService: SWFSInstallResult_Enum = -5;
-pub const SWFSInstallResult_Enum_SWFSInstallResult_CreateService: SWFSInstallResult_Enum = -6;
-pub const SWFSInstallResult_Enum_SWFSInstallResult_QueryService: SWFSInstallResult_Enum = -7;
-pub const SWFSInstallResult_Enum_SWFSInstallResult_RequiresReboot: SWFSInstallResult_Enum = -8;
-pub const SWFSInstallResult_Enum_SWFSInstallResult_UnableToReplaceOldDriver:
-    SWFSInstallResult_Enum = -9;
-pub const SWFSInstallResult_Enum_SWFSInstallResult_StartService: SWFSInstallResult_Enum = -10;
-pub type SWFSInstallResult_Enum = ::std::os::raw::c_int;
 pub type SWFSReadFileFn = ::std::option::Option<
     unsafe extern "C" fn(
         swfs_handle: SWFSHandle,
@@ -180,8 +169,8 @@ pub struct SWFSInit {
     pub shared_memory_name: *const swfs_utf8,
     pub num_write_threads: ::std::os::raw::c_int,
     pub callbacks: SWFSCallbacks,
-    pub driver_install_path: *const ::std::os::raw::c_char,
     pub log_path: *const ::std::os::raw::c_char,
+    pub source_revision: *const swfs_utf8,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -198,9 +187,9 @@ const _: () = {
     ["Offset of field: SWFSInit::num_write_threads"]
         [::std::mem::offset_of!(SWFSInit, num_write_threads) - 40usize];
     ["Offset of field: SWFSInit::callbacks"][::std::mem::offset_of!(SWFSInit, callbacks) - 48usize];
-    ["Offset of field: SWFSInit::driver_install_path"]
-        [::std::mem::offset_of!(SWFSInit, driver_install_path) - 104usize];
-    ["Offset of field: SWFSInit::log_path"][::std::mem::offset_of!(SWFSInit, log_path) - 112usize];
+    ["Offset of field: SWFSInit::log_path"][::std::mem::offset_of!(SWFSInit, log_path) - 104usize];
+    ["Offset of field: SWFSInit::source_revision"]
+        [::std::mem::offset_of!(SWFSInit, source_revision) - 112usize];
 };
 pub type SWFSDataCBFn = ::std::option::Option<
     unsafe extern "C" fn(
@@ -223,8 +212,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn swfsFreeze(
         swfs_handle: SWFSHandle,
-        paths: *const swfs_utf8,
-        num_paths: swfs_u32,
+        cb_fn: SWFSDataCBFn,
+        cb_user_data: *mut ::std::os::raw::c_void,
     ) -> bool;
 }
 unsafe extern "C" {
@@ -257,6 +246,9 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn swfsResetCache(swfs_handle: SWFSHandle) -> bool;
+}
+unsafe extern "C" {
+    pub fn swfsRevalidateSource(swfs_handle: SWFSHandle) -> bool;
 }
 unsafe extern "C" {
     pub fn swfsFillDirAddFiles(swfs_handle: SWFSHandle, first_file: *const SWFSFile) -> bool;

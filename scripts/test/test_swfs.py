@@ -1,4 +1,5 @@
 import os
+import typing
 
 import pytest
 from error_types import RepositoryAlreadyExistsError, SwfsOutsideServiceError
@@ -27,15 +28,18 @@ def test_no_swfs_clone_outside_service(new_lore_repo):
         lore.clone(vfs="swfs", use_shared_store=True)
 
 
-@pytest.mark.skip(
-    reason="swfs is generally not available; test fails randomly under parallel execution"
-)
 @pytest.mark.smoke
-def test_swfs_creates_external_dot_lore(new_lore_repo, background_lore_service, global_dir_name):
+@pytest.mark.skipif(
+    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
+)
+def test_swfs_creates_external_dot_lore(
+    new_lore_repo, background_lore_service, global_dir_name
+):
     repo: Lore = new_lore_repo(
         create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
     )
 
+    repo.shared_store_create(repo.remote)
     repo.repository_create(vfs="swfs", use_shared_store=True)
 
     instance_id = get_instance_id(repo.repository_info())
@@ -49,16 +53,16 @@ def test_swfs_creates_external_dot_lore(new_lore_repo, background_lore_service, 
     assert os.path.exists(external_dot_lore)
 
     # Expect the .lore directory to be the same even after performing another operation on the repository.
-    repo.write_commit_push("Test", {"abc": os.urandom(1000)})
+    repo.status()
 
     assert not repo.path_exists(".lore")
     assert os.path.exists(external_dot_lore)
 
 
-@pytest.mark.skip(
-    reason="swfs is generally not available; test fails randomly under parallel execution"
-)
 @pytest.mark.smoke
+@pytest.mark.skipif(
+    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
+)
 def test_swfs_repo_prevents_creating_non_swfs_repo(
     new_lore_repo, background_lore_service
 ):
@@ -66,12 +70,13 @@ def test_swfs_repo_prevents_creating_non_swfs_repo(
         create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
     )
 
+    repo.shared_store_create(repo.remote)
     repo.repository_create(vfs="swfs", use_shared_store=True)
 
     # Creating a second repository on top of the first one should fail, even though there is no local .lore directory.
     # Also the .lore directory should still continue to not exist after the attempt.
     with pytest.raises(RepositoryAlreadyExistsError):
-        repo.repository_create("test_name")
+        repo.repository_create(repo.remote + "/test_name")
 
     assert not repo.path_exists(".lore")
 
@@ -79,92 +84,14 @@ def test_swfs_repo_prevents_creating_non_swfs_repo(
     with pytest.raises(RepositoryAlreadyExistsError):
         lore.clone(repo.path)
 
-
-@pytest.mark.skip(
-    reason="swfs is generally not available; test fails randomly under parallel execution"
-)
-@pytest.mark.smoke
-def test_swfs_repo_prevents_creating_non_swfs_repo_after_restart(
-    new_lore_repo, lore_service_runner
-):
-    lore_service_runner.start()
-    repo: Lore = new_lore_repo(
-        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
-    )
-
-    repo.repository_create(vfs="swfs", use_shared_store=True)
-    lore_service_runner.terminate_all()
-    lore_service_runner.start()
-
-    # Creating a second repository on top of the first one should fail, even though there is no local .lore directory.
-    # Also the .lore directory should still continue to not exist after the attempt.
+    # Repeat those checks with `--force`, expecting the same results.
     with pytest.raises(RepositoryAlreadyExistsError):
-        repo.repository_create("test_name")
+        repo.repository_create(repo.remote + "/test_name", force=True)
 
     assert not repo.path_exists(".lore")
 
-    lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
     with pytest.raises(RepositoryAlreadyExistsError):
-        lore.clone(repo.path)
-
-
-@pytest.mark.skip(
-    reason="swfs is generally not available; test fails randomly under parallel execution"
-)
-@pytest.mark.smoke
-def test_swfs_repo_can_be_force_created_over(new_lore_repo, background_lore_service):
-    repo: Lore = new_lore_repo(
-        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
-    )
-
-    original_repo_file = "file1.txt"
-    new_repo_file = "file2.txt"
-
-    # Create a repo with a file and clone it
-    repo.repository_create(vfs="swfs", use_shared_store=True)
-    clone_of_original_repo = repo.clone()
-
-    repo.write_commit_push(None, {original_repo_file: os.urandom(1000)})
-
-    # Create a new repository over the original using --force and add a file to it
-    repo.repository_create("test_name2", force=True)
-    assert repo.path_exists(".lore")
-
-    repo.write_commit_push(None, {new_repo_file: os.urandom(1000)})
-
-    clone_of_original_repo.sync()
-    assert clone_of_original_repo.file_exists(original_repo_file)
-    assert not clone_of_original_repo.file_exists(new_repo_file)
-
-
-@pytest.mark.skip(reason="swfs is generally not available; test fails constantly in CI")
-@pytest.mark.smoke
-def test_swfs_repo_can_be_force_cloned_over(new_lore_repo, background_lore_service):
-    repo: Lore = new_lore_repo(
-        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
-    )
-
-    original_repo_file = "file1.txt"
-    new_repo_file = "file2.txt"
-
-    repo.repository_create(vfs="swfs", use_shared_store=True)
-    repo.write_commit_push(None, {original_repo_file: os.urandom(1000)})
-
-    clone_of_original_repo = repo.clone()
-
-    source_for_force_clone: Lore = new_lore_repo(
-        environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
-    )
-
-    force_cloned_repo = source_for_force_clone.clone(path=repo.path, force=True)
-    assert repo.path_exists(".lore")
-    assert force_cloned_repo.path_exists(".lore")
-
-    force_cloned_repo.write_commit_push(None, {new_repo_file: os.urandom(1000)})
-
-    clone_of_original_repo.sync()
-    assert clone_of_original_repo.file_exists(original_repo_file)
-    assert not clone_of_original_repo.file_exists(new_repo_file)
+        lore.clone(repo.path, force=True)
 
 
 def _get_stores_size(stores_path: str) -> int:
@@ -188,7 +115,9 @@ def _get_stores_size(stores_path: str) -> int:
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="swfs not fully supported yet")
+@pytest.mark.skipif(
+    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
+)
 def test_caches_file_contents(new_lore_repo, background_lore_service, scratch_dir):
     # Create a repo to clone
     original_repo: Lore = new_lore_repo(
@@ -215,8 +144,19 @@ def test_caches_file_contents(new_lore_repo, background_lore_service, scratch_di
     assert swfs_size - regular_size > 1024 * 5
 
 
+def _repositories_match_files(
+    expected_repo: Lore, actual_repo: Lore, files: typing.Sequence[str]
+):
+    for file_name in files:
+        assert expected_repo.compare_file(
+            actual_repo, file_name, only_file_contents=True
+        ), f"File mismatch {file_name}"
+
+
 @pytest.mark.smoke
-@pytest.mark.skip(reason="swfs not fully supported yet")
+@pytest.mark.skipif(
+    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
+)
 def test_swfs_actually_mounted(new_lore_repo, lore_service_runner):
     # Create a repo and clone it into a SWFS-backed instance.
     lore_service_runner.start()
@@ -236,11 +176,7 @@ def test_swfs_actually_mounted(new_lore_repo, lore_service_runner):
 
     # Assert that the SWFS instance exists both immediately and after a service restart, but not while the service is
     # not running.
-    assert os.path.exists(swfs_repo.path)
-    for file_name in file_contents:
-        assert original_repo.compare_file(swfs_repo, file_name), (
-            f"File mismatch: {file_name}"
-        )
+    _repositories_match_files(original_repo, swfs_repo, file_contents)
 
     lore_service_runner.terminate()
 
@@ -248,6 +184,211 @@ def test_swfs_actually_mounted(new_lore_repo, lore_service_runner):
 
     lore_service_runner.start()
 
-    assert os.path.exists(swfs_repo.path)
-    for file_name in file_contents:
-        assert original_repo.compare_file(swfs_repo, file_name)
+    _repositories_match_files(original_repo, swfs_repo, file_contents)
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
+)
+def test_swfs_sync(new_lore_repo, background_lore_service):
+    # Create the original repo with 2 revisions
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    deleted_file = "deleted.txt"
+    nested_deleted_file = "nested/deleted.txt"
+    new_file = "new.txt"
+    nested_new_file = "nested/new.txt"
+
+    def first_contents():
+        return "first contents!"
+
+    def second_contents():
+        return "second contents!"
+
+    file_contents = (
+        {f"f{i}.txt": first_contents() for i in range(4)}
+        | {f"nested/f{i}.txt": first_contents() for i in range(4)}
+        | {deleted_file: first_contents(), nested_deleted_file: first_contents()}
+    )
+    original_repo.write_commit_push(
+        "test message",
+        file_contents,
+    )
+    updated_file_contents = {
+        file_name: second_contents() for file_name in file_contents
+    } | {new_file: second_contents(), nested_new_file: second_contents()}
+    del updated_file_contents[deleted_file]
+    del updated_file_contents[nested_deleted_file]
+    original_repo.remove_file(deleted_file)
+    original_repo.remove_file(nested_deleted_file)
+    original_repo.stage(".", scan=True)
+    original_repo.write_commit_push("update message", updated_file_contents)
+
+    # Clone that repository into an SWFS repo
+    original_repo.shared_store_create(original_repo.remote)
+
+    swfs_repo = original_repo.clone(vfs="swfs", use_shared_store=True)
+
+    _repositories_match_files(original_repo, swfs_repo, updated_file_contents)
+    assert not swfs_repo.file_exists(deleted_file)
+    assert not swfs_repo.file_exists(nested_deleted_file)
+
+    # Sync backwards and forwards, expecting the content to update each way
+    swfs_repo.sync("main@1", force=True)
+    original_repo.sync("main@1")
+
+    _repositories_match_files(original_repo, swfs_repo, file_contents)
+    assert not swfs_repo.file_exists(new_file)
+    assert not swfs_repo.file_exists(nested_new_file)
+
+    swfs_repo.sync("main@latest", force=True)
+    original_repo.sync("main@latest")
+
+    _repositories_match_files(original_repo, swfs_repo, updated_file_contents)
+    assert not swfs_repo.file_exists(deleted_file)
+    assert not swfs_repo.file_exists(nested_deleted_file)
+
+
+def _swfs_clone(original_repo: Lore) -> Lore:
+    original_repo.shared_store_create(original_repo.remote)
+    return original_repo.clone(vfs="swfs", use_shared_store=True)
+
+
+def _remove_commit_push(repo: Lore, message: str, removed: typing.Sequence[str]):
+    for file_name in removed:
+        repo.remove_file(file_name)
+    repo.stage(".", scan=True)
+    repo.commit(message=message)
+    repo.push()
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
+)
+def test_swfs_sync_removes_file_with_no_other_changes(
+    new_lore_repo, background_lore_service
+):
+    # The second revision only removes files, so nothing else is written during the sync that
+    # could cause the thaw to take effect incidentally.
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    removed_file = "removed.txt"
+    nested_removed_file = "nested/removed.txt"
+    kept_contents = {
+        "kept.txt": "kept contents!",
+        "nested/kept.txt": "nested kept contents!",
+    }
+    original_repo.write_commit_push(
+        "first",
+        kept_contents
+        | {removed_file: "to be removed", nested_removed_file: "nested to be removed"},
+    )
+    _remove_commit_push(original_repo, "remove only", [removed_file, nested_removed_file])
+
+    swfs_repo = _swfs_clone(original_repo)
+    assert not swfs_repo.file_exists(removed_file)
+    assert not swfs_repo.file_exists(nested_removed_file)
+
+    swfs_repo.sync("main@1", force=True)
+    assert swfs_repo.file_exists(removed_file)
+    assert swfs_repo.file_exists(nested_removed_file)
+
+    swfs_repo.sync("main@latest", force=True)
+    assert not swfs_repo.file_exists(removed_file)
+    assert not swfs_repo.file_exists(nested_removed_file)
+    _repositories_match_files(original_repo, swfs_repo, kept_contents)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "A forced sync does not yet clear SWFS's local writes to a file the sync changes: "
+        "the mount keeps showing the locally written contents."
+    ),
+)
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
+)
+def test_swfs_sync_force_clears_local_writes(new_lore_repo, background_lore_service):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    unchanged_contents = {
+        "unchanged.txt": "unchanged contents",
+        "nested/unchanged.txt": "nested unchanged contents",
+    }
+    original_repo.write_commit_push(
+        "first",
+        unchanged_contents
+        | {"changed.txt": "first changed", "nested/changed.txt": "first nested changed"},
+    )
+    changed_contents = {
+        "changed.txt": "second changed",
+        "nested/changed.txt": "second nested changed",
+    }
+    original_repo.write_commit_push("second", changed_contents)
+
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.sync("main@1", force=True)
+    original_repo.sync("main@1")
+
+    # Overwrite tracked files through the mount, with contents of a different length: some the
+    # next revision changes, some it leaves alone.
+    local_contents = {
+        "changed.txt": "locally written changed, longer than the original",
+        "nested/changed.txt": "local",
+        "unchanged.txt": "locally written unchanged, longer than the original",
+        "nested/unchanged.txt": "local",
+    }
+    swfs_repo.write_files(local_contents)
+    for file_name in local_contents:
+        assert not original_repo.compare_file(
+            swfs_repo, file_name, only_file_contents=True
+        )
+
+    swfs_repo.sync("main@latest", force=True)
+    original_repo.sync("main@latest")
+
+    # The files the sync changed hold the synced contents, the local writes gone.
+    _repositories_match_files(original_repo, swfs_repo, list(changed_contents))
+    # As on a plain filesystem, a forced sync leaves alone files it has no change for.
+    for file_name in unchanged_contents:
+        with swfs_repo.open_file(file_name) as unchanged_file:
+            assert unchanged_file.read() == local_contents[file_name]
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
+)
+def test_swfs_sync_force_removes_locally_written_file(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    removed_file = "removed.txt"
+    nested_removed_file = "nested/removed.txt"
+    kept_contents = {"kept.txt": "kept contents!"}
+    original_repo.write_commit_push(
+        "first",
+        kept_contents
+        | {removed_file: "to be removed", nested_removed_file: "nested to be removed"},
+    )
+    _remove_commit_push(original_repo, "remove only", [removed_file, nested_removed_file])
+
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.sync("main@1", force=True)
+    assert swfs_repo.file_exists(removed_file)
+    assert swfs_repo.file_exists(nested_removed_file)
+
+    # Write locally to the files the next revision removes, so SWFS holds changes to them.
+    swfs_repo.write_files(
+        {
+            removed_file: "locally written, longer than the original contents",
+            nested_removed_file: "local",
+        }
+    )
+
+    swfs_repo.sync("main@latest", force=True)
+
+    assert not swfs_repo.file_exists(removed_file)
+    assert not swfs_repo.file_exists(nested_removed_file)
+    _repositories_match_files(original_repo, swfs_repo, kept_contents)
