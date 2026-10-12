@@ -143,7 +143,7 @@ pub struct LoreRepositoryCloneArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::RepositoryCloneBegin`](crate::interface::LoreEvent::RepositoryCloneBegin) | Emitted when clone begins, includes remote URL and target path |
 /// | [`LoreEvent::RepositoryCloneProgress`](crate::interface::LoreEvent::RepositoryCloneProgress) | Emitted periodically during clone with progress data, and at completion with final totals |
-/// | [`LoreEvent::RepositoryCloneEnd`](crate::interface::LoreEvent::RepositoryCloneEnd) | Emitted when clone completes successfully |
+/// | [`LoreEvent::RepositoryCloneEnd`](crate::interface::LoreEvent::RepositoryCloneEnd) | Emitted only when the clone succeeds; [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) reports the outcome of every clone |
 /// | [`LoreEvent::RevisionSyncTarget`](crate::interface::LoreEvent::RevisionSyncTarget) | Emitted after resolving the target revision to sync during clone |
 /// | [`LoreEvent::RevisionSyncRevision`](crate::interface::LoreEvent::RevisionSyncRevision) | Emitted with the resulting revision |
 /// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted periodically during initial file sync |

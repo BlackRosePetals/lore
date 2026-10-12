@@ -7,13 +7,25 @@
 
 use std::sync::Arc;
 
+use lore_base::error::AddressNotFound;
 use lore_base::lore_spawn;
+use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
+use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::os::OsFilesystem;
+use lore_revision::node::Node;
+use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::clone::*;
+use lore_revision::stage::stage_single_node;
+use lore_revision::state::State;
 use lore_revision::util::path::RelativePath;
+use zerocopy::FromZeros;
+
+use crate::fs::filesystem_provider::setup_test_execution;
+use crate::repository::test_helpers::file_node;
+use crate::repository::test_helpers::working_tree_repository;
 
 async fn create_operation() -> (TempDir, Arc<InstanceOperationImpl>) {
     let temp = TempDir::new("lore-clone-temp-path-");
@@ -238,4 +250,83 @@ async fn adversarial_concurrent_calls_same_parent() {
 
     assert!(on_disk(&temp, &parent).is_dir());
     assert_eq!(stats.created_parents.len(), 1);
+}
+
+/// A node with neither the file nor the link flag, which makes it a directory, and no children.
+fn empty_directory_node() -> Node {
+    Node::new_zeroed()
+}
+
+/// A state holding at its root `count` empty directories and as many files whose content no store
+/// holds, named so that directories and files alternate in any order of names. Discovery creates
+/// each empty directory as it reaches it, which keeps it walking the tree while writing the files
+/// fails.
+async fn state_of_unwritable_files(
+    repository: &Arc<RepositoryContext>,
+    count: usize,
+) -> Arc<State> {
+    let state = State::new();
+    for index in 0..count {
+        let entries = [
+            (format!("{index:04}-directory"), empty_directory_node()),
+            (
+                format!("{index:04}-file"),
+                file_node(index.to_string().as_bytes()),
+            ),
+        ];
+        for (name, node) in entries {
+            stage_single_node(
+                repository.clone(),
+                state.clone(),
+                relative_path(&name),
+                node,
+                Arc::default(),
+                None,
+                FilterMode::Full,
+            )
+            .await
+            .expect("stage the node");
+        }
+    }
+    state
+}
+
+/// Whether `error`, or an error among its sources, is a `T`.
+fn caused_by<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| error.source()).any(|error| error.is::<T>())
+}
+
+/// A clone that fails to write a file reports that failure. Discovery is still walking the tree
+/// when writing stops, and then fails because it cannot pass on the files it finds next. The clone
+/// does not report that second failure.
+#[tokio::test]
+async fn a_clone_reports_a_failed_file_write_rather_than_the_stopped_discovery() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-unwritable-files-");
+            let repository = working_tree_repository(temp.path()).await;
+            let state = state_of_unwritable_files(&repository, 2_000).await;
+            let ctx = CloneContext {
+                operation: repository
+                    .file_system()
+                    .begin_operation()
+                    .await
+                    .expect("Starting test operation"),
+                repository,
+                state,
+                options: Arc::default(),
+                stats: Arc::default(),
+                modified_times: Arc::default(),
+            };
+
+            let error = clone_in_path(ctx)
+                .await
+                .expect_err("no file can be written");
+
+            assert!(
+                caused_by::<AddressNotFound>(&error),
+                "the clone reported {error:?} rather than the content it could not fetch"
+            );
+        })
+        .await;
 }

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
+from error_types import LoreException
 from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
 
 from lore import Lore
@@ -270,3 +271,32 @@ def test_clone_keeps_file_metadata_for_offline_use(new_lore_repo, flag):
     clone: Lore = repo.clone(**{flag: True})
 
     assert "blue" in clone.file_metadata_get("described.txt", "color", offline=True)
+
+
+@pytest.mark.smoke
+def test_failed_clone_sends_no_clone_end_event(new_lore_repo, scratch_dir):
+    """A clone that fails to write a file fails the command and sends no repositoryCloneEnd
+    event. That event, and the "Clone complete" line the CLI prints for it, are only for a clone
+    that succeeded."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(
+        "Initial commit",
+        {"blocker/inside.txt": "inside\n", "file.txt": "content\n"},
+    )
+
+    # The clone target holds a file where the revision has the directory `blocker`, so the
+    # clone cannot write blocker/inside.txt.
+    target = scratch_dir("blocked-clone", create=True)
+    (target / "blocker").write_text("not a directory\n")
+
+    with pytest.raises(LoreException) as failure:
+        repo.run(["repository", "clone", repo.remote_path, str(target)], json=True)
+    output = str(failure.value)
+
+    # The command reports the failure on its complete event ...
+    complete = parse_jsonl(output, "complete")
+    assert complete and complete[-1]["status"] != 0, f"the clone should fail: {output}"
+    # ... and never reports the clone as finished.
+    assert not parse_jsonl(output, "repositoryCloneEnd"), (
+        f"a clone that failed sent a repositoryCloneEnd event: {output}"
+    )

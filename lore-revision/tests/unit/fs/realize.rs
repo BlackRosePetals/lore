@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::path::Path;
 use std::sync::Arc;
 
 use lore_revision::change;
@@ -25,8 +24,8 @@ use lore_revision::util::path::RelativePathBuf;
 use lore_storage::hash;
 use zerocopy::FromZeros;
 
-use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
-use crate::repository::test_helpers::default_repository_creation_args;
+use crate::repository::test_helpers::file_node;
+use crate::repository::test_helpers::working_tree_repository;
 
 async fn with_execution<F: Future>(body: F) -> F::Output {
     let execution = Arc::new(lore_revision::interface::ExecutionContext::new_client(
@@ -38,43 +37,10 @@ async fn with_execution<F: Future>(body: F) -> F::Output {
         .await
 }
 
-async fn working_tree_repository(path: &Path) -> Arc<RepositoryContext> {
-    let immutable_store = lore_storage::local::immutable_store::create(
-        None::<&str>,
-        lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
-        false,
-        lore_storage::ImmutableStoreSettings::default(),
-    )
-    .await
-    .expect("in-memory immutable store");
-    let mutable_store = lore_storage::local::mutable_store::create(
-        None::<&str>,
-        lore_storage::MutableStoreSettings::default(),
-        immutable_store.clone(),
-    )
-    .await
-    .expect("in-memory mutable store");
-
-    Arc::new(
-        RepositoryContext::new(
-            default_repository_creation_args(immutable_store, mutable_store).with_path(path),
-        )
-        .with_write_token(lore_revision::repository::RepositoryWriteToken::acquire(path).await),
-    )
-}
-
 fn pseudo_random_bytes(length: usize, salt: usize) -> Vec<u8> {
     (0..length)
         .map(|index| (index.wrapping_add(salt).wrapping_mul(2_654_435_761) >> 11) as u8)
         .collect()
-}
-
-fn file_node(content: &[u8]) -> Node {
-    let mut node = Node::new_zeroed();
-    node.flags = NodeFlags::File.bits();
-    node.address = lore_base::types::Address::zero_context_hash(hash::hash_slice(content));
-    node.size = content.len() as u64;
-    node
 }
 
 /// One side of a change: the state holding a node at a path, and what it addresses.

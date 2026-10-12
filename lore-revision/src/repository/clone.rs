@@ -246,7 +246,8 @@ pub struct LoreRepositoryCloneProgressEventData {
     pub count: LoreRepositoryCloneCountData,
 }
 
-/// Data for the event emitted when a clone finishes.
+/// Data for the event emitted when a clone succeeds. A clone that fails sends no such event, and
+/// reports its outcome on the complete event as every clone does.
 #[repr(C)]
 #[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
@@ -1023,6 +1024,9 @@ pub async fn clone(
 /// Completes [`clone`] once the repository exists locally and its branch is fetched: applies the
 /// view, resolves the revision and layer, records the branch and materializes the tree.
 ///
+/// Sends the clone end event only for a clone that succeeded. A failure to materialize the tree
+/// is reported ahead of a failure to record the branch or to finish the operation.
+///
 /// A function of its own because its locals live across several awaits: kept in [`clone`] they
 /// would take space in its future while the repository is created as well.
 #[allow(clippy::too_many_arguments)]
@@ -1284,6 +1288,8 @@ async fn clone_into(
         let _ = task.await;
     }
 
+    materialize_result.and(store_result).and(operation_result)?;
+
     event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
         branch: branch_name.into(),
         revision,
@@ -1291,7 +1297,7 @@ async fn clone_into(
     })
     .send();
 
-    operation_result.and(materialize_result.and(store_result))
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1348,6 +1354,9 @@ async fn clone_materialize_hold(ctx: &CloneContext) -> Result<(), CloneError> {
         .forward::<CloneError>("Holding the cloned revision")
 }
 
+/// Materializes `revision` in the working tree and records it, and `branch_id`, as the instance's
+/// current state, which it records whether or not materializing succeeded. A failure to
+/// materialize is reported ahead of a failure to record the state.
 async fn clone_materialize(
     ctx: CloneContext,
     remote: Arc<lore_transport::Connection>,
@@ -1418,17 +1427,22 @@ async fn clone_materialize(
         }
     }
 
-    crate::instance::store_current_anchor_branch(&repository, branch_id)
-        .await
-        .forward::<CloneError>("Failed to write current state anchor to repository")?;
-    crate::instance::store_current_anchor(&repository, revision)
-        .await
-        .forward::<CloneError>("Failed to write current state anchor to repository")?;
+    let anchor_result = async {
+        crate::instance::store_current_anchor_branch(&repository, branch_id).await?;
+        crate::instance::store_current_anchor(&repository, revision).await
+    }
+    .await
+    .forward::<CloneError>("Failed to write current state anchor to repository");
 
-    clone_result
+    clone_result.and(anchor_result)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Writes the files of `ctx.state` to the working tree, discovering them in one task and writing
+/// them in another.
+///
+/// A failure to write a file is reported ahead of a failure in discovery. Discovery fails once
+/// writing stops taking files, so its error is then a result of the failure to write.
+#[lore_macro::test_pub]
 async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
     let (file_tx, file_rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
 
@@ -1539,8 +1553,10 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
     let consumer = lore_spawn!(async move { clone_execute(file_rx, ctx).await });
 
     let (producer_result, consumer_result) = tokio::join!(producer, consumer);
-    producer_result.internal("Recursion task failed")??;
-    consumer_result.internal("Recursion task failed")??;
+    let producer_result = producer_result.internal("Recursion task failed")?;
+    let consumer_result = consumer_result.internal("Recursion task failed")?;
+    consumer_result?;
+    producer_result?;
 
     Ok(())
 }

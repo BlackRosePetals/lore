@@ -1110,7 +1110,8 @@ pub enum LoreEvent {
     RepositoryCloneBegin(LoreRepositoryCloneBeginEventData),
     /// Progress during a repository clone.
     RepositoryCloneProgress(LoreRepositoryCloneProgressEventData),
-    /// The end of a repository clone.
+    /// The end of a repository clone that succeeded. A clone that fails sends none, and reports its
+    /// outcome on the complete event as every clone does.
     RepositoryCloneEnd(LoreRepositoryCloneEndEventData),
     /// The start of resolving dependencies.
     DependencyResolveBegin(LoreDependencyResolveBeginEventData),

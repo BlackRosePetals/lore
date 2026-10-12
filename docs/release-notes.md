@@ -48,6 +48,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore clone` reports the error that stopped it, such as a file it failed to fetch or write, in place of
+  `Recursion task failed`. A clone that fails no longer prints `Clone complete`, and the C API sends
+  `LORE_EVENT_REPOSITORY_CLONE_END` only for a clone that succeeded, as documented. A consumer reads the outcome of a
+  clone from `LORE_EVENT_COMPLETE`, which every clone sends whether it succeeded or failed
 - `loreserver`: a revision list starting at a revision numbered above the branch's latest, such as one a client hasn't
   pushed, returns no forward cursor in place of stopping the server
 - QUIC: the client requests a 512 KiB UDP receive buffer, which Linux allocates as 1 MiB. Linux caps the request at
