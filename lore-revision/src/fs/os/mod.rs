@@ -68,6 +68,7 @@ impl FilesystemProvider for OsFilesystem {
     async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
         Ok(Arc::new(InstanceOperationImpl::new(
             StaticDispatchInstanceOperation::Os(OsFilesystem::begin_operation(self)),
+            self.holds_state(),
         )))
     }
 }

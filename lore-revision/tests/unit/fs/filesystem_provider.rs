@@ -16,10 +16,12 @@ use lore_revision::fs::filesystem_provider::FilesystemDiffIntent;
 use lore_revision::fs::filesystem_provider::FilesystemDiffTree;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::FsError;
+use lore_revision::fs::filesystem_provider::HoldOptions;
 use lore_revision::fs::filesystem_provider::InstanceOperation;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::filesystem_provider::StaticDispatchInstanceOperation;
 use lore_revision::fs::filesystem_provider::create_empty_directory;
+use lore_revision::fs::filesystem_provider::test_util::HoldCalls;
 use lore_revision::fs::filesystem_provider::test_util::TestOperation;
 use lore_revision::fs::filesystem_provider::with_operation;
 use lore_revision::fs::filesystem_provider::with_operation_if;
@@ -40,6 +42,7 @@ pub struct TestFilesystemProvider {
     pub holds_name_count: Arc<AtomicUsize>,
     pub names_folding_count: Arc<AtomicUsize>,
     pub finalize_events: Arc<Mutex<Vec<bool>>>,
+    pub hold_calls: HoldCalls,
     /// Paths whose scan fails.
     pub failing_scans: Arc<Mutex<Vec<String>>>,
     /// Paths whose scan finds the named node stale.
@@ -47,6 +50,8 @@ pub struct TestFilesystemProvider {
     finalize_fails: bool,
     write_fails: bool,
     holds_paths: bool,
+    holds_state: bool,
+    hold_refuses: bool,
 }
 
 impl TestFilesystemProvider {
@@ -79,6 +84,22 @@ impl TestFilesystemProvider {
         }
     }
 
+    /// A provider that holds its state in a `State`.
+    pub fn holding_state() -> TestFilesystemProvider {
+        Self {
+            holds_state: true,
+            ..Self::new()
+        }
+    }
+
+    /// A provider that holds its state, whose operations refuse each hold for local changes.
+    pub fn refusing_holds() -> TestFilesystemProvider {
+        Self {
+            hold_refuses: true,
+            ..Self::holding_state()
+        }
+    }
+
     pub fn begins(&self) -> usize {
         self.begin_count.load(Ordering::Acquire)
     }
@@ -102,6 +123,16 @@ impl TestFilesystemProvider {
 pub async fn test_repository(filesystem: Arc<TestFilesystemProvider>) -> Arc<RepositoryContext> {
     let (immutable_store, mutable_store, _context) =
         test_store_create().await.expect("Making test stores");
+    test_repository_over(immutable_store, mutable_store, filesystem)
+}
+
+/// A repository over `immutable_store` and `mutable_store` whose filesystem provider is
+/// `filesystem`.
+pub fn test_repository_over(
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    filesystem: Arc<TestFilesystemProvider>,
+) -> Arc<RepositoryContext> {
     Arc::new(RepositoryContext::new(
         default_repository_creation_args(immutable_store, mutable_store)
             .with_filesystem_provider(filesystem),
@@ -121,10 +152,17 @@ impl FilesystemProvider for TestFilesystemProvider {
                 finalize_fails: self.finalize_fails,
                 write_fails: self.write_fails,
                 holds_paths: self.holds_paths,
+                hold_calls: self.hold_calls.clone(),
+                hold_refuses: self.hold_refuses,
                 failing_scans: self.failing_scans.clone(),
                 stale_on_scan: self.stale_on_scan.clone(),
             }),
+            self.holds_state,
         )))
+    }
+
+    fn holds_state(&self) -> bool {
+        self.holds_state
     }
 }
 
@@ -305,6 +343,107 @@ async fn an_operation_whose_write_failed_finalizes_as_changed() {
 
     result.expect_err("The write failed");
     assert_eq!(vec![true], *(filesystem.finalize_events.lock()));
+}
+
+/// Holding a revision changes what the provider serves, as a write does.
+#[tokio::test]
+async fn an_operation_that_held_a_revision_finalizes_as_changed() {
+    let filesystem = Arc::new(TestFilesystemProvider::holding_state());
+    let repository = test_repository(filesystem.clone()).await;
+
+    with_operation(repository.file_system(), async |operation| {
+        operation
+            .hold_state(repository.clone(), State::new(), HoldOptions::default())
+            .await
+    })
+    .await
+    .expect("The hold succeeded");
+
+    assert_eq!(vec![true], *(filesystem.finalize_events.lock()));
+}
+
+/// A dry run changes nothing the provider serves.
+#[tokio::test]
+async fn an_operation_that_held_a_revision_in_a_dry_run_finalizes_unchanged() {
+    let filesystem = Arc::new(TestFilesystemProvider::holding_state());
+    let repository = test_repository(filesystem.clone()).await;
+
+    with_operation(repository.file_system(), async |operation| {
+        operation
+            .hold_state(
+                repository.clone(),
+                State::new(),
+                HoldOptions {
+                    dry_run: true,
+                    ..Default::default()
+                },
+            )
+            .await
+    })
+    .await
+    .expect("The hold succeeded");
+
+    assert_eq!(vec![false], *(filesystem.finalize_events.lock()));
+}
+
+/// An OS operation holds no `State`, and refuses to hold a revision.
+#[tokio::test]
+async fn an_os_operation_refuses_to_hold_a_revision() {
+    let dir = lore_base::test_util::TempDir::new("lore-fs-provider-hold-state-");
+    let operation = os_operation(dir.path()).await;
+    assert!(!operation.holds_state());
+
+    let repository = test_repository(Arc::new(TestFilesystemProvider::new())).await;
+    let refused = operation
+        .hold_state(repository, State::new(), HoldOptions::default())
+        .await;
+    assert!(matches!(refused, Err(FsError::Internal(_))), "{refused:?}");
+}
+
+/// A provider that holds no `State` refuses to hold a revision, records nothing, and its
+/// operation finalizes unchanged.
+#[tokio::test]
+async fn a_refused_hold_finalizes_unchanged() {
+    let filesystem = Arc::new(TestFilesystemProvider::new());
+    let repository = test_repository(filesystem.clone()).await;
+
+    let refused = with_operation(repository.file_system(), async |operation| {
+        operation
+            .hold_state(repository.clone(), State::new(), HoldOptions::default())
+            .await
+    })
+    .await;
+
+    assert!(matches!(refused, Err(FsError::Internal(_))), "{refused:?}");
+    assert!(filesystem.hold_calls.lock().is_empty());
+    assert_eq!(vec![false], *(filesystem.finalize_events.lock()));
+}
+
+/// A provider built with `holding_state()` reports it holds its state, and its operation records
+/// the target revision and the options it was given.
+#[tokio::test]
+async fn a_holding_test_operation_records_the_target_and_options() {
+    let filesystem = Arc::new(TestFilesystemProvider::holding_state());
+    let repository = test_repository(filesystem.clone()).await;
+    let operation = filesystem.begin_operation().await.expect("an operation");
+    assert!(operation.holds_state());
+
+    let target = State::new();
+    target.set_revision(lore_base::types::Hash::from_u64(2));
+    let options = HoldOptions {
+        keep_local: true,
+        ..Default::default()
+    };
+
+    operation
+        .hold_state(repository, target.clone(), options)
+        .await
+        .expect("a holding test operation always succeeds");
+
+    assert_eq!(
+        vec![(target.revision(), options)],
+        *filesystem.hold_calls.lock()
+    );
 }
 
 #[tokio::test]
@@ -721,9 +860,16 @@ pub async fn test_store_create() -> Result<
 }
 
 pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
+    test_execution_with(lore_revision::interface::LoreGlobalArgs::default())
+}
+
+/// An execution whose global arguments are `args`.
+pub fn test_execution_with(
+    args: lore_revision::interface::LoreGlobalArgs,
+) -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
     std::sync::Arc::new(
         lore_revision::interface::ExecutionContext::new_client_with_user_id(
-            lore_revision::interface::LoreGlobalArgs::default(),
+            args,
             lore_revision::relay::EventDispatcher::no_dispatch(),
             "test-user".to_string(),
         ),

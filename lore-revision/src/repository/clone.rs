@@ -41,11 +41,13 @@ use crate::event::EventError;
 use crate::filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::HoldOptions;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::create_empty_directory;
 use crate::fs::filesystem_provider::match_node_executable;
 use crate::fs::filesystem_provider::set_file_to_node;
+use crate::fs::hold;
 use crate::hash::hash_string_bytes;
 use crate::instance::InstanceId;
 use crate::interface::LoreArray;
@@ -1180,6 +1182,7 @@ async fn clone_into(
             );
         }
     }
+    refuse_on_held_state(&repository, &options, revision)?;
 
     let (state, metadata) = tokio::try_join!(
         async {
@@ -1302,6 +1305,49 @@ pub struct CloneContext {
     pub modified_times: Arc<state::RecordedModifiedTimes>,
 }
 
+/// Refuses a clone of `revision` restricted to a dependency set onto a provider that holds its
+/// state in a `State` ([`FilesystemProvider::holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)),
+/// which holds whole revisions. A bare clone, or one of an empty repository, writes no tree, so it
+/// is refused nothing.
+#[lore_macro::test_pub]
+fn refuse_on_held_state(
+    repository: &RepositoryContext,
+    options: &CloneOptions,
+    revision: Hash,
+) -> Result<(), CloneError> {
+    if options.bare
+        || revision.is_zero()
+        || options.root_files.is_empty()
+        || !repository.file_system().holds_state()
+    {
+        return Ok(());
+    }
+    Err(hold::refused("restrict a clone to a dependency set").into())
+}
+
+/// Hands `ctx.state` to the operation to hold ([`InstanceOperationImpl::hold_state`]), for a
+/// provider that holds its state in a `State` ([`InstanceOperationImpl::holds_state`]).
+///
+/// A bare clone, or one of an empty repository, hands it nothing, as either writes no tree, and
+/// so does a dry run.
+#[lore_macro::test_pub]
+async fn clone_materialize_hold(ctx: &CloneContext) -> Result<(), CloneError> {
+    if ctx.options.bare || ctx.state.revision().is_zero() {
+        return Ok(());
+    }
+    if execution_context().globals().dry_run() {
+        return Ok(());
+    }
+    ctx.operation
+        .hold_state(
+            ctx.repository.clone(),
+            ctx.state.clone(),
+            HoldOptions::default(),
+        )
+        .await
+        .forward::<CloneError>("Holding the cloned revision")
+}
+
 async fn clone_materialize(
     ctx: CloneContext,
     remote: Arc<lore_transport::Connection>,
@@ -1318,7 +1364,9 @@ async fn clone_materialize(
     let mut clone_result = Ok(());
     let mut cache_task = None;
 
-    if !options.bare && !revision.is_zero() {
+    if ctx.operation.holds_state() {
+        clone_materialize_hold(&ctx).await?;
+    } else if !options.bare && !revision.is_zero() {
         lore_info!("Pull state {revision}");
         let correlation_id = execution_context().globals().correlation_id.to_string();
         let _storage = remote

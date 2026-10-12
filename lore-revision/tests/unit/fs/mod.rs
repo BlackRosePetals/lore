@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 pub(crate) mod filesystem_provider;
+mod hold;
 mod os;
 mod realize;
 mod swfs;

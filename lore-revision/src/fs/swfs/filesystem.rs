@@ -64,8 +64,10 @@ impl SwfsFilesystem {
 #[async_trait]
 impl FilesystemProvider for SwfsFilesystem {
     async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
+        let holds_state = self.holds_state();
         Ok(Arc::new(InstanceOperationImpl::new(
             StaticDispatchInstanceOperation::Swfs(self.begin_operation().await?),
+            holds_state,
         )))
     }
 }

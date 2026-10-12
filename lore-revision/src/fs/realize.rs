@@ -23,6 +23,7 @@ use crate::errors::WriteRequired;
 use crate::event;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
+use crate::fs::filesystem_provider::HoldOptions;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::MeasuredNode;
@@ -70,7 +71,9 @@ use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::path::expand_path_ancestors;
 
-/// Carries the working tree from `state_current` to `state_target`.
+/// Carries the working tree from `state_current` to `state_target`. A provider that holds its
+/// state in a `State` is handed `state_target` alone and carries itself there
+/// ([`InstanceOperationImpl::hold_state`]).
 ///
 /// Each context answers for the state beside it: one for a revision change, and two for a view
 /// change, where the tree holds what the current view materialized and is left holding what the
@@ -128,6 +131,22 @@ pub async fn realize_state(
         }
     }
     */
+
+    if operation.holds_state() {
+        let hold = {
+            let context = execution_context();
+            let globals = context.globals();
+            HoldOptions {
+                overwrite_local: globals.force(),
+                keep_local: options.forward_changes,
+                dry_run: globals.dry_run(),
+            }
+        };
+        return operation
+            .hold_state(repository_target, state_target, hold)
+            .await
+            .forward::<SyncError>("Holding the target revision");
+    }
 
     let stats: Arc<SyncRealizeStats> = Arc::default();
     let changes = if !options.reset {
@@ -2750,7 +2769,7 @@ async fn stage_divergent_move(
 }
 
 impl LoreRevisionSyncFileEventData {
-    fn new(node_change: &NodeChange, size: u64, file: bool) -> Self {
+    pub(crate) fn new(node_change: &NodeChange, size: u64, file: bool) -> Self {
         Self {
             path: LoreString::from(node_change.path()),
             size,

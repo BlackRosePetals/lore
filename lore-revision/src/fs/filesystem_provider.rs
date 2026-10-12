@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::error::InvalidArguments;
+use lore_base::error::LocalModifications;
 use lore_base::types::Fragment;
 use lore_error_set::ErrorSet;
 use lore_error_set::error_set;
@@ -44,6 +45,7 @@ use crate::util::path::RelativePath;
 #[error_set]
 pub enum FsError {
     InvalidArguments,
+    LocalModifications,
 }
 
 impl From<std::io::Error> for FsError {
@@ -324,6 +326,14 @@ pub trait FilesystemProvider: Send + Sync + 'static {
     /// - **`SWFS`**: Freezes the filesystem, creates a snapshot, returns operations that work
     ///   against the snapshot.
     async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError>;
+
+    /// Whether the provider holds the working tree's current state as a `State` it serves reads
+    /// from, rather than as files on a filesystem. Every operation it begins answers the same
+    /// ([`InstanceOperationImpl::holds_state`]), so a provider handing out another provider's
+    /// operations answers as that provider does.
+    fn holds_state(&self) -> bool {
+        false
+    }
 }
 
 /// Runs `work` inside one filesystem operation, finalizing it whether or not the work
@@ -714,8 +724,25 @@ pub enum StaticDispatchInstanceOperation {
     Test(test_util::TestOperation),
 }
 
+/// What holding a target revision does to the local changes at the paths it changes
+/// ([`InstanceOperationImpl::hold_state`]). Without `overwrite_local` or `keep_local`, a local
+/// change at such a path refuses the hold, as it refuses a sync.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HoldOptions {
+    /// Give a local file the target's content, or remove it where the target removes it, as a
+    /// forced sync does, whatever `keep_local` asks.
+    pub overwrite_local: bool,
+    /// Keep each local change, a local deletion included, as a sync forwarding local changes
+    /// does.
+    pub keep_local: bool,
+    /// Check and report what holding the target changes, changing nothing.
+    pub dry_run: bool,
+}
+
 pub struct InstanceOperationImpl {
     dispatch: StaticDispatchInstanceOperation,
+    /// What the provider that began the operation answers for [`FilesystemProvider::holds_state`].
+    holds_state: bool,
     finalized: AtomicBool,
     changed: AtomicBool,
     modified_times: RecordedModifiedTimes,
@@ -724,9 +751,10 @@ pub struct InstanceOperationImpl {
 }
 
 impl InstanceOperationImpl {
-    pub fn new(dispatch: StaticDispatchInstanceOperation) -> Self {
+    pub fn new(dispatch: StaticDispatchInstanceOperation, holds_state: bool) -> Self {
         Self {
             dispatch,
+            holds_state,
             finalized: AtomicBool::new(false),
             changed: AtomicBool::new(false),
             modified_times: RecordedModifiedTimes::default(),
@@ -793,6 +821,39 @@ impl InstanceOperationImpl {
             StaticDispatchInstanceOperation::Os(_this) => Ok(()),
             StaticDispatchInstanceOperation::Swfs(this) => this.finalize(changes_made).await,
         }
+    }
+
+    /// Whether the provider that began this operation holds its state in a `State`
+    /// ([`FilesystemProvider::holds_state`]).
+    pub fn holds_state(&self) -> bool {
+        self.holds_state
+    }
+
+    /// Hands `target`, under `repository`, its context, to a provider that holds its state in a
+    /// `State` ([`FilesystemProvider::holds_state`]) to hold as the revision the working tree
+    /// stands at, its local changes refused, kept or overwritten as `options` asks
+    /// ([`crate::fs::hold`]). Outside a dry run the hold counts as a change. An operation that
+    /// holds no `State` refuses, changing nothing.
+    #[allow(clippy::unused_async)]
+    pub async fn hold_state(
+        &self,
+        repository: Arc<RepositoryContext>,
+        target: Arc<State>,
+        options: HoldOptions,
+    ) -> Result<(), FsError> {
+        #[cfg(feature = "test-util")]
+        if let StaticDispatchInstanceOperation::Test(this) = &self.dispatch
+            && self.holds_state
+        {
+            if !options.dry_run {
+                self.record_change();
+            }
+            return this.hold_state(&target, options);
+        }
+        let _ = (repository, target, options);
+        Err(FsError::internal(
+            "Unable to hold a revision through an operation that holds no State",
+        ))
     }
 }
 
@@ -1036,6 +1097,7 @@ pub mod test_util {
     use std::sync::atomic::Ordering;
 
     use bytes::Bytes;
+    use lore_base::error::LocalModifications;
     use lore_base::types::Fragment;
     use parking_lot::Mutex;
 
@@ -1043,19 +1105,25 @@ pub mod test_util {
     use crate::fs::filesystem_provider::FileInfo;
     use crate::fs::filesystem_provider::FilesystemDiffContext;
     use crate::fs::filesystem_provider::FsError;
+    use crate::fs::filesystem_provider::HoldOptions;
     use crate::fs::filesystem_provider::InstanceOperation;
     use crate::lore::Address;
+    use crate::lore::Hash;
     use crate::node::Node;
     use crate::node::NodeID;
     use crate::repository::RepositoryContext;
     use crate::state::ChangeStream;
     use crate::state::FilesystemDiffStats;
     use crate::state::NodeComparison;
+    use crate::state::State;
     use crate::state::StateError;
     use crate::util::path::RelativePath;
 
-    /// Answers the reads and the directory create these tests make, and records each finalize.
-    /// Every other member panics.
+    /// Each `hold_state` call recorded as `(target revision, options)`.
+    pub type HoldCalls = Arc<Mutex<Vec<(Hash, HoldOptions)>>>;
+
+    /// Answers the reads and the directory create these tests make, and records each finalize
+    /// and hold. Every other member panics.
     pub struct TestOperation {
         pub file_info_count: Arc<AtomicUsize>,
         pub holds_name_count: Arc<AtomicUsize>,
@@ -1064,6 +1132,9 @@ pub mod test_util {
         pub finalize_fails: bool,
         pub write_fails: bool,
         pub holds_paths: bool,
+        pub hold_calls: HoldCalls,
+        /// Whether each hold is refused for local changes.
+        pub hold_refuses: bool,
         /// Paths whose scan fails, as one over a working tree that cannot be read does.
         pub failing_scans: Arc<Mutex<Vec<String>>>,
         /// Paths whose scan finds the named node of the tree it walks stale, and queues it for
@@ -1093,6 +1164,20 @@ pub mod test_util {
             } else {
                 FileInfo::NotExist
             }
+        }
+
+        /// Records the target revision and the options it was given, rather than acting on
+        /// either, having no State to hold, then refuses for local changes where told to.
+        pub(super) fn hold_state(
+            &self,
+            target: &State,
+            options: HoldOptions,
+        ) -> Result<(), FsError> {
+            self.hold_calls.lock().push((target.revision(), options));
+            if self.hold_refuses {
+                return Err(LocalModifications.into());
+            }
+            Ok(())
         }
     }
 

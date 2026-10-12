@@ -341,6 +341,47 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// A provider that holds its state in a `State` refuses a sync carrying the mount, before the
+    /// working tree or the view moves: it holds no files for the layer to be written into.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_holding_its_state_refuses_a_sync_carrying_a_layer() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                fixture.materialize_mount();
+                let narrow = fixture.view_file(NARROW_VIEW, &[EXCLUDE_MOUNT]);
+                let view = fixture.stored_view();
+
+                let result = sync::sync_boxed(
+                    test_holding_context(&fixture.reopened()),
+                    &fixture.instance.write_token,
+                    SyncOptions {
+                        view: Some(narrow),
+                        ..Default::default()
+                    },
+                )
+                .await;
+
+                assert!(
+                    matches!(result, Err(SyncError::InvalidArguments(_))),
+                    "the sync is refused, got {result:?}"
+                );
+                assert_eq!(
+                    (
+                        fixture.working_file(MOUNTED_DROPPED).as_deref(),
+                        fixture.stored_view()
+                    ),
+                    (Some(DROPPED_CONTENT), view),
+                    "the mount and the view stay as they were"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// A mount leaving the view has its content removed, and nothing outside the mount with it.
     ///
     /// The mount path itself is left behind as an empty directory: it is no node of the instance's

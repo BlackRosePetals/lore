@@ -6,6 +6,7 @@
 //! OS-backed and VFS-backed (e.g., SWFS) repository instances.
 
 pub mod filesystem_provider;
+pub mod hold;
 pub mod invalid_filesystem_provider;
 pub mod os;
 pub mod realize;

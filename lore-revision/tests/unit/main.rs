@@ -16,6 +16,9 @@ mod file;
 mod filter;
 mod fs;
 mod global;
+/// The fixtures the crate's process-isolated tests include, shared with these.
+#[path = "../helper.rs"]
+mod helper;
 mod immutable;
 mod infer;
 mod instance;

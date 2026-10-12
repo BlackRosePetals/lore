@@ -162,6 +162,66 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// A provider that holds its state in a `State` refuses a sync restricted to a dependency set,
+    /// as it holds whole revisions, and one resetting local changes, before the instance moves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_holding_its_state_refuses_a_dependency_set_and_a_reset() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                let script = instance.path.join(SCRIPT);
+                test_file_write(script.as_path(), FIRST);
+                let first = test_commit_tree(&instance, "First").await.revision();
+                test_file_write(script.as_path(), SECOND);
+                let second = test_commit_tree(&instance, "Second").await.revision();
+
+                for refused in [
+                    SyncOptions {
+                        root_files: vec![SCRIPT.to_string()],
+                        ..Default::default()
+                    },
+                    SyncOptions {
+                        reset: true,
+                        ..Default::default()
+                    },
+                ] {
+                    let result = sync::sync_boxed(
+                        test_holding_context(&instance.repository),
+                        &instance.write_token,
+                        SyncOptions {
+                            revision: Some(first.to_string()),
+                            ..refused
+                        },
+                    )
+                    .await;
+
+                    assert!(
+                        matches!(result, Err(sync::SyncError::InvalidArguments(_))),
+                        "the sync is refused, got {result:?}"
+                    );
+                    let (current, _) =
+                        lore_revision::instance::load_current_anchor_boxed(&instance.repository)
+                            .await
+                            .expect("Failed to load current anchor");
+                    assert_eq!(
+                        current, second,
+                        "the instance stays at the revision it stood on"
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn sync_explicit_revision() {
         let (_immutable_store, _mutable_store, execution) =

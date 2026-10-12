@@ -226,6 +226,67 @@ pub fn test_filter_context(
     ))
 }
 
+/// An OS filesystem that holds its state in a `State` as far as a command asks it
+/// ([`lore_revision::fs::filesystem_provider::FilesystemProvider::holds_state`]), as its
+/// operations do, while they read and write the files themselves.
+#[allow(dead_code)]
+pub struct HoldingFilesystem {
+    pub inner: lore_revision::fs::os::OsFilesystem,
+}
+
+#[async_trait::async_trait]
+impl lore_revision::fs::filesystem_provider::FilesystemProvider for HoldingFilesystem {
+    async fn begin_operation(
+        &self,
+    ) -> Result<
+        std::sync::Arc<lore_revision::fs::filesystem_provider::InstanceOperationImpl>,
+        lore_revision::fs::filesystem_provider::FsError,
+    > {
+        Ok(std::sync::Arc::new(
+            lore_revision::fs::filesystem_provider::InstanceOperationImpl::new(
+                lore_revision::fs::filesystem_provider::StaticDispatchInstanceOperation::Os(
+                    self.inner.begin_operation(),
+                ),
+                self.holds_state(),
+            ),
+        ))
+    }
+
+    fn holds_state(&self) -> bool {
+        true
+    }
+}
+
+/// `repository`, with its stores, filter and write token, reading its working tree through a
+/// [`HoldingFilesystem`].
+#[allow(dead_code)]
+pub fn test_holding_context(
+    repository: &lore_revision::repository::RepositoryContext,
+) -> std::sync::Arc<lore_revision::repository::RepositoryContext> {
+    let path = repository.require_path().expect("A repository on disk");
+    std::sync::Arc::new(
+        lore_revision::repository::RepositoryContext::new(
+            default_repository_creation_args(
+                repository.immutable_store(),
+                repository.mutable_store.clone(),
+            )
+            .with_path(path)
+            .with_id(repository.id)
+            .with_instance_id(repository.instance_id)
+            .with_filter(repository.filter.clone())
+            .with_filesystem_provider(std::sync::Arc::new(HoldingFilesystem {
+                inner: lore_revision::fs::os::OsFilesystem::new(path),
+            })),
+        )
+        .with_write_token(
+            repository
+                .try_write_token()
+                .expect("A repository opened for writing")
+                .share(),
+        ),
+    )
+}
+
 /// Stages the whole working tree of `instance` and commits it, answering the state of the
 /// revision that produced.
 ///

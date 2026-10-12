@@ -28,6 +28,7 @@ use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
+use crate::fs::hold;
 use crate::history;
 use crate::interface::LoreBranchLocation;
 use crate::interface::LoreError;
@@ -414,11 +415,24 @@ async fn revision_advances_branch_latest(
 /// measured against the view that materialized it and written under the view it is left holding.
 /// Everything else here takes the target context, since that is the view the instance keeps once
 /// this returns.
+///
+/// A provider that holds its state in a `State` ([`FilesystemProvider::holds_state`]) holds whole
+/// revisions, keeps its local changes itself and holds no files for a layer to be written into,
+/// so a sync restricted to a dependency set, one resetting local changes, and one carrying layers
+/// are refused there.
 pub(crate) async fn sync(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
+    if repository.file_system().holds_state() {
+        if !options.root_files.is_empty() {
+            return Err(hold::refused("restrict a sync to a dependency set").into());
+        }
+        if options.reset {
+            return Err(hold::refused("reset local changes in a sync").into());
+        }
+    }
     let view = sync_load_view(&options).await?;
     let view_change = view.is_some();
     let repository_current = repository.clone();
@@ -762,6 +776,9 @@ pub(crate) async fn sync(
         return Ok(());
     }
 
+    if !layers.is_empty() && repository.file_system().holds_state() {
+        return Err(hold::refused("sync layers").into());
+    }
     if !force && !options.reset {
         sync_reject_staged_layers(&layers).await?;
     }
