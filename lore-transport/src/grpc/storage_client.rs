@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -117,8 +120,9 @@ struct StreamState<K, S> {
 
 type StreamHandle<K, S> = Arc<StreamState<K, S>>;
 
-/// Keyed by the address the server echoes back. A `Vec` per key so concurrent requests for
-/// the same address coalesce onto one round trip and all get woken by its response.
+/// Keyed by the address a request reads or writes: the address the server echoes back, or for a
+/// copy the target, see [`CopyRouting`]. A `Vec` per key so concurrent requests for the same
+/// address coalesce onto one round trip and all get woken by its response.
 type Inflight<S> = DashMap<Address, Vec<oneshot::Sender<Result<S, ProtocolError>>>>;
 
 /// Returns true for the first waiter on `key`, meaning the caller should put the request on
@@ -224,6 +228,74 @@ impl StreamResponse for storage_v1::CopyResponse {
     }
 }
 
+/// The copies on a copy stream, by source address. A copy response names only its source, so a
+/// source address is on the wire for one target at a time, and a copy of it to another target
+/// waits for the response to the one before.
+#[derive(Default)]
+struct CopyRouting {
+    /// The target each source address on the wire is being copied to.
+    wire: HashMap<Address, Address>,
+    /// The copies waiting for a source address on the wire, in arrival order.
+    queued: HashMap<Address, VecDeque<storage_v1::CopyRequest>>,
+}
+
+impl CopyRouting {
+    /// The source and target addresses of `request`. The target is in the session's partition,
+    /// with the source's hash and the target context, or the source's context when it names
+    /// none.
+    fn addresses(request: &storage_v1::CopyRequest) -> Option<(Address, Address)> {
+        let source = Address::from(request.source_address.as_ref()?);
+        let context = match request.target_context.as_ref() {
+            [] => source.context,
+            bytes => Context::from(<[u8; 16]>::try_from(bytes).ok()?),
+        };
+        Some((
+            source,
+            Address {
+                hash: source.hash,
+                context,
+            },
+        ))
+    }
+
+    /// Put `request` on the wire for `source`, returning it, or queue it behind the copy of
+    /// `source` on the wire.
+    fn admit(
+        &mut self,
+        source: Address,
+        target: Address,
+        request: storage_v1::CopyRequest,
+    ) -> Option<storage_v1::CopyRequest> {
+        match self.wire.entry(source) {
+            Entry::Occupied(_) => {
+                self.queued.entry(source).or_default().push_back(request);
+                None
+            }
+            Entry::Vacant(wire) => {
+                wire.insert(target);
+                Some(request)
+            }
+        }
+    }
+
+    /// Take the answered copy of `source` off the wire, returning its target and the next copy
+    /// of `source`, which goes on the wire in its place.
+    fn answered(&mut self, source: Address) -> (Option<Address>, Option<storage_v1::CopyRequest>) {
+        let target = self.wire.remove(&source);
+        let Some(queue) = self.queued.get_mut(&source) else {
+            return (target, None);
+        };
+        let next = queue.pop_front();
+        if queue.is_empty() {
+            self.queued.remove(&source);
+        }
+        if let Some((_, next_target)) = next.as_ref().and_then(Self::addresses) {
+            self.wire.insert(source, next_target);
+        }
+        (target, next)
+    }
+}
+
 /// A per-item failure arrives in-band on an `Ok` message and costs only that request. An
 /// `Err` is terminal by construction — tonic surfaces a stream status once and then reports
 /// the stream exhausted — so it ends the loop and everything still outstanding fails.
@@ -233,10 +305,13 @@ impl StreamResponse for storage_v1::CopyResponse {
 /// also what lets `StreamCache::request` replay them: the ordinary ways a connection dies
 /// arrive as `Internal` or `Cancelled` (`Status::from_h2_error`), neither of which a caller
 /// would otherwise retry. The real status is kept on the error's trace.
+///
+/// `route` maps the address a response echoes to the key its request was registered under.
 async fn pump_responses<R>(
     mut stream: tonic::Streaming<R>,
     inflight: Arc<Inflight<R::Success>>,
     verb: Verb,
+    mut route: impl FnMut(Address) -> Option<Address>,
 ) where
     R: StreamResponse,
 {
@@ -262,7 +337,7 @@ async fn pump_responses<R>(
             lore_error!("{} response missing address", verb.label());
             continue;
         };
-        let Some((_, senders)) = inflight.remove(&address) else {
+        let Some((_, senders)) = route(address).and_then(|key| inflight.remove(&key)) else {
             lore_error!(
                 "{} received unexpected result for address {address}",
                 verb.label()
@@ -1107,7 +1182,7 @@ impl StorageService {
             match client.get(req).await {
                 Ok(response) => {
                     state.opened.store(true, Ordering::Relaxed);
-                    pump_responses(response.into_inner(), inflight, Verb::Get).await;
+                    pump_responses(response.into_inner(), inflight, Verb::Get, Some).await;
                 }
                 Err(status) => {
                     lore_debug!("{} request failed: {status}", Verb::Get.label());
@@ -1152,7 +1227,7 @@ impl StorageService {
             match client.get_metadata(req).await {
                 Ok(response) => {
                     state.opened.store(true, Ordering::Relaxed);
-                    pump_responses(response.into_inner(), inflight, Verb::GetMetadata).await;
+                    pump_responses(response.into_inner(), inflight, Verb::GetMetadata, Some).await;
                 }
                 Err(status) => {
                     lore_debug!("{} request failed: {status}", Verb::GetMetadata.label());
@@ -1200,7 +1275,7 @@ impl StorageService {
             match client.put(req).await {
                 Ok(response) => {
                     state.opened.store(true, Ordering::Relaxed);
-                    pump_responses(response.into_inner(), inflight, Verb::Put).await;
+                    pump_responses(response.into_inner(), inflight, Verb::Put, Some).await;
                 }
                 Err(status) => {
                     lore_debug!("put request failed: {status}");
@@ -1225,19 +1300,41 @@ impl StorageService {
         });
         let state = handle.clone();
         let inflight: Arc<Inflight<()>> = Arc::new(DashMap::new());
+        let routing = Arc::new(parking_lot::Mutex::new(CopyRouting::default()));
+        let (resend, mut resent) = mpsc::unbounded_channel::<storage_v1::CopyRequest>();
 
         let request_inflight = inflight.clone();
+        let request_routing = routing.clone();
         let requests = async_stream::stream! {
-            while let Some((request, sender)) = rx.recv().await {
-                let Some(address) = request.source_address.as_ref().map(Address::from) else {
-                    lore_debug!("Missing source_address in copy request");
-                    let _ = sender.send(Err(ProtocolError::internal("copy: missing source_address")));
-                    continue;
-                };
-                if register(&request_inflight, address, sender) {
-                    yield request;
+            loop {
+                tokio::select! {
+                    received = rx.recv() => {
+                        let Some((request, sender)) = received else {
+                            break;
+                        };
+                        let Some((source, target)) = CopyRouting::addresses(&request) else {
+                            lore_debug!("Missing source_address or invalid target_context in copy request");
+                            let _ = sender.send(Err(ProtocolError::internal("copy: invalid request")));
+                            continue;
+                        };
+                        if !register(&request_inflight, target, sender) {
+                            continue;
+                        }
+                        let admitted = request_routing.lock().admit(source, target, request);
+                        if let Some(request) = admitted {
+                            yield request;
+                        }
+                    }
+                    Some(request) = resent.recv() => yield request,
                 }
             }
+        };
+        let route = move |source| {
+            let (target, next) = routing.lock().answered(source);
+            if let Some(next) = next {
+                let _ = resend.send(next);
+            }
+            target
         };
 
         let ctx = ctx.clone();
@@ -1248,7 +1345,7 @@ impl StorageService {
             match client.copy(req).await {
                 Ok(response) => {
                     state.opened.store(true, Ordering::Relaxed);
-                    pump_responses(response.into_inner(), inflight, Verb::Copy).await;
+                    pump_responses(response.into_inner(), inflight, Verb::Copy, route).await;
                 }
                 Err(status) => {
                     lore_debug!("copy request failed: {status}");

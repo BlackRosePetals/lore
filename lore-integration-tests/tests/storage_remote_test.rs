@@ -2676,6 +2676,97 @@ mod storage_remote_tests {
             .await
     }
 
+    /// Copies of one source to several target contexts, in one call, each reach the server, over
+    /// both transports. Push copies an association from the zero-context source this way. A copy
+    /// response names only its source, so a client that merged the copies by source answered all
+    /// of them with the first one's result, and the server held only one target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copies_of_one_source_to_many_contexts_each_reach_the_server() -> TestResult {
+        use lore::storage::copy;
+        use lore::storage::copy::LoreStorageCopyArgs;
+        use lore::storage::copy::LoreStorageCopyItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
+        use lore_storage::store_types::StoreMatch;
+
+        const TARGETS: u8 = 8;
+
+        let execution = setup_execution("storage-remote-copy-many-contexts".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xc5u8; 16]);
+                    let handle_id = open_remote_handle(&server).await;
+                    let source = put_local_and_remote_via_handle(
+                        handle_id,
+                        partition,
+                        b"copied to many contexts",
+                    )
+                    .await;
+                    let targets: Vec<Address> = (1..=TARGETS)
+                        .map(|index| Address {
+                            hash: source.hash,
+                            context: Context::from([index; 16]),
+                        })
+                        .collect();
+
+                    let completed: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+                    let completed_for_cb = completed.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StorageCopyItemComplete(data) = event {
+                            completed_for_cb.lock().unwrap().push(data.error.error_code);
+                        }
+                    }));
+                    let items = targets
+                        .iter()
+                        .zip(0u64..)
+                        .map(|(target, id)| LoreStorageCopyItem {
+                            id,
+                            source_partition: partition,
+                            target_partition: partition,
+                            source_address: source,
+                            target_context: target.context,
+                        })
+                        .collect();
+                    let status = copy::copy(
+                        LoreGlobalArgs::default(),
+                        LoreStorageCopyArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(items),
+                        },
+                        callback,
+                    )
+                    .await;
+
+                    assert_eq!(status, 0, "{transport:?}");
+                    assert_eq!(
+                        *completed.lock().unwrap(),
+                        vec![0; TARGETS as usize],
+                        "{transport:?}"
+                    );
+                    for target in targets {
+                        let on_server =
+                            query_one(&server.backend_immutable.clone(), partition, target)
+                                .await
+                                .unwrap();
+                        assert_eq!(
+                            on_server.match_made,
+                            StoreMatch::MatchFull,
+                            "{transport:?}: the server must hold {target}",
+                        );
+                    }
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
     /// Copy idempotency: re-copying onto an already-populated target tuple succeeds with the
     /// same `error_code = None` and produces no observable change. Exercises the remote path
     /// (idempotent on both server-side `session.copy` and the local mirror).
