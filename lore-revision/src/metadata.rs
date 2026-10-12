@@ -198,7 +198,11 @@ where
         let path = RelativePath::new_from_user_path(repository_path, &user_path)
             .forward_any::<E>("Failed to resolve the binary metadata path")?;
         return with_operation(repository.file_system(), async |operation| {
-            store(operation.content_source(&path)).await
+            let source = operation
+                .content_source(&path)
+                .await
+                .forward_any::<E>("naming the content of the binary metadata payload")?;
+            store(source).await
         })
         .await;
     }

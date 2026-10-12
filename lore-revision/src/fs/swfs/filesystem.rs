@@ -174,9 +174,7 @@ impl InstanceOperation for SwfsOperation {
         node: &Node,
         path: &RelativePath);
 
-    fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static> {
-        self.os.content_source(path)
-    }
+    fake_with_os!(content_source, lore_storage::ContentSource<'static>, path: &RelativePath);
 
     fake_with_os!( file_holds_content, NodeComparison,
         repository: Arc<RepositoryContext>,

@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_base::error::FileNotFound;
 use lore_base::error::InvalidArguments;
 use lore_base::error::LocalModifications;
 use lore_base::types::Fragment;
@@ -27,6 +28,7 @@ use crate::fs::swfs::filesystem::SwfsOperation;
 use crate::hash::hash_string;
 use crate::lore::Address;
 use crate::lore::Context;
+use crate::lore_debug;
 use crate::lore_trace;
 use crate::node::Node;
 use crate::node::NodeFileMode;
@@ -44,6 +46,7 @@ use crate::util::path::RelativePath;
 
 #[error_set]
 pub enum FsError {
+    FileNotFound,
     InvalidArguments,
     LocalModifications,
 }
@@ -569,8 +572,14 @@ pub trait InstanceOperation: Send + Sync {
     /// which a provider keeping its own record answers without reading at all.
     ///
     /// A caller that needs the bytes — to address content matching nothing stored — takes its
-    /// source from here rather than naming a host path the provider may not read through.
-    fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static>;
+    /// source from here rather than naming a host path the provider may not read through. A path
+    /// holding no file, nothing or a directory, has no content: a provider that resolves the path
+    /// to name a source reports `FileNotFound`, and one that names a host path without reading it
+    /// leaves the read to fail. A provider that cannot name the content of a file reports why.
+    fn content_source(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<lore_storage::ContentSource<'static>, FsError>> + Send;
 
     /// Whether the file at `path` holds the content `previous` addresses, and `previous_size`
     /// bytes of it.
@@ -698,7 +707,9 @@ pub trait InstanceOperation: Send + Sync {
     /// Whether the content at `path` can be diffed, or must only be compared opaquely.
     ///
     /// Reads the head of the content, which is what telling text from an opaque format takes.
-    /// Content that cannot be read is not diffable, there being nothing to diff.
+    /// Content that cannot be read is not diffable, there being nothing to diff, and neither is a
+    /// path holding no file. A provider that cannot name the content of a file reports why
+    /// ([`content_source`](Self::content_source)).
     ///
     /// Derived from [`content_source`](Self::content_source). A provider that answers without
     /// reading overrides this.
@@ -707,9 +718,41 @@ pub trait InstanceOperation: Send + Sync {
         path: &RelativePath,
     ) -> impl Future<Output = Result<bool, FsError>> + Send {
         async move {
-            Ok(crate::infer::infer_is_diffable(&self.content_source(path))
+            let source = match self.content_source(path).await {
+                Ok(source) => source,
+                Err(FsError::FileNotFound(_)) => return Ok(false),
+                Err(err) => return Err(err),
+            };
+            Ok(crate::infer::infer_is_diffable(&source)
                 .await
                 .unwrap_or(false))
+        }
+    }
+
+    /// Whether the content at `path` holds conflict markers.
+    ///
+    /// Content that cannot be opened or read holds none, a failed read logged at debug, and neither
+    /// does a path holding no file. A provider that cannot name the content of a file reports why
+    /// ([`content_source`](Self::content_source)).
+    ///
+    /// Derived from [`content_source`](Self::content_source). A provider that answers without
+    /// reading overrides this.
+    fn infer_is_conflicted(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<bool, FsError>> + Send {
+        async move {
+            let source = match self.content_source(path).await {
+                Ok(source) => source,
+                Err(FsError::FileNotFound(_)) => return Ok(false),
+                Err(err) => return Err(err),
+            };
+            Ok(crate::infer::infer_is_conflicted(&source)
+                .await
+                .unwrap_or_else(|err| {
+                    lore_debug!("Conflict check cannot read {path}: {err}");
+                    false
+                }))
         }
     }
 }
@@ -925,12 +968,15 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static> {
+    async fn content_source(
+        &self,
+        path: &RelativePath,
+    ) -> Result<lore_storage::ContentSource<'static>, FsError> {
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
-            StaticDispatchInstanceOperation::Os(this) => this.content_source(path),
-            StaticDispatchInstanceOperation::Swfs(this) => this.content_source(path),
+            StaticDispatchInstanceOperation::Test(this) => this.content_source(path).await,
+            StaticDispatchInstanceOperation::Os(this) => this.content_source(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.content_source(path).await,
         }
     }
 
@@ -1081,9 +1127,18 @@ impl InstanceOperation for InstanceOperationImpl {
     async fn infer_is_diffable(&self, path: &RelativePath) -> Result<bool, FsError> {
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.infer_is_diffable(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.infer_is_diffable(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.infer_is_diffable(path).await,
+        }
+    }
+
+    async fn infer_is_conflicted(&self, path: &RelativePath) -> Result<bool, FsError> {
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.infer_is_conflicted(path).await,
+            StaticDispatchInstanceOperation::Os(this) => this.infer_is_conflicted(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.infer_is_conflicted(path).await,
         }
     }
 }
@@ -1097,6 +1152,7 @@ pub mod test_util {
     use std::sync::atomic::Ordering;
 
     use bytes::Bytes;
+    use lore_base::error::FileNotFound;
     use lore_base::error::LocalModifications;
     use lore_base::types::Fragment;
     use parking_lot::Mutex;
@@ -1132,6 +1188,10 @@ pub mod test_util {
         pub finalize_fails: bool,
         pub write_fails: bool,
         pub holds_paths: bool,
+        /// Whether the provider cannot name the content at any path.
+        pub content_source_fails: bool,
+        /// Whether the provider holds no file at any path.
+        pub content_source_missing: bool,
         pub hold_calls: HoldCalls,
         /// Whether each hold is refused for local changes.
         pub hold_refuses: bool,
@@ -1250,7 +1310,21 @@ pub mod test_util {
             panic!("Test operation unimplemented except finalize")
         }
 
-        fn content_source(&self, _path: &RelativePath) -> lore_storage::ContentSource<'static> {
+        /// Reports no file where the provider was told it holds none, fails where it was told it
+        /// cannot name content, and panics otherwise.
+        async fn content_source(
+            &self,
+            path: &RelativePath,
+        ) -> Result<lore_storage::ContentSource<'static>, FsError> {
+            if self.content_source_missing {
+                return Err(FileNotFound {
+                    resource: path.to_string(),
+                }
+                .into());
+            }
+            if self.content_source_fails {
+                return Err(FsError::internal("Content source failed"));
+            }
             panic!("Test operation unimplemented except finalize")
         }
 
@@ -1320,10 +1394,6 @@ pub mod test_util {
             _source_path: &RelativePath,
             _destination_path: &RelativePath,
         ) -> Result<(), FsError> {
-            panic!("Test operation unimplemented except finalize")
-        }
-
-        async fn infer_is_diffable(&self, _path: &RelativePath) -> Result<bool, FsError> {
             panic!("Test operation unimplemented except finalize")
         }
     }

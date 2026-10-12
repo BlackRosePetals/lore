@@ -119,9 +119,12 @@ pub(crate) async fn merge3_text_in_operation(
     result: &RelativePath,
     mode: MergeTextMode<'_>,
 ) -> Result<bool, FsError> {
-    let base_source = operation.content_source(base);
-    let mine_source = operation.content_source(mine);
-    let theirs_source = operation.content_source(theirs);
+    let (base_source, mine_source, theirs_source) = tokio::try_join!(
+        operation.content_source(base),
+        operation.content_source(mine),
+        operation.content_source(theirs)
+    )
+    .forward::<FsError>("naming the sides of the merge")?;
 
     let base_read = lore_spawn!(async move { base_source.read_all().await });
     let mine_read = lore_spawn!(async move { mine_source.read_all().await });

@@ -3,12 +3,17 @@
 // Fixtures build filesystem state directly; what these test is how the merge reads and writes it.
 #![allow(clippy::disallowed_methods)]
 
+use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
+use lore_revision::fs::filesystem_provider::FsError;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::os::OsFilesystem;
 use lore_revision::merge::*;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::util::path::RelativePath;
+
+use crate::fs::filesystem_provider::TestFilesystemProvider;
+use crate::fs::filesystem_provider::setup_test_execution;
 
 /// The three sides a merge reads, written under `root`.
 fn sides(root: &std::path::Path, base: &str, mine: &str, theirs: &str) {
@@ -74,6 +79,29 @@ async fn a_conflicting_merge_writes_the_marked_result() {
     assert!(conflicted);
     let result = std::fs::read_to_string(dir.path().join("result")).expect("read the result");
     assert!(result.contains("mine") && result.contains("theirs"));
+}
+
+/// A merge whose sides the provider cannot name reports the provider's error.
+#[tokio::test]
+async fn a_merge_of_sides_that_cannot_be_named_reports_the_error() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let filesystem = TestFilesystemProvider::failing_content_sources();
+            let operation = filesystem.begin_operation().await.expect("an operation");
+
+            let merged = merge3_text_in_operation(
+                &operation,
+                &relative("base"),
+                &relative("mine"),
+                &relative("theirs"),
+                &relative("result"),
+                MergeTextMode::DryRun,
+            )
+            .await;
+
+            assert!(matches!(merged, Err(FsError::Internal(_))), "{merged:?}");
+        })
+        .await;
 }
 
 /// A dry run reports the conflict and leaves the result path alone.

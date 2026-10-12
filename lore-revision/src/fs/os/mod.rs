@@ -165,8 +165,11 @@ impl InstanceOperation for OsOperation {
         )))
     }
 
-    fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static> {
-        lore_storage::ContentSource::owned_file(self.absolute(path))
+    async fn content_source(
+        &self,
+        path: &RelativePath,
+    ) -> Result<lore_storage::ContentSource<'static>, FsError> {
+        Ok(lore_storage::ContentSource::owned_file(self.absolute(path)))
     }
 
     /// Measures the file the operation's root holds at `path` against the stored object's own

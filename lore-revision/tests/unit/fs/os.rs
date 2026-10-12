@@ -8,11 +8,14 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::InstanceOperation;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::os::*;
 use lore_revision::util::path::RelativePath;
+
+use crate::fs::filesystem_provider::setup_test_execution;
 
 fn temp_dir() -> lore_base::test_util::TempDir {
     lore_base::test_util::TempDir::new("lore-fs-os-test-")
@@ -420,6 +423,43 @@ async fn infer_is_diffable_reports_content_that_is_not_there() {
             .await
             .expect("an unreadable path is an answer, not a failure")
     );
+}
+
+/// Conflict markers are read from the content the operation names at the path, and a path
+/// holding no file holds none.
+#[tokio::test]
+async fn infer_is_conflicted_reads_the_content_at_the_path() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let dir = temp_dir();
+            std::fs::write(
+                dir.path().join("marked"),
+                b"clean line\n<<<<<<< ours\nmore\n",
+            )
+            .expect("write marked");
+            std::fs::write(dir.path().join("clean"), b"one\ntwo\n").expect("write clean");
+            let operation = os_operation(dir.path()).await;
+
+            assert!(
+                operation
+                    .infer_is_conflicted(&relative("marked"))
+                    .await
+                    .expect("reading the content must succeed")
+            );
+            assert!(
+                !operation
+                    .infer_is_conflicted(&relative("clean"))
+                    .await
+                    .expect("reading the content must succeed")
+            );
+            assert!(
+                !operation
+                    .infer_is_conflicted(&relative("absent"))
+                    .await
+                    .expect("a path holding no file is an answer, not a failure")
+            );
+        })
+        .await;
 }
 
 /// A move between two filesystems is no rename, so the content is copied and the source

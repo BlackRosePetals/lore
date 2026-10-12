@@ -35,7 +35,6 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::immutable;
-use crate::infer;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreMetadataType;
@@ -2556,19 +2555,32 @@ fn commit_file(
 
         debug_assert!(node.is_file());
 
+        // A sparse checkout has no working-tree file for a view-excluded path, so
+        // the staged content hash is the only source and no markers are read.
+        // Re-fragmenting would read a file that is absent or stale.
+        //
+        // This test must stay identical to the one realize gates disk writes on
+        // (`fs/realize.rs`), because that is what decided whether the file was
+        // written.
+        let excluded = repository
+            .filter
+            .excludes_tree(&relative_path, false, FilterMode::View);
+
         if node.is_staged_merge_conflict() {
             reject_unresolved_conflict(&node, relative_path.as_str())?;
-            // Check if file has conflict markers remaining
-            if infer::infer_is_conflicted(&operation.content_source(&relative_path))
-                .await
-                .internal_with(|| format!("Failed reading file {}", relative_path.as_str()))?
+            if !excluded
+                && operation
+                    .infer_is_conflicted(&relative_path)
+                    .await
+                    .forward_with::<CommitError, _>(|| {
+                        format!("checking {relative_path} for conflict markers")
+                    })?
             {
                 return Err(Conflict {
                     path: relative_path.as_str().to_string(),
                 }
                 .into());
             }
-            // Clean up theirs/base files
             if !execution_context().globals().dry_run() {
                 sync::unlink_merge_artifacts(&operation, &relative_path).await;
             }
@@ -2581,56 +2593,51 @@ fn commit_file(
             node.flags
         );
 
-        // A sparse checkout has no working-tree file for a view-excluded path, so
-        // the staged content hash is the only source. Re-fragmenting would read a
-        // file that is absent or stale.
-        //
-        // This test must stay identical to the one realize gates disk writes on
-        // (`fs/realize.rs`), because that is what decided whether the file was
-        // written.
-        let (address, content_size, mode, modified_time) =
-            if repository
-                .filter
-                .excludes_tree(&relative_path, false, FilterMode::View)
-            {
-                (node.address, node.size, node.mode, None)
-            } else {
-                if node.address.context.is_zero() {
-                    // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
-                    node.address.context = uuid::Uuid::now_v7().into();
-                    lore_trace!(
-                        "Generate file ID for file: {} {}",
-                        relative_path.as_str(),
-                        node.address.context
-                    );
-                }
+        let (address, content_size, mode, modified_time) = if excluded {
+            (node.address, node.size, node.mode, None)
+        } else {
+            if node.address.context.is_zero() {
+                // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
+                node.address.context = uuid::Uuid::now_v7().into();
+                lore_trace!(
+                    "Generate file ID for file: {} {}",
+                    relative_path.as_str(),
+                    node.address.context
+                );
+            }
 
-                let info = info_before_fragmenting(&operation, &relative_path).await?;
+            let info = info_before_fragmenting(&operation, &relative_path).await?;
 
-                let (address, size_content) = immutable::write_from_file_with_tracker(
-                    repository.clone(),
-                    &operation.content_source(&relative_path),
-                    node.address.context,
-                    immutable::write_options_from_repository(repository.clone()),
-                    Some(tracker),
-                )
+            let source = operation
+                .content_source(&relative_path)
                 .await
                 .forward_with::<CommitError, _>(|| {
-                    format!(
-                        "Failed writing file {} to immutable store",
-                        relative_path.as_str()
-                    )
+                    format!("naming the content of {relative_path}")
                 })?;
-
-                stats.file_read(size_content);
-
-                (
-                    address,
-                    size_content,
-                    info.mode(node.mode),
-                    Some(info.mtime()),
+            let (address, size_content) = immutable::write_from_file_with_tracker(
+                repository.clone(),
+                &source,
+                node.address.context,
+                immutable::write_options_from_repository(repository.clone()),
+                Some(tracker),
+            )
+            .await
+            .forward_with::<CommitError, _>(|| {
+                format!(
+                    "Failed writing file {} to immutable store",
+                    relative_path.as_str()
                 )
-            };
+            })?;
+
+            stats.file_read(size_content);
+
+            (
+                address,
+                size_content,
+                info.mode(node.mode),
+                Some(info.mtime()),
+            )
+        };
 
         let modified = util::fs::mode_changed(node.mode, mode)
             || node.size != content_size

@@ -30,7 +30,6 @@ use crate::find;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
-use crate::infer;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreEvent;
@@ -3532,10 +3531,12 @@ async fn resolve_single_file(
         return Ok(());
     }
 
-    // Check if the file still has conflict markers
-    if infer::infer_is_conflicted(&operation.content_source(&relative_path))
+    if operation
+        .infer_is_conflicted(&relative_path)
         .await
-        .unwrap_or(false)
+        .forward_with::<MergeError, _>(|| {
+            format!("checking {relative_path} for conflict markers")
+        })?
     {
         lore_warn!(
             "Cannot resolve path with conflict markers still present: {}",

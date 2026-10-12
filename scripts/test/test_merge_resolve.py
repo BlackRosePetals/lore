@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: MIT
 import json
 import logging
+from pathlib import Path
 
 import pytest
+from lore_parsers import parse_status_json
 
 from lore import Lore
-from lore_parsers import parse_status_json
 
 logger = logging.getLogger(__name__)
 
@@ -646,5 +647,87 @@ def test_merge_resolve_theirs_restores_missing_trailing_newline(new_lore_repo):
     assert content == THEIRS_NO_EOL, (
         f"resolve theirs must restore the exact bytes, got {content!r}"
     )
+
+    repo.branch_merge_abort(offline=True)
+
+
+# ---------------------------------------------------------------------------
+# Test: stage merge and resolve read the conflict markers a merged file holds
+# ---------------------------------------------------------------------------
+
+STAGE_MERGE_BASE = ["line1\n", "line2\n", "line3\n"]
+STAGE_MERGE_CURRENT = ["line1\n", "line2 current\n", "line3\n"]
+STAGE_MERGE_INCOMING = ["line1\n", "line2 incoming\n", "line3\n"]
+
+
+def remove_merge_sidecars(repo: Lore, path: str):
+    """Remove the copies a conflicted merge leaves beside `path`, so that only its content
+    tells whether it is still in conflict."""
+    for suffix in ["~mine", "~theirs", "~base"]:
+        (Path(repo.path) / f"{path}{suffix}").unlink(missing_ok=True)
+
+
+@pytest.mark.smoke
+def test_file_stage_merge_flags_a_merged_file_holding_markers(new_lore_repo):
+    """Staging a file the merge took cleanly as merged reads its content: markers written into
+    it flag it in conflict, resolve leaves it in conflict while they stay, and once they are
+    gone it resolves and the merge commits."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(
+        "Base commit",
+        {"a.txt": STAGE_MERGE_BASE, "b.txt": STAGE_MERGE_BASE},
+        offline=True,
+    )
+    repo.branch_create("incoming", offline=True)
+    repo.write_commit_push(
+        "Incoming changes",
+        {"a.txt": STAGE_MERGE_INCOMING, "b.txt": STAGE_MERGE_INCOMING},
+        offline=True,
+    )
+    repo.branch_switch("main", offline=True)
+    repo.branch_create("current", offline=True)
+    repo.write_commit_push(
+        "Current changes", {"a.txt": STAGE_MERGE_CURRENT}, offline=True
+    )
+    repo.branch_merge_start("incoming", no_commit=True, check=False, offline=True)
+    assert get_conflicted_paths(repo) == {"a.txt"}, "only a.txt conflicts"
+
+    with repo.open_file("b.txt", "w+") as f:
+        f.writelines(["line1\n", "<<<<<<< ours\n", "mine\n", "=======\n"])
+        f.writelines(["theirs\n", ">>>>>>> theirs\n", "line3\n"])
+    repo.file_stage_merge(["b.txt"], offline=True)
+    assert "b.txt" in get_conflicted_paths(repo), "markers must flag b.txt in conflict"
+
+    repo.branch_merge_resolve(["b.txt"], offline=True, check=False)
+    assert "b.txt" in get_conflicted_paths(repo), (
+        "resolve must leave b.txt with markers"
+    )
+
+    for path in ["a.txt", "b.txt"]:
+        with repo.open_file(path, "w+") as f:
+            f.writelines(["line1\n", "line2 merged\n", "line3\n"])
+    repo.branch_merge_resolve(["a.txt", "b.txt"], offline=True)
+    assert not get_conflicted_paths(repo), "no file holds markers any more"
+
+    repo.commit("Merge incoming", offline=True)
+
+
+@pytest.mark.smoke
+def test_stage_merge_and_resolve_of_a_deleted_file_find_no_markers(new_lore_repo):
+    """A merged file the user deleted holds no markers: resolving it marks it resolved and
+    staging it as merged marks it merged, rather than failing for a file that is not there."""
+    repo: Lore = new_lore_repo()
+    setup_merge_conflict(
+        repo,
+        {"a.txt": (STAGE_MERGE_BASE, STAGE_MERGE_CURRENT, STAGE_MERGE_INCOMING)},
+    )
+    remove_merge_sidecars(repo, "a.txt")
+    (Path(repo.path) / "a.txt").unlink()
+
+    repo.branch_merge_resolve(["a.txt"], offline=True)
+    assert "a.txt" not in get_conflicted_paths(repo), "a.txt must be resolved"
+
+    repo.file_stage_merge(["a.txt"], offline=True)
+    assert "a.txt" in get_merged_paths(repo), "a.txt must be staged as merged"
 
     repo.branch_merge_abort(offline=True)

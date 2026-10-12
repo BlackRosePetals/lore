@@ -31,7 +31,6 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::hash;
-use crate::infer::infer_is_conflicted;
 use crate::interface::LoreArray;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
@@ -1175,9 +1174,14 @@ pub(crate) async fn stage_merge_path(
         let mut merge_flags = NodeFlags::StagedMerge;
 
         if sync::exist_merge_artifacts(&operation, change.path()).await
-            || infer_is_conflicted(&operation.content_source(change.path()))
-                .await
-                .unwrap_or_default()
+            || (change.action != change::FileAction::Delete
+                && change.to.flags.contains(NodeFlags::File)
+                && operation
+                    .infer_is_conflicted(change.path())
+                    .await
+                    .forward_with::<StageError, _>(|| {
+                        format!("checking {} for conflict markers", change.path())
+                    })?)
         {
             lore_debug!(
                 "Merge change filesystem state is conflicted: {}",

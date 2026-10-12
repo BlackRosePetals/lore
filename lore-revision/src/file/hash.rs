@@ -69,7 +69,11 @@ pub async fn hash(
                     .await
                     .forward_any::<HashError>("reading file information")?,
             )?;
-            let hash = immutable::hash_file(repository.clone(), &operation.content_source(tracked))
+            let source = operation
+                .content_source(tracked)
+                .await
+                .forward_any::<HashError>("naming the content of the file")?;
+            let hash = immutable::hash_file(repository.clone(), &source)
                 .await
                 .forward_any::<HashError>("hashing file")?;
             Ok((size, hash))

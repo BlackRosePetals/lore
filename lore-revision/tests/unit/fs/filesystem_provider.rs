@@ -49,6 +49,8 @@ pub struct TestFilesystemProvider {
     pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
     finalize_fails: bool,
     write_fails: bool,
+    content_source_fails: bool,
+    content_source_missing: bool,
     holds_paths: bool,
     holds_state: bool,
     hold_refuses: bool,
@@ -63,6 +65,22 @@ impl TestFilesystemProvider {
     pub fn failing_finalize() -> TestFilesystemProvider {
         Self {
             finalize_fails: true,
+            ..Self::new()
+        }
+    }
+
+    /// A provider whose operations cannot name the content at any path.
+    pub fn failing_content_sources() -> TestFilesystemProvider {
+        Self {
+            content_source_fails: true,
+            ..Self::new()
+        }
+    }
+
+    /// A provider whose operations hold no file at any path, which they report naming no source.
+    pub fn missing_content_sources() -> TestFilesystemProvider {
+        Self {
+            content_source_missing: true,
             ..Self::new()
         }
     }
@@ -151,6 +169,8 @@ impl FilesystemProvider for TestFilesystemProvider {
                 finalize_events: self.finalize_events.clone(),
                 finalize_fails: self.finalize_fails,
                 write_fails: self.write_fails,
+                content_source_fails: self.content_source_fails,
+                content_source_missing: self.content_source_missing,
                 holds_paths: self.holds_paths,
                 hold_calls: self.hold_calls.clone(),
                 hold_refuses: self.hold_refuses,
@@ -619,6 +639,70 @@ async fn a_lookup_through_an_operation_is_counted() {
 
     assert!(!info.exists());
     assert_eq!(1, filesystem.file_infos());
+}
+
+/// Whether content is diffable is derived from its source, so a provider that cannot name the
+/// content reports its error rather than answering.
+#[tokio::test]
+async fn diffability_of_content_that_cannot_be_named_reports_the_error() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let filesystem = TestFilesystemProvider::failing_content_sources();
+            let operation = filesystem.begin_operation().await.expect("an operation");
+
+            let diffable = operation.infer_is_diffable(&relative("unnamed")).await;
+
+            assert!(
+                matches!(diffable, Err(FsError::Internal(_))),
+                "{diffable:?}"
+            );
+        })
+        .await;
+}
+
+/// Whether content holds conflict markers is derived from its source, so a provider that cannot
+/// name the content reports its error rather than answering.
+#[tokio::test]
+async fn conflict_markers_in_content_that_cannot_be_named_report_the_error() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let filesystem = TestFilesystemProvider::failing_content_sources();
+            let operation = filesystem.begin_operation().await.expect("an operation");
+
+            let conflicted = operation.infer_is_conflicted(&relative("unnamed")).await;
+
+            assert!(
+                matches!(conflicted, Err(FsError::Internal(_))),
+                "{conflicted:?}"
+            );
+        })
+        .await;
+}
+
+/// A path holding no file is neither diffable nor conflicted: content a provider reports not found
+/// is answered rather than failing the caller.
+#[tokio::test]
+async fn content_reported_not_found_is_neither_diffable_nor_conflicted() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let filesystem = TestFilesystemProvider::missing_content_sources();
+            let operation = filesystem.begin_operation().await.expect("an operation");
+            let path = relative("absent");
+
+            assert!(
+                !operation
+                    .infer_is_diffable(&path)
+                    .await
+                    .expect("a path holding no file is an answer")
+            );
+            assert!(
+                !operation
+                    .infer_is_conflicted(&path)
+                    .await
+                    .expect("a path holding no file is an answer")
+            );
+        })
+        .await;
 }
 
 /// An operation rooted at `root`, which is what a caller names its paths against.
