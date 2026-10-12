@@ -800,6 +800,34 @@ pub fn target_paths<'a>(layers: impl IntoIterator<Item = &'a Layer>) -> Vec<Stri
         .collect()
 }
 
+/// Where a walk over the parent's tree switches to each layer's staged tree rather than treating
+/// the mount's contents as parent adds: the node the layer's source path names, at the path the
+/// layer is mounted at. A layer whose staged tree holds no such node is left out.
+pub(crate) async fn mounts(layers: &[(Layer, LayerState)]) -> Arc<Vec<state::LayerMountInfo>> {
+    let mut mounts = Vec::with_capacity(layers.len());
+    for (layer, layer_state) in layers {
+        let Ok(source) = layer_state
+            .state_staged
+            .find_node_link(layer_state.repository.clone(), &layer.source_path)
+            .await
+        else {
+            lore_debug!(
+                "Skipping layer mount {} — source path {} not found in layer state",
+                layer.target_path,
+                layer.source_path
+            );
+            continue;
+        };
+        mounts.push(state::LayerMountInfo {
+            target_path: layer.target_path.clone(),
+            repository: layer_state.repository.clone(),
+            state: layer_state.state_staged.clone(),
+            source_node: source.node,
+        });
+    }
+    Arc::new(mounts)
+}
+
 /// For operations that cascade into every configured layer.
 ///
 /// Each context costs its own connection until UCS-19226 lands, so they are

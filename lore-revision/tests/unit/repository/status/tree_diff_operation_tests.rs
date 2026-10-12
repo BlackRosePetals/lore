@@ -56,6 +56,36 @@ async fn operations_begun(plan: TreeDiffPlan) -> (usize, Vec<bool>) {
     (filesystem.begins(), finalizes)
 }
 
+/// Status options asking for the staged comparison, scanning and checking dirty flags as given.
+fn options(scan: bool, check_dirty: bool) -> StatusOptions {
+    StatusOptions {
+        staged: true,
+        scan,
+        check_dirty,
+        reset: false,
+        sync_point: false,
+        revision_only: false,
+        count: false,
+    }
+}
+
+/// A provider whose diff is exact is scanned without `--scan`, with no dirty flag to check, and
+/// any other provider is scanned only when asked.
+#[test]
+fn an_exact_provider_diff_plans_a_scan_without_the_flag() {
+    let exact = TreeDiffPlan::for_status(&options(false, true), true, true);
+    assert!(exact.scan, "an exact diff is scanned unasked");
+    assert!(!exact.check_dirty, "an exact diff leaves no flag to check");
+    assert!(exact.compare_staged);
+
+    let unasked = TreeDiffPlan::for_status(&options(false, true), true, false);
+    assert!(
+        !unasked.scan,
+        "a provider whose diff is not exact is scanned only when asked"
+    );
+    assert!(unasked.check_dirty);
+}
+
 #[tokio::test]
 async fn a_staged_comparison_alone_reads_no_working_tree() {
     let (begins, finalizes) = operations_begun(TreeDiffPlan {

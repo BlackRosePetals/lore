@@ -355,8 +355,9 @@ mod tests {
                 let narrow = fixture.view_file(NARROW_VIEW, &[EXCLUDE_MOUNT]);
                 let view = fixture.stored_view();
 
+                let (holding, _) = test_holding_context(&fixture.reopened());
                 let result = sync::sync_boxed(
-                    test_holding_context(&fixture.reopened()),
+                    holding,
                     &fixture.instance.write_token,
                     SyncOptions {
                         view: Some(narrow),

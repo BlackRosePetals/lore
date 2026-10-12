@@ -194,8 +194,9 @@ mod tests {
                         ..Default::default()
                     },
                 ] {
+                    let (holding, _) = test_holding_context(&instance.repository);
                     let result = sync::sync_boxed(
-                        test_holding_context(&instance.repository),
+                        holding,
                         &instance.write_token,
                         SyncOptions {
                             revision: Some(first.to_string()),

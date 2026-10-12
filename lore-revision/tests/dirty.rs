@@ -3456,31 +3456,6 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// The children of `parent` in `state` named `name`.
-    async fn children_named(
-        repository: &Arc<lore_revision::repository::RepositoryContext>,
-        state: &Arc<State>,
-        parent: lore_revision::node::NodeID,
-        name: &str,
-    ) -> Vec<lore_revision::node::NodeID> {
-        let name_hash = hash_string(name);
-        let mut named = Vec::new();
-        for child in state
-            .node_children(repository.clone(), parent)
-            .await
-            .expect("Failed to list the children")
-        {
-            let node = state
-                .node(repository.clone(), child)
-                .await
-                .expect("Failed to read a child");
-            if node.name_hash == name_hash {
-                named.push(child);
-            }
-        }
-        named
-    }
-
     fn scan_status_options() -> lore_revision::repository::status::StatusOptions {
         lore_revision::repository::status::StatusOptions {
             staged: false,
@@ -3747,6 +3722,64 @@ mod tests {
                     !holds(&repository, &staged, "added.txt").await,
                     "a walk handed no queue discards once it has drained"
                 );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A status over a provider that holds its state, whose diff is exact, scans without `--scan`,
+    /// persists what it marks, and emits the summary of its scan.
+    #[tokio::test]
+    async fn a_status_over_an_exact_diff_persists_its_marks_and_emits_its_summary() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (repository, tempdir) = committed_repository("", &[]).await;
+                test_file_write(tempdir.path().join("added.txt").as_path(), b"added");
+                let (exact, _) = test_holding_context(&repository);
+                let adds = Arc::new(std::sync::Mutex::new(None));
+                let captured = adds.clone();
+                let execution = Arc::new(
+                    lore_revision::interface::ExecutionContext::new_client_with_user_id(
+                        lore_revision::interface::LoreGlobalArgs::default(),
+                        lore_revision::relay::EventDispatcher::new(Some(Box::new(move |event| {
+                            if let lore_revision::event::LoreEvent::RepositoryStatusSummary(data) =
+                                event
+                            {
+                                *captured.lock().expect("summary") = Some(data.adds);
+                            }
+                        }))),
+                        "test-user".to_string(),
+                    ),
+                );
+
+                LORE_CONTEXT
+                    .scope(
+                        execution.clone(),
+                        lore_revision::repository::status::status_boxed(
+                            exact.clone(),
+                            None,
+                            lore_revision::repository::status::StatusOptions {
+                                scan: false,
+                                ..scan_status_options()
+                            },
+                        ),
+                    )
+                    .await
+                    .expect("Status failed");
+                execution.dispatcher.drain().await;
+                assert_eq!(
+                    *adds.lock().expect("summary"),
+                    Some(1),
+                    "The status emitted no summary of its scan"
+                );
+
+                let (_, staged, _) = State::deserialize_current_and_staged(exact.clone())
+                    .await
+                    .expect("Deserialize failed");
+                let staged = staged.expect("The status persisted no marks");
+                let added = children_named(&exact, &staged, ROOT_NODE, "added.txt").await;
+                assert_eq!(added.len(), 1, "The status marked no add");
             }))
             .await
             .expect("Test task failed");

@@ -332,7 +332,9 @@ pub trait FilesystemProvider: Send + Sync + 'static {
     async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError>;
 
     /// Whether the provider holds the working tree's current state as a `State` it serves reads
-    /// from, rather than as files on a filesystem. Every operation it begins answers the same
+    /// from, rather than as files on a filesystem. Its
+    /// [`InstanceOperation::changes_from_filesystem_to_state`] then answers every change the
+    /// working tree holds without reading it. Every operation it begins answers the same
     /// ([`InstanceOperationImpl::holds_state`]), so a provider handing out another provider's
     /// operations answers as that provider does.
     fn holds_state(&self) -> bool {

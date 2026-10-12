@@ -228,10 +228,12 @@ pub fn test_filter_context(
 
 /// An OS filesystem that holds its state in a `State` as far as a command asks it
 /// ([`lore_revision::fs::filesystem_provider::FilesystemProvider::holds_state`]), as its
-/// operations do, while they read and write the files themselves.
+/// operations do, while they read and write the files themselves. Counts the operations begun on
+/// it.
 #[allow(dead_code)]
 pub struct HoldingFilesystem {
     pub inner: lore_revision::fs::os::OsFilesystem,
+    pub begins: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -242,6 +244,8 @@ impl lore_revision::fs::filesystem_provider::FilesystemProvider for HoldingFiles
         std::sync::Arc<lore_revision::fs::filesystem_provider::InstanceOperationImpl>,
         lore_revision::fs::filesystem_provider::FsError,
     > {
+        self.begins
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(std::sync::Arc::new(
             lore_revision::fs::filesystem_provider::InstanceOperationImpl::new(
                 lore_revision::fs::filesystem_provider::StaticDispatchInstanceOperation::Os(
@@ -257,14 +261,21 @@ impl lore_revision::fs::filesystem_provider::FilesystemProvider for HoldingFiles
     }
 }
 
-/// `repository`, with its stores, filter and write token, reading its working tree through a
-/// [`HoldingFilesystem`].
+/// `repository`, with its stores, filter and write token, reading its working tree through the
+/// [`HoldingFilesystem`] answered beside it.
 #[allow(dead_code)]
 pub fn test_holding_context(
     repository: &lore_revision::repository::RepositoryContext,
-) -> std::sync::Arc<lore_revision::repository::RepositoryContext> {
+) -> (
+    std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    std::sync::Arc<HoldingFilesystem>,
+) {
     let path = repository.require_path().expect("A repository on disk");
-    std::sync::Arc::new(
+    let filesystem = std::sync::Arc::new(HoldingFilesystem {
+        inner: lore_revision::fs::os::OsFilesystem::new(path),
+        begins: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let context = std::sync::Arc::new(
         lore_revision::repository::RepositoryContext::new(
             default_repository_creation_args(
                 repository.immutable_store(),
@@ -274,9 +285,7 @@ pub fn test_holding_context(
             .with_id(repository.id)
             .with_instance_id(repository.instance_id)
             .with_filter(repository.filter.clone())
-            .with_filesystem_provider(std::sync::Arc::new(HoldingFilesystem {
-                inner: lore_revision::fs::os::OsFilesystem::new(path),
-            })),
+            .with_filesystem_provider(filesystem.clone()),
         )
         .with_write_token(
             repository
@@ -284,7 +293,8 @@ pub fn test_holding_context(
                 .expect("A repository opened for writing")
                 .share(),
         ),
-    )
+    );
+    (context, filesystem)
 }
 
 /// Stages the whole working tree of `instance` and commits it, answering the state of the
@@ -510,4 +520,30 @@ pub fn test_reported(changes: &[lore_revision::change::NodeChange]) -> Vec<(Stri
             )
         })
         .collect()
+}
+
+/// The children of `parent` in `state` named `name`.
+#[allow(dead_code)]
+pub async fn children_named(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state: &std::sync::Arc<lore_revision::state::State>,
+    parent: lore_revision::node::NodeID,
+    name: &str,
+) -> Vec<lore_revision::node::NodeID> {
+    let name_hash = lore_storage::hash::hash_string(name);
+    let mut named = Vec::new();
+    for child in state
+        .node_children(repository.clone(), parent)
+        .await
+        .expect("Failed to list the children")
+    {
+        let node = state
+            .node(repository.clone(), child)
+            .await
+            .expect("Failed to read a child");
+        if node.name_hash == name_hash {
+            named.push(child);
+        }
+    }
+    named
 }
