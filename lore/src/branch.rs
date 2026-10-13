@@ -1307,9 +1307,7 @@ async fn archive_layers(
                 .into_iter()
                 .find(|layer| layer.target_path == path)
                 .ok_or_else(|| -> BranchError { lore_base::error::NotALayer { path }.into() })?;
-            vec![Arc::new(
-                repository.to_layer_context(layer.repository).await,
-            )]
+            vec![repository.to_layer_context(layer.repository).await]
         }
     };
 

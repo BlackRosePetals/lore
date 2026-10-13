@@ -715,6 +715,38 @@ def test_push_names_parent_branch_for_parent_revision(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
+def test_link_push_tells_a_layer_from_a_link(new_lore_repo):
+    """A repository holding both a link and a layer reports each mount as its own
+    kind, and the parent as neither.
+
+    A mount carries one kind, so each context reports exactly one of the three
+    and none reports both flags at once.
+    """
+    parent_repo, _link_repo = make_parent_with_link(new_lore_repo, "vendor/lib")
+
+    layer_repo: Lore = new_lore_repo(parent_repo.name + "_layer")
+    layer_repo.make_dirs("lay")
+    layer_repo.write_commit_push(None, {"lay/layered.txt": b"layer content"})
+    parent_repo.layer_add("lay", layer_repo, "lay/")
+
+    parent_repo.write_files({"vendor/lib/linked.txt": "edited through the mount\n"})
+    parent_repo.stage("vendor/lib/linked.txt")
+    parent_repo.commit("Edit through the mount")
+
+    # A link is pushed once per parent revision walked, so the kinds are
+    # collected as a set rather than counted.
+    kinds = {
+        (event["flagLink"], event["flagLayer"])
+        for event in parse_jsonl(parent_repo.push(json=True), "branchPush")
+    }
+
+    assert kinds == {(False, False), (False, True), (True, False)}, (
+        "Push must report the parent as neither a link nor a layer, the layer as "
+        f"a layer, and the link as a link, got {kinds}"
+    )
+
+
 def _remote_branch_entries(repo: Lore) -> list[dict]:
     """Remote branch list entries for a repository.
 

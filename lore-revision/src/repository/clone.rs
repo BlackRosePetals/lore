@@ -1161,7 +1161,7 @@ async fn clone_into(
         );
 
         lore_info!("Resolving layer revisions");
-        let module = Arc::new(repository.to_layer_context(repository_id).await);
+        let module = repository.to_layer_context(repository_id).await;
         let layer_latest = layer::latest_revision(module.clone(), branch_id)
             .await
             .forward::<CloneError>("Failed to get layer latest revision")?;
