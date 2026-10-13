@@ -11,6 +11,7 @@ use bytes::Bytes;
 use lore_base::lore_spawn;
 use lore_base::types::BranchMetadata;
 use lore_error_set::prelude::*;
+use lore_transport::BranchPushResponse;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
 use lore_transport::Revision;
@@ -43,6 +44,7 @@ use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
+use crate::state::Collection;
 use crate::state::State;
 use crate::store::StoreMatch;
 use crate::util::request_tracker::StoreRequestTracker;
@@ -1141,6 +1143,7 @@ fn collect_fragments_and_push(
                 remote.environment.max_query_batch(),
                 &state,
                 dry_run,
+                Collection::New,
             )
             .await?;
         }
@@ -1228,6 +1231,7 @@ async fn push_local_history(
             remote.environment.max_query_batch(),
             &state,
             dry_run,
+            Collection::New,
         )
         .await?;
 
@@ -1250,56 +1254,27 @@ async fn push_local_history(
         let mut response_message = None;
 
         if !dry_run && remote_latest != current_revision {
-            let push_result = revision_protocol
-                .branch_push(branch, current_revision, force, options.fast_forward_merge)
-                .await;
-
-            // If the server returns NotFound, the branch was deleted on the server.
-            // Recreate it via branch_create and retry the push.
-            let response = match push_result {
-                Err(ProtocolError::NotFound(_)) => {
-                    lore_debug!("Branch push returned NotFound, recreating branch on server");
-
-                    event::LoreEvent::BranchPushBranchCreateBegin(
-                        LoreBranchPushBranchCreateBeginEventData {
-                            repository: repository.id,
-                            branch,
-                            local_revision: remote_latest,
-                        },
-                    )
-                    .send();
-
-                    revision_protocol
-                        .branch_create(
-                            branch,
-                            branch_metadata.name.as_str(),
-                            branch_metadata.category.as_str(),
-                            branch_metadata.creator.as_str(),
-                            &branch_metadata.stack,
-                        )
-                        .await
-                        .forward::<PushError>("creating branch on remote")?;
-
-                    event::LoreEvent::BranchPushBranchCreateEnd(
-                        LoreBranchPushBranchCreateEndEventData {
-                            remote_revision: remote_latest,
-                        },
-                    )
-                    .send();
-
-                    forward_branch_push(
-                        revision_protocol
-                            .branch_push(
-                                branch,
-                                current_revision,
-                                force,
-                                options.fast_forward_merge,
-                            )
-                            .await,
-                    )?
-                }
-                result => forward_branch_push(result)?,
-            };
+            let response = offer_revision(
+                revision_protocol.as_ref(),
+                repository.id,
+                branch,
+                branch_metadata,
+                remote_latest,
+                current_revision,
+                force,
+                options.fast_forward_merge,
+                || {
+                    Box::pin(upload_revision_fragments(
+                        repository,
+                        storage_protocol,
+                        remote.environment.max_query_batch(),
+                        &state,
+                        false,
+                        Collection::Recovery,
+                    ))
+                },
+            )
+            .await?;
             if response.fast_forward_merged {
                 // Server performed a fast-forward merge — push succeeded with a new revision.
                 // Store the server-created revision as local latest (marked divergent since the
@@ -1420,11 +1395,6 @@ async fn push_local_history(
 
 /// Forward what the peer answered a branch push with, naming the fragment where it refused for
 /// a missing one.
-///
-/// A push reaches the peer twice where the branch was deleted under it: the attempt that finds
-/// it gone and the one that follows recreating it. Either can be refused for a fragment the peer
-/// does not hold, and the address is the peer's answer rather than anything the attempt decides,
-/// so both report it the same way.
 #[track_caller]
 fn forward_branch_push<T>(result: Result<T, ProtocolError>) -> Result<T, PushError> {
     match result {
@@ -1859,8 +1829,8 @@ async fn push_revision_links(
     Ok(())
 }
 
-/// Upload what `state` holds that its first parent does not, and the revision the second
-/// parent of a merge names.
+/// Upload what `state` holds that its first parent does not, of the addresses `collection`
+/// keeps, and the revision the second parent of a merge names.
 ///
 /// The peer needs this of every revision a push reaches, whether the revision goes on to
 /// be offered as a new latest revision or sits on a line that is only named by a merge.
@@ -1870,6 +1840,7 @@ async fn upload_revision_fragments(
     max_query_batch: Option<usize>,
     state: &Arc<State>,
     dry_run: bool,
+    collection: Collection,
 ) -> Result<(), PushError> {
     let state_parent = State::deserialize(repository.clone(), state.parent_self())
         .await
@@ -1880,11 +1851,11 @@ async fn upload_revision_fragments(
         state_parent.revision(),
         state.revision()
     );
-    let mut fragments = state::collect_new_fragments(
+    let mut fragments = state::collect_fragments(
         repository.clone(),
         state_parent,
         state.clone(),
-        true, /* Ignore already durably stored fragments */
+        collection,
         Arc::new(StoreRequestTracker::default()),
     )
     .await
@@ -1902,6 +1873,69 @@ async fn upload_revision_fragments(
         dry_run,
     )
     .await
+}
+
+/// Offer `revision` to the peer as the latest revision of `branch`, and return the peer's answer.
+///
+/// A peer that holds no such branch had it deleted while the push ran: the branch is created on
+/// the peer again from `metadata`, and `revision` offered once more. A peer that refuses an offer
+/// for a missing fragment has `recover` upload what it is missing, and `revision` is offered once
+/// more. A push that stopped part way can leave a list on the peer without every fragment it
+/// names, and a list the local store has since evicted hides those fragments from the collection
+/// of [`Collection::New`]. `recover` runs at most once, and only after such a refusal.
+#[allow(clippy::too_many_arguments)]
+#[lore_macro::test_pub]
+async fn offer_revision(
+    revision_protocol: &dyn Revision,
+    repository: RepositoryId,
+    branch: BranchId,
+    metadata: &BranchMetadata,
+    remote_latest: Hash,
+    revision: Hash,
+    force: bool,
+    fast_forward_merge: bool,
+    recover: impl AsyncFnOnce() -> Result<(), PushError>,
+) -> Result<BranchPushResponse, PushError> {
+    let mut answer = revision_protocol
+        .branch_push(branch, revision, force, fast_forward_merge)
+        .await;
+    if let Err(ProtocolError::NotFound(_)) = answer {
+        lore_debug!("Branch push returned NotFound, recreating branch on server");
+        event::LoreEvent::BranchPushBranchCreateBegin(LoreBranchPushBranchCreateBeginEventData {
+            repository,
+            branch,
+            local_revision: remote_latest,
+        })
+        .send();
+        revision_protocol
+            .branch_create(
+                branch,
+                metadata.name.as_str(),
+                metadata.category.as_str(),
+                metadata.creator.as_str(),
+                &metadata.stack,
+            )
+            .await
+            .forward::<PushError>("creating branch on remote")?;
+        event::LoreEvent::BranchPushBranchCreateEnd(LoreBranchPushBranchCreateEndEventData {
+            remote_revision: remote_latest,
+        })
+        .send();
+        answer = revision_protocol
+            .branch_push(branch, revision, force, fast_forward_merge)
+            .await;
+    }
+    if let Err(ProtocolError::AddressNotFound(missing)) = &answer {
+        lore_debug!(
+            "Branch push missing fragment {}, collecting through the remote",
+            Address::from(&missing.address[..])
+        );
+        recover().await?;
+        answer = revision_protocol
+            .branch_push(branch, revision, force, fast_forward_merge)
+            .await;
+    }
+    forward_branch_push(answer)
 }
 
 /// Upload those of `fragments` the peer answers that it is missing, reporting progress

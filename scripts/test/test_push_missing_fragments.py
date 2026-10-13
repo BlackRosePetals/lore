@@ -1,16 +1,25 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
+import hashlib
 import logging
+import os
+import uuid
+from pathlib import Path
 
+import grpc
 import pytest
-
+from error_types import LoreException
 from grpc_admin import fetch_server_features
+from grpc_probe import STORAGE_QUERY, call, repository_metadata
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
     generate_server_config,
     launch_lore_server,
 )
+from protobuf_wire import encode_bytes_field, field_packed_ints, parse_fields
+from store_layout import index_hashes
+
 from lore import Lore
 
 logger = logging.getLogger(__name__)
@@ -132,3 +141,122 @@ def test_push_missing_fragments(new_lore_repo, missing_fragments_remote_url):
     clone.commit("Reverted text-File.txt")
     clone.branch_push()
     clone.branch_merge_into("main", "CHECK IN CHANGES")
+
+
+# The chunk of `_distinct_content` with the highest hash. A push uploads in hash order, so the
+# list of chunks and every other chunk go up before the refused one fails the push. Tied to the
+# bytes `_distinct_content` writes; change them together.
+REFUSED_CHUNK_HASH = "ec2de87711a81bb44a1a7d72685e494c39e9f66c61105e2e51a80789c4de8452"
+# The list of chunks of `_distinct_content`. Tied to its bytes like `REFUSED_CHUNK_HASH`.
+LIST_HASH = "c6f1ceb7e5c944cd34fbdc730ada1aba10fe1fb6752d81219ce57f184c66065e"
+# The storage query statuses for content held in the asked context, or in another one.
+HELD_STATUSES = (0, 1)
+
+
+def _distinct_content() -> bytes:
+    """1 MiB of bytes that split into chunks of distinct content."""
+    return b"".join(
+        hashlib.sha256(index.to_bytes(4, "little")).digest() for index in range(32768)
+    )
+
+
+@pytest.fixture()
+def refusing_server(request, tmp_path_factory, lore_server_executable_path):
+    """Yield the remote URL and the gRPC target of a dedicated loreserver that refuses the
+    first write of `REFUSED_CHUNK_HASH` and accepts the writes after it."""
+    shared_port = allocate_free_port()
+    ports = {
+        "quic": shared_port,
+        "grpc": shared_port,
+        "http": allocate_free_port(),
+        "internal": allocate_free_port(),
+    }
+    server_root, server_env = generate_server_config(request, tmp_path_factory, ports)
+    server_env["LORE_REFUSE_FRAGMENT_WRITES"] = REFUSED_CHUNK_HASH
+    proc, log_path, log_fd = launch_lore_server(
+        server_root, server_env, lore_server_executable_path
+    )
+    host = "127.0.0.1"
+    try:
+        # LORE_REFUSE_FRAGMENT_WRITES is only honored when the server is built with
+        # the `failure_generator` cargo feature.
+        features = fetch_server_features(f"{host}:{ports['grpc']}")
+        if "failure_generator" not in features:
+            pytest.skip(
+                "server not built with the 'failure_generator' feature "
+                "(build loreserver with --features failure_generator)"
+            )
+        yield f"lore://{host}:{ports['quic']}/", f"{host}:{ports['grpc']}"
+    finally:
+        _kill_server_by_pid(proc.pid, log_path, label="refusing server")
+        log_fd.close()
+
+
+def _server_holds(grpc_target: str, repo_id: str, hash_hex: str) -> bool:
+    """Whether the server holds content with `hash_hex` in the repository, in any context."""
+    address = encode_bytes_field(1, bytes.fromhex(hash_hex)) + encode_bytes_field(
+        2, bytes(16)
+    )
+    status, body, message = call(
+        grpc_target,
+        STORAGE_QUERY,
+        encode_bytes_field(1, address),
+        repository_metadata(repo_id),
+    )
+    assert status == grpc.StatusCode.OK, message
+    [state] = field_packed_ints(parse_fields(body), 1)
+    return state in HELD_STATUSES
+
+
+def _set_store_caps(repo: Lore, max_size: str, max_capacity: str) -> None:
+    """Rewrite the repository's [store] GC caps in config.toml."""
+    config_path = Path(os.path.join(repo.dot_path(), "config.toml"))
+    lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.strip().startswith("max_size"):
+            lines[index] = f"max_size = {max_size}\n"
+        elif line.strip().startswith("max_capacity"):
+            lines[index] = f"max_capacity = {max_capacity}\n"
+    config_path.write_text("".join(lines), encoding="utf-8")
+
+
+@pytest.mark.smoke
+@pytest.mark.requires_instrumented_lore
+def test_push_after_a_failed_push_uploads_what_an_evicted_list_names(
+    new_lore_repo, refusing_server
+):
+    """A push that fails part way leaves the server holding the list of a file's chunks but
+    not every chunk, and the list durable in the local store, where eviction can remove its
+    entry. The next push offers the list alone, the server refuses the branch push for the
+    missing chunk, and the push collects again through the server, finds the chunks the list
+    names, uploads the one the server lacks and offers the branch push again."""
+    remote_url, grpc_target = refusing_server
+    repo_id = uuid.uuid4().hex
+    repo: Lore = new_lore_repo(remote_url=remote_url, repo_id=repo_id)
+    content = _distinct_content()
+    with repo.open_file("large.uasset", "w+b") as output_file:
+        output_file.write(content)
+    repo.stage(scan=True)
+    repo.commit("Large file", local=True)
+
+    with pytest.raises(LoreException):
+        repo.push()
+    assert _server_holds(grpc_target, repo_id, LIST_HASH), "the list of chunks went up"
+    assert not _server_holds(grpc_target, repo_id, REFUSED_CHUNK_HASH), (
+        "the refused chunk did not"
+    )
+
+    local_store = os.path.join(repo.dot_path(), "immutable")
+    assert bytes.fromhex(LIST_HASH) in index_hashes(local_store)
+    _set_store_caps(repo, max_size="1", max_capacity="1")
+    repo.repository_gc()
+    assert bytes.fromhex(LIST_HASH) not in index_hashes(local_store), (
+        "gc evicted the list"
+    )
+    repo.push()
+
+    assert _server_holds(grpc_target, repo_id, REFUSED_CHUNK_HASH)
+    assert "in sync with remote" in repo.status()
+    clone = repo.clone()
+    with clone.open_file("large.uasset", "rb") as cloned:
+        assert cloned.read() == content

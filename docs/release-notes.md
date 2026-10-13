@@ -63,6 +63,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   clone from `LORE_EVENT_COMPLETE`, which every clone sends whether it succeeded or failed
 - `loreserver`: a revision list starting at a revision numbered above the branch's latest, such as one a client hasn't
   pushed, returns no forward cursor in place of stopping the server
+- `lore push` after a push that stopped part way uploads the fragments of a file whose fragment list the server holds
+  and the local store has evicted. Before, the push offered the list alone and failed with a missing fragment on every
+  retry
 - gRPC: concurrent copies of one content to different files each reach the server. Before, a copy answered with the
   result of another, so a push recorded content the server did not hold, and the branch push failed with a missing
   fragment on every retry

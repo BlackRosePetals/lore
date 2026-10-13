@@ -8008,15 +8008,50 @@ fn collect_diff_addresses(from: Vec<Address>, to: Vec<Address>) -> Vec<Address> 
     new
 }
 
-/// Returns sorted and deduplicated addresses
+/// Which addresses a collection of the fragments a state adds keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Collection {
+    /// Every address, durable or not, as for the state a diff starts from.
+    All,
+    /// The addresses the local store holds no durable full match for, which a push sends.
+    New,
+    /// As [`Collection::New`], and an address the local store holds no entry for, as after
+    /// eviction removed it, is asked of the remote, and when the remote holds it as a list the
+    /// fragments it names are collected too. For a push the remote refused for a missing
+    /// fragment: one that stopped part way can leave a list on the remote without every fragment
+    /// it names.
+    Recovery,
+}
+
+/// As [`collect_fragments`], keeping the addresses the local store holds no durable full match
+/// for with `ignore_durably_stored`, and every address without it.
 ///
-/// `tracker` counts the store reads of the per-address tasks the collection spawns to look up
-/// each candidate fragment.
-pub async fn collect_new_fragments(
+/// Not an `async fn`, which would hold the collection's future in a state of its own.
+pub fn collect_new_fragments(
     repository: Arc<RepositoryContext>,
     state_from: Arc<State>,
     state_to: Arc<State>,
     ignore_durably_stored: bool,
+    tracker: Arc<StoreRequestTracker>,
+) -> impl Future<Output = Result<Vec<Address>, StateError>> {
+    let collection = if ignore_durably_stored {
+        Collection::New
+    } else {
+        Collection::All
+    };
+    collect_fragments(repository, state_from, state_to, collection, tracker)
+}
+
+/// The addresses of the fragments `state_to` holds that `state_from` does not, that
+/// `collection` keeps, sorted and deduplicated.
+///
+/// `tracker` counts the store reads of the per-address tasks the collection spawns to look up
+/// each candidate fragment.
+pub async fn collect_fragments(
+    repository: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    state_to: Arc<State>,
+    collection: Collection,
     tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     let from_state_address = lore_spawn!({
@@ -8027,7 +8062,7 @@ pub async fn collect_new_fragments(
             let addresses = collect_state_fragments(repository.clone(), state).await?;
             // Collect all from block addresses, even uploaded, as we want to diff against these
             let mut addresses =
-                collect_new_addresses(repository, &addresses, false, tracker).await?;
+                collect_new_addresses(repository, &addresses, Collection::All, tracker).await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -8040,8 +8075,7 @@ pub async fn collect_new_fragments(
         async move {
             let addresses = collect_state_fragments(repository.clone(), state).await?;
             let mut addresses =
-                collect_new_addresses(repository, &addresses, ignore_durably_stored, tracker)
-                    .await?;
+                collect_new_addresses(repository, &addresses, collection, tracker).await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -8098,13 +8132,7 @@ pub async fn collect_new_fragments(
             // Safe to filter these directly to only contain not uploaded fragments, we don't
             // use it as input to any other collection
             collect_new_file_fragments(
-                repository,
-                state_from,
-                state_to,
-                ROOT_NODE,
-                ROOT_NODE,
-                ignore_durably_stored,
-                tracker,
+                repository, state_from, state_to, ROOT_NODE, ROOT_NODE, collection, tracker,
             )
             .await
         }
@@ -8115,13 +8143,8 @@ pub async fn collect_new_fragments(
         let metadata_hash = state_to.metadata_hash();
         let tracker = tracker.clone();
         async move {
-            collect_new_revision_metadata_fragments(
-                repository,
-                metadata_hash,
-                ignore_durably_stored,
-                tracker,
-            )
-            .await
+            collect_new_revision_metadata_fragments(repository, metadata_hash, collection, tracker)
+                .await
         }
     });
 
@@ -8172,8 +8195,7 @@ pub async fn collect_new_fragments(
         async move {
             let addresses = collect_name_fragments(repository.clone(), blocks).await?;
             let mut addresses =
-                collect_new_addresses(repository, &addresses, ignore_durably_stored, tracker)
-                    .await?;
+                collect_new_addresses(repository, &addresses, collection, tracker).await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -8185,13 +8207,8 @@ pub async fn collect_new_fragments(
         let repository = repository.clone();
         let tracker = tracker.clone();
         async move {
-            let mut addresses = collect_new_addresses(
-                repository,
-                &diff_block_address,
-                ignore_durably_stored,
-                tracker,
-            )
-            .await?;
+            let mut addresses =
+                collect_new_addresses(repository, &diff_block_address, collection, tracker).await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -8285,7 +8302,7 @@ pub async fn collect_new_fragments(
                         from_block_address,
                         *to_block_address,
                         block_index,
-                        ignore_durably_stored,
+                        collection,
                         tracker.clone(),
                     )
                 );
@@ -8377,7 +8394,7 @@ pub async fn collect_new_fragments(
         let metadata_fragments = collect_new_addresses(
             repository.clone(),
             &[Address::zero_context_hash(metadata_hash)],
-            ignore_durably_stored,
+            collection,
             tracker,
         )
         .await;
@@ -8454,7 +8471,7 @@ async fn collect_new_file_fragments(
     state_to: Arc<State>,
     node_from: NodeID,
     node_to: NodeID,
-    ignore_durably_stored: bool,
+    collection: Collection,
     tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     let (from, to) = join!(
@@ -8513,8 +8530,7 @@ async fn collect_new_file_fragments(
                 let address = [to_node.address];
                 let tracker = tracker.clone();
                 lore_spawn!(tasks, async move {
-                    collect_new_addresses(repository, &address, ignore_durably_stored, tracker)
-                        .await
+                    collect_new_addresses(repository, &address, collection, tracker).await
                 });
             } else {
                 let repository = to.repository.clone();
@@ -8528,7 +8544,7 @@ async fn collect_new_file_fragments(
                         state_to,
                         from_node_id,
                         to_node_id,
-                        ignore_durably_stored,
+                        collection,
                         tracker,
                     )
                     .await
@@ -8566,17 +8582,11 @@ fn collect_new_file_fragments_recurse(
     state_to: Arc<State>,
     node_from: NodeID,
     node_to: NodeID,
-    ignore_durably_stored: bool,
+    collection: Collection,
     tracker: Arc<StoreRequestTracker>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Address>, StateError>> + Send + 'static>> {
     Box::pin(collect_new_file_fragments(
-        repository,
-        state_from,
-        state_to,
-        node_from,
-        node_to,
-        ignore_durably_stored,
-        tracker,
+        repository, state_from, state_to, node_from, node_to, collection, tracker,
     ))
 }
 
@@ -8618,7 +8628,7 @@ async fn collect_new_node_metadata_fragments(
     block_address_from: Option<Address>,
     block_address_to: Address,
     block_index: usize,
-    ignore_durably_stored: bool,
+    collection: Collection,
     tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     let metadata_block_from = if let Some(address) = block_address_from {
@@ -8669,12 +8679,12 @@ async fn collect_new_node_metadata_fragments(
     let mut addresses = collect_new_addresses(
         repository.clone(),
         &metadata_blobs,
-        ignore_durably_stored,
+        collection,
         tracker.clone(),
     )
     .await?;
     let mut more_addresses =
-        collect_new_addresses(repository, &metadata_refs, ignore_durably_stored, tracker).await?;
+        collect_new_addresses(repository, &metadata_refs, collection, tracker).await?;
     addresses.append(&mut more_addresses);
 
     addresses.sort_unstable();
@@ -8690,7 +8700,7 @@ async fn collect_new_node_metadata_fragments(
 async fn collect_new_revision_metadata_fragments(
     repository: Arc<RepositoryContext>,
     metadata_hash: Hash,
-    ignore_durably_stored: bool,
+    collection: Collection,
     tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     if metadata_hash.is_zero() {
@@ -8705,7 +8715,7 @@ async fn collect_new_revision_metadata_fragments(
     collect_metadata_address_refs(&metadata, &mut metadata_refs)?;
 
     let mut addresses =
-        collect_new_addresses(repository, &metadata_refs, ignore_durably_stored, tracker).await?;
+        collect_new_addresses(repository, &metadata_refs, collection, tracker).await?;
 
     addresses.sort_unstable();
     addresses.dedup();
@@ -8713,10 +8723,13 @@ async fn collect_new_revision_metadata_fragments(
     Ok(addresses)
 }
 
+/// The addresses among `addresses`, and among the fragments the lists of them name, that
+/// `collection` keeps. An address the local store holds no entry for is collected alone, unless
+/// [`Collection::Recovery`] finds the remote holds it as a list.
 async fn collect_new_addresses(
     repository: Arc<RepositoryContext>,
     addresses: &[Address],
-    ignore_durably_stored: bool,
+    collection: Collection,
     tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     let mut new_addresses = Vec::with_capacity(addresses.len());
@@ -8740,55 +8753,57 @@ async fn collect_new_addresses(
                         .get_metadata(repository.id, address)
                         .await
                 };
-                if let Ok(query) = query {
-                    let mut addresses = vec![];
-                    if query.fragment.flags & FragmentFlags::PayloadFragmented != 0
-                        && let Ok((_fragment, buffer)) = {
-                            let _request = tracker.track();
-                            immutable::load_raw(
-                                repository.clone(),
-                                address,
-                                immutable::read_options_from_repository(&repository),
-                            )
-                            .await
-                        }
-                    {
-                        let buffer = buffer.to_aligned::<FragmentReference>();
-                        let mut subaddress =
-                            Vec::with_capacity(buffer.count::<FragmentReference>());
-                        for reference in buffer.as_type_slice::<FragmentReference>().iter() {
-                            subaddress.push(Address {
-                                context: address.context,
-                                hash: reference.hash,
-                            });
-                        }
-                        if let Ok(mut subaddress) = collect_new_addresses_recurse(
+                let query = query
+                    .ok()
+                    .filter(|query| query.match_made != StoreMatch::MatchNone);
+                let (fragmented, new) = match &query {
+                    Some(query) => (
+                        query.fragment.flags & FragmentFlags::PayloadFragmented != 0,
+                        collection == Collection::All
+                            || query.match_made != StoreMatch::MatchFull
+                            || (query.fragment.flags & FragmentFlags::PayloadStoredDurable) == 0,
+                    ),
+                    None => (
+                        collection == Collection::Recovery
+                            && remote_lists_fragments(&repository, address, &tracker).await,
+                        true,
+                    ),
+                };
+                let mut addresses = vec![];
+                if fragmented
+                    && let Ok((_fragment, buffer)) = {
+                        let _request = tracker.track();
+                        immutable::load_raw(
                             repository.clone(),
-                            subaddress.as_slice(),
-                            ignore_durably_stored,
-                            tracker.clone(),
+                            address,
+                            immutable::read_options_from_repository(&repository),
                         )
                         .await
-                        {
-                            addresses.append(&mut subaddress);
-                        }
                     }
-
-                    if !ignore_durably_stored
-                        || query.match_made != StoreMatch::MatchFull
-                        || (query.fragment.flags & FragmentFlags::PayloadStoredDurable) == 0
+                {
+                    let buffer = buffer.to_aligned::<FragmentReference>();
+                    let mut subaddress = Vec::with_capacity(buffer.count::<FragmentReference>());
+                    for reference in buffer.as_type_slice::<FragmentReference>().iter() {
+                        subaddress.push(Address {
+                            context: address.context,
+                            hash: reference.hash,
+                        });
+                    }
+                    if let Ok(mut subaddress) = collect_new_addresses_recurse(
+                        repository.clone(),
+                        subaddress.as_slice(),
+                        collection,
+                        tracker.clone(),
+                    )
+                    .await
                     {
-                        addresses.push(address);
+                        addresses.append(&mut subaddress);
                     }
-
-                    if !addresses.is_empty() {
-                        Some(addresses)
-                    } else {
-                        None
-                    }
-                } else {
-                    Some(vec![address])
                 }
+                if new {
+                    addresses.push(address);
+                }
+                (!addresses.is_empty()).then_some(addresses)
             }
         });
 
@@ -8810,17 +8825,31 @@ async fn collect_new_addresses(
     Ok(new_addresses)
 }
 
+/// Whether the remote holds `address` as a list of fragments. `false` without a remote, or when
+/// the remote cannot answer. The remote read counts as a request of `tracker`.
+async fn remote_lists_fragments(
+    repository: &Arc<RepositoryContext>,
+    address: Address,
+    tracker: &StoreRequestTracker,
+) -> bool {
+    let Some(session) = immutable::resolve_session(repository) else {
+        return false;
+    };
+    let _request = tracker.track();
+    session
+        .get_metadata(&address)
+        .await
+        .is_ok_and(|fragment| fragment.flags & FragmentFlags::PayloadFragmented != 0)
+}
+
 fn collect_new_addresses_recurse(
     repository: Arc<RepositoryContext>,
     addresses: &[Address],
-    ignore_durably_stored: bool,
+    collection: Collection,
     tracker: Arc<StoreRequestTracker>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Address>, StateError>> + Send + '_>> {
     Box::pin(collect_new_addresses(
-        repository,
-        addresses,
-        ignore_durably_stored,
-        tracker,
+        repository, addresses, collection, tracker,
     ))
 }
 

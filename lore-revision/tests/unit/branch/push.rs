@@ -226,3 +226,191 @@ mod mark {
         );
     }
 }
+
+/// What an offer of a revision as a branch's latest does with each answer of the peer.
+mod offer {
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use async_trait::async_trait;
+    use lore_base::error::NotFound;
+    use lore_base::types::BranchId;
+    use lore_base::types::BranchMetadata;
+    use lore_base::types::BranchPoint;
+    use lore_base::types::RepositoryId;
+    use lore_transport::BranchListResponse;
+    use lore_transport::BranchPushResponse;
+    use lore_transport::BranchQueryResponse;
+    use lore_transport::MetadataSetResult;
+    use lore_transport::Revision;
+    use lore_transport::RevisionListResponse;
+    use lore_transport::RevisionListStart;
+    use parking_lot::Mutex;
+
+    use super::*;
+    use crate::branch::with_execution;
+
+    /// A peer that answers each branch push with the next of its answers, and counts the
+    /// branches it creates.
+    struct Peer {
+        answers: Mutex<VecDeque<Result<BranchPushResponse, ProtocolError>>>,
+        created: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Revision for Peer {
+        async fn branch_create(
+            &self,
+            _: BranchId,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[BranchPoint],
+        ) -> Result<Hash, ProtocolError> {
+            self.created.fetch_add(1, Ordering::Relaxed);
+            Ok(Hash::default())
+        }
+
+        async fn branch_delete(&self, _: BranchId) -> Result<(), ProtocolError> {
+            unreachable!("an offer deletes no branch")
+        }
+
+        async fn branch_query(
+            &self,
+            _: Option<BranchId>,
+            _: Option<&str>,
+        ) -> Result<BranchQueryResponse, ProtocolError> {
+            unreachable!("an offer queries no branch")
+        }
+
+        async fn branch_push(
+            &self,
+            _: BranchId,
+            _: Hash,
+            _: bool,
+            _: bool,
+        ) -> Result<BranchPushResponse, ProtocolError> {
+            self.answers
+                .lock()
+                .pop_front()
+                .expect("the peer was not offered more than it answers")
+        }
+
+        async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
+            unreachable!("an offer lists no branches")
+        }
+
+        async fn revision_list(
+            &self,
+            _: RevisionListStart,
+        ) -> Result<RevisionListResponse, ProtocolError> {
+            unreachable!("an offer lists no revisions")
+        }
+
+        async fn branch_metadata_get(&self, _: BranchId) -> Result<Hash, ProtocolError> {
+            unreachable!("an offer reads no branch metadata")
+        }
+
+        async fn branch_metadata_set(
+            &self,
+            _: BranchId,
+            _: Hash,
+            _: Hash,
+        ) -> Result<MetadataSetResult, ProtocolError> {
+            unreachable!("an offer writes no branch metadata")
+        }
+    }
+
+    fn accepted() -> Result<BranchPushResponse, ProtocolError> {
+        Ok(BranchPushResponse {
+            fast_forward_merged: false,
+            revision: Hash::from([1; 32]),
+            revision_number: 1,
+            message: None,
+        })
+    }
+
+    fn deleted() -> Result<BranchPushResponse, ProtocolError> {
+        Err(ProtocolError::from(NotFound))
+    }
+
+    fn missing() -> Result<BranchPushResponse, ProtocolError> {
+        Err(ProtocolError::from(AddressNotFound { address: [7; 48] }))
+    }
+
+    /// The recovery runs once if the peer refuses the first offer or the offer after a deleted
+    /// branch is created again for a missing fragment, and for no other answer. A refusal the
+    /// recovery does not fix reaches the caller as the missing fragment it is.
+    #[tokio::test]
+    async fn recovery_runs_once_and_only_after_a_refusal_for_a_missing_fragment() {
+        let cases = [
+            ("accepted", vec![accepted()], 0, 0, None),
+            ("deleted, accepted", vec![deleted(), accepted()], 1, 0, None),
+            ("missing, accepted", vec![missing(), accepted()], 0, 1, None),
+            (
+                "deleted, missing, accepted",
+                vec![deleted(), missing(), accepted()],
+                1,
+                1,
+                None,
+            ),
+            (
+                "missing, missing",
+                vec![missing(), missing()],
+                0,
+                1,
+                Some(LoreError::AddressNotFound),
+            ),
+            (
+                "deleted, deleted",
+                vec![deleted(), deleted()],
+                1,
+                0,
+                Some(LoreError::NotFound),
+            ),
+        ];
+        for (name, answers, created, recovered, error) in cases {
+            let peer = Peer {
+                answers: Mutex::new(answers.into()),
+                created: AtomicUsize::new(0),
+            };
+            let recoveries = AtomicUsize::new(0);
+
+            let result = with_execution(offer_revision(
+                &peer,
+                RepositoryId::default(),
+                BranchId::default(),
+                &BranchMetadata::default(),
+                Hash::default(),
+                Hash::from([1; 32]),
+                false,
+                false,
+                async || {
+                    recoveries.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            ))
+            .await;
+
+            assert!(
+                result.err().map(|error| error.translated()) == error,
+                "{name}: the result"
+            );
+            assert_eq!(
+                peer.created.load(Ordering::Relaxed),
+                created,
+                "{name}: branches created"
+            );
+            assert_eq!(
+                recoveries.load(Ordering::Relaxed),
+                recovered,
+                "{name}: recoveries"
+            );
+            assert!(
+                peer.answers.lock().is_empty(),
+                "{name}: every answer was asked for"
+            );
+        }
+    }
+}

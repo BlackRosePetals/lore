@@ -347,6 +347,22 @@ impl ImmutableStoreGroup {
 pub struct LocalImmutableStoreFailureGenerator {
     retry_rate: f32,
     miss_fragment_writes: HashSet<Hash>,
+    /// Hashes whose first write fails, from `LORE_REFUSE_FRAGMENT_WRITES`.
+    refuse_fragment_writes: parking_lot::Mutex<HashSet<Hash>>,
+}
+
+#[cfg(feature = "failure_generator")]
+impl LocalImmutableStoreFailureGenerator {
+    /// The hashes the environment variable `name` lists, separated by commas.
+    fn hashes_from_env(name: &str) -> HashSet<Hash> {
+        std::env::var(name)
+            .map(|val| {
+                val.split(",")
+                    .filter_map(|hash| Hash::from_str(hash.trim()).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Holds a store's garbage collection stop raised while it lives. A terminating request
@@ -1128,13 +1144,12 @@ impl LocalImmutableStore {
                 .unwrap_or_default()
                 .parse::<f32>()
                 .unwrap_or_default(),
-            miss_fragment_writes: std::env::var("LORE_MISS_FRAGMENT_WRITES")
-                .map(|val| {
-                    val.split(",")
-                        .filter_map(|hash| Hash::from_str(hash.trim()).ok())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            miss_fragment_writes: LocalImmutableStoreFailureGenerator::hashes_from_env(
+                "LORE_MISS_FRAGMENT_WRITES",
+            ),
+            refuse_fragment_writes: parking_lot::Mutex::new(
+                LocalImmutableStoreFailureGenerator::hashes_from_env("LORE_REFUSE_FRAGMENT_WRITES"),
+            ),
         };
 
         // Target 70% percentage of max size by default if the given setting is invalid
@@ -3992,6 +4007,18 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 address.hash
             );
             return Ok(());
+        }
+        #[cfg(feature = "failure_generator")]
+        if self
+            .failure_generator
+            .refuse_fragment_writes
+            .lock()
+            .remove(&address.hash)
+        {
+            return Err(StoreError::internal(format!(
+                "Refusing the first write for fragment with hash {} based on failure generator configuration",
+                address.hash
+            )));
         }
         if force && payload.is_some() {
             lore_base::lore_debug!("Force overwrite fragment in local store");

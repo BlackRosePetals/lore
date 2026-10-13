@@ -92,6 +92,22 @@ def parse_fields(message: bytes) -> Fields:
     return fields
 
 
+def field_packed_ints(fields: Fields, field_number: int) -> list[int]:
+    """Values of a repeated varint field (int32/int64/enum), packed into one
+    length-delimited field, as proto3 writes it, or one field per value; absent
+    reads back as empty."""
+    values = []
+    for value in fields.get(field_number, []):
+        if isinstance(value, int):
+            values.append(value)
+            continue
+        pos = 0
+        while pos < len(value):
+            item, pos = _read_varint(value, pos)
+            values.append(item)
+    return values
+
+
 def field_int(fields: Fields, field_number: int) -> int:
     """Value of a varint field. A proto3 field carrying its type's default is
     not put on the wire, so an absent field reads back as 0."""

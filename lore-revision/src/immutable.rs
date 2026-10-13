@@ -160,7 +160,7 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
 /// gone by the time a session resolves has no pool left to take sessions from. A call that
 /// takes the session holds the context until it completes.
 #[lore_macro::test_pub]
-fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc<StorageSession>> {
+pub(crate) fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc<StorageSession>> {
     if repository.is_offline() {
         return None;
     }
@@ -256,7 +256,6 @@ pub async fn store_raw_remote_retry(
                 return Err(Disconnected.into());
             }
             Err(err) => {
-                debug_assert!(false, "Remote server responded with error on put: {err}");
                 return Err(ImmutableError::internal_with_context(
                     err,
                     "Failed to store fragments, remote error",

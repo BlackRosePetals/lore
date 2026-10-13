@@ -89,6 +89,23 @@ def unreachable_index_entries(store_root: str) -> list[str]:
     return findings
 
 
+def index_hashes(store_root: str) -> set[bytes]:
+    """The hash of every entry in the bucket files of the store at `store_root`, the
+    directory holding `index/`."""
+    hashes = set()
+    index_root = os.path.join(store_root, "index")
+    if not os.path.isdir(index_root):
+        return hashes
+    for group in os.listdir(index_root):
+        group_dir = os.path.join(index_root, group)
+        if not os.path.isdir(group_dir):
+            continue
+        for name in os.listdir(group_dir):
+            if name.startswith(_BUCKET_PREFIX) and len(name) == len(_BUCKET_PREFIX) + 2:
+                hashes.update(_entry_hashes(os.path.join(group_dir, name)))
+    return hashes
+
+
 def assert_all_index_entries_reachable(repo) -> None:
     """Fail when the repository's local store holds an entry no lookup can reach."""
     store_root = os.path.join(repo.dot_path(), "immutable")
