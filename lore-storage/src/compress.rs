@@ -708,6 +708,8 @@ fn decompress_into(
     compressed: &[u8],
     mut decompressed: BytesMut,
 ) -> Result<(Fragment, BytesMut), FragmentError> {
+    #[cfg(feature = "test-util")]
+    crate::test_util::count_decode();
     if fragment.size_content as usize > FRAGMENT_SIZE_THRESHOLD
         || compressed.len() < fragment.size_payload as usize
         || decompressed.capacity() < fragment.size_content as usize
@@ -839,6 +841,8 @@ pub fn decompress_into_slice(
     compressed: &[u8],
     decompressed: &mut [u8],
 ) -> Result<Fragment, FragmentError> {
+    #[cfg(feature = "test-util")]
+    crate::test_util::count_decode();
     if fragment.size_content as usize > FRAGMENT_SIZE_THRESHOLD
         || decompressed.len() < fragment.size_content as usize
         || compressed.len() < fragment.size_payload as usize

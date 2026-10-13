@@ -18,6 +18,7 @@ mod local;
 mod maintenance;
 mod packstore;
 mod read;
+mod read_flight;
 mod store_fixture;
 mod write;
 mod write_stats;

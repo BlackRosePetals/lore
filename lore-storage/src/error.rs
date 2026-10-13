@@ -4,7 +4,7 @@ use lore_error_set::prelude::*;
 
 use crate::errors::*;
 
-#[error_set]
+#[error_set(clone)]
 pub enum StorageError {
     AddressNotFound,
     PayloadNotFound,

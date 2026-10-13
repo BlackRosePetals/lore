@@ -35,6 +35,35 @@ use lore_storage::local::immutable_store::ImmutableStoreSettings;
 use lore_storage::local::immutable_store::LocalImmutableStore;
 use lore_storage::write::*;
 
+/// A reader looking for a store while its guard drops finds the entry or sees the count
+/// moved, never neither: neither would let it skip the probe that finds the store.
+#[test]
+fn a_dropping_guard_is_never_both_gone_and_uncounted() {
+    let partition = Partition::from([0xC7; 16]);
+    let address = Address {
+        hash: lore_storage::hash::hash_slice(b"a dropping guard"),
+        context: Context::from([0xC7; 16]),
+    };
+    let before = stores_landed(address);
+    let guard = try_acquire_in_flight(partition, address).expect("fresh address");
+    let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+    {
+        let seen = seen.clone();
+        lore_storage::test_util::set_guard_midpoint(move |dropped, still_in_flight| {
+            if dropped == address {
+                seen.set(Some(still_in_flight && stores_landed(address) != before));
+            }
+        });
+    }
+    drop(guard);
+    lore_storage::test_util::clear_guard_midpoint();
+    assert_eq!(
+        seen.get(),
+        Some(true),
+        "midway through the drop the store was gone and its count unmoved"
+    );
+}
+
 #[test]
 fn remote_put_retry_accepts_arc_storage_session_and_is_send() {
     // Compile-only: asserts remote_put_retry's signature takes

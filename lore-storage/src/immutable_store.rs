@@ -108,10 +108,27 @@ pub fn validate_fragment_payload(
 /// where they do not, but only at ingress, and a store may already hold one from before that
 /// boundary existed: its payload is shorter than the content it claims, so it is not the content.
 pub(crate) fn payload_is_content(fragment: &Fragment) -> bool {
+    payload_is_plain(fragment) && fragment.size_payload as u64 == fragment.size_content
+}
+
+/// Whether the payload is neither a fragment list nor compressed.
+fn payload_is_plain(fragment: &Fragment) -> bool {
     let fragmented =
         (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented;
     let compressed = (fragment.flags & FragmentFlags::PayloadCompressed) != 0;
-    !fragmented && !compressed && fragment.size_payload as u64 == fragment.size_content
+    !fragmented && !compressed
+}
+
+/// Refuse a plain payload ([`payload_is_plain`]), which is the content, whose size differs from
+/// the content size it claims.
+pub(crate) fn validate_plain_payload_size(fragment: &Fragment) -> Result<(), StoreError> {
+    if payload_is_plain(fragment) && fragment.size_payload as u64 != fragment.size_content {
+        return Err(StoreError::internal(format!(
+            "uncompressed unfragmented fragment has mismatching size_payload {} and size_content {}",
+            fragment.size_payload, fragment.size_content
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse content the destination has no room for, rather than truncating it.
@@ -215,14 +232,7 @@ pub fn validate_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError>
         }));
     }
 
-    if !is_compressed && !is_fragmented && fragment.size_payload as u64 != fragment.size_content {
-        return Err(StoreError::internal(format!(
-            "uncompressed unfragmented fragment has mismatching size_payload {} and size_content {}",
-            fragment.size_payload, fragment.size_content
-        )));
-    }
-
-    Ok(())
+    validate_plain_payload_size(fragment)
 }
 
 /// Validate a fragmented fragment's payload bytes as a well-formed list of

@@ -113,6 +113,10 @@ pub struct ReadOptions {
     pub sync_data: bool,
     /// Priority read hint for stream scheduling (metadata/tree blocks)
     pub priority: bool,
+    /// A local miss answers `AddressNotFound` at once: the load never waits on another task's
+    /// store or fetch of the address, and never reaches the remote itself. The local probe still
+    /// takes the store's own locks.
+    pub never_wait: bool,
     /// Refuse to read if the fragment's declared `size_content` exceeds this
     /// cap. `None` means "no cap" (existing behavior). Callers that know the
     /// maximum legitimate blob size for the data they are reading should set
@@ -132,6 +136,7 @@ impl Default for ReadOptions {
             direct_write: false,
             sync_data: false,
             priority: false,
+            never_wait: false,
             max_content_size: None,
         }
     }
@@ -200,6 +205,12 @@ impl ReadOptions {
 
     pub fn with_priority(mut self) -> Self {
         self.priority = true;
+        self
+    }
+
+    /// See [`ReadOptions::never_wait`].
+    pub fn never_wait(mut self) -> Self {
+        self.never_wait = true;
         self
     }
 

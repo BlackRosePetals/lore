@@ -26,7 +26,13 @@ pub mod mutable_store;
 pub mod options;
 pub mod packstore;
 pub mod read;
+#[cfg(not(feature = "test-util"))]
+mod read_flight;
+#[cfg(feature = "test-util")]
+pub mod read_flight;
 pub mod store_types;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 pub(crate) mod typed_bytes;
 pub(crate) mod types;
 pub mod write;
@@ -136,6 +142,7 @@ pub use read::read_resolved_into_buffer;
 pub use read::read_resolved_into_file;
 pub use read::read_resolved_stream;
 pub use read::read_stream;
+pub use read::remote_fetch_bytes;
 pub use read::remote_fetch_inflight;
 pub use read::write_all_to_file;
 // Re-export store types

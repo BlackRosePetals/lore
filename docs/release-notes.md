@@ -48,6 +48,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore-storage`: concurrent reads of content missing from the local store fetch it from the remote once, including
+  identical content in different files, and a read that misses while the same content is being stored waits for that
+  store and reads it locally. Every fragment
+  fetched from a remote is checked against its sizes and its address on receipt, whether or not the read asked for
+  verification, and one that fails is neither returned nor stored
 - Immutable stores: compaction rewrites a group only once 10% of its packfile bytes are no longer referenced, copying
   each payload once. Client stores count local-only data toward `max_size` and `max_capacity` but never evict it
 - `lore repository gc` loads the whole store index before evicting, and applies `max_size` to compaction and

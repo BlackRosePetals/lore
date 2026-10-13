@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -86,10 +87,28 @@ pub async fn write_raw(
 // in flight to be stored locally, and a token to wait for completion
 static STORE_IN_FLIGHT: OnceLock<DashMap<StoreInFlightKey, CancellationToken>> = OnceLock::new();
 
+#[lore_macro::test_pub]
 #[derive(Clone, Eq, Hash, PartialEq)]
-pub struct StoreInFlightKey {
+pub(crate) struct StoreInFlightKey {
     pub partition: Partition,
     pub address: Address,
+}
+
+/// Stores that have left [`STORE_IN_FLIGHT`], counted per bucket of addresses before each entry
+/// goes: a reader that read its bucket's count before a local probe that missed, and finds no
+/// entry afterwards, tells from the count whether a store may have landed in between.
+static STORES_LANDED: [AtomicU64; LANDED_BUCKETS] = [const { AtomicU64::new(0) }; LANDED_BUCKETS];
+const LANDED_BUCKETS: usize = 1024;
+
+fn landed_bucket(address: Address) -> &'static AtomicU64 {
+    let hash = address.hash.as_ref();
+    &STORES_LANDED[u16::from_le_bytes([hash[0], hash[1]]) as usize % LANDED_BUCKETS]
+}
+
+/// How many stores of addresses in `address`'s bucket have left [`STORE_IN_FLIGHT`].
+#[lore_macro::test_pub]
+pub(crate) fn stores_landed(address: Address) -> u64 {
+    landed_bucket(address).load(Ordering::SeqCst)
 }
 
 /// RAII guard that removes the in-flight entry and notifies waiters on drop.
@@ -99,6 +118,14 @@ pub struct StoreInFlightGuard {
 
 impl Drop for StoreInFlightGuard {
     fn drop(&mut self) {
+        // Before the entry goes, so a reader that finds it gone sees the count moved.
+        landed_bucket(self.key.address).fetch_add(1, Ordering::SeqCst);
+        #[cfg(feature = "test-util")]
+        crate::test_util::guard_midpoint(self.key.address, || {
+            STORE_IN_FLIGHT
+                .get()
+                .is_some_and(|in_flight| in_flight.contains_key(&self.key))
+        });
         if let Some(in_flight) = STORE_IN_FLIGHT.get()
             && let Some((_, token)) = in_flight.remove(&self.key)
         {
@@ -151,22 +178,19 @@ pub fn try_acquire_in_flight(
 
 /// If another task is currently writing `(partition, address)` via the tracker
 /// path, wait for its cancellation token so subsequent reads observe the
-/// terminal store entry the leader produces. Returns immediately when no
-/// write is in flight.
-///
-/// Readers call this before hitting the store so a same-operation commit that
-/// dispatches a leader and then reads the just-written fragment back (e.g.,
-/// `weave_history` loading the delta block that `generate_delta_block` just
-/// handed to the tracker) doesn't race ahead of the background write.
-pub async fn wait_if_in_flight(partition: Partition, address: Address) {
+/// terminal store entry the leader produces, and answer true. Returns false
+/// immediately when no write is in flight.
+pub async fn wait_if_in_flight(partition: Partition, address: Address) -> bool {
     let Some(in_flight) = STORE_IN_FLIGHT.get() else {
-        return;
+        return false;
     };
     let key = StoreInFlightKey { partition, address };
     let token = in_flight.get(&key).map(|entry| entry.value().clone());
-    if let Some(token) = token {
-        token.cancelled().await;
-    }
+    let Some(token) = token else {
+        return false;
+    };
+    token.cancelled().await;
+    true
 }
 
 /// Result of a [`store_fragment`] operation.

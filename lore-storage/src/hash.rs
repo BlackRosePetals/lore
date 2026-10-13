@@ -73,6 +73,8 @@ pub fn hash_function_strs_slice(salt: &[u8], function: &str, args: &[&str]) -> H
 
 /// Hash a raw data slice using blake3.
 pub fn hash_slice(data: &[u8]) -> Hash {
+    #[cfg(feature = "test-util")]
+    crate::test_util::count_hash();
     blake3::hash(data).as_bytes().into()
 }
 
