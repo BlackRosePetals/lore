@@ -582,3 +582,66 @@ async fn recover_level_transition_is_idempotent() {
     assert_eq!(second, None);
     assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(2));
 }
+
+#[test]
+fn a_group_dir_name_parses_only_in_the_form_group_dirs_are_given() {
+    assert_eq!(parse_group_dir_name("00"), Some(0));
+    assert_eq!(parse_group_dir_name("7f"), Some(0x7f));
+    assert_eq!(parse_group_dir_name("ff"), Some(0xff));
+    for name in ["", "0", "000", "FF", "0g", "-1", "pack"] {
+        assert_eq!(
+            parse_group_dir_name(name),
+            None,
+            "{name:?} is not a group dir"
+        );
+    }
+}
+
+/// The listing finds the group directories a store has written and nothing else: a file named
+/// like a group, and a name in a form no group is given, are not groups.
+#[tokio::test]
+async fn existing_group_dirs_finds_the_written_groups() {
+    let dir = temp_group_dir();
+    let index_path = dir.path().join("index");
+    std::fs::create_dir_all(group_dir_path(&index_path, 0x07)).unwrap();
+    std::fs::create_dir_all(group_dir_path(&index_path, 0xde)).unwrap();
+    std::fs::write(index_path.join("4a"), b"").unwrap();
+    std::fs::create_dir_all(index_path.join("XY")).unwrap();
+
+    let existing = existing_group_dirs(&index_path, 256)
+        .await
+        .expect("the index directory lists");
+
+    let found: Vec<usize> = (0..256).filter(|&group| existing[group]).collect();
+    assert_eq!(found, vec![0x07, 0xde]);
+}
+
+/// An entry named like a group whose metadata does not resolve, here a link to nothing, may be a
+/// group that is there, so the listing gives no answer and the caller probes rather than
+/// treating it as absent. A link that does not look like a group does not matter.
+#[cfg(unix)]
+#[tokio::test]
+async fn existing_group_dirs_with_an_unresolved_group_entry_is_no_answer() {
+    let dir = temp_group_dir();
+    let index_path = dir.path().join("index");
+    std::fs::create_dir_all(&index_path).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("gone"), index_path.join("not-a-group")).unwrap();
+    assert!(existing_group_dirs(&index_path, 256).await.is_some());
+
+    std::os::unix::fs::symlink(dir.path().join("gone"), group_dir_path(&index_path, 0x31)).unwrap();
+
+    assert!(existing_group_dirs(&index_path, 256).await.is_none());
+}
+
+/// A store that has written no index yet has no groups, rather than a failure that would send
+/// the caller back to probing every group.
+#[tokio::test]
+async fn existing_group_dirs_of_a_missing_index_is_no_groups() {
+    let dir = temp_group_dir();
+
+    let existing = existing_group_dirs(&dir.path().join("index"), 256)
+        .await
+        .expect("a missing index is an answer");
+
+    assert!(existing.iter().all(|&exists| !exists));
+}

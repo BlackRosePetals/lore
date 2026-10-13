@@ -817,8 +817,18 @@ impl LocalMutableStore {
         let mut group_levels = vec![GroupLevel::Unwritten; GROUP_COUNT];
         if let Some(path) = mutable_path.as_ref() {
             let index_path = path.join("index");
+            // One listing says which groups exist, so only those are read; the rest stay
+            // unwritten. Without one, every group is probed.
+            let existing =
+                crate::local::fan_out::existing_group_dirs(&index_path, GROUP_COUNT).await;
             let mut tasks = JoinSet::new();
             for group_index in 0..GROUP_COUNT {
+                if existing
+                    .as_ref()
+                    .is_some_and(|existing| !existing[group_index])
+                {
+                    continue;
+                }
                 let group_path = crate::local::fan_out::group_dir_path(&index_path, group_index);
                 lore_base::lore_spawn!(tasks, async move {
                     if !group_path.exists() {

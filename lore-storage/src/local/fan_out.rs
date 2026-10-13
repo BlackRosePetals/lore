@@ -205,6 +205,54 @@ pub fn group_dir_path(index_path: &Path, group_index: usize) -> PathBuf {
     path
 }
 
+/// Which of the `group_count` groups have a directory under `index_path`, found with one
+/// listing rather than a probe per group: a store open asks this of every group, and a small
+/// store has written only a few of them.
+///
+/// # Returns
+/// * One flag per group, all `false` when `index_path` does not exist.
+/// * `None` when the listing fails for another reason, or an entry named like a group cannot be
+///   resolved to what it is, so the caller can probe each group as it would without this.
+pub async fn existing_group_dirs(index_path: &Path, group_count: usize) -> Option<Vec<bool>> {
+    let mut existing = vec![false; group_count];
+    let mut entries = match lore_io::IoDriver::global().read_dir(index_path).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(existing),
+        Err(_) => return None,
+    };
+    while let Some(entry) = entries.next().await {
+        let entry = entry.ok()?;
+        let Some(group_index) = entry.file_name.to_str().and_then(parse_group_dir_name) else {
+            continue;
+        };
+        // A name that could be a group but whose metadata did not resolve may be a group that
+        // is there, so it is not an absent one: the caller probes.
+        let metadata = entry.metadata.as_ref()?;
+        if !metadata.is_dir() {
+            continue;
+        }
+        if let Some(flag) = existing.get_mut(group_index) {
+            *flag = true;
+        }
+    }
+    Some(existing)
+}
+
+/// The group a directory name stands for, when it is exactly the name [`push_group_dir`] gives
+/// one: two lowercase hex digits.
+#[lore_macro::test_pub]
+fn parse_group_dir_name(name: &str) -> Option<usize> {
+    let &[high, low] = name.as_bytes() else {
+        return None;
+    };
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    Some(usize::from(digit(high)? << 4 | digit(low)?))
+}
+
 /// Format the path for a bucket index file inside a group directory: `<group_path>/index_<bb>`
 /// where `<bb>` is the lowercase 2-digit hex of `bucket_index as u8`.
 ///
