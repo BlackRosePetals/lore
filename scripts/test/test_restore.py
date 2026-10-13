@@ -13,6 +13,12 @@ from lore import Lore, verify_signatures
 
 logger = logging.getLogger(__name__)
 
+# Top directories of generated files in `test_restore`, each holding 100 files in
+# ten subdirectories, one of each ten 500 KB. Ten made 1,000 files and 50 MB, a
+# large share of one of the slowest tests in the suite; three still restore many
+# directories and files in both directions.
+GENERATED_TOP_DIRS = 3
+
 
 @pytest.mark.smoke
 def test_restore(new_lore_repo):
@@ -127,7 +133,7 @@ def test_restore(new_lore_repo):
     output = repo.revision_info()
     restore_base_revision = output.signature
 
-    for i in range(10):
+    for i in range(GENERATED_TOP_DIRS):
         subpath = str(i)
         repo.make_dirs(subpath)
         for j in range(10):

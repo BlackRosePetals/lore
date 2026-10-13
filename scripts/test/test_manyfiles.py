@@ -14,18 +14,27 @@ from store_layout import assert_all_index_entries_reachable
 
 logger = logging.getLogger(__name__)
 
+# The small files are laid out as TOP_DIRS x SUB_DIRS directories of FILES_PER_DIR
+# files each. Ten top directories made 10 000 files, and writing, cloning,
+# comparing and removing them made this the longest test in the suite; three
+# still keep the mid-commit kill below landing inside the commit, which the
+# second commit checks by having something left to commit.
+TOP_DIRS = 3
+SUB_DIRS = 10
+FILES_PER_DIR = 100
+
 
 @pytest.mark.smoke
 @pytest.mark.runs_in_process("terminates the process carrying out a commit")
 def test_file(new_lore_repo, lore_executable_path):
     repo: Lore = new_lore_repo()
-    for i in range(10):
+    for i in range(TOP_DIRS):
         subpath = str(i)
         repo.make_dirs(subpath)
-        for j in range(10):
+        for j in range(SUB_DIRS):
             subsubpath = os.path.join(subpath, str(j))
             repo.make_dirs(os.path.join(subsubpath))
-            for k in range(100):
+            for k in range(FILES_PER_DIR):
                 with repo.open_file(
                     os.path.join(subsubpath, str(k) + ".uasset"), "w+b"
                 ) as output_file:
@@ -104,11 +113,11 @@ def test_file(new_lore_repo, lore_executable_path):
     clone = repo.clone()
 
     # Verify files contents, mode and last modified timestamp
-    for i in range(10):
+    for i in range(TOP_DIRS):
         subpath = str(i)
-        for j in range(10):
+        for j in range(SUB_DIRS):
             subsubpath = os.path.join(subpath, str(j))
-            for k in range(100):
+            for k in range(FILES_PER_DIR):
                 filepath = os.path.join(subsubpath, str(k) + ".uasset")
                 assert repo.compare_file(clone, filepath), (
                     f'Path "{filepath}" does not match in cloned repository'
@@ -131,12 +140,14 @@ def test_file(new_lore_repo, lore_executable_path):
 
     clone.repository_verify()
 
-    # Delete random source files and some directories
-    for i in range(6000):
-        fileint = random.randint(0, 100)
-        dirint = random.randint(0, 100)
+    # Delete random source files and some directories, in the proportions the
+    # test used at ten top directories: about 60% of files and 20% of directories.
+    dir_count = TOP_DIRS * SUB_DIRS
+    for i in range(dir_count * FILES_PER_DIR * 6 // 10):
+        fileint = random.randint(0, FILES_PER_DIR)
+        dirint = random.randint(0, dir_count)
         path = os.path.join(
-            str(int(dirint / 10)), str(int(dirint % 10)), str(fileint) + ".uasset"
+            str(dirint // SUB_DIRS), str(dirint % SUB_DIRS), str(fileint) + ".uasset"
         )
         # noinspection PyBroadException
         try:
@@ -144,9 +155,9 @@ def test_file(new_lore_repo, lore_executable_path):
         except:
             pass
 
-    for i in range(20):
-        dirint = random.randint(0, 100)
-        path = os.path.join(str(int(dirint / 10)), str(int(dirint % 10)))
+    for i in range(dir_count // 5):
+        dirint = random.randint(0, dir_count)
+        path = os.path.join(str(dirint // SUB_DIRS), str(dirint % SUB_DIRS))
         shutil.rmtree(os.path.join(repo.path, path), ignore_errors=True)
 
     repo.stage(scan=True)
@@ -157,17 +168,17 @@ def test_file(new_lore_repo, lore_executable_path):
     # Sync the cloned repository
     clone.sync()
 
-    for i in range(10):
+    for i in range(TOP_DIRS):
         subpath = str(i)
         assert repo.path_exists(subpath) == clone.path_exists(subpath), (
             "Source directory does not match clone directory"
         )
-        for j in range(10):
+        for j in range(SUB_DIRS):
             subsubpath = os.path.join(subpath, str(j))
             assert repo.path_exists(subsubpath) == clone.path_exists(subsubpath), (
                 "Source directory does not match clone directory"
             )
-            for k in range(100):
+            for k in range(FILES_PER_DIR):
                 filepath = os.path.join(subsubpath, str(k) + ".uasset")
                 assert repo.path_exists(filepath) == clone.path_exists(filepath), (
                     "Source directory does not match clone directory"

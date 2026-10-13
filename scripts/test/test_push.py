@@ -10,6 +10,12 @@ from lore import Lore
 
 logger = logging.getLogger(__name__)
 
+# Size of each of the three large files in `test_push`: many dozens of
+# fragments, and deliberately not a multiple of any block size. It was ten times
+# this, a gigabyte of random data written, pushed, cloned and compared, which
+# made the test one of the slowest in the suite without covering more.
+LARGE_FILE_SIZE = 34567890
+
 
 @pytest.mark.smoke
 def test_push(new_lore_repo):
@@ -29,7 +35,7 @@ def test_push(new_lore_repo):
 
     # Generate a larger file
     with repo.open_file(large_file, "w+b") as output_file:
-        output_file.write(os.urandom(345678901))
+        output_file.write(os.urandom(LARGE_FILE_SIZE))
 
     # Stage the files
     repo.stage(scan=True)
@@ -42,7 +48,7 @@ def test_push(new_lore_repo):
 
     # Generate another large file
     with repo.open_file(my_feature_file, "w+b") as output_file:
-        output_file.write(os.urandom(345678901))
+        output_file.write(os.urandom(LARGE_FILE_SIZE))
 
     # Stage the repository again
     repo.stage(scan=True)
@@ -55,7 +61,7 @@ def test_push(new_lore_repo):
 
     # Generate another large file
     with repo.open_file(my_mega_feature_file, "w+b") as output_file:
-        output_file.write(os.urandom(345678901))
+        output_file.write(os.urandom(LARGE_FILE_SIZE))
 
     # Stage the repository again
     repo.stage(scan=True)

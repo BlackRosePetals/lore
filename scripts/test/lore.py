@@ -2818,3 +2818,4 @@ class GlobalOptions(TypedDict, total=False):
     search_nearest: bool
     no_gc: bool
     non_interactive: bool
+    event_interval: int

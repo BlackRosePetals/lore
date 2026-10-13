@@ -466,14 +466,20 @@ def test_push_progress_events(new_lore_repo):
 
 # ─── Large repo constants ──────────────────────────────────────────
 
-LARGE_FILE_COUNT = 10_000
+LARGE_FILE_COUNT = 2_000
 LARGE_FILE_SIZE = 10_000  # 10 000 bytes per file
 LARGE_TOTAL_BYTES = LARGE_FILE_COUNT * LARGE_FILE_SIZE
-LARGE_DIR_COUNT = 100  # spread files across 100 directories (100 files each)
+LARGE_DIR_COUNT = 20  # spread files across 20 directories (100 files each)
+# Progress events every 10 ms, the shortest interval Lore allows, rather than the
+# default 100 ms. A repository large enough to take several default intervals
+# was 10 000 files, whose writing and removal made these the slowest tests in
+# the suite; at this interval a fifth of that still reports many times over.
+LARGE_EVENT_INTERVAL_MS = 10
 
 
 def generate_large_repo_files(repo: Lore):
-    """Generate 10 000 files of 10 000 byte random binary data spread across directories."""
+    """Generate LARGE_FILE_COUNT files of LARGE_FILE_SIZE bytes of random data spread
+    across LARGE_DIR_COUNT directories."""
     for d in range(LARGE_DIR_COUNT):
         dir_path = f"dir_{d:03d}"
         repo.make_dirs(dir_path)
@@ -497,12 +503,14 @@ def create_large_test_repo(repo: Lore):
 
 @pytest.mark.smoke
 def test_large_commit_progress_events(new_lore_repo):
-    """Commit progress for 10k x 10 000 byte files reports correct counts and monotonic progress."""
+    """Commit progress for a large repository reports correct counts and monotonic progress."""
     repo: Lore = new_lore_repo()
     generate_large_repo_files(repo)
     repo.stage(scan=True)
 
-    output = repo.commit("Large commit", json=True)
+    output = repo.commit(
+        "Large commit", json=True, event_interval=LARGE_EVENT_INTERVAL_MS
+    )
 
     progress_events = parse_jsonl(output, "revisionCommitProgress")
     end_events = parse_jsonl(output, "revisionCommitEnd")
@@ -543,7 +551,7 @@ def test_large_commit_progress_events(new_lore_repo):
         },
     )
 
-    # With 10k files we expect multiple progress ticks
+    # A large repository reports multiple progress ticks
     assert len(progress_counts) > 1, (
         "Expected multiple progress events for a large commit"
     )
@@ -584,7 +592,7 @@ def test_large_push_progress_events(new_lore_repo):
     repo.stage(scan=True)
     repo.commit("Large commit for push")
 
-    output = repo.push(json=True)
+    output = repo.push(json=True, event_interval=LARGE_EVENT_INTERVAL_MS)
 
     push_events = parse_jsonl(output, "branchPush")
     fragment_begin_events = parse_jsonl(output, "branchPushFragmentBegin")
@@ -642,7 +650,7 @@ def test_large_push_progress_events(new_lore_repo):
 
 @pytest.mark.smoke
 def test_large_clone_progress_events(new_lore_repo, scratch_dir):
-    """Clone progress for 10k x 10 000 byte files reports correct counts and monotonic progress."""
+    """Clone progress for a large repository reports correct counts and monotonic progress."""
     source: Lore = new_lore_repo()
     create_large_test_repo(source)
 
@@ -650,6 +658,7 @@ def test_large_clone_progress_events(new_lore_repo, scratch_dir):
     output = source.run(
         ["repository", "clone", source.remote + source.name, new_repo_path],
         json=True,
+        event_interval=LARGE_EVENT_INTERVAL_MS,
     )
 
     progress_events = parse_jsonl(output, "repositoryCloneProgress")
@@ -689,7 +698,7 @@ def test_large_clone_progress_events(new_lore_repo, scratch_dir):
         },
     )
 
-    # With 10k files there must be multiple progress events
+    # A large repository must report multiple progress events
     assert len(progress_counts) > 1, (
         "Expected multiple progress events for a large clone"
     )
@@ -744,7 +753,7 @@ def test_large_sync_progress_events(new_lore_repo):
     source.push()
 
     # Sync the clone
-    output = cloned.sync(json=True)
+    output = cloned.sync(json=True, event_interval=LARGE_EVENT_INTERVAL_MS)
 
     progress_events = parse_jsonl(output, "revisionSyncProgress")
     revision_events = parse_jsonl(output, "revisionSyncRevision")
