@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "URC tests"
 readme = "README.md"
 classifiers = ["Private :: Do Not Upload"]
-requires-python = ">=3.13"
+# Bounded above because uv otherwise runs the suite on the newest CPython it
+# finds or can download, and the locked grpcio publishes no wheels for CPython
+# 3.15: uv then builds grpcio from source, which fails under MSVC on Windows.
+# Raise the bound together with a grpcio that ships wheels for the next release.
+requires-python = ">=3.13,<3.15"
 dependencies = [
     "cryptography>=44.0.0",
     "grpcio>=1.81.0",

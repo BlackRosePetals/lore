@@ -21,7 +21,7 @@ We welcome code contributions — bug fixes, features, performance improvements.
 You need the following tools installed:
 
 - **Rust** — install via [rustup](https://rustup.rs/). Lore requires the stable toolchain plus nightly for formatting.
-- **Python 3.13+** — required for smoke tests, with [uv](https://github.com/astral-sh/uv) for dependency management.
+- **Python 3.13 or 3.14** — required for smoke tests, with [uv](https://github.com/astral-sh/uv) for dependency management.
 
 Install the Rust toolchains:
 

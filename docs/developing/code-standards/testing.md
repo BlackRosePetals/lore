@@ -332,7 +332,7 @@ def test_commit(new_lore_repo):
 
 ### Running with uv
 
-Tests require Python 3.13+. Use `uv` to manage dependencies and run tests:
+Tests require Python 3.13 or 3.14. Use `uv` to manage dependencies and run tests:
 
 ```bash
 # Install dependencies
