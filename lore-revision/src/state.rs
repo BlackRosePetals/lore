@@ -2163,45 +2163,19 @@ impl State {
             sibling
         );
 
-        let metadata_node_id = node::node_to_file_metadata(node_id);
-        let metadata_block_index = NodeFileMetadataBlock::index(metadata_node_id);
-        let metadata_node_index = NodeFileMetadata::index(metadata_node_id);
-
-        // The slot may be recycled, in which case it still carries the metadata of
-        // whatever used to live there and has to be cleared. Where no metadata
-        // block exists there is nothing to carry, so nothing to clear.
-        if let Some(metadata_block) = self
-            .try_block_file_metadata_existing(repository.clone(), metadata_block_index)
-            .await?
-        {
-            let dirtied = {
-                let mut block_lock = metadata_block.write();
-
-                let node_metadata = block_lock.node(metadata_node_index);
-                if !node_metadata.metadata.is_zero() {
-                    node_metadata.metadata.zero();
-
-                    block_lock.mark_dirty()
-                } else {
-                    false
-                }
-            };
-
-            if dirtied {
-                self.block_file_metadata_modified(metadata_block, metadata_block_index);
-            }
-        }
-
         Ok(node_id)
     }
 
-    /// Fill in every field of a freshly grabbed slot except `sibling`, returning
-    /// the block that holds it.
+    /// Fill in every field of a freshly grabbed slot except `sibling`, and clear the file
+    /// metadata a recycled slot still carries from whatever used to live there, returning the
+    /// block that holds it. Where no file metadata block exists there is nothing to carry.
     ///
     /// The slot is initialized fully before it is reachable: `grab_node_unused`
     /// left it zeroed, so a concurrent chain walk that observed it
     /// published-but-uninitialized would read `parent`/`sibling` as 0 and error
-    /// or truncate. `sibling` is set atomically at publish.
+    /// or truncate, and a reader of the published node would read its predecessor's
+    /// metadata. `sibling` is set atomically at publish. The metadata is cleared after every
+    /// step that can fail, so a failed initialization leaves it untouched.
     async fn initialize_node(
         &self,
         repository: Arc<RepositoryContext>,
@@ -2214,6 +2188,12 @@ impl State {
         let block = self
             .block_with_nametable(repository.clone(), block_index)
             .await?;
+        let metadata_node_id = node::node_to_file_metadata(node_id);
+        let metadata_block_index = NodeFileMetadataBlock::index(metadata_node_id);
+        let metadata_block = self
+            .try_block_file_metadata_existing(repository, metadata_block_index)
+            .await?;
+
         let dirtied = {
             let mut block_lock = block.write();
             let (name_offset, name_length) = block_lock
@@ -2228,6 +2208,22 @@ impl State {
         };
         if dirtied {
             self.block_modified(block.clone(), block_index);
+        }
+
+        if let Some(metadata_block) = metadata_block {
+            let dirtied = {
+                let mut block_lock = metadata_block.write();
+                let node_metadata = block_lock.node(NodeFileMetadata::index(metadata_node_id));
+                if node_metadata.metadata.is_zero() {
+                    false
+                } else {
+                    node_metadata.metadata.zero();
+                    block_lock.mark_dirty()
+                }
+            };
+            if dirtied {
+                self.block_file_metadata_modified(metadata_block, metadata_block_index);
+            }
         }
 
         Ok(block)

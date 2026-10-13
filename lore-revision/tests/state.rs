@@ -3430,4 +3430,129 @@ mod block_single_flight {
             })
             .await;
     }
+
+    /// An add into a recycled slot whose name the name table refuses fails before it clears the
+    /// metadata the slot still carries; the next add that takes the slot clears it.
+    #[tokio::test]
+    async fn an_add_refusing_its_name_leaves_the_recycled_slots_metadata() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let repository = seed.repository.clone();
+                let state = State::deserialize(repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                let first = state
+                    .find_subnode(repository.clone(), ROOT_NODE, hash_string("first"))
+                    .await
+                    .expect("the seeded node");
+                lore_revision::state::node_discard_patch(
+                    state.clone(),
+                    repository.clone(),
+                    first,
+                    |_, _| {},
+                )
+                .await
+                .expect("Failed to discard the seeded node");
+                let slot_metadata = || {
+                    let state = state.clone();
+                    let repository = repository.clone();
+                    async move {
+                        let metadata_node = node_to_file_metadata(first);
+                        let block = state
+                            .block_file_metadata(
+                                repository,
+                                NodeFileMetadataBlock::index(metadata_node),
+                            )
+                            .await
+                            .expect("Failed to read the file metadata block");
+                        block
+                            .read()
+                            .node(NodeFileMetadata::index(metadata_node))
+                            .metadata
+                    }
+                };
+                let add = |name: &'static str| {
+                    state.node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string(name),
+                            ..Default::default()
+                        },
+                        name,
+                    )
+                };
+
+                assert!(add("..").await.is_err(), "the name table refuses `..`");
+                assert_eq!(
+                    slot_metadata().await,
+                    Hash::from_u64(9),
+                    "the refused add cleared the recycled slot's metadata"
+                );
+
+                let added = add("second").await.expect("Failed to add a node");
+                assert_eq!(added, first, "the add takes the recycled slot");
+                assert!(
+                    slot_metadata().await.is_zero(),
+                    "the add that took the slot cleared its metadata"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// An add whose slot's file metadata block cannot be read fails before the node is
+    /// published: the parent's chain keeps only the children it had.
+    #[tokio::test]
+    async fn an_add_that_cannot_clear_its_slots_metadata_publishes_nothing() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let state = State::deserialize(seed.repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                seed.store
+                    .clone()
+                    .obliterate(seed.repository.id, seed.metadata_block, Arc::default())
+                    .await
+                    .expect("Failed to obliterate the file metadata block");
+
+                let added = state
+                    .node_add(
+                        seed.repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string("second"),
+                            ..Default::default()
+                        },
+                        "second",
+                    )
+                    .await;
+
+                assert!(
+                    added.is_err(),
+                    "the add cannot clear the slot's file metadata"
+                );
+                let children = state
+                    .node_children(seed.repository.clone(), ROOT_NODE)
+                    .await
+                    .expect("the root's children");
+                assert_eq!(
+                    children.len(),
+                    1,
+                    "the root holds only the node it held: {children:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
 }
