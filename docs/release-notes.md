@@ -47,6 +47,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore dirty` on a path inside a link, or on the link's mount, marks the change in the linked repository, so
+  `lore status` reports it without a scan and staging the mount, or a directory above it, picks it up. It previously
+  recorded nothing. The markers survive a commit and a branch switch, `lore status --check-dirty` persists what it
+  verifies inside a link, and a commit pins a link holding only dirty markers at the revision it was linked or updated
+  to. `lore file dirty move` and `copy` refuse a path inside a link
 - Fragment caching keeps at most 512 fetches in flight per connection to a remote, so a read a command needs at once is
   queued behind at most 512 of them; `LORE_CACHE_GETS` sets another cap, and 0 turns it off. A fetch of content a read
   or another fetch is already fetching, under any context, shares its get. Each fragment it fetches is retried as a

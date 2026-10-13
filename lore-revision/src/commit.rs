@@ -70,6 +70,7 @@ use crate::node::NodeFileMetadataFlags;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
+use crate::node::NodeLink;
 use crate::node::NodeNameLock;
 use crate::node::ROOT_NODE;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
@@ -1344,26 +1345,17 @@ async fn commit_link_only(
         .forward::<CommitError>("Failed to resolve link node in owning repository")?
         .node;
 
-    link::update_link_pin_by_node(
+    link::repin_link_node(
         &owner_state,
         owner_repository.clone(),
         resolved_staged.link_context.id,
         resolved_staged.link_reference.branch,
         link_signature,
         link_local_node,
+        NodeFlags::Staged,
     )
     .await
     .forward::<CommitError>("Failed to update link pin")?;
-
-    owner_state
-        .node_mark(
-            owner_repository.clone(),
-            link_local_node,
-            NodeFlags::Staged,
-            true,
-        )
-        .await
-        .forward::<CommitError>("Failed to mark link node as staged")?;
 
     // For a nested link, each intermediate link between the committed target
     // and the top-level repo must itself be COMMITTED (not just reserialized),
@@ -2814,7 +2806,6 @@ async fn commit_link_node(
     parent_branch: BranchId,
     parent_tracker: Arc<lore_storage::write_tracker::WriteTracker>,
 ) -> Result<(), CommitError> {
-    // First check if this was an initial add of the link
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
 
@@ -2824,7 +2815,16 @@ async fn commit_link_node(
         .forward::<CommitError>("Failed deserializing state block")?;
     let node = block.node(node_index);
 
-    if node.is_staged_add() {
+    let link = node.linked_node();
+    let link_node = link.node;
+    let (link_repository, link_state) = link
+        .open(&repository)
+        .await
+        .forward::<CommitError>("Failed to deserialize link state")?;
+
+    // An added link pinned at a committed revision has nothing inside it to commit; one pinned at
+    // an uncommitted state, as dirtying or staging inside it leaves, goes through `commit_link`.
+    if node.is_staged_add() && link_state.revision_number() != 0 {
         lore_trace!("Reset staged add flag on link node {relative_path}");
 
         delta_add(delta, node_id, node.flags);
@@ -2845,14 +2845,6 @@ async fn commit_link_node(
 
     // Link, recurse and check if there are changes inside the link to commit, and if so update the
     // target repository hash and potentially target node index in this node data
-
-    let link = node.linked_node();
-    let link_repository = repository.to_link_context(link.repository).await;
-    let signature = link.revision;
-    let link_node = link.node;
-    let link_state = State::deserialize(link_repository.clone(), signature)
-        .await
-        .forward::<CommitError>("Failed to deserialize link state")?;
 
     let link_reference = state
         .link_find(repository.clone(), link.repository, node_id)
@@ -2879,7 +2871,6 @@ async fn commit_link_node(
         relative_path,
         link_node,
         branch_id,
-        signature,
         link_metadata,
         link_messages,
         stats,
@@ -2948,7 +2939,6 @@ async fn commit_link(
     relative_path: RelativePath,
     node_id: NodeID,
     branch: BranchId,
-    current_revision: Hash,
     metadata: Arc<Metadata>,
     link_messages: Arc<HashMap<String, String>>,
     stats: Arc<CommitStats>,
@@ -3140,11 +3130,12 @@ async fn commit_link(
         Err(e) => return Err(e),
     };
 
-    // Unchanged link: no new revision, no event to emit. Return early with
-    // the pre-existing revision/node so the parent keeps its current pin.
+    // Unchanged link: no new revision, no event to emit. Return early with the committed revision
+    // the pinned state is based on, which is the pin itself unless the state holds dirty markers
+    // alone.
     let signature = match signature_opt {
         Some(sig) => sig,
-        None => return Ok((current_revision, node_id)),
+        None => return Ok((state.committed_revision(), node_id)),
     };
 
     // For linked repos, RevisionCommitRevision emission is strictly after
@@ -3935,7 +3926,7 @@ async fn prune_dirty_leave(
 
     let node_index = Node::index(node_id);
     let is_root = node_id == ROOT_NODE;
-    let (is_staged, is_dirty_add, is_dirty, is_dir_now, child_now) = {
+    let (is_staged, is_dirty_add, is_dirty, is_dir_now, child_now, link) = {
         let node = block.node(node_index);
         (
             node.is_staged(),
@@ -3943,6 +3934,7 @@ async fn prune_dirty_leave(
             node.is_dirty(),
             node.is_directory(),
             node.child,
+            node.is_link().then(|| node.linked_node()),
         )
     };
 
@@ -3951,6 +3943,9 @@ async fn prune_dirty_leave(
     }
 
     if is_dirty {
+        if let Some(link) = link.filter(|_| !is_staged) {
+            restore_committed_link_pin(state, repository, node_id, link).await?;
+        }
         let dirtied = {
             let mut block_writer = block.write();
             let node = block_writer.node(node_index);
@@ -3967,6 +3962,37 @@ async fn prune_dirty_leave(
     }
 
     Ok(is_dir_now && !child_now.is_valid_node_id() && !is_root)
+}
+
+async fn restore_committed_link_pin(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    link: NodeLink,
+) -> Result<(), CommitError> {
+    let (_, linked_state) = link
+        .open(repository)
+        .await
+        .forward::<CommitError>("Failed to deserialize dirty linked state")?;
+    let committed = linked_state.committed_revision();
+    if committed == link.revision {
+        return Ok(());
+    }
+    let branch = state
+        .link_find(repository.clone(), link.repository, node_id)
+        .await
+        .forward::<CommitError>("Failed to find link")?
+        .branch;
+    link::update_link_pin_by_node(
+        state,
+        repository.clone(),
+        link.repository,
+        branch,
+        committed,
+        node_id,
+    )
+    .await
+    .forward::<CommitError>("Failed to restore committed link pin")
 }
 
 /// Resolve which branch a revision built on `current_revision` publishes to.

@@ -31,8 +31,10 @@ use crate::lore_debug;
 use crate::lore_info;
 use crate::node::Node;
 use crate::node::NodeBlock;
+use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
+use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::is_reserved_node_name;
@@ -669,6 +671,117 @@ pub async fn update_link_pin_by_node(
         .await
 }
 
+/// [`update_link_pin_by_node`], then `mark` on the link node and up to the root.
+pub async fn repin_link_node(
+    state: &Arc<State>,
+    repository: Arc<RepositoryContext>,
+    link_repo_id: RepositoryId,
+    branch: BranchId,
+    new_signature: Hash,
+    node_id: NodeID,
+    mark: NodeFlags,
+) -> Result<(), StateError> {
+    update_link_pin_by_node(
+        state,
+        repository.clone(),
+        link_repo_id,
+        branch,
+        new_signature,
+        node_id,
+    )
+    .await?;
+    if mark.intersects(NodeFlags::StagedBits) {
+        state.node_mark(repository, node_id, mark, true).await
+    } else {
+        state.node_mark_dirty(repository, node_id, mark, true).await
+    }
+}
+
+/// A linked repository's state, with the context reaching it.
+pub type LinkedState = (Arc<RepositoryContext>, Arc<State>);
+
+/// What a linked staged state holds below its root, which decides how
+/// [`settle_linked_staged_state`] pins its link.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LinkedStagedContent {
+    /// At least one dirty marker, with or without staged nodes.
+    Dirty,
+    /// Staged nodes and no dirty marker.
+    Staged,
+    /// Neither.
+    Empty,
+}
+
+impl LinkedStagedContent {
+    /// What `state` holds below its root. A node that cannot be read counts as holding a marker,
+    /// so the link keeps its pin.
+    pub async fn of(state: &Arc<State>, repository: &Arc<RepositoryContext>) -> Self {
+        if state
+            .node_has_dirty_children(repository.clone(), ROOT_NODE)
+            .await
+            .unwrap_or(true)
+        {
+            LinkedStagedContent::Dirty
+        } else if state
+            .node_has_staged_children(repository.clone(), ROOT_NODE)
+            .await
+            .unwrap_or(true)
+        {
+            LinkedStagedContent::Staged
+        } else {
+            LinkedStagedContent::Empty
+        }
+    }
+}
+
+/// Pin the link at `link_node` in `state` by what `linked` holds.
+///
+/// A state holding anything is serialized on the committed revision it derives from, so a commit
+/// can restore that revision from the pin alone, and the link keeps its dirty flag only while a
+/// marker remains. An empty state has nothing to pin, so the link goes back to that revision.
+pub async fn settle_linked_staged_state(
+    state: &Arc<State>,
+    repository: Arc<RepositoryContext>,
+    link_node: NodeID,
+    branch: BranchId,
+    (linked_repository, linked_state): &LinkedState,
+    content: LinkedStagedContent,
+    token: &RepositoryWriteToken,
+) -> Result<(), StateError> {
+    let committed = linked_state.committed_revision();
+    let signature = if content == LinkedStagedContent::Empty {
+        committed
+    } else {
+        linked_state.reparent_onto(committed);
+        linked_state
+            .serialize(linked_repository.clone(), token)
+            .await?
+    };
+
+    if content == LinkedStagedContent::Dirty {
+        return repin_link_node(
+            state,
+            repository,
+            linked_repository.id,
+            branch,
+            signature,
+            link_node,
+            NodeFlags::Dirty,
+        )
+        .await;
+    }
+    update_link_pin_by_node(
+        state,
+        repository.clone(),
+        linked_repository.id,
+        branch,
+        signature,
+        link_node,
+    )
+    .await?;
+    state.node_clear_dirty(repository, link_node).await
+}
+
 /// Reserializes a tracked link's state and updates the parent repository's
 /// block tree and link registry.
 ///
@@ -937,27 +1050,17 @@ pub async fn propagate_link_chain(
             .await
             .forward::<LinkError>("Failed to serialize linked state")?;
 
-        update_link_pin_by_node(
+        repin_link_node(
             &level.state,
             level.repository.clone(),
             level.child_repository_id,
             level.branch,
             new_signature,
             level.link_node_id,
+            NodeFlags::Staged,
         )
         .await
         .forward::<LinkError>("Failed to update link pin")?;
-
-        level
-            .state
-            .node_mark(
-                level.repository.clone(),
-                level.link_node_id,
-                crate::node::NodeFlags::Staged,
-                true,
-            )
-            .await
-            .forward::<LinkError>("Failed to mark link node staged")?;
     }
 
     Ok(())
@@ -1086,7 +1189,7 @@ pub async fn drain_link_tracker(
                 .node_mark(
                     parent_repository,
                     link_context.link_node_id,
-                    crate::node::NodeFlags::Staged,
+                    NodeFlags::Staged,
                     true,
                 )
                 .await?;

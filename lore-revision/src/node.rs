@@ -29,6 +29,7 @@ use crate::immutable::ImmutableError;
 use crate::immutable::ReadBoxFromImmutable;
 use crate::interface::LoreNodeStagedAction;
 use crate::interface::LoreNodeType;
+use crate::link::LinkedState;
 use crate::lore::Address;
 use crate::lore::CloneHeapAlloc;
 use crate::lore::Hash;
@@ -1849,12 +1850,20 @@ impl NodeLink {
         if self.is_valid_or_root()
             && (repository.id != self.repository || state.revision() != self.revision)
         {
-            let repository = repository.to_link_context(self.repository).await;
-            let state = State::deserialize(repository.clone(), self.revision).await?;
-            Ok((repository, state))
+            self.open(&repository).await
         } else {
             Ok((repository, state))
         }
+    }
+
+    /// The repository and revision state this link names, reached from `repository`.
+    pub async fn open(
+        &self,
+        repository: &Arc<RepositoryContext>,
+    ) -> Result<LinkedState, StateError> {
+        let repository = repository.to_link_context(self.repository).await;
+        let state = State::deserialize(repository.clone(), self.revision).await?;
+        Ok((repository, state))
     }
 }
 

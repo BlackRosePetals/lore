@@ -66,3 +66,10 @@ def unstaged_entries(repo: "Lore") -> list[dict]:
         ),
         key=lambda entry: entry["path"],
     )
+
+
+def status_by_path(repo: "Lore", **kwargs) -> dict[str, dict]:
+    """The `status` entries keyed by path."""
+    return {
+        e.get("path"): e for e in parse_status_json(repo.status(json=True, **kwargs))
+    }

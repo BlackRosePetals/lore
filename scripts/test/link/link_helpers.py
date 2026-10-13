@@ -11,6 +11,7 @@ from lore import Lore
 
 DEFAULT_LINK_MOUNT = "vendor/lib"
 DEFAULT_PARENT_FILE = "README.txt"
+MAX_LINK_DEPTH = 8
 
 
 def make_repo(new_lore_repo, files: dict, message: str = "Initial commit") -> Lore:
@@ -50,6 +51,12 @@ def link_pin(repo: Lore, source_id: str) -> str:
     match = re.search(rf"Link\s+{source_id}.*?Revision:\s*(\w+)", output, re.DOTALL)
     assert match, f"No pin for {source_id} in link list:\n{output}"
     return match.group(1)
+
+
+def committed_link_pin(repo: Lore, source_id: str) -> str:
+    """The pin `repo`'s latest pushed revision holds, which `link list` on `repo` itself does not
+    show while the staged state repins the link."""
+    return link_pin(repo.clone(), source_id)
 
 
 def assert_crr_clean(
@@ -143,3 +150,49 @@ def parse_revision_diff(output: str) -> list[tuple[str, str]]:
         if len(parts) == 2 and parts[0] in DIFF_ACTIONS:
             entries.append((parts[0], parts[1].strip()))
     return entries
+
+
+def build_nested_link_repos_at(new_lore_repo, b_mount, c_inner_mount):
+    """Build A -> B -> C with configurable mount paths.
+
+    A links B at `b_mount`; C is linked at `<b_mount>/<c_inner_mount>` (i.e.
+    `c_inner_mount` is C's path *relative to B's root*). Returns
+    (repo_a, repo_b, repo_c, b_mount, nested_mount).
+
+    Lets tests control the relative depths of the outer and inner mounts, which
+    matters for the tracker's inner-first ordering.
+    """
+    repo_c = make_repo(
+        new_lore_repo, {"c-data/inner.txt": "content from repository C\n"}, "C initial"
+    )
+    repo_b = make_repo(
+        new_lore_repo, {"b-root.txt": "content from repository B\n"}, "B initial"
+    )
+    repo_a = make_repo(
+        new_lore_repo, {"a-root.txt": "content from repository A\n"}, "A initial"
+    )
+
+    repo_a.link_add(b_mount, repo_b.get_id(), "/")
+    repo_a.commit("A links B")
+    repo_a.push()
+
+    nested_mount = f"{b_mount}/{c_inner_mount}"
+    repo_a.link_add(nested_mount, repo_c.get_id(), "/")
+    repo_a.commit("A links B links C")
+    repo_a.push()
+
+    return repo_a, repo_b, repo_c, b_mount, nested_mount
+
+
+def build_link_chain(new_lore_repo, links: int) -> tuple[Lore, str]:
+    """A parent holding `links` links, each mounted inside the one before, every linked
+    repository holding `a.txt` and `b.txt`. Returns (parent_repo, deepest_mount)."""
+    parent_repo = make_repo(new_lore_repo, {DEFAULT_PARENT_FILE: "baseline\n"})
+    mount = ""
+    for level in range(1, links + 1):
+        linked = make_repo(new_lore_repo, {"a.txt": "a\n", "b.txt": "b\n"})
+        mount = f"{mount}/l{level}".lstrip("/")
+        parent_repo.link_add(mount, linked.get_id(), "/")
+        parent_repo.commit(f"Link level {level}")
+        parent_repo.push()
+    return parent_repo, mount

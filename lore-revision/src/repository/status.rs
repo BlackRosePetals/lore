@@ -16,6 +16,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use super::RepositoryContext;
+use super::RepositoryWriteToken;
 use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::branch;
 use crate::change::FileAction;
@@ -38,6 +39,9 @@ use crate::interface::LoreFileAction;
 use crate::interface::LoreNodeType;
 use crate::interface::LoreString;
 use crate::layer;
+use crate::link::LinkedStagedContent;
+use crate::link::LinkedState;
+use crate::link::settle_linked_staged_state;
 use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
@@ -685,6 +689,7 @@ struct StagedDiff {
     summary: Arc<StatusSummaryStats>,
     show_scan: bool,
     check_dirty: Option<Arc<InstanceOperationImpl>>,
+    cleared_links: Arc<parking_lot::Mutex<Vec<LinkedState>>>,
 }
 
 /// Report every change the diff against the staged state answers for.
@@ -712,6 +717,16 @@ async fn report_staged_changes(
             && change.flags.is_dirty()
             && !dirty_change_is_modified(operation, repository, change, summary).await?
         {
+            let mapping = &change.to.mapping;
+            if mapping.repository.id != repository.id {
+                let mut cleared_links = diff.cleared_links.lock();
+                if !cleared_links
+                    .iter()
+                    .any(|(_, state)| Arc::ptr_eq(state, &mapping.state))
+                {
+                    cleared_links.push((mapping.repository.clone(), mapping.state.clone()));
+                }
+            }
             if !change.flags.is_stage() {
                 continue;
             }
@@ -764,6 +779,89 @@ async fn layer_holds_staging(layer: &layer::Layer, layer_state: &layer::LayerSta
     }
 
     state::count_staged_files(repository.clone(), state.clone(), source_node).await > 0
+}
+
+/// Persist the markers `--check-dirty` cleared in the linked states `pending` names, for the links
+/// `state` holds and the links below them, and whether `state` changed for it.
+///
+/// Only a dirty link is visited: a cleared marker was propagated to its link node, which nothing
+/// has cleared yet.
+async fn settle_cleared_links(
+    repository: &Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    state: &Arc<State>,
+    pending: &mut Vec<LinkedState>,
+    depth: usize,
+) -> Result<bool, StatusError> {
+    if depth >= state::MAX_LINK_DEPTH {
+        return Ok(false);
+    }
+
+    let mut changed = false;
+    let links = state
+        .link_list(repository.clone())
+        .await
+        .forward::<StatusError>("listing links to settle")?;
+    for link in links {
+        if pending.is_empty() {
+            break;
+        }
+        let node = link.local_node();
+        if !repository.can_read_link(link.repository)
+            || !state
+                .node(repository.clone(), node)
+                .await
+                .forward::<StatusError>("reading link node to settle")?
+                .is_dirty()
+        {
+            continue;
+        }
+
+        let cleared = pending
+            .iter()
+            .position(|(linked, linked_state)| {
+                linked.id == link.repository && linked_state.revision() == link.signature
+            })
+            .map(|index| pending.swap_remove(index));
+        let is_cleared = cleared.is_some();
+        let linked = if let Some(linked) = cleared {
+            linked
+        } else {
+            let linked_repository = repository.to_link_context(link.repository).await;
+            let linked_state = State::deserialize(linked_repository.clone(), link.signature)
+                .await
+                .forward::<StatusError>("deserializing linked state to settle")?;
+            (linked_repository, linked_state)
+        };
+        let (linked_repository, linked_state) = &linked;
+
+        let nested = Box::pin(settle_cleared_links(
+            linked_repository,
+            token,
+            linked_state,
+            pending,
+            depth + 1,
+        ))
+        .await?;
+        if !is_cleared && !nested {
+            continue;
+        }
+
+        let content = LinkedStagedContent::of(linked_state, linked_repository).await;
+        settle_linked_staged_state(
+            state,
+            repository.clone(),
+            node,
+            link.branch,
+            &linked,
+            content,
+            token,
+        )
+        .await
+        .forward::<StatusError>("repinning settled link")?;
+        changed = true;
+    }
+    Ok(changed)
 }
 
 /// Compare a repository's own tree against its staged state below `path`, or the whole of it where
@@ -1589,23 +1687,27 @@ async fn report_tree_diffs(
     layer_mounts: &Arc<Vec<state::LayerMountInfo>>,
     summary: &Arc<StatusSummaryStats>,
     plan: TreeDiffPlan,
-) -> Result<(), StatusError> {
+) -> Result<Vec<LinkedState>, StatusError> {
     with_operation_if(
         repository.file_system(),
         plan.reads_working_tree(),
         async |operation| {
+            let mut cleared_links = vec![];
             if plan.compare_staged {
                 let diff = StagedDiff {
                     summary: summary.clone(),
                     show_scan: plan.scan,
                     check_dirty: operation.clone().filter(|_| plan.checks_dirty()),
+                    cleared_links: Arc::default(),
                 };
+                let cleared = diff.cleared_links.clone();
                 report_staged_diffs(repository, paths, state_current, state_staged, layers, diff)
                     .await?;
+                cleared_links = std::mem::take(&mut *cleared.lock());
             }
 
             let Some(operation) = operation.filter(|_| plan.scan) else {
-                return Ok(());
+                return Ok(cleared_links);
             };
             let outside_layers;
             let paths = if operation.holds_state() && !layers.is_empty() {
@@ -1628,7 +1730,7 @@ async fn report_tree_diffs(
                 Some(summary),
             )
             .await?;
-            Ok(())
+            Ok(cleared_links)
         },
     )
     .await
@@ -1948,7 +2050,7 @@ pub(crate) async fn status(
 
     let plan =
         TreeDiffPlan::for_status(&options, has_staged, repository.file_system().holds_state());
-    report_tree_diffs(
+    let mut cleared_links = report_tree_diffs(
         &repository,
         &paths,
         &state_current,
@@ -1978,6 +2080,14 @@ pub(crate) async fn status(
         event::LoreEvent::RepositoryStatusSummary(data).send();
     }
 
+    let mut settled_links = false;
+    if !cleared_links.is_empty()
+        && let Some(token) = repository.try_write_token()
+    {
+        settled_links =
+            settle_cleared_links(&repository, token, &state_staged, &mut cleared_links, 0).await?;
+    }
+
     // If the staged state was updated (by scan or other operations), serialize it.
     // When scanning, the state may have been modified even if no staged anchor existed before.
     // Opportunistically serialize only when the context carries write capability.
@@ -1994,16 +2104,27 @@ pub(crate) async fn status(
             state_staged.set_parent_other(Hash::default());
             state_staged.set_metadata_hash(Hash::default());
         }
-        // Serialize the new staged state
-        let signature = state_staged
-            .serialize(repository.clone(), token)
-            .await
-            .forward::<StatusError>("serializing staged revision state")?;
-
-        // Serialize the new staged anchor
-        crate::instance::store_staged_anchor(&repository, signature)
-            .await
-            .forward::<StatusError>("serializing staged revision anchor")?;
+        let emptied = settled_links
+            && state_staged.parent_other().is_zero()
+            && !state_staged
+                .node_has_staged_or_dirty_children(repository.clone(), ROOT_NODE)
+                .await
+                .unwrap_or(true);
+        if emptied {
+            if !execution_context().globals().dry_run() {
+                crate::instance::delete_staged_anchor(&repository)
+                    .await
+                    .forward::<StatusError>("deleting staged revision anchor")?;
+            }
+        } else {
+            let signature = state_staged
+                .serialize(repository.clone(), token)
+                .await
+                .forward::<StatusError>("serializing staged revision state")?;
+            crate::instance::store_staged_anchor(&repository, signature)
+                .await
+                .forward::<StatusError>("serializing staged revision anchor")?;
+        }
     }
 
     // A layer's nodes live in the layer's own staged state, so a reconciling status mutates that
