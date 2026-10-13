@@ -211,26 +211,19 @@ Pushed revision 1 -> a3f8c2d1... to branch main
 
 ## Step 6 — Set up a shared store and clone a second working tree
 
-Now that the repository has a revision on the server, clone it into a sibling directory to get a second, independent working tree. First, create a *shared store* for the server. A shared store lets you keep multiple worktrees on your machine without each one costing its own disk space: instead of copying content into every tree's `.lore/`, all the trees that point at the store draw from one on-disk copy. Any tree cloned from the same server can use it, and because Lore stores content as deduplicated *fragments*, even similar files share the parts they have in common — not just byte-for-byte duplicates.
+Now that the repository has a revision on the server, clone it into a sibling directory to get a second, independent working tree, and keep that tree's content in a *shared store*. With a shared store, you can keep multiple working trees on your machine without each one costing its own disk space: instead of copying content into every tree's `.lore/`, all the trees that point at the store draw from one on-disk copy. Any tree cloned from the same server can use it, and because Lore stores content as deduplicated *fragments*, even similar files share the parts they have in common — not just byte-for-byte duplicates.
 
-Create the store, passing the server URL — host and port, with **no** repository path:
+Clone into the sibling directory, adding `--use-shared-store` so the new tree keeps its content in the shared store instead of its own `.lore/`. There's no store for this server yet, so the clone creates one first:
 
 ```bash
 cd ~
-lore shared-store create lore://127.0.0.1:41337
-```
-
-`lore shared-store info` shows where the store lives.
-
-Now clone into the sibling directory, adding `--use-shared-store` so the new tree keeps its objects in the shared store instead of its own `.lore/`:
-
-```bash
 lore clone lore://127.0.0.1:41337/my-project my-project-b --use-shared-store
 ```
 
 Expected output:
 
 ```text
+[Warn] Creating new shared store for remote lore://127.0.0.1:41337 in shared store at /home/you/.local/share/lore/shared_store/127.0.0.1_41337/shared_store
 Cloning repository 3f2a1b4c5d6e7f8a... branch main into /home/you/my-project-b
 Pull state a3f8c2d1...
 Cloned 2/2 files (269.00 bytes/269.00 bytes)
@@ -238,7 +231,7 @@ Branch main revision a3f8c2d1...
 Clone complete in 0.12s
 ```
 
-(Your repository ID, hashes, and timing will differ.)
+(Your repository ID, hashes, timing, and store path will differ. The store lives in Lore's data directory, shown here for Linux.)
 
 The clone already contains the committed files — confirm it:
 
@@ -273,7 +266,27 @@ sample.bin
 
 You now have two independent working trees of the same repository.
 
-Go back into the primary working tree:
+To have every later `lore clone` and `lore repository create` on this machine use the shared store without the flag, turn on automatic use:
+
+```bash
+lore shared-store set-use-automatically true
+```
+
+`lore shared-store info` shows the setting and where the store lives:
+
+```text
+Shared store will be used automatically: true
+Remote URL: 127.0.0.1:41337
+  Path: /home/you/.local/share/lore/shared_store/127.0.0.1_41337/shared_store
+  Exists: true
+```
+
+`~/my-project`, created in Step 2 before the store existed, keeps its own store in `.lore/`. Only working trees cloned over the shared store draw from it.
+
+> [!TIP]
+> Working trees over a shared store are Lore's equivalent of worktrees, with no main repository. To keep one for each branch, build, or automated tool, and to list, move, prune, and remove them, see [Run parallel instances over a shared store](../how-to/run-parallel-instances-over-a-shared-store.md).
+
+Go back into the first working tree:
 
 ```bash
 cd ~/my-project
@@ -475,3 +488,4 @@ Your revision hash will differ from `c7d1e8b3...`. Both working trees at revisio
 - [Lore Server config reference](../reference/lore-server-config.md) — every server config field, its default, and how to point the server at a persistent store.
 - [Install the Lore CLI](../how-to/install-lore-cli.md) — alternative PATH setups, shell completions, and building the CLI from source.
 - [Deploy a local Lore Server](../how-to/deploy-local-lore-server.md) — stand up a persistent server with your own certificate and store, run it from source, or run it in Docker.
+- [Run parallel instances over a shared store](../how-to/run-parallel-instances-over-a-shared-store.md) — keep many working trees over the shared store from Step 6, and move, prune, and remove them.

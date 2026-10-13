@@ -296,7 +296,7 @@ Also see: sync.
 
 ### Repository instance
 
-A local working directory of a repository, with its own working tree, view, and staged state, identified by a UUIDv7 in `.lore/instance`. Multiple instances can share one shared store on a machine while keeping independent state. Created by `lore clone`.
+A local working directory of a repository, with its own working tree, view, and staged state, identified by a UUIDv7 in `.lore/instance`. Multiple instances can share one shared store on a machine while keeping independent state. Created by `lore clone`. Closest Git analog: worktree, but every instance is a peer and none is a main repository; see [Run parallel instances over a shared store](how-to/run-parallel-instances-over-a-shared-store.md).
 
 Also see: shared store, working tree.
 

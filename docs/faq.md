@@ -40,6 +40,10 @@ What isn’t yet in place is enforcement — the current implementation informs 
 
 The next iteration of locking, currently in design, will focus on cross-branch lock scalability in repositories with millions of files and thousands of concurrent users. We’ll share updates on progress through the [public roadmap](roadmap.md) and Discord.
 
+## Does Lore support worktrees?
+
+Yes. Clone a repository as many times as you need over a shared store, and each clone is an instance with its own working tree, branch, and staged state, while the content is stored on disk once. Unlike Git worktrees, there’s no main repository: every instance is a peer, any of them can be deleted without affecting the others, and branches and revisions committed in one instance are available in all of them before you push. See [Run parallel instances over a shared store](how-to/run-parallel-instances-over-a-shared-store.md).
+
 ## What infrastructure do I need to run a Lore server?
 
 For local use, none — Lore’s zero-config local mode runs as a single server executable with no external dependencies, no certificates, and no cloud account required.

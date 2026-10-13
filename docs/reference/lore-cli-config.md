@@ -92,7 +92,7 @@ The table key and both fields accept legacy serde aliases for backward compatibi
 
 A config that uses the legacy names still loads. New configs use the current names.
 
-Lore normally writes this table for you when you clone with `--use-shared-store`. For how shared stores work and how to set one up, see [Step 6 of the Quickstart](../tutorials/quickstart.md#step-6-set-up-a-shared-store-and-clone-a-second-working-tree); for the `lore clone` and `lore shared-store` flags, see the [Lore CLI command reference](lore-cli-commands.md).
+Lore normally writes this table for you when you clone with `--use-shared-store`, or with automatic use turned on by `lore shared-store set-use-automatically true`. For how shared stores work and how to set one up, see [Step 6 of the Quickstart](../tutorials/quickstart.md#step-6-set-up-a-shared-store-and-clone-a-second-working-tree); for running and maintaining many instances over one store, see [Run parallel instances over a shared store](../how-to/run-parallel-instances-over-a-shared-store.md); for the `lore clone` and `lore shared-store` flags, see the [Lore CLI command reference](lore-cli-commands.md).
 
 ## User-level `cli.toml`
 
@@ -229,4 +229,5 @@ pager = "bat --paging=always"
 
 - [Lore Server configuration reference](lore-server-config.md) — the `loreserver` daemon's settings, distinct from the client config on this page.
 - [Quickstart](../tutorials/quickstart.md) — clone, stage, commit, and push your first revision, and set up a shared store.
+- [Run parallel instances over a shared store](../how-to/run-parallel-instances-over-a-shared-store.md) — keep many working trees over one shared store, and move, prune, and remove them.
 - [Lore CLI command reference](lore-cli-commands.md) — the `lore clone`, `lore repository create`, and `lore shared-store` flags that write these files.

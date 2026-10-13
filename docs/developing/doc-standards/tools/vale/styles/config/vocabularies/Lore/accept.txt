@@ -130,3 +130,4 @@ syscall
 syscalls
 [Tt]iering
 worktree
+worktrees
