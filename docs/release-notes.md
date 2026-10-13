@@ -47,6 +47,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore repository create` syncs the created repository to disk only under `--sync-data`, as every other command does.
+  It previously always forced a sync
 - Opening a repository lists each store's index directory once to find the groups it has written, rather than checking
   for each of the 256 possible groups in turn, which every command paid twice before doing any work
 - `lore dirty` on a path inside a link, or on the link's mount, marks the change in the linked repository, so

@@ -2599,7 +2599,11 @@ pub async fn create_local(
     let config_path = dotpath.join(CONFIG);
     save_config(config_path, &config).await?;
 
-    repository.flush(true).await?;
+    // Written before returning, since clone drops this handle and loads the
+    // repository afresh from disk; synced only under `--sync-data`.
+    let sync_data = crate::runtime::try_execution_context()
+        .is_some_and(|context| context.globals().sync_data());
+    repository.flush(sync_data).await?;
 
     Ok(repository)
 }
