@@ -257,20 +257,17 @@ def reclone_retained_scan(repo: Lore, clone: Lore, file_count: int) -> tuple[int
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("flag", ["offline", "cache"])
-def test_clone_keeps_file_metadata_for_offline_use(new_lore_repo, flag):
+def test_clone_keeps_file_metadata_blocks_for_offline_commit(new_lore_repo, flag):
     """A clone given `--offline` or `--cache` keeps every file metadata block of the cloned
-    revision and the metadata they name, so reading a file's metadata works offline after it."""
+    revision, so a commit, which writes file history into them, works offline after it. A first
+    revision records no file history and has no block, so the clone is of the second."""
     repo: Lore = new_lore_repo()
-    with repo.open_file("described.txt", "w+") as f:
-        f.write("described\n")
-    repo.stage("described.txt")
-    repo.file_metadata_set("described.txt", ["color", "blue"])
-    repo.commit("Base")
-    repo.push()
+    repo.write_commit_push("Base", {"tracked.txt": "base\n"})
+    repo.write_commit_push("Second", {"tracked.txt": "second\n"})
 
     clone: Lore = repo.clone(**{flag: True})
 
-    assert "blue" in clone.file_metadata_get("described.txt", "color", offline=True)
+    clone.write_commit_push("Change", {"tracked.txt": "changed\n"}, offline=True)
 
 
 @pytest.mark.smoke

@@ -1636,13 +1636,13 @@ mod storage_remote_tests {
             .await
     }
 
-    /// `State::cache_file_metadata` caches every file metadata block and the metadata its slots
-    /// name, so each reads without a remote: with a batch of one, which caches the metadata of
-    /// each block in turn while the next is read, and with one batch for all.
+    /// With `file_metadata`, `State::cache_fragments` caches every file metadata block, so each
+    /// reads without a remote. The custom metadata the slots name is left alone: the remote lacks
+    /// it, and caching succeeds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn file_metadata_cache_makes_file_metadata_available_offline() -> TestResult {
+    async fn file_metadata_cache_makes_file_metadata_blocks_available_offline() -> TestResult {
+        use lore_base::types::Hash;
         use lore_revision::lore::RepositoryId;
-        use lore_revision::metadata::Metadata;
         use lore_revision::node::Node;
         use lore_revision::node::NodeFileMetadata;
         use lore_revision::node::NodeFileMetadataBlock;
@@ -1655,10 +1655,7 @@ mod storage_remote_tests {
         let execution = setup_execution("storage-remote-file-metadata-cache".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
-                for (transport, batch) in TRANSPORTS
-                    .into_iter()
-                    .flat_map(|transport| [(transport, 1), (transport, 16_384)])
-                {
+                for transport in TRANSPORTS {
                     let test =
                         CacheTest::start(transport, RepositoryId::from([0xd3u8; 16])).await?;
                     let write_token = RepositoryWriteToken::acquire(std::path::Path::new(
@@ -1683,9 +1680,7 @@ mod storage_remote_tests {
 
                     let mut expected = Vec::new();
                     for (index, &node) in described.iter().enumerate() {
-                        let mut metadata = Metadata::new();
-                        metadata.set_string("index", &index.to_string())?;
-                        let hash = metadata.serialize(test.server_repository.clone()).await?;
+                        let history = Hash::from_u64(index as u64 + 1);
                         let metadata_node = node_to_file_metadata(node);
                         let block_index = NodeFileMetadataBlock::index(metadata_node);
                         let block = state
@@ -1693,43 +1688,43 @@ mod storage_remote_tests {
                             .await?;
                         {
                             let mut writer = block.write();
-                            writer.node(NodeFileMetadata::index(metadata_node)).metadata = hash;
+                            let slot = writer.node(NodeFileMetadata::index(metadata_node));
+                            slot.revision[0] = history;
+                            slot.metadata = Hash::from_u64(9);
                             writer.mark_dirty();
                         }
                         state.block_file_metadata_modified(block, block_index);
-                        expected.push((block_index, NodeFileMetadata::index(metadata_node), index));
+                        expected.push((
+                            block_index,
+                            NodeFileMetadata::index(metadata_node),
+                            history,
+                        ));
                     }
                     assert_eq!(
                         expected[0].0 + 2,
                         expected[2].0,
-                        "the metadata spans three blocks"
+                        "the slots span three blocks"
                     );
                     state.mark_dirty();
                     let revision = state
                         .serialize(test.server_repository.clone(), &write_token)
                         .await?;
 
-                    let client_state =
-                        State::deserialize(test.client_repository.clone(), revision).await?;
-                    client_state
-                        .cache_fragments(test.client_repository.clone(), false)
-                        .await?;
-                    client_state
-                        .cache_file_metadata(&test.client_repository, batch)
+                    State::deserialize(test.client_repository.clone(), revision)
+                        .await?
+                        .cache_fragments(test.client_repository.clone(), true)
                         .await?;
 
                     let offline = test.offline();
                     let offline_state = State::deserialize(offline.clone(), revision).await?;
-                    for (block_index, node_index, index) in expected {
-                        let hash = offline_state
+                    for (block_index, node_index, history) in expected {
+                        let block = offline_state
                             .block_file_metadata(offline.clone(), block_index)
-                            .await?
-                            .read()
-                            .node_block()
-                            .node[node_index]
-                            .metadata;
-                        let metadata = Metadata::deserialize(offline.clone(), hash).await?;
-                        assert_eq!(metadata.get_string("index")?, index.to_string());
+                            .await?;
+                        assert_eq!(
+                            block.read().node_block().node[node_index].revision[0],
+                            history
+                        );
                     }
                 }
                 Ok(())
@@ -1737,10 +1732,11 @@ mod storage_remote_tests {
             .await
     }
 
-    /// With `file_metadata`, `State::cache_fragments` fails when the remote lacks metadata a file
-    /// metadata block names. Without it, caching disregards the failure.
+    /// With `file_metadata`, `State::cache_fragments` fails when the remote lacks a file metadata
+    /// block. Without it, caching disregards the failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn file_metadata_cache_fails_on_metadata_the_remote_lacks() -> TestResult {
+    async fn file_metadata_cache_fails_on_a_block_the_remote_lacks() -> TestResult {
+        use lore_base::types::Address;
         use lore_base::types::Hash;
         use lore_revision::lore::RepositoryId;
         use lore_revision::node::Node;
@@ -1750,6 +1746,8 @@ mod storage_remote_tests {
         use lore_revision::node::node_to_file_metadata;
         use lore_revision::repository::RepositoryWriteToken;
         use lore_revision::state::State;
+        use lore_storage::StoreObliterateStats;
+        use lore_storage::TypedBytes;
         use lore_storage::hash::hash_string;
 
         let execution = setup_execution("storage-remote-file-metadata-cache-failure".to_string());
@@ -1777,8 +1775,8 @@ mod storage_remote_tests {
                         .await?;
                     {
                         let mut writer = block.write();
-                        writer.node(NodeFileMetadata::index(metadata_node)).metadata =
-                            Hash::from_u64(9);
+                        writer.node(NodeFileMetadata::index(metadata_node)).revision[0] =
+                            Hash::from_u64(1);
                         writer.mark_dirty();
                     }
                     state.block_file_metadata_modified(block, block_index);
@@ -1786,6 +1784,30 @@ mod storage_remote_tests {
                     let revision = state
                         .serialize(test.server_repository.clone(), &write_token)
                         .await?;
+
+                    let tree = state.tree(test.server_repository.clone()).await?;
+                    let blocks = lore_revision::immutable::read(
+                        test.server_repository.clone(),
+                        Address::zero_context_hash(tree.hash_file_metadata),
+                        None,
+                        lore_revision::immutable::read_options_from_repository(
+                            &test.server_repository,
+                        ),
+                    )
+                    .await?;
+                    for &hash in blocks.as_type_slice::<Hash>() {
+                        if !hash.is_zero() {
+                            test.server
+                                .backend_immutable
+                                .clone()
+                                .obliterate(
+                                    test.repository_id,
+                                    Address::zero_context_hash(hash),
+                                    Arc::new(StoreObliterateStats::default()),
+                                )
+                                .await?;
+                        }
+                    }
 
                     let client_state =
                         State::deserialize(test.client_repository.clone(), revision).await?;
@@ -1797,7 +1819,7 @@ mod storage_remote_tests {
                             .cache_fragments(test.client_repository.clone(), true)
                             .await
                             .is_err(),
-                        "metadata the remote lacks fails the file metadata cache"
+                        "a block the remote lacks fails the file metadata cache"
                     );
                 }
                 Ok(())

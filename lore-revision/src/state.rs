@@ -37,7 +37,6 @@ use stream::emit;
 use tokio::join;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tokio_util::task::AbortOnDropHandle;
 use zerocopy::FromZeros;
 use zerocopy::Immutable;
 
@@ -4115,29 +4114,31 @@ impl State {
         Ok(tree)
     }
 
-    /// The most file metadata blocks, or metadata addresses, [`Self::cache_fragments`] collects
-    /// for one cache request.
-    const FILE_METADATA_CACHE_BATCH: usize = 16_384;
-
-    /// The most file metadata blocks [`Self::cache_fragments`] reads at once.
-    const FILE_METADATA_BLOCK_READS: usize = 64;
-
     /// Caches the state's own records in the local store, so the state reads without the remote,
-    /// and with `file_metadata` every file metadata block and the metadata it names, so file
-    /// metadata does too.
+    /// and with `file_metadata` every file metadata block, so staging and committing, which write
+    /// to them, do too. The custom metadata a block names is not cached.
     ///
     /// Without `file_metadata` caching is best effort and its failures are disregarded. With it, a
-    /// fragment left uncached fails the call, since offline file metadata reads need every one.
-    /// The file metadata pass is boxed: few callers ask for it, and inline it would make every
-    /// caller's future as large as its own.
+    /// fragment left uncached fails the call, since an offline commit can need any block.
     pub async fn cache_fragments(
         &self,
         repository: Arc<RepositoryContext>,
         file_metadata: bool,
     ) -> Result<(), StateError> {
         let tree = self.tree(repository.clone()).await?;
+        let blocks = if file_metadata {
+            self.file_metadata_addresses(
+                &repository,
+                tree.hash_file_metadata,
+                tree.block_count as usize,
+            )
+            .await?
+        } else {
+            Bytes::default()
+        };
+        let blocks = blocks.as_type_slice::<Hash>();
 
-        let mut address = Vec::with_capacity(7);
+        let mut address = Vec::with_capacity(7 + blocks.len());
 
         // A remote can return the state and tree records without the local cache priority
         // flag, so a read does not keep them. Cache them to keep the state readable offline.
@@ -4153,12 +4154,18 @@ impl State {
 
         address.push(Address::zero_context_hash(tree.hash_delta));
         address.push(Address::zero_context_hash(tree.hash_file_metadata));
+        address.extend(
+            blocks
+                .iter()
+                .filter(|hash| !hash.is_zero())
+                .map(|&hash| Address::zero_context_hash(hash)),
+        );
 
         let cached = immutable::cache(repository.clone(), address, true).await;
         if file_metadata {
-            cached.forward::<StateError>("Failed to cache the state records")?;
-            Box::pin(self.cache_file_metadata(&repository, Self::FILE_METADATA_CACHE_BATCH))
-                .await?;
+            cached.forward::<StateError>(
+                "Failed to cache the state records and file metadata blocks",
+            )?;
         }
 
         /* Avoid caching all the blocks, generally it's better to fetch these on demand
@@ -4185,105 +4192,6 @@ impl State {
         let _ = immutable::cache(repository.clone(), address, false).await;
         */
 
-        Ok(())
-    }
-
-    /// Caches every file metadata block of the state and the metadata their slots name: the blocks
-    /// `batch` at a time, reading up to [`Self::FILE_METADATA_BLOCK_READS`] of them at once, and
-    /// the metadata whenever another block's would take it past `batch` addresses, that batch in
-    /// the background while reading goes on. At most one batch is in flight, so memory stays
-    /// bounded however large the tree. A freed slot keeps the metadata it held last and is cached
-    /// with the rest: telling it apart would read every node block.
-    #[lore_macro::test_pub]
-    async fn cache_file_metadata(
-        &self,
-        repository: &Arc<RepositoryContext>,
-        batch: usize,
-    ) -> Result<(), StateError> {
-        let tree = self.tree(repository.clone()).await?;
-        let blocks = self
-            .file_metadata_addresses(
-                repository,
-                tree.hash_file_metadata,
-                tree.block_count as usize,
-            )
-            .await?;
-        let blocks = blocks.as_type_slice::<Hash>();
-
-        let mut metadata =
-            Vec::with_capacity(batch.min(blocks.len() * BLOCK_NODE_FILE_METADATA_COUNT));
-        let mut caching = None;
-        let mut reads = JoinSet::new();
-        for chunk in blocks.chunks(batch) {
-            let mut stored = chunk.iter().filter(|hash| !hash.is_zero());
-            immutable::cache(
-                repository.clone(),
-                stored
-                    .clone()
-                    .map(|&hash| Address::zero_context_hash(hash))
-                    .collect(),
-                true,
-            )
-            .await
-            .forward::<StateError>("Failed to cache file metadata blocks")?;
-
-            loop {
-                while reads.len() < Self::FILE_METADATA_BLOCK_READS
-                    && let Some(&hash) = stored.next()
-                {
-                    lore_spawn!(
-                        reads,
-                        NodeFileMetadataBlockData::read_box_from_immutable_compat(
-                            repository.clone(),
-                            Address::zero_context_hash(hash),
-                            true,
-                        )
-                    );
-                }
-                let Some(read) = reads.join_next().await else {
-                    break;
-                };
-                let data = read
-                    .internal("Reading a file metadata block")?
-                    .forward::<StateError>("Failed to deserialize file metadata block")?;
-                if metadata.len() + data.node.len() > batch {
-                    if let Some(previous) = caching.take() {
-                        Self::file_metadata_cached(previous).await?;
-                    }
-                    let full = std::mem::replace(&mut metadata, Vec::with_capacity(batch));
-                    caching = Some(AbortOnDropHandle::new(lore_spawn!(immutable::cache(
-                        repository.clone(),
-                        full,
-                        true
-                    ))));
-                }
-                metadata.extend(
-                    data.node
-                        .iter()
-                        .filter(|node| !node.metadata.is_zero())
-                        .map(|node| Address::zero_context_hash(node.metadata)),
-                );
-            }
-        }
-        if let Some(previous) = caching {
-            Self::file_metadata_cached(previous).await?;
-        }
-        if !metadata.is_empty() {
-            immutable::cache(repository.clone(), metadata, true)
-                .await
-                .forward::<StateError>("Failed to cache file metadata")?;
-        }
-        Ok(())
-    }
-
-    /// Waits for a metadata batch [`Self::cache_file_metadata`] caches in the background.
-    async fn file_metadata_cached(
-        caching: AbortOnDropHandle<Result<usize, ImmutableError>>,
-    ) -> Result<(), StateError> {
-        caching
-            .await
-            .internal("Caching file metadata")?
-            .forward::<StateError>("Failed to cache file metadata")?;
         Ok(())
     }
 

@@ -378,6 +378,35 @@ async fn an_invalidated_pool_is_not_handed_out_again() {
     assert!(!Arc::ptr_eq(&held, &after), "a fresh pool");
 }
 
+/// A cache get cap above what a semaphore holds is clamped to it, and a cap of zero sets
+/// none.
+#[test]
+fn cache_get_permits_clamp_to_what_a_semaphore_holds() {
+    let permits = Connection::detached(Vec::new())
+        .cache_get_permits(usize::MAX)
+        .expect("a cap");
+    assert_eq!(
+        permits.available_permits(),
+        tokio::sync::Semaphore::MAX_PERMITS
+    );
+    assert!(
+        Connection::detached(Vec::new())
+            .cache_get_permits(0)
+            .is_none()
+    );
+}
+
+/// The first call fixes a connection's cache get permits; a later call with another cap
+/// answers the same ones.
+#[test]
+fn cache_get_permits_are_fixed_by_the_first_call() {
+    let connection = Connection::detached(Vec::new());
+    let first = connection.cache_get_permits(4).expect("a cap");
+    let later = connection.cache_get_permits(8).expect("a cap");
+    assert!(Arc::ptr_eq(&first, &later));
+    assert_eq!(later.available_permits(), 4);
+}
+
 #[test]
 fn not_supported_to_tonic_status() {
     let err = ProtocolError::from(NotSupported {

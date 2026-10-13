@@ -24,7 +24,7 @@ use lore_transport::StorageSession;
 
 /// A context carrying the given remote state, on in-memory stores so
 /// everything but the remote is valid.
-async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
+pub(super) async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
     let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
         .await
         .expect("in-memory stores should be creatable");
@@ -43,7 +43,7 @@ async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
 /// Build and run the future `body` returns under an execution context, which is where the
 /// correlation id a session is attributed to comes from. The future is built inside the
 /// context, as a wrapper resolves its session when built.
-async fn under_execution_context<F: Future>(body: impl FnOnce() -> F) -> F::Output {
+pub(super) async fn under_execution_context<F: Future>(body: impl FnOnce() -> F) -> F::Output {
     let execution = Arc::new(ExecutionContext::new_client(
         LoreGlobalArgs::default(),
         EventDispatcher::no_dispatch(),
@@ -75,7 +75,7 @@ fn held_pool() -> Arc<lore_transport::SessionPool> {
 
 /// A session that counts how often it is resolved, and fails: the test asks which session
 /// answered, not what it yields.
-fn counting_session(resolutions: Arc<AtomicUsize>) -> Arc<StorageSession> {
+pub(super) fn counting_session(resolutions: Arc<AtomicUsize>) -> Arc<StorageSession> {
     Arc::new(StorageSession::pending(move || {
         let resolutions = resolutions.clone();
         async move {

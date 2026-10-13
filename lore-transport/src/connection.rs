@@ -877,6 +877,9 @@ pub struct Connection {
     session_cache: dashmap::DashMap<(Partition, String), Arc<SessionPool>>,
     connector: tokio::sync::Mutex<Option<Connector>>,
     pub stale: std::sync::atomic::AtomicBool,
+    /// Permits for the gets callers run over this connection to cache fragments ahead of a read,
+    /// made by the first caller to ask ([`Self::cache_get_permits`]); `None` for no cap.
+    cache_gets: std::sync::OnceLock<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl Drop for Connection {
@@ -927,6 +930,7 @@ impl Connection {
             session_cache: dashmap::DashMap::new(),
             connector: tokio::sync::Mutex::new(None),
             stale: std::sync::atomic::AtomicBool::new(false),
+            cache_gets: std::sync::OnceLock::new(),
         }
     }
 
@@ -951,6 +955,22 @@ impl Connection {
 
     pub fn remote_url(&self) -> &str {
         self.remote_url.as_str()
+    }
+
+    /// The permits gets that cache fragments over this connection take: `cap` of them, at most
+    /// [`tokio::sync::Semaphore::MAX_PERMITS`], fixed by the first call; `None` for a cap of zero.
+    /// Each connection has its own, so a stalled remote holds back only the cache gets over its
+    /// connections, and a connection that replaces a stale one has permits of its own.
+    pub fn cache_get_permits(&self, cap: usize) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.cache_gets
+            .get_or_init(|| {
+                (cap > 0).then(|| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        cap.min(tokio::sync::Semaphore::MAX_PERMITS),
+                    ))
+                })
+            })
+            .clone()
     }
 
     pub fn auth_url(&self) -> &str {

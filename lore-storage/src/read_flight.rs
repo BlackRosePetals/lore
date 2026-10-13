@@ -4,13 +4,16 @@ use std::hash::BuildHasherDefault;
 use std::hash::Hasher;
 use std::sync::OnceLock;
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use dashmap::Entry;
 use tokio::sync::watch;
 
 use crate::error::StorageError;
 use crate::read::Fetched;
+use crate::read::Flown;
 use crate::types::Address;
+use crate::types::Fragment;
 use crate::types::Hash;
 use crate::types::Partition;
 use crate::write::StoreInFlightKey;
@@ -154,8 +157,31 @@ impl ReadFlightGuard {
     /// one is.
     #[lore_macro::test_pub]
     pub(crate) fn complete(mut self, result: &Result<Fetched, StorageError>) {
-        if let Some(key) = self.key.take() {
-            finish(key, Some(result));
+        if let Some(sender) = self.key.take().and_then(close) {
+            sender.send_replace(Some(result.clone()));
+        }
+    }
+
+    /// End the flight with `raw`, the payload at `address` as fetched, unchecked. Where a follower
+    /// is subscribed, the payload is checked on receipt ([`crate::read::verify_receipt`]) and the
+    /// content published; one that fails the check is not published, so the followers fetch for
+    /// themselves, as after a leader that vanished, and is handed back rejected. Where none is, the
+    /// payload is handed back unchecked.
+    pub(crate) fn complete_unverified(mut self, address: Address, raw: (Fragment, Bytes)) -> Flown {
+        let Some(sender) = self.key.take().and_then(close) else {
+            return Flown::Unverified(raw);
+        };
+        let (fragment, payload) = raw;
+        match crate::read::verify_receipt(fragment, payload.clone(), address) {
+            Ok(content) => {
+                let fetched = Fetched {
+                    content,
+                    raw: (fragment, payload),
+                };
+                sender.send_replace(Some(Ok(fetched.clone())));
+                Flown::Fetched(fetched)
+            }
+            Err(_) => Flown::Rejected((fragment, payload)),
         }
     }
 }
@@ -163,27 +189,18 @@ impl ReadFlightGuard {
 impl Drop for ReadFlightGuard {
     fn drop(&mut self) {
         if let Some(key) = self.key.take() {
-            finish(key, None);
+            close(key);
         }
     }
 }
 
-/// Removes the flight for `key`, and sends `result` where the flight has a channel a follower
-/// still listens on. Removing the entry first closes the flight to further followers, so every
-/// follower that joined holds a receiver of what is sent. A flight ended without a result drops its
-/// channel, which tells its followers to join again.
-fn finish(key: ReadFlightKey, result: Option<&Result<Fetched, StorageError>>) {
-    let Some((_, flight)) = READ_IN_FLIGHT
-        .get()
-        .and_then(|in_flight| in_flight.remove(&key))
-    else {
-        return;
-    };
-    if let (Some(result), Some(sender)) = (result, flight.sender)
-        && sender.receiver_count() > 0
-    {
-        sender.send_replace(Some(result.clone()));
-    }
+/// Removes the flight for `key`, and answers its channel where a follower still listens on it.
+/// Removing the entry first closes the flight to further followers, so every follower that joined
+/// holds a receiver of what is sent. A flight ended without a result drops its channel, which tells
+/// its followers to join again.
+fn close(key: ReadFlightKey) -> Option<watch::Sender<ReadFlightResult>> {
+    let (_, flight) = READ_IN_FLIGHT.get()?.remove(&key)?;
+    flight.sender.filter(|sender| sender.receiver_count() > 0)
 }
 
 /// Join the read single-flight for `address`'s content: its hash, and `partition` where

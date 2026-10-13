@@ -1496,10 +1496,10 @@ work:
   without contacting the remote.
 - *A fragment cache.* Bytes for fragments that have been fetched at any point. Subsequent
   reads of those fragments do not hit the remote.
-- *File metadata, after a clone prepared for offline work.* A clone that writes its files,
-  given `--offline` or `--cache`, holds every file metadata block of its revision and the
-  metadata they name. Any other clone fetches a block the first time a command needs it, so
-  offline work right after it, such as staging a new file, can need the remote.
+- *File metadata blocks, after a clone prepared for offline work.* A clone that writes its
+  files, given `--offline` or `--cache`, holds every file metadata block of its revision, which
+  staging and committing write to. Any other clone fetches a block the first time a command
+  needs it, so offline work right after it, such as a commit, can need the remote.
 
 What the client does *not* hold is the canonical answer to "what is the current latest of
 this branch on the remote." That answer can be queried at sync time; between syncs, the

@@ -327,9 +327,9 @@ pub struct CloneOptions {
     pub dependency_recursive: bool,
     /// Maximum dependency traversal depth. 0 means unlimited.
     pub dependency_depth_limit: u32,
-    /// Where the clone writes its files, cache every file metadata block of the cloned revision
-    /// and the metadata they name, so commands reading file metadata work without the remote, and
-    /// fail the clone if that fails.
+    /// Where the clone writes its files, cache every file metadata block of the cloned revision,
+    /// which staging and committing write to, so both work without the remote, and fail the clone
+    /// if that fails.
     pub cache_file_metadata: bool,
 }
 

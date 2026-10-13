@@ -3799,7 +3799,8 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
     }
 
     /// This store holds the fragment it was given, so the representation comes straight off the
-    /// entry and there is nothing further to fetch.
+    /// entry and there is nothing further to fetch. `PayloadStoredLocal` reports whether the entry
+    /// holds its payload, as `query` reports `stored_local`, whatever flags it was stored with.
     async fn get_metadata(
         self: Arc<Self>,
         partition: Partition,
@@ -3832,7 +3833,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
 
         Ok(StoreGetData::metadata(
             Fragment {
-                flags: find.data.flags | local_flags,
+                flags: (find.data.flags & !FragmentFlags::PayloadStoredLocal.bits()) | local_flags,
                 size_payload: find.data.size_payload,
                 size_content: find.data.size_content,
             },

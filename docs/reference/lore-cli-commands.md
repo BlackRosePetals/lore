@@ -361,8 +361,8 @@ Clone a remote repository into the given path
 
 A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
 instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
-revision and the metadata they name, so commands reading file metadata work without the remote, and fails if it cannot.
-A bare clone writes no files and reads them from the remote when a command needs them.
+revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
+writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore repository clone [OPTIONS] <url> [path]`
 
@@ -2107,8 +2107,8 @@ Clone a remote repository into the given path
 
 A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
 instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
-revision and the metadata they name, so commands reading file metadata work without the remote, and fails if it cannot.
-A bare clone writes no files and reads them from the remote when a command needs them.
+revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
+writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore clone [OPTIONS] <url> [path]`
 

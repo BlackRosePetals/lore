@@ -29,6 +29,7 @@ use crate::lore::TypedBytes;
 use crate::lore::VecBytes;
 use crate::lore_debug;
 use crate::lore_trace;
+use crate::lore_warn;
 use crate::repository::RepositoryContext;
 use crate::store::ImmutableStore;
 use crate::store::StoreError;
@@ -55,6 +56,8 @@ pub enum ImmutableError {
 
 use lore_storage::options::ReadOptions;
 use lore_storage::options::WriteOptions;
+use lore_storage::read::Fetched;
+use lore_storage::read::Flown;
 
 /// Event data reporting a single fragment written or deduplicated.
 #[repr(C)]
@@ -656,10 +659,250 @@ pub fn file_matches(
 // Cache and query helpers
 // ---------------------------------------------------------------------------
 
-/// Fetches every fragment at `address` the local store lacks from the remote and stores it, then
-/// the subfragments of fragmented ones when `cache_fragmented` is set. Once connected, every
-/// fragment that can be cached is, and the answer is the failure to connect, the first failure to
-/// query, fetch or store a fragment, or else how many were fetched.
+/// Default cap on the gets [`cache`] calls have in flight on one connection to a remote together, so
+/// they put no unbounded backlog of gets ahead of a demand read's priority get, at the server and on
+/// the link.
+#[lore_macro::test_pub]
+const CACHE_GETS: usize = 512;
+
+/// The cap on cache gets in flight on one connection to a remote, from `LORE_CACHE_GETS`, read and
+/// logged once ([`cache_gets_from`]). Zero means no cap.
+fn cache_gets() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let cap = cache_gets_from(std::env::var("LORE_CACHE_GETS").ok());
+        if cap == 0 {
+            lore_debug!("Cache gets are not capped");
+        } else {
+            lore_debug!("Cache gets are capped at {cap} per connection");
+        }
+        cap
+    })
+}
+
+/// The cap a `LORE_CACHE_GETS` of `value` sets: the count; [`CACHE_GETS`] where it is
+/// unset or, with a warning, not a count.
+#[lore_macro::test_pub]
+fn cache_gets_from(value: Option<String>) -> usize {
+    let Some(value) = value else {
+        return CACHE_GETS;
+    };
+    let Ok(cap) = value.trim().parse::<usize>() else {
+        lore_warn!(
+            "LORE_CACHE_GETS={value} is not a count; cache gets take the default cap \
+             of {CACHE_GETS}"
+        );
+        return CACHE_GETS;
+    };
+    cap
+}
+
+/// The connection's cache get permits, which every [`cache_through`] fetch takes; `None` with no
+/// cap.
+type CacheGets = Option<Arc<tokio::sync::Semaphore>>;
+
+/// What one [`cache_through`] fetch came to.
+#[lore_macro::test_pub]
+enum Fetch {
+    /// A payload fetched: its fragment, marked durable as the remote holds it, the payload as
+    /// fetched, for a fragment list the list it expands to, and whether it overwrites a corrupt
+    /// local copy.
+    Fetched {
+        address: Address,
+        fragment: Fragment,
+        payload: Bytes,
+        list: Option<Bytes>,
+        replace: bool,
+    },
+    /// The fragment at this address turned local while the get waited for its permit, so nothing
+    /// was fetched. With `cache_fragmented` the next round queries it again, which walks a list
+    /// stored meanwhile, as a demand read stores a root alone.
+    Local(Address),
+    /// The fetch failed, or a payload it checked failed its check.
+    Failed(Box<ImmutableError>),
+}
+
+/// What the local store holds at an address [`cache_through`] looks up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalCopy {
+    /// A payload, which for a fragment list reads and verifies.
+    Held,
+    /// No entry, or an entry without its payload, as eviction leaves one: nothing to serve or walk.
+    Lacking,
+    /// A fragment list that does not read or verify, fetched again to overwrite it.
+    Corrupt,
+}
+
+/// Whether `resolved` holds a payload locally. An entry without its payload, as eviction leaves
+/// one, holds nothing to serve or walk, so it counts as lacking.
+fn held_locally(resolved: &StoreMatchResult) -> bool {
+    resolved.match_made != StoreMatch::MatchNone && resolved.stored_local
+}
+
+/// The flags of the fragment the local store holds a payload for at `address`, in one lookup:
+/// zero where it holds none, so an entry without its payload counts as lacking.
+async fn held_flags(
+    repository: &Arc<RepositoryContext>,
+    address: Address,
+) -> Result<u32, StoreError> {
+    let metadata = repository
+        .immutable_store()
+        .get_metadata(repository.id, address)
+        .await?;
+    let held = metadata.match_made != StoreMatch::MatchNone
+        && metadata.fragment.flags & FragmentFlags::PayloadStoredLocal != 0;
+    Ok(if held { metadata.fragment.flags } else { 0 })
+}
+
+/// Pushes the address of every fragment `list` references, in `context`, onto `into`.
+fn push_subfragments(list: Bytes, context: Context, into: &mut Vec<Address>) {
+    let list = list.to_aligned::<FragmentReference>();
+    into.extend(
+        list.as_type_slice::<FragmentReference>()
+            .iter()
+            .map(|reference| Address {
+                context,
+                hash: reference.hash,
+            }),
+    );
+}
+
+/// Fetches `address` for the cache: the payload as fetched and marked durable, unchecked
+/// ([`Flown::Unverified`]), as a read checks what it loads, unless it is a fragment list, which is
+/// checked on receipt and healed once as a read's fetch is
+/// ([`lore_storage::read::check_fetched`]), as walking a list expands it and a corrupt list could
+/// name itself.
+async fn fetch_checking_lists(
+    session: &StorageSession,
+    address: Address,
+) -> Result<Flown, lore_storage::StorageError> {
+    let raw = lore_storage::read::fetch_payload(session, address, false).await?;
+    if raw.0.flags & FragmentFlags::PayloadFragmented == 0 {
+        return Ok(Flown::Unverified(raw));
+    }
+    lore_storage::read::check_fetched(session, address, false, raw)
+        .await
+        .map(Flown::Fetched)
+}
+
+/// Fetches `address` through `remote_storage` ([`fetch_checking_lists`]) in the read flight for its
+/// content ([`lore_storage::read::fetch_single_flight`]), so a read or a fetch of the same content
+/// in flight shares one get. A payload fetched unchecked is checked only where a follower joined,
+/// which takes the content the check expands; one that fails that check is healed once, as a read's
+/// fetch is ([`lore_storage::read::check_fetched`]). It joins with the local probe off: the cache
+/// looked locally already, and the probe asserts on a corrupt copy in debug builds.
+///
+/// The fetch holds one of `permits`, taken before it joins, so a read following it never waits for
+/// one, and gives it back on joining as a follower, which makes no get of its own; a follower whose
+/// leader fails on another address fetches without it. A fetch that had to wait asks the local store
+/// first, since a demand read may have stored the fragment meanwhile, unless it is to `replace` a
+/// corrupt local copy, which that store holds.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn fetch_to_cache(
+    repository: Arc<RepositoryContext>,
+    remote_storage: Arc<StorageSession>,
+    permits: CacheGets,
+    address: Address,
+    replace: bool,
+) -> impl Future<Output = Fetch> {
+    async move {
+        let fetched = {
+            let mut permit = match &permits {
+                None => None,
+                Some(permits) => {
+                    if let Ok(permit) = permits.try_acquire() {
+                        Some(permit)
+                    } else {
+                        let permit = permits.acquire().await.ok();
+                        if !replace && is_stored_local(repository.clone(), address).await {
+                            return Fetch::Local(address);
+                        }
+                        permit
+                    }
+                }
+            };
+            let checked = |fetched: Fetched| {
+                let list = (fetched.raw.0.flags & FragmentFlags::PayloadFragmented != 0)
+                    .then_some(fetched.content.1);
+                (fetched.raw, list)
+            };
+            match lore_storage::read::fetch_single_flight(
+                repository.immutable_store(),
+                repository.id,
+                address,
+                ReadOptions {
+                    local: false,
+                    ..ReadOptions::default()
+                },
+                || fetch_checking_lists(&remote_storage, address),
+                || drop(permit.take()),
+            )
+            .await
+            {
+                Ok(Flown::Local(_)) => return Fetch::Local(address),
+                Ok(Flown::Unverified(raw)) => Ok((raw, None)),
+                Ok(Flown::Rejected(raw)) => {
+                    lore_storage::read::check_fetched(&remote_storage, address, false, raw)
+                        .await
+                        .map(checked)
+                }
+                Ok(Flown::Fetched(fetched)) => Ok(checked(fetched)),
+                Err(error) => Err(error),
+            }
+        };
+        match fetched {
+            Ok(((fragment, payload), list)) => Fetch::Fetched {
+                address,
+                fragment,
+                payload,
+                list,
+                replace,
+            },
+            Err(error) => Fetch::Failed(Box::new(error.forward("fetching fragment to cache"))),
+        }
+    }
+}
+
+/// One batch [`cache_through`] looked up locally: its addresses, what the store holds of each, and
+/// the subfragments of those it holds locally as fragment lists.
+type QueriedBatch = Result<(Bytes, Vec<LocalCopy>, Vec<Address>), StoreError>;
+
+/// Pushes the subfragments of the fragment list the local store holds at `address` onto
+/// `children`, answering whether the list read and verified; one that does not pushes nothing. The
+/// list is read verified, as a corrupt list naming itself or an ancestor would be walked forever,
+/// and raw, as `load_fragment` asserts on a failed local check in debug builds and a list read is
+/// no reason to join a read flight.
+async fn push_local_list_children(
+    repository: &Arc<RepositoryContext>,
+    address: Address,
+    children: &mut Vec<Address>,
+) -> bool {
+    let Ok((fragment, payload)) =
+        lore_storage::read::read_raw(repository.immutable_store(), repository.id, address, true)
+            .await
+    else {
+        return false;
+    };
+    let options = ReadOptions::default().with_decompress().with_verify();
+    let Ok((_, list)) = lore_storage::decompress_and_verify(fragment, payload, address, options)
+    else {
+        return false;
+    };
+    push_subfragments(list, address.context, children);
+    true
+}
+
+/// Fetches every fragment at `address` the local store lacks from the remote and stores it, then,
+/// when `cache_fragmented` is set, the subfragments of fragment lists, fetched or held locally. A
+/// fragment the store indexes without a local payload counts as lacking, and a local list it
+/// cannot read or verify is fetched again and overwritten, as a read replaces a corrupt fragment,
+/// and the fetched list walked. Once connected, every fragment that can be cached is, and the
+/// answer is the failure to connect, the first failure to query, fetch, verify or store a
+/// fragment, or else how many fragments it fetched, by its own get or one it joined: a fragment
+/// found local after waiting for a cache get permit is not fetched.
 pub async fn cache(
     repository: Arc<RepositoryContext>,
     address: Vec<Address>,
@@ -679,17 +922,28 @@ pub async fn cache(
         .await
         .forward("connecting to remote storage for cache");
     let remote_storage = storage_result?;
+    let permits = remote.cache_get_permits(cache_gets());
 
-    cache_through(repository, remote_storage, address, cache_fragmented).await
+    cache_through(
+        repository,
+        remote_storage,
+        permits,
+        address,
+        cache_fragmented,
+    )
+    .await
 }
 
-/// [`cache`] once connected, fetching through `remote_storage`.
+/// [`cache`] once connected, fetching through `remote_storage`, each get holding one of
+/// `permits`.
 ///
-/// A function of its own because its batches live across several awaits: kept in [`cache`]
-/// they would take space in its future while the remote is connected as well.
+/// A function of its own because its batches live across several awaits: kept in [`cache`] they
+/// would take space in its future while the remote is connected as well.
+#[lore_macro::test_pub]
 async fn cache_through(
     repository: Arc<RepositoryContext>,
     remote_storage: Arc<StorageSession>,
+    permits: CacheGets,
     address: Vec<Address>,
     cache_fragmented: bool,
 ) -> Result<usize, ImmutableError> {
@@ -705,7 +959,8 @@ async fn cache_through(
     }
 
     let start = Instant::now();
-    let mut total_store_count = 0;
+    let mut total_fetches = 0;
+    let mut total_already_local = 0;
     let mut total_query_count = 0;
     let mut failure = None;
 
@@ -714,8 +969,7 @@ async fn cache_through(
         total_query_count += query_count;
         lore_trace!("Query and cache {query_count} immutable fragments from remote");
 
-        let mut query_tasks: JoinSet<Result<(Bytes, Vec<StoreMatchResult>), StoreError>> =
-            JoinSet::new();
+        let mut query_tasks: JoinSet<QueriedBatch> = JoinSet::new();
         while !query_address.is_empty() {
             // Cap number of tasks to a reasonable batch size
             const BATCH_COUNT: usize = 100;
@@ -732,12 +986,40 @@ async fn cache_through(
             let repository = repository.clone();
             lore_spawn!(query_tasks, async move {
                 let addresses = slice.as_type_slice::<Address>();
-                let mut matches = vec![StoreMatchResult::default(); addresses.len()];
-                repository
-                    .immutable_store()
-                    .query(repository.id, addresses, &mut matches)
-                    .await?;
-                Ok((slice, matches))
+                let mut children = Vec::new();
+                let held = if cache_fragmented {
+                    let mut held = Vec::with_capacity(addresses.len());
+                    for address in addresses {
+                        let flags = held_flags(&repository, *address).await?;
+                        held.push(if flags == 0 {
+                            LocalCopy::Lacking
+                        } else if flags & FragmentFlags::PayloadFragmented == 0
+                            || push_local_list_children(&repository, *address, &mut children).await
+                        {
+                            LocalCopy::Held
+                        } else {
+                            LocalCopy::Corrupt
+                        });
+                    }
+                    held
+                } else {
+                    let mut matches = vec![StoreMatchResult::default(); addresses.len()];
+                    repository
+                        .immutable_store()
+                        .query(repository.id, addresses, &mut matches)
+                        .await?;
+                    matches
+                        .iter()
+                        .map(|resolved| {
+                            if held_locally(resolved) {
+                                LocalCopy::Held
+                            } else {
+                                LocalCopy::Lacking
+                            }
+                        })
+                        .collect()
+                };
+                Ok((slice, held, children))
             });
         }
 
@@ -747,15 +1029,27 @@ async fn cache_through(
         let mut additional_address = Vec::with_capacity(query_count);
 
         let mut process_fetch =
-            |result: Result<Result<(Address, Fragment, Bytes), ProtocolError>, JoinError>,
+            |result: Result<Fetch, JoinError>,
              store_tasks: &mut JoinSet<Result<(), StoreError>>,
+             additional_address: &mut Vec<Address>,
              failure: &mut Option<Box<ImmutableError>>| {
-                let (address, fragment, mut buffer) = match result {
-                    Ok(Ok(fetched)) => fetched,
-                    Ok(Err(error)) => {
-                        failure.get_or_insert_with(|| {
-                            Box::new(error.forward("fetching fragment to cache"))
-                        });
+                let (address, fragment, payload, list, replace) = match result {
+                    Ok(Fetch::Fetched {
+                        address,
+                        fragment,
+                        payload,
+                        list,
+                        replace,
+                    }) => (address, fragment, payload, list, replace),
+                    Ok(Fetch::Local(address)) => {
+                        total_already_local += 1;
+                        if cache_fragmented {
+                            additional_address.push(address);
+                        }
+                        return;
+                    }
+                    Ok(Fetch::Failed(error)) => {
+                        failure.get_or_insert(error);
                         return;
                     }
                     Err(error) => {
@@ -769,30 +1063,21 @@ async fn cache_through(
                     }
                 };
 
-                // If the data is fragmented and we should cache subfragments, queue additional fragments
-                if cache_fragmented && (fragment.flags & FragmentFlags::PayloadFragmented) != 0 {
-                    // Fragment lists are always uncompressed
-                    buffer = buffer.to_aligned::<FragmentReference>();
-                    let fragment_list = buffer.as_type_slice::<FragmentReference>();
-                    for fragment_ref in fragment_list {
-                        additional_address.push(Address {
-                            context: address.context,
-                            hash: fragment_ref.hash,
-                        });
-                    }
+                if cache_fragmented && let Some(list) = list {
+                    push_subfragments(list, address.context, additional_address);
                 }
 
                 let repository = repository.clone();
                 lore_spawn!(store_tasks, async move {
                     repository
                         .immutable_store()
-                        .put(repository.id, address, fragment, Some(buffer), false)
+                        .put(repository.id, address, fragment, Some(payload), replace)
                         .await
                 });
             };
 
         while let Some(result) = query_tasks.join_next().await {
-            let (address, matches) = match result {
+            let (address, held, children) = match result {
                 Ok(Ok(queried)) => queried,
                 Ok(Err(error)) => {
                     failure.get_or_insert_with(|| {
@@ -810,32 +1095,45 @@ async fn cache_through(
                     continue;
                 }
             };
+            additional_address.extend(children);
             let address = address.as_type_slice::<Address>();
-            for (index, resolved) in matches.iter().enumerate() {
-                if resolved.match_made != StoreMatch::MatchNone {
+            for (index, &local) in held.iter().enumerate() {
+                if local == LocalCopy::Held {
                     continue;
                 }
 
                 fetch_count += 1;
 
-                let remote_storage = remote_storage.clone();
-                let address = address[index];
-                lore_spawn!(fetch_tasks, async move {
-                    remote_storage
-                        .get(&address)
-                        .await
-                        .map(|(fragment, buffer)| (address, fragment, buffer))
-                });
+                lore_spawn!(
+                    fetch_tasks,
+                    fetch_to_cache(
+                        repository.clone(),
+                        remote_storage.clone(),
+                        permits.clone(),
+                        address[index],
+                        local == LocalCopy::Corrupt,
+                    )
+                );
 
                 {
                     while let Some(result) = fetch_tasks.try_join_next() {
-                        process_fetch(result, &mut store_tasks, &mut failure);
+                        process_fetch(
+                            result,
+                            &mut store_tasks,
+                            &mut additional_address,
+                            &mut failure,
+                        );
                     }
 
                     while fetch_tasks.len() > MAX_REQUEST_COUNT
                         && let Some(result) = fetch_tasks.join_next().await
                     {
-                        process_fetch(result, &mut store_tasks, &mut failure);
+                        process_fetch(
+                            result,
+                            &mut store_tasks,
+                            &mut additional_address,
+                            &mut failure,
+                        );
                     }
                 }
 
@@ -853,7 +1151,12 @@ async fn cache_through(
             );
         }
         while let Some(result) = fetch_tasks.join_next().await {
-            process_fetch(result, &mut store_tasks, &mut failure);
+            process_fetch(
+                result,
+                &mut store_tasks,
+                &mut additional_address,
+                &mut failure,
+            );
 
             while store_tasks.len() > MAX_REQUEST_COUNT
                 && let Some(result) = store_tasks.join_next().await
@@ -872,7 +1175,7 @@ async fn cache_through(
             keep_store_failure(&mut failure, result);
         }
 
-        total_store_count += fetch_count;
+        total_fetches += fetch_count;
 
         additional_address.sort_unstable();
         additional_address.dedup();
@@ -883,12 +1186,13 @@ async fn cache_through(
         }
     }
 
+    let fetched = total_fetches - total_already_local;
     lore_debug!(
-        "Cached {total_store_count} / {total_query_count} immutable fragments from remote in {:.3}s",
+        "Fetched {fetched} / {total_query_count} immutable fragments in {:.3}s",
         start.elapsed().as_secs_f64()
     );
 
-    failure.map_or(Ok(total_store_count), |failure| Err(*failure))
+    failure.map_or(Ok(fetched), |failure| Err(*failure))
 }
 
 /// Keeps the failure of a [`cache_through`] store task in `failure`, unless it holds an earlier one.
@@ -916,7 +1220,7 @@ pub async fn is_stored_local(repository: Arc<RepositoryContext>, address: Addres
     lore_trace!("Check if {} is cached in local store", address);
     if let Ok(resolved) = query_one(&repository.immutable_store(), repository.id, address).await {
         lore_trace!("Resolve result {:?}", resolved);
-        resolved.stored_local
+        held_locally(&resolved)
     } else {
         false
     }

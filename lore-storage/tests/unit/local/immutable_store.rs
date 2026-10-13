@@ -3115,6 +3115,57 @@ async fn an_isolating_store_reports_further_than_it_reads() {
     );
 }
 
+/// An entry stored without its payload holds nothing locally, whatever flags it was stored with:
+/// `get_metadata` reports no `PayloadStoredLocal`, as `query` reports no `stored_local`.
+#[tokio::test]
+async fn an_entry_stored_without_its_payload_is_not_reported_local() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let store = LocalImmutableStore::new(None, ImmutableStoreSettings::default())
+        .await
+        .expect("an in-memory store");
+    let partition = Partition::from([0x71u8; 16]);
+    let payload = Bytes::from_static(b"the payload the entry is stored without");
+    let address = Address {
+        hash: hash::hash_slice(&payload),
+        context: Context::from([0x71u8; 16]),
+    };
+    let fragment = Fragment {
+        flags: FragmentFlags::PayloadStoredLocal.bits(),
+        size_payload: payload.len() as u32,
+        size_content: payload.len() as u64,
+    };
+    store
+        .clone()
+        .put(partition, address, fragment, None, false)
+        .await
+        .expect("the entry is stored without its payload");
+
+    let metadata = store
+        .clone()
+        .get_metadata(partition, address)
+        .await
+        .expect("get_metadata answers");
+    assert_ne!(
+        metadata.match_made,
+        StoreMatch::MatchNone,
+        "the entry is indexed"
+    );
+    assert_eq!(
+        metadata.fragment.flags & FragmentFlags::PayloadStoredLocal,
+        0,
+        "get_metadata reported a payload the entry does not hold"
+    );
+    let resolved = lore_storage::immutable_store::query_one(
+        &(store.clone() as Arc<dyn ImmutableStore>),
+        partition,
+        address,
+    )
+    .await
+    .expect("query the entry");
+    assert!(!resolved.stored_local);
+}
+
 /// The source forms `copy` accepts: an exact association, and any association a partition
 /// holds. A caller acting on a partition match only ever has the second.
 mod copy_source {

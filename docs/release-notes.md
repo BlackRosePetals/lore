@@ -38,9 +38,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   so its size and its other fields' offsets are unchanged, and a zero-initialized item reads as before
 - `lore clone --offline` prepares the clone for working offline. A clone needs the remote, so the flag does not keep it
   from connecting. With it, or with `--cache`, a clone that writes its files caches every file metadata block of the
-  cloned revision and the metadata they name, so commands reading file metadata, such as `lore file metadata get`, work
-  offline after it, and fails if it cannot. A bare clone, or a clone without either flag, reads them from the remote
-  when a command first needs them
+  cloned revision, which staging and committing write to, so both work offline after it, and fails if it cannot. A
+  bare clone, or a clone without either flag, reads them from the remote when a command first needs them
 - Add a Bazel remote execution server on Lore's storage API under `contrib/bazel/`: a Remote Execution API v2 endpoint
   and scheduler whose action cache and content-addressable storage are Lore partitions, executors that move content
   between their input roots and a shared loreserver by path, and a script that builds, runs and stops them. A
@@ -48,11 +47,19 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- Fragment caching keeps at most 512 fetches in flight per connection to a remote, so a read a command needs at once is
+  queued behind at most 512 of them; `LORE_CACHE_GETS` sets another cap, and 0 turns it off. A fetch of content a read
+  or another fetch is already fetching, under any context, shares its get. Each fragment it fetches is retried as a
+  read's fetch is and stored as fetched and as durable, so the client store may evict it. It is not decoded or checked
+  against its address, as a read checks what it loads, unless a read joins its fetch or it is a fragment list, which
+  walking expands; one that fails that check is healed once as a read's fetch is, and one that still fails is not stored
+  and fails the caching as a failed fetch does. A fragment list the local store holds without its subfragments has them
+  fetched, a local list that fails its check is fetched again and overwritten, as a read replaces a corrupt fragment,
+  and an entry the store keeps without its payload is fetched as a miss
 - `lore-storage`: concurrent reads of content missing from the local store fetch it from the remote once, including
   identical content in different files, and a read that misses while the same content is being stored waits for that
-  store and reads it locally. Every fragment
-  fetched from a remote is checked against its sizes and its address on receipt, whether or not the read asked for
-  verification, and one that fails is neither returned nor stored
+  store and reads it locally. Every fragment a read fetches from a remote is checked against its sizes and its address
+  on receipt, whether or not the read asked for verification, and one that fails is neither returned nor stored
 - Immutable stores: compaction rewrites a group only once 10% of its packfile bytes are no longer referenced, copying
   each payload once. Client stores count local-only data toward `max_size` and `max_capacity` but never evict it
 - `lore repository gc` loads the whole store index before evicting, and applies `max_size` to compaction and

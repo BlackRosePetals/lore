@@ -2449,19 +2449,27 @@ async fn followers_get_the_leaders_bytes_when_nothing_is_cached() {
             let gate = gate.clone();
             lore_base::lore_spawn!(async move {
                 gate.wait().await;
-                fetch_single_flight(store, partition, address, ReadOptions::default(), || {
-                    let fetches = fetches.clone();
-                    let payload = payload.clone();
-                    async move {
-                        fetches.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        Ok(Fetched {
-                            content: (fragment, payload.clone()),
-                            raw: (fragment, payload),
-                        })
-                    }
-                })
+                fetch_single_flight(
+                    store,
+                    partition,
+                    address,
+                    ReadOptions::default(),
+                    || {
+                        let fetches = fetches.clone();
+                        let payload = payload.clone();
+                        async move {
+                            fetches.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            Ok(Flown::Fetched(Fetched {
+                                content: (fragment, payload.clone()),
+                                raw: (fragment, payload),
+                            }))
+                        }
+                    },
+                    || {},
+                )
                 .await
+                .map(|flown| flown.take(true))
             })
         })
         .collect();
@@ -2508,19 +2516,27 @@ async fn concurrent_misses_of_one_content_under_different_addresses_fetch_once()
             };
             lore_base::lore_spawn!(async move {
                 gate.wait().await;
-                fetch_single_flight(store, partition, address, ReadOptions::default(), || {
-                    let fetches = fetches.clone();
-                    let payload = payload.clone();
-                    async move {
-                        fetches.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        Ok(Fetched {
-                            content: (fragment, payload.clone()),
-                            raw: (fragment, payload),
-                        })
-                    }
-                })
+                fetch_single_flight(
+                    store,
+                    partition,
+                    address,
+                    ReadOptions::default(),
+                    || {
+                        let fetches = fetches.clone();
+                        let payload = payload.clone();
+                        async move {
+                            fetches.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            Ok(Flown::Fetched(Fetched {
+                                content: (fragment, payload.clone()),
+                                raw: (fragment, payload),
+                            }))
+                        }
+                    },
+                    || {},
+                )
                 .await
+                .map(|flown| flown.take(true))
             })
         })
         .collect();
@@ -2571,14 +2587,16 @@ async fn only_a_follower_of_the_leaders_address_takes_its_error() {
                         fetches.fetch_add(1, Ordering::SeqCst);
                         let raw = raw.clone();
                         async move {
-                            Ok(Fetched {
+                            Ok(Flown::Fetched(Fetched {
                                 content: raw.clone(),
                                 raw,
-                            })
+                            }))
                         }
                     },
+                    || {},
                 )
                 .await
+                .map(|flown| flown.take(true))
             })
         };
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -2607,6 +2625,152 @@ async fn only_a_follower_of_the_leaders_address_takes_its_error() {
     }
 }
 
+/// A leader whose fetch answers a payload unchecked, and that no follower joined, hands it back
+/// unchecked: nothing decodes or hashes it, so even a payload that would fail its check returns.
+#[tokio::test]
+async fn an_unchecked_fetch_no_follower_joined_is_handed_back_unchecked() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, _) = make_input(0xEC);
+    let altered = Bytes::from(vec![!0xECu8; 64]);
+    lore_storage::test_util::reset_counts();
+
+    let flown = fetch_single_flight(
+        store,
+        partition,
+        address,
+        ReadOptions::default(),
+        || {
+            let raw = (fragment, altered.clone());
+            async move { Ok(Flown::Unverified(raw)) }
+        },
+        || {},
+    )
+    .await
+    .expect("the leader hands back its fetch");
+
+    assert!(matches!(flown, Flown::Unverified((_, ref payload)) if *payload == altered));
+    assert_eq!(
+        lore_storage::test_util::counts(),
+        (0, 0, 0),
+        "nothing is decoded or hashed"
+    );
+}
+
+/// A leader whose fetch answers a payload unchecked checks it once a follower joined, and both
+/// take the checked fetch: the payload is hashed once, by the leader.
+#[tokio::test]
+async fn an_unchecked_fetch_is_checked_once_for_a_follower() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xED);
+    let followers = lore_storage::test_util::followers();
+    let follower_fetches = Arc::new(AtomicU64::new(0));
+    lore_storage::test_util::reset_counts();
+
+    let lead = fetch_single_flight(
+        store.clone(),
+        partition,
+        address,
+        ReadOptions::default(),
+        || {
+            let raw = (fragment, payload.clone());
+            async move {
+                while lore_storage::test_util::followers() == followers {
+                    tokio::task::yield_now().await;
+                }
+                Ok(Flown::Unverified(raw))
+            }
+        },
+        || {},
+    );
+    let follow = fetch_single_flight(
+        store,
+        partition,
+        address,
+        ReadOptions::default(),
+        || {
+            follower_fetches.fetch_add(1, Ordering::SeqCst);
+            async { Err(StorageError::internal("the follower fetches nothing")) }
+        },
+        || {},
+    );
+    let (led, followed) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(lead, follow) })
+            .await
+            .expect("the follower joins the leader");
+
+    for flown in [led, followed] {
+        let flown = flown.expect("the checked fetch");
+        assert!(matches!(flown, Flown::Fetched(_)), "got {flown:?}");
+        assert_eq!(flown.take(true).1, payload);
+    }
+    assert_eq!(follower_fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        lore_storage::test_util::counts().2,
+        1,
+        "the payload is hashed once"
+    );
+}
+
+/// A leader whose fetch answers a payload that fails its check, once a follower joined, publishes
+/// nothing: the follower fetches for itself, as after a leader that vanished, and the leader takes
+/// its payload back rejected.
+#[tokio::test]
+async fn an_unchecked_fetch_failing_its_check_is_not_published() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xEE);
+    let altered = Bytes::from(vec![!0xEEu8; 64]);
+    let followers = lore_storage::test_util::followers();
+    let follower_fetches = Arc::new(AtomicU64::new(0));
+
+    let lead = fetch_single_flight(
+        store.clone(),
+        partition,
+        address,
+        ReadOptions::default(),
+        || {
+            let raw = (fragment, altered.clone());
+            async move {
+                while lore_storage::test_util::followers() == followers {
+                    tokio::task::yield_now().await;
+                }
+                Ok(Flown::Unverified(raw))
+            }
+        },
+        || {},
+    );
+    let follow = fetch_single_flight(
+        store,
+        partition,
+        address,
+        ReadOptions::default(),
+        || {
+            follower_fetches.fetch_add(1, Ordering::SeqCst);
+            let raw = (fragment, payload.clone());
+            async move {
+                Ok(Flown::Fetched(Fetched {
+                    content: raw.clone(),
+                    raw,
+                }))
+            }
+        },
+        || {},
+    );
+    let (led, followed) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(lead, follow) })
+            .await
+            .expect("the follower joins the leader");
+
+    assert!(
+        matches!(led, Ok(Flown::Rejected((_, ref payload))) if *payload == altered),
+        "the leader takes its payload back rejected, got {led:?}"
+    );
+    let (_, bytes) = followed
+        .expect("the follower fetches for itself")
+        .take(true);
+    assert_eq!(bytes, payload);
+    assert_eq!(follower_fetches.load(Ordering::SeqCst), 1);
+}
+
 /// Where the store isolates partitions, a miss in another partition fetches for itself rather
 /// than following a flight for the same content held in another.
 #[tokio::test(flavor = "multi_thread")]
@@ -2632,17 +2796,19 @@ async fn an_isolating_store_never_shares_a_flight_across_partitions() {
                 fetches.fetch_add(1, Ordering::SeqCst);
                 let raw = (fragment, payload.clone());
                 async move {
-                    Ok(Fetched {
+                    Ok(Flown::Fetched(Fetched {
                         content: raw.clone(),
                         raw,
-                    })
+                    }))
                 }
             },
+            || {},
         ),
     )
     .await
     .expect("the miss in another partition followed the held flight")
-    .expect("the miss fetches itself");
+    .expect("the miss fetches itself")
+    .take(true);
     assert_eq!(bytes, payload);
     assert_eq!(fetches.load(Ordering::SeqCst), 1);
     drop(leader);
@@ -2666,19 +2832,27 @@ async fn a_local_only_miss_never_follows_a_remote_flight() {
         let leader = {
             let (store, started, released) = (store.clone(), started.clone(), released.clone());
             lore_base::lore_spawn!(async move {
-                fetch_single_flight(store, partition, address, ReadOptions::default(), || {
-                    let (started, released, payload) =
-                        (started.clone(), released.clone(), payload.clone());
-                    async move {
-                        started.notify_one();
-                        released.notified().await;
-                        Ok(Fetched {
-                            content: (fragment, payload.clone()),
-                            raw: (fragment, payload),
-                        })
-                    }
-                })
+                fetch_single_flight(
+                    store,
+                    partition,
+                    address,
+                    ReadOptions::default(),
+                    || {
+                        let (started, released, payload) =
+                            (started.clone(), released.clone(), payload.clone());
+                        async move {
+                            started.notify_one();
+                            released.notified().await;
+                            Ok(Flown::Fetched(Fetched {
+                                content: (fragment, payload.clone()),
+                                raw: (fragment, payload),
+                            }))
+                        }
+                    },
+                    || {},
+                )
                 .await
+                .map(|flown| flown.take(true))
             })
         };
         started.notified().await;
@@ -2852,19 +3026,27 @@ async fn never_wait_with_a_session_never_follows_a_flight() {
     let leader = {
         let (store, started, released) = (store.clone(), started.clone(), released.clone());
         lore_base::lore_spawn!(async move {
-            fetch_single_flight(store, partition, address, ReadOptions::default(), || {
-                let (started, released, payload) =
-                    (started.clone(), released.clone(), payload.clone());
-                async move {
-                    started.notify_one();
-                    released.notified().await;
-                    Ok(Fetched {
-                        content: (fragment, payload.clone()),
-                        raw: (fragment, payload),
-                    })
-                }
-            })
+            fetch_single_flight(
+                store,
+                partition,
+                address,
+                ReadOptions::default(),
+                || {
+                    let (started, released, payload) =
+                        (started.clone(), released.clone(), payload.clone());
+                    async move {
+                        started.notify_one();
+                        released.notified().await;
+                        Ok(Flown::Fetched(Fetched {
+                            content: (fragment, payload.clone()),
+                            raw: (fragment, payload),
+                        }))
+                    }
+                },
+                || {},
+            )
             .await
+            .map(|flown| flown.take(true))
         })
     };
     started.notified().await;
@@ -2969,19 +3151,27 @@ async fn a_never_waiting_whole_read_into_a_buffer_never_follows_a_flight() {
     let leader = {
         let (store, started, released) = (store.clone(), started.clone(), released.clone());
         lore_base::lore_spawn!(async move {
-            fetch_single_flight(store, partition, address, ReadOptions::default(), || {
-                let (started, released, payload) =
-                    (started.clone(), released.clone(), payload.clone());
-                async move {
-                    started.notify_one();
-                    released.notified().await;
-                    Ok(Fetched {
-                        content: (fragment, payload.clone()),
-                        raw: (fragment, payload),
-                    })
-                }
-            })
+            fetch_single_flight(
+                store,
+                partition,
+                address,
+                ReadOptions::default(),
+                || {
+                    let (started, released, payload) =
+                        (started.clone(), released.clone(), payload.clone());
+                    async move {
+                        started.notify_one();
+                        released.notified().await;
+                        Ok(Flown::Fetched(Fetched {
+                            content: (fragment, payload.clone()),
+                            raw: (fragment, payload),
+                        }))
+                    }
+                },
+                || {},
+            )
             .await
+            .map(|flown| flown.take(true))
         })
     };
     started.notified().await;
