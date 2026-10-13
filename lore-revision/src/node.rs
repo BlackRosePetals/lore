@@ -1262,7 +1262,26 @@ impl NodeBlock {
     /// Callers must drop the returned value before calling `write()` on the same block,
     /// or the write lock acquisition will deadlock.
     pub fn node_name_ref(&self, node_index: usize) -> Result<NodeNameLock, NodeNameError> {
+        Self::name_lock(self.data.read_arc(), node_index)
+    }
+
+    /// A copy of a node and its name, both read under one read lock, which the name keeps
+    /// held; see [`Self::node_name_ref`].
+    pub fn node_and_name_ref(
+        &self,
+        node_index: usize,
+    ) -> (Node, Result<NodeNameLock, NodeNameError>) {
         let guard = self.data.read_arc();
+        let node = guard.data.node[node_index];
+        (node, Self::name_lock(guard, node_index))
+    }
+
+    /// The name of the node at `node_index`, read from the name table `guard` holds, which the
+    /// name keeps held.
+    fn name_lock(
+        guard: parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, NodeBlockRuntimeData>,
+        node_index: usize,
+    ) -> Result<NodeNameLock, NodeNameError> {
         let node = &guard.data.node[node_index];
         let offset = node.name_offset as usize;
         let length = node.name_length as usize;

@@ -267,11 +267,10 @@ impl StateNodeChildrenWithNameIterator {
             }
 
             let block = self.current_block.as_ref().unwrap();
-            let node_index = Node::index(node_id);
-            let node = block.node(node_index);
+            let (node, name) = block.node_and_name_ref(Node::index(node_id));
             node.walk_step(node_id, self.parent_node_id, &mut self.cycle)?;
             self.current_node_id = node.sibling();
-            match block.node_name_ref(node_index) {
+            match name {
                 Ok(name) => return Ok(Some((node_id, node, name))),
                 Err(err) => {
                     lore_warn!("Skipping node {node_id} with invalid name: {err}");

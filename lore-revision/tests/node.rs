@@ -472,6 +472,10 @@ mod tests {
                 block.node_name_ref(0).is_err(),
                 "node_name_ref should reject name: {name:?}"
             );
+            assert!(
+                block.node_and_name_ref(0).1.is_err(),
+                "node_and_name_ref should reject name: {name:?}"
+            );
         }
     }
 
@@ -501,6 +505,17 @@ mod tests {
                 .node_name_ref(node_index)
                 .unwrap_or_else(|_| panic!("node_name_ref should accept name: {name:?}"));
             assert_eq!(&*locked, *name);
+            drop(locked);
+
+            let (node, locked) = block.node_and_name_ref(node_index);
+            let locked =
+                locked.unwrap_or_else(|_| panic!("node_and_name_ref should accept name: {name:?}"));
+            assert_eq!(&*locked, *name);
+            assert_eq!(
+                zerocopy::IntoBytes::as_bytes(&node),
+                zerocopy::IntoBytes::as_bytes(&block.node(node_index)),
+                "the node the name is read for"
+            );
         }
     }
 
@@ -522,6 +537,10 @@ mod tests {
         assert!(
             block.node_name_ref(node_index).is_err(),
             "node_name_ref should reject out-of-bounds name"
+        );
+        assert!(
+            block.node_and_name_ref(node_index).1.is_err(),
+            "node_and_name_ref should reject out-of-bounds name"
         );
     }
 
