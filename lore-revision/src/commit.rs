@@ -128,11 +128,17 @@ pub struct LoreRevisionCommitCountData {
 }
 
 impl LoreRevisionCommitCountData {
+    /// The counters as they stand. A count is incremented with `Release` once its total holds what
+    /// it counts, and loaded here with `Acquire` ahead of its total, so no count reads ahead of its
+    /// total.
+    #[lore_macro::test_pub]
     fn new(stats: Arc<CommitStats>) -> Self {
+        let directory_count = stats.complete.directory_count.load(Ordering::Acquire);
+        let file_count = stats.complete.file_count.load(Ordering::Acquire);
         Self {
-            directory_count: stats.complete.directory_count.load(Ordering::Relaxed),
+            directory_count,
             directory_total: stats.complete.directory_total.load(Ordering::Relaxed),
-            file_count: stats.complete.file_count.load(Ordering::Relaxed),
+            file_count,
             file_total: stats.complete.file_total.load(Ordering::Relaxed),
             directory_delete_count: stats
                 .complete
@@ -367,6 +373,26 @@ impl CommitStats {
             statistics: crate::runtime::try_execution_context()
                 .is_some_and(|context| context.globals().stats()),
         })
+    }
+
+    /// Counts one directory in the total and as done, the total first, as
+    /// [`LoreRevisionCommitCountData::new`] reads them.
+    #[lore_macro::test_pub]
+    fn count_directory(&self) {
+        self.complete
+            .directory_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.complete
+            .directory_count
+            .fetch_add(1, Ordering::Release);
+    }
+
+    /// Counts one file in the total and as done, the total first, as
+    /// [`LoreRevisionCommitCountData::new`] reads them.
+    #[lore_macro::test_pub]
+    fn count_file(&self) {
+        self.complete.file_total.fetch_add(1, Ordering::Relaxed);
+        self.complete.file_count.fetch_add(1, Ordering::Release);
     }
 
     /// One file was read off disk and fragmented. The byte total is what a
@@ -2128,14 +2154,7 @@ impl CommitFrame {
     /// Leaves the directory, counting it when a child of it was committed or discarded.
     fn leave(self, stats: &CommitStats) {
         if self.updated {
-            stats
-                .complete
-                .directory_count
-                .fetch_add(1, Ordering::Relaxed);
-            stats
-                .complete
-                .directory_total
-                .fetch_add(1, Ordering::Relaxed);
+            stats.count_directory();
         }
     }
 }
@@ -2368,7 +2387,7 @@ async fn commit_discard_subnodes(
                     true,
                     move |_discarded_node_id, flags| {
                         if flags & NodeFlags::File != 0 {
-                            stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
+                            stats.complete.file_count.fetch_add(1, Ordering::Release);
                             stats
                                 .complete
                                 .file_delete_count
@@ -2377,7 +2396,7 @@ async fn commit_discard_subnodes(
                             stats
                                 .complete
                                 .directory_count
-                                .fetch_add(1, Ordering::Relaxed);
+                                .fetch_add(1, Ordering::Release);
                             stats
                                 .complete
                                 .directory_delete_count
@@ -2437,7 +2456,7 @@ async fn commit_discard(
             move |discarded_node_id, flags| {
                 delta_add(delta.clone(), discarded_node_id, flags);
                 if flags & NodeFlags::File != 0 {
-                    stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
+                    stats.complete.file_count.fetch_add(1, Ordering::Release);
                     stats
                         .complete
                         .file_delete_count
@@ -2446,7 +2465,7 @@ async fn commit_discard(
                     stats
                         .complete
                         .directory_count
-                        .fetch_add(1, Ordering::Relaxed);
+                        .fetch_add(1, Ordering::Release);
                     stats
                         .complete
                         .directory_delete_count
@@ -2774,7 +2793,7 @@ fn commit_file(
             modified_times.record(&repository, &relative_path, modified_time);
         }
 
-        stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
+        stats.complete.file_count.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -4457,8 +4476,7 @@ async fn freeze_directory(
 
             delta_add(delta.clone(), child_node_id, child_node.flags);
             freeze_node(repository.clone(), state.clone(), child_node_id).await?;
-            stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
-            stats.complete.file_total.fetch_add(1, Ordering::Relaxed);
+            stats.count_file();
             stats
                 .complete
                 .file_modify_count
@@ -4469,14 +4487,7 @@ async fn freeze_directory(
         pending[first_subdirectory..].reverse();
 
         if updated {
-            stats
-                .complete
-                .directory_count
-                .fetch_add(1, Ordering::Relaxed);
-            stats
-                .complete
-                .directory_total
-                .fetch_add(1, Ordering::Relaxed);
+            stats.count_directory();
         }
     }
 

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::commit::*;
@@ -40,4 +42,38 @@ async fn a_count_is_kept_only_where_something_reports_it() {
         assert_eq!(files.file_bytes, kept * 4096, "level {level}");
         assert_eq!(files.bytes_transferred, 4096, "level {level}");
     }
+}
+
+/// A progress snapshot taken while directories and files are counted never reads a count ahead
+/// of its total.
+#[test]
+fn a_progress_snapshot_never_reads_a_count_ahead_of_its_total() {
+    let stats = CommitStats::new();
+    let counted = Arc::new(AtomicBool::new(false));
+    let counter = std::thread::spawn({
+        let (stats, counted) = (stats.clone(), counted.clone());
+        move || {
+            for _ in 0..10_000_000 {
+                stats.count_directory();
+                stats.count_file();
+            }
+            counted.store(true, Ordering::SeqCst);
+        }
+    });
+    while !counted.load(Ordering::SeqCst) {
+        let snapshot = LoreRevisionCommitCountData::new(stats.clone());
+        assert!(
+            snapshot.directory_count <= snapshot.directory_total,
+            "{} directories counted of {}",
+            snapshot.directory_count,
+            snapshot.directory_total
+        );
+        assert!(
+            snapshot.file_count <= snapshot.file_total,
+            "{} files counted of {}",
+            snapshot.file_count,
+            snapshot.file_total
+        );
+    }
+    counter.join().expect("the counter thread");
 }
