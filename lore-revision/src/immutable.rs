@@ -771,13 +771,14 @@ fn push_subfragments(list: Bytes, context: Context, into: &mut Vec<Address>) {
 /// ([`Flown::Unverified`]), as a read checks what it loads, unless it is a fragment list, which is
 /// checked on receipt and healed once as a read's fetch is
 /// ([`lore_storage::read::check_fetched`]), as walking a list expands it and a corrupt list could
-/// name itself.
+/// name itself. With `verify`, every payload is checked so, for readers that trust local bytes.
 async fn fetch_checking_lists(
     session: &StorageSession,
     address: Address,
+    verify: bool,
 ) -> Result<Flown, lore_storage::StorageError> {
     let raw = lore_storage::read::fetch_payload(session, address, false).await?;
-    if raw.0.flags & FragmentFlags::PayloadFragmented == 0 {
+    if !verify && raw.0.flags & FragmentFlags::PayloadFragmented == 0 {
         return Ok(Flown::Unverified(raw));
     }
     lore_storage::read::check_fetched(session, address, false, raw)
@@ -785,12 +786,12 @@ async fn fetch_checking_lists(
         .map(Flown::Fetched)
 }
 
-/// Fetches `address` through `remote_storage` ([`fetch_checking_lists`]) in the read flight for its
-/// content ([`lore_storage::read::fetch_single_flight`]), so a read or a fetch of the same content
-/// in flight shares one get. A payload fetched unchecked is checked only where a follower joined,
-/// which takes the content the check expands; one that fails that check is healed once, as a read's
-/// fetch is ([`lore_storage::read::check_fetched`]). It joins with the local probe off: the cache
-/// looked locally already, and the probe asserts on a corrupt copy in debug builds.
+/// Fetches `address` through `remote_storage` ([`fetch_checking_lists`], with `verify`) in the read
+/// flight for its content ([`lore_storage::read::fetch_single_flight`]), so a read or a fetch of the
+/// same content in flight shares one get. A payload fetched unchecked is checked only where a
+/// follower joined, which takes the content the check expands; one that fails that check is healed
+/// once, as a read's fetch is ([`lore_storage::read::check_fetched`]). It joins with the local probe
+/// off: the cache looked locally already, and the probe asserts on a corrupt copy in debug builds.
 ///
 /// The fetch holds one of `permits`, taken before it joins, so a read following it never waits for
 /// one, and gives it back on joining as a follower, which makes no get of its own; a follower whose
@@ -807,6 +808,7 @@ fn fetch_to_cache(
     permits: CacheGets,
     address: Address,
     replace: bool,
+    verify: bool,
 ) -> impl Future<Output = Fetch> {
     async move {
         let fetched = {
@@ -837,7 +839,7 @@ fn fetch_to_cache(
                     local: false,
                     ..ReadOptions::default()
                 },
-                || fetch_checking_lists(&remote_storage, address),
+                || fetch_checking_lists(&remote_storage, address, verify),
                 || drop(permit.take()),
             )
             .await
@@ -908,6 +910,42 @@ pub async fn cache(
     address: Vec<Address>,
     cache_fragmented: bool,
 ) -> Result<usize, ImmutableError> {
+    cache_counted(repository, address, cache_fragmented, false)
+        .await?
+        .into_result()
+}
+
+/// What [`cache_counted`] came to.
+#[derive(Debug, Default)]
+pub struct Cached {
+    /// Fragments gone to the remote for, by its own get or one it joined, whether or not the fetch
+    /// succeeded.
+    pub fragments: usize,
+    /// Payload bytes of the fragments fetched.
+    pub bytes: u64,
+    /// Fragments found local after waiting for a cache get permit, and so not fetched.
+    pub already_local: usize,
+    /// The first failure to query, fetch, check or store a fragment.
+    pub failure: Option<Box<ImmutableError>>,
+}
+
+impl Cached {
+    /// The fragments fetched, or the first failure, as [`cache`] answers.
+    pub fn into_result(self) -> Result<usize, ImmutableError> {
+        self.failure
+            .map_or(Ok(self.fragments), |failure| Err(*failure))
+    }
+}
+
+/// [`cache`], answering everything it fetched ([`Cached`]) rather than its first failure; only a
+/// failure to connect is an error. With `verify`, every payload is checked on receipt and one that
+/// fails is not stored, for readers that trust local bytes and never check what they load.
+pub async fn cache_counted(
+    repository: Arc<RepositoryContext>,
+    address: Vec<Address>,
+    cache_fragmented: bool,
+    verify: bool,
+) -> Result<Cached, ImmutableError> {
     let remote_result: Result<_, ImmutableError> = repository
         .remote()
         .await
@@ -924,21 +962,22 @@ pub async fn cache(
     let remote_storage = storage_result?;
     let permits = remote.cache_get_permits(cache_gets());
 
-    cache_through(
+    Ok(cache_through(
         repository,
         remote_storage,
         permits,
         address,
         cache_fragmented,
+        verify,
     )
-    .await
+    .await)
 }
 
-/// [`cache`] once connected, fetching through `remote_storage`, each get holding one of
+/// [`cache_counted`] once connected, fetching through `remote_storage`, each get holding one of
 /// `permits`.
 ///
-/// A function of its own because its batches live across several awaits: kept in [`cache`] they
-/// would take space in its future while the remote is connected as well.
+/// A function of its own because its batches live across several awaits: kept in
+/// [`cache_counted`] they would take space in its future while the remote is connected as well.
 #[lore_macro::test_pub]
 async fn cache_through(
     repository: Arc<RepositoryContext>,
@@ -946,7 +985,8 @@ async fn cache_through(
     permits: CacheGets,
     address: Vec<Address>,
     cache_fragmented: bool,
-) -> Result<usize, ImmutableError> {
+    verify: bool,
+) -> Cached {
     const MAX_REQUEST_COUNT: usize = 1000;
 
     let mut query_address = address;
@@ -961,6 +1001,7 @@ async fn cache_through(
     let start = Instant::now();
     let mut total_fetches = 0;
     let mut total_already_local = 0;
+    let mut total_bytes = 0;
     let mut total_query_count = 0;
     let mut failure = None;
 
@@ -1040,7 +1081,10 @@ async fn cache_through(
                         payload,
                         list,
                         replace,
-                    }) => (address, fragment, payload, list, replace),
+                    }) => {
+                        total_bytes += payload.len() as u64;
+                        (address, fragment, payload, list, replace)
+                    }
                     Ok(Fetch::Local(address)) => {
                         total_already_local += 1;
                         if cache_fragmented {
@@ -1112,6 +1156,7 @@ async fn cache_through(
                         permits.clone(),
                         address[index],
                         local == LocalCopy::Corrupt,
+                        verify,
                     )
                 );
 
@@ -1192,7 +1237,12 @@ async fn cache_through(
         start.elapsed().as_secs_f64()
     );
 
-    failure.map_or(Ok(fetched), |failure| Err(*failure))
+    Cached {
+        fragments: fetched,
+        bytes: total_bytes,
+        already_local: total_already_local,
+        failure,
+    }
 }
 
 /// Keeps the failure of a [`cache_through`] store task in `failure`, unless it holds an earlier one.
