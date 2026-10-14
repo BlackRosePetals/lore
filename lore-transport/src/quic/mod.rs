@@ -19,6 +19,7 @@ use lore_credential::domain_from_url_str_or_url;
 use lore_error_set::prelude::*;
 use thiserror::Error;
 
+use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
@@ -95,7 +96,7 @@ pub struct UnknownCommand(pub QuicOpCode);
 pub async fn storage(
     connection: Weak<Connection>,
     remote_url: &str,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     partition: Partition,
     credentials: &Arc<SuppliedCredentials>,
@@ -107,7 +108,7 @@ pub async fn storage(
         connection,
         remote_url,
         remote_domain,
-        auth_url,
+        auth_endpoint,
         identity,
         partition,
         credentials,

@@ -17,6 +17,7 @@ pub async fn connect(
         globals.max_connections as usize,
         globals.identity_token(),
         globals.access_token(),
+        globals.auth_mode,
     )
     .await?;
     take_server_compression_mode(&connection);

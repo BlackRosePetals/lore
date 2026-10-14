@@ -1542,6 +1542,7 @@ mod storage_remote_tests {
                 1,
                 "",
                 "",
+                lore_transport::auth::AuthMode::Auto,
             )
             .await?;
             let client_repository =

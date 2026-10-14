@@ -47,6 +47,7 @@ use super::super::storage_service;
 use super::super::storage_service::Command;
 use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
+use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
@@ -63,7 +64,7 @@ pub struct StorageClient {
     remote_url: String,
     transport_config: TransportConfig,
     auth_adapter: Arc<dyn AuthAdapter<ErrorType = ProtocolError>>,
-    auth_url: String,
+    auth_endpoint: AuthEndpoint,
     recipient_domain: String,
     identity: String,
     credentials: Arc<SuppliedCredentials>,
@@ -94,7 +95,7 @@ impl StorageClient {
         remote_url: &str,
         transport_config: TransportConfig,
         auth_adapter: Arc<dyn AuthAdapter<ErrorType = ProtocolError>>,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         recipient_domain: &str,
         identity: &str,
         partition: Partition,
@@ -107,7 +108,7 @@ impl StorageClient {
             remote_url: remote_url.to_string(),
             transport_config,
             auth_adapter,
-            auth_url: auth_url.to_string(),
+            auth_endpoint: auth_endpoint.clone(),
             recipient_domain: recipient_domain.to_string(),
             identity: identity.to_string(),
             credentials: credentials.clone(),
@@ -125,7 +126,7 @@ impl StorageClient {
         connection: Weak<Connection>,
         remote_url: &str,
         remote_domain: String,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         partition: Partition,
         credentials: &Arc<SuppliedCredentials>,
@@ -134,7 +135,7 @@ impl StorageClient {
         let user_agent = user_agent.unwrap_or_else(|| crate::user_agent().to_string());
         let auth_adapter = Arc::new(StorageClientAuth {
             recipient_domain: remote_domain.clone(),
-            auth_url: auth_url.to_string(),
+            auth_url: auth_endpoint.url.clone(),
             identity: identity.to_string(),
             partition,
             user_agent,
@@ -168,7 +169,7 @@ impl StorageClient {
             remote_url,
             transport_config,
             auth_adapter.clone(),
-            auth_url,
+            auth_endpoint,
             &remote_domain,
             identity,
             partition,
@@ -287,10 +288,10 @@ impl Storage for StorageClient {
         // The credentials are read here, not at construction: the server checks
         // storage authorization at each session start, so a session opened later
         // must present whatever the newest call supplied.
-        let token = if !self.auth_url.is_empty() {
+        let token = if !self.auth_endpoint.is_none() {
             let (identity_token, access_token) = self.credentials.tokens();
             let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
-                &self.auth_url,
+                &self.auth_endpoint,
                 &self.recipient_domain,
                 &self.identity,
                 partition,

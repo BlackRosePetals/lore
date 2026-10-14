@@ -51,6 +51,7 @@ use lore_base::types::TypedBytes;
 use lore_base::types::fragment_flags::FragmentFlags;
 use lore_transport::ProtocolError;
 use lore_transport::Storage;
+use lore_transport::auth::AuthMode;
 use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
@@ -352,7 +353,7 @@ async fn connect_clients(
     repository: Partition,
     connections: usize,
 ) -> Arc<Vec<(Arc<StorageClient>, u32)>> {
-    let connection = lore_transport::connect(remote, "", repository, 1, "", "")
+    let connection = lore_transport::connect(remote, "", repository, 1, "", "", AuthMode::Auto)
         .await
         .expect("connect");
     connection
@@ -373,7 +374,7 @@ async fn connect_clients(
             Weak::new(),
             &storage_url,
             domain.clone(),
-            connection.auth_url(),
+            connection.auth_endpoint(),
             connection.identity(),
             repository,
             connection.credentials(),
@@ -635,7 +636,7 @@ async fn report(
 /// whose fetch fails is kept as it is. Answers the expanded list and how many fetches failed.
 async fn expand(addresses: &[Address]) -> (Vec<Address>, usize) {
     let (remote, repository) = target();
-    let connection = lore_transport::connect(&remote, "", repository, 4, "", "")
+    let connection = lore_transport::connect(&remote, "", repository, 4, "", "", AuthMode::Auto)
         .await
         .expect("connect");
     let pool = connection
@@ -689,9 +690,10 @@ async fn connect_cost(counts: &str) {
             .map(|count| count.trim().parse::<usize>().expect("count"))
         {
             let started = Instant::now();
-            let connection = lore_transport::connect(&remote, "", repository, count, "", "")
-                .await
-                .expect("connect");
+            let connection =
+                lore_transport::connect(&remote, "", repository, count, "", "", AuthMode::Auto)
+                    .await
+                    .expect("connect");
             let pool = connection
                 .session_pool(repository, &format!("connect-cost-{round}-{count}"))
                 .await

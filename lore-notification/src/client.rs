@@ -84,7 +84,7 @@ impl NotificationClient {
 
         let endpoint = self.endpoint.as_str();
 
-        let auth_url = self.remote.auth_url.as_str();
+        let auth_endpoint = self.remote.auth_endpoint();
         // Fall back to the identity the connection authenticated as when the
         // context carries none, so authorization never has to guess one.
         let context_identity = execution_context().user_id().await;
@@ -107,7 +107,7 @@ impl NotificationClient {
                 Ok(connection) => {
                     let auth = connection
                         .repository_authz(
-                            auth_url,
+                            auth_endpoint,
                             &identity,
                             repository,
                             self.remote.credentials(),

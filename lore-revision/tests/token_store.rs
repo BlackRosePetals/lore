@@ -19,6 +19,15 @@ mod tests {
     include!("helper.rs");
 
     const AUTH_ENDPOINT: &str = "http://storeload.auth.example.com";
+
+    /// `AUTH_ENDPOINT` behind an implementation that refuses every grant, so an
+    /// exchange that misses the cache and the store fails before any network call.
+    fn refusing_endpoint() -> lore_transport::auth::AuthEndpoint {
+        lore_transport::auth::AuthEndpoint::new(
+            AUTH_ENDPOINT.to_string(),
+            lore_transport::auth::AuthEndpoint::none().auth,
+        )
+    }
     static TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
     async fn sequential_mutex_lock() -> tokio::sync::MutexGuard<'static, ()> {
@@ -582,9 +591,8 @@ mod tests {
     /// We do not want to mix externally provided tokens with internal login
     /// results.
     ///
-    /// `AUTH_ENDPOINT` has an `http` scheme, which no `Authentication`
-    /// implementation is registered for, so the exchange the supplied call falls
-    /// through to fails before any network call.
+    /// The endpoint's implementation refuses every grant, so the exchange the
+    /// supplied call falls through to fails before any network call.
     #[tokio::test]
     async fn a_supplied_identity_token_bypasses_the_stored_authorization_token() {
         let _lock = sequential_mutex_lock().await;
@@ -612,7 +620,7 @@ mod tests {
 
                 // Nothing supplied: the stored authorization token answers.
                 let stored = lore_transport::auth::exchange::exchange(
-                    AUTH_ENDPOINT,
+                    &refusing_endpoint(),
                     identity,
                     repository,
                     "example.com".to_string(),
@@ -625,9 +633,9 @@ mod tests {
 
                 // An identity token supplied: neither the store nor the entry the
                 // call above cached answers, so this goes on to exchange and
-                // fails on the unregistered scheme.
+                // is refused by the endpoint's implementation.
                 let result = lore_transport::auth::exchange::exchange(
-                    AUTH_ENDPOINT,
+                    &refusing_endpoint(),
                     identity,
                     repository,
                     "example.com".to_string(),
@@ -697,8 +705,8 @@ mod tests {
     /// An authorization one caller's token store earned is cached for that store alone: a caller
     /// naming a store that holds nothing for the identity is not served it.
     ///
-    /// `AUTH_ENDPOINT` has an `http` scheme, which no `Authentication` implementation is
-    /// registered for, so a call that misses the cache and the store fails before any network call.
+    /// The endpoint's implementation refuses every grant, so a call that misses the cache and
+    /// the store fails before any network call.
     #[tokio::test]
     async fn a_relayed_call_is_served_only_its_callers_authorization() {
         let _lock = sequential_mutex_lock().await;
@@ -710,15 +718,16 @@ mod tests {
         let repository: RepositoryId = "00112233445566778899aabbccddeeff"
             .parse()
             .expect("a valid repository id");
-        let exchange = move || {
+        let exchange = move || async move {
             lore_transport::auth::exchange::exchange(
-                AUTH_ENDPOINT,
+                &refusing_endpoint(),
                 identity,
                 repository,
                 "example.com".to_string(),
                 "",
                 "",
             )
+            .await
         };
 
         #[allow(clippy::disallowed_methods)]

@@ -16,6 +16,7 @@ lore-credential = { workspace = true }
 
 async-trait = { workspace = true }
 async-stream = { workspace = true }
+bitcode = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }

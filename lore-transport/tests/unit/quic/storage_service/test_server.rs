@@ -19,6 +19,7 @@ use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
+use lore_transport::auth::AuthEndpoint;
 use lore_transport::connection::SuppliedCredentials;
 use lore_transport::quic::QuicServiceError;
 use lore_transport::quic::command_header::COMMAND_HEADER_SIZE_V4;
@@ -169,7 +170,7 @@ impl TestStorageServer {
                 Weak::new(),
                 &self.url,
                 "127.0.0.1".to_string(),
-                "",
+                &AuthEndpoint::none(),
                 "",
                 test_partition(),
                 &Arc::new(SuppliedCredentials::default()),

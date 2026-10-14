@@ -14,7 +14,11 @@ use lore_transport::AuthSession;
 use lore_transport::AuthSessionPoll;
 use lore_transport::Authentication;
 use lore_transport::AuthenticationToken;
+use lore_transport::EnvironmentConfig;
+use lore_transport::ProtocolError;
+use lore_transport::auth::AuthEndpoint;
 use lore_transport::auth::authentication;
+use lore_transport::auth::authentication::Selected;
 use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout_at;
@@ -101,6 +105,16 @@ impl EventError for InteractiveLoginError {
     }
 }
 
+fn select_auth_path(environment: &EnvironmentConfig) -> Result<Selected, ProtocolError> {
+    let mode = crate::lore::execution_context().globals().auth_mode;
+    authentication::select(mode, environment)?.ok_or_else(|| {
+        NotSupported {
+            operation: "No authentication configured on server".to_string(),
+        }
+        .into()
+    })
+}
+
 /// How much a `slow_down` answer widens the polling interval, per RFC 8628
 /// §3.5.
 const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
@@ -111,15 +125,17 @@ const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Exchanges an external token for a URC authentication token via the
-/// registered `Authentication` implementation.
+/// endpoint's `Authentication` implementation.
 async fn exchange_token(
-    auth_url: String,
+    auth_endpoint: AuthEndpoint,
     token: &str,
     token_type: &str,
     recipient_url: &Url,
 ) -> Result<UserInfo, LoginError> {
-    let auth_impl =
-        authentication::find(&auth_url).forward::<LoginError>("finding authentication handler")?;
+    let AuthEndpoint {
+        url: auth_url,
+        auth: auth_impl,
+    } = auth_endpoint;
     let correlation_id = crate::lore::execution_context()
         .globals()
         .correlation_id
@@ -175,12 +191,14 @@ pub(crate) async fn with_token(
 ) -> Result<UserInfo, LoginError> {
     lore_debug!("Authenticating using remote {remote_url}");
 
-    let (auth_url, remote_url) = if let Some(url) = explicit_auth_url {
+    let (auth_endpoint, remote_url) = if let Some(url) = explicit_auth_url {
         // Auth URL provided directly (e.g. via --auth-url), skip environment resolution.
         // Use the auth URL's domain for JWT validation when no remote URL is available.
         lore_debug!("Using explicit auth URL: {url}");
         let parsed = url::Url::parse(url).internal("parsing explicit auth URL")?;
-        (url.to_string(), parsed)
+        let endpoint =
+            AuthEndpoint::resolve(url).forward::<LoginError>("resolving the auth URL")?;
+        (endpoint, parsed)
     } else {
         let (parsed_remote, protocol) =
             lore_transport::parse(remote_url).forward::<LoginError>("parsing remote URL")?;
@@ -195,20 +213,11 @@ pub(crate) async fn with_token(
             .forward::<LoginError>("getting environment config")?;
         lore_debug!("Server environment config: {:?}", environment);
 
-        let auth_url = environment
-            .endpoint
-            .and_then(|endpoint| endpoint.auth_url)
-            .unwrap_or_default();
-
-        if auth_url.is_empty() {
-            return Err(NotSupported {
-                operation: "No authentication configured on server".to_string(),
-            }
-            .into());
-        }
-
-        (auth_url, parsed_remote)
+        let selected = select_auth_path(&environment)
+            .forward::<LoginError>("selecting the authentication path")?;
+        (selected.endpoint, parsed_remote)
     };
+    let auth_url = auth_endpoint.url.clone();
 
     let user_info = if token_type == "lore" {
         // Direct lore token — just validate and store, no exchange needed
@@ -231,7 +240,7 @@ pub(crate) async fn with_token(
             return Err(LoginError::internal("Invalid token"));
         }
     } else {
-        exchange_token(auth_url, token, token_type, &remote_url).await?
+        exchange_token(auth_endpoint, token, token_type, &remote_url).await?
     };
 
     Ok(user_info)
@@ -278,20 +287,15 @@ pub async fn interactive(
         .forward::<InteractiveLoginError>("getting environment config")?;
     lore_debug!("Server environment config: {:?}", environment);
 
-    let auth_url = environment
-        .endpoint
-        .and_then(|endpoint| endpoint.auth_url)
-        .unwrap_or_default();
-
-    if auth_url.is_empty() {
-        return Err(NotSupported {
-            operation: "No authentication configured on server".to_string(),
-        }
-        .into());
-    }
-
-    let auth_impl = authentication::find(&auth_url)
-        .forward::<InteractiveLoginError>("finding authentication handler")?;
+    let Selected {
+        path,
+        endpoint: AuthEndpoint {
+            url: auth_url,
+            auth: auth_impl,
+        },
+    } = select_auth_path(&environment)
+        .forward::<InteractiveLoginError>("selecting the authentication path")?;
+    lore_debug!("Login over the {path:?} path");
     let correlation_id = crate::lore::execution_context()
         .globals()
         .correlation_id

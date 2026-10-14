@@ -18,6 +18,7 @@ use lore_proto::lore::model::v1 as model_v1;
 use lore_proto::lore::storage::v1 as storage_v1;
 use lore_proto::lore::storage::v1::storage_service_server::StorageService as StorageServiceV1;
 use lore_proto::lore::storage::v1::storage_service_server::StorageServiceServer;
+use lore_transport::auth::AuthEndpoint;
 use lore_transport::error::ProtocolError;
 use lore_transport::grpc::storage_client::*;
 use tokio_stream::Stream;
@@ -525,7 +526,7 @@ async fn a_storage_operation_recovers_across_a_reconnect() {
     let storage = lore_transport::grpc::GRPCStorage {
         connection: connection.clone(),
         client: StorageService::new(connection.clone()),
-        auth_url: String::new(),
+        auth_endpoint: AuthEndpoint::none(),
         identity: String::new(),
         credentials: Arc::new(lore_transport::connection::SuppliedCredentials::default()),
         session_counter: std::sync::atomic::AtomicU32::new(1),

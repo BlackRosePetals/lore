@@ -3725,7 +3725,7 @@ pub async fn prepare_commit_metadata(
     if commit_user.is_empty() {
         // Authorship is required only when the active remote authenticates.
         let require_identity = match repository.remote().await {
-            Ok(conn) => !conn.auth_url.is_empty(),
+            Ok(conn) => !conn.auth_url().is_empty(),
             Err(lore_transport::ProtocolError::NoRemote(_)) => false,
             Err(_) => true,
         };
@@ -4095,7 +4095,7 @@ async fn stamp_commit_metadata(
     let identity = execution_context().user_id().await;
     if identity.is_empty() {
         let require_identity = match repository.remote().await {
-            Ok(connection) => !connection.auth_url.is_empty(),
+            Ok(connection) => !connection.auth_url().is_empty(),
             Err(lore_transport::ProtocolError::NoRemote(_)) => false,
             Err(_) => true,
         };

@@ -52,6 +52,7 @@ use tower::Service;
 use tower::ServiceBuilder;
 use url::Url;
 
+use crate::auth::AuthEndpoint;
 use crate::auth::exchange::auth_exchange;
 use crate::auth::exchange::auth_exchange_custom_resource;
 use crate::connection::Connection;
@@ -95,7 +96,7 @@ pub struct GRPCAuth {
 
 impl GRPCAuth {
     async fn new(
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         remote_domain: &str,
         identity: &str,
         repository: RepositoryId,
@@ -108,7 +109,7 @@ impl GRPCAuth {
         let ((identity_token, access_token), rotated) = credentials.tokens_and_signal();
 
         let (authentication_token, authorization_token, resolved_identity) = auth_exchange(
-            auth_url,
+            auth_endpoint,
             &remote_domain,
             identity,
             repository,
@@ -127,7 +128,7 @@ impl GRPCAuth {
         let auth_ref = Arc::downgrade(&auth);
         let refresher = Some(lore_base::lore_spawn_net!(grpc_auth_refresher(
             auth_ref,
-            auth_url.to_string(),
+            auth_endpoint.clone(),
             remote_domain,
             resolved_identity,
             repository,
@@ -147,7 +148,7 @@ impl GRPCAuth {
     /// caller-supplied resource identifier. Used for endpoints whose authz
     /// model is not repository-based.
     async fn new_for_custom_resource(
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         remote_domain: &str,
         identity: &str,
         resource_id: &str,
@@ -161,7 +162,7 @@ impl GRPCAuth {
 
         let (authentication_token, authorization_token, resolved_identity) =
             auth_exchange_custom_resource(
-                auth_url,
+                auth_endpoint,
                 &remote_domain,
                 identity,
                 resource_id,
@@ -181,7 +182,7 @@ impl GRPCAuth {
         let refresher = Some(lore_base::lore_spawn_net!(
             grpc_auth_refresher_custom_resource(
                 auth_ref,
-                auth_url.to_string(),
+                auth_endpoint.clone(),
                 remote_domain,
                 resolved_identity,
                 resource_id.to_string(),
@@ -231,7 +232,7 @@ async fn await_refresh(rotated: &mut tokio::sync::watch::Receiver<u64>) {
 #[allow(clippy::too_many_arguments)]
 async fn grpc_auth_refresher(
     auth: Weak<parking_lot::RwLock<GRPCAuth>>,
-    auth_url: String,
+    auth_endpoint: AuthEndpoint,
     remote_domain: String,
     identity: String,
     repository: RepositoryId,
@@ -248,7 +249,7 @@ async fn grpc_auth_refresher(
 
         let (identity_token, access_token) = credentials.tokens();
         let (authentication_token, authorization_token, _) = auth_exchange(
-            &auth_url,
+            &auth_endpoint,
             &remote_domain,
             &identity,
             repository,
@@ -266,7 +267,7 @@ async fn grpc_auth_refresher(
 #[allow(clippy::too_many_arguments)]
 async fn grpc_auth_refresher_custom_resource(
     auth: Weak<parking_lot::RwLock<GRPCAuth>>,
-    auth_url: String,
+    auth_endpoint: AuthEndpoint,
     remote_domain: String,
     identity: String,
     resource_id: String,
@@ -282,7 +283,7 @@ async fn grpc_auth_refresher_custom_resource(
 
         let (identity_token, access_token) = credentials.tokens();
         let (authentication_token, authorization_token, _) = auth_exchange_custom_resource(
-            &auth_url,
+            &auth_endpoint,
             &remote_domain,
             &identity,
             &resource_id,
@@ -492,13 +493,13 @@ impl GRPCConnection {
 
     pub async fn repository_authz(
         &self,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
     ) -> GRPCAuthRef {
         let key = (
-            auth_url.to_string(),
+            auth_endpoint.url.clone(),
             identity.to_string(),
             repository.to_string(),
             credentials.from_supplied_credentials(),
@@ -510,7 +511,7 @@ impl GRPCConnection {
         }
 
         let auth = GRPCAuth::new(
-            auth_url,
+            auth_endpoint,
             self.remote_url.host_str().unwrap_or_default(),
             identity,
             repository,
@@ -528,13 +529,13 @@ impl GRPCConnection {
     /// the connection-local cache.
     pub async fn custom_resource_authz(
         &self,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         resource: &str,
         credentials: &Arc<SuppliedCredentials>,
     ) -> GRPCAuthRef {
         let key = (
-            auth_url.to_string(),
+            auth_endpoint.url.clone(),
             identity.to_string(),
             resource.to_string(),
             credentials.from_supplied_credentials(),
@@ -546,7 +547,7 @@ impl GRPCConnection {
         }
 
         let auth = GRPCAuth::new_for_custom_resource(
-            auth_url,
+            auth_endpoint,
             self.remote_url.host_str().unwrap_or_default(),
             identity,
             resource,
@@ -824,7 +825,7 @@ async fn handle_error(retry: &mut crate::util::Retry, status: Status) -> Result<
 #[allow(clippy::unused_async)]
 pub async fn storage_client(
     connection: Arc<GRPCConnection>,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     _partition: Partition,
     credentials: &Arc<SuppliedCredentials>,
@@ -836,7 +837,7 @@ pub async fn storage_client(
     let storage = GRPCStorage {
         connection,
         client: storage_client,
-        auth_url: auth_url.to_string(),
+        auth_endpoint: auth_endpoint.clone(),
         identity: identity.to_string(),
         credentials: credentials.clone(),
         session_counter: std::sync::atomic::AtomicU32::new(1),
@@ -850,7 +851,7 @@ pub async fn storage_client(
 
 pub async fn revision_client(
     connection: Arc<GRPCConnection>,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     repository: RepositoryId,
     credentials: &Arc<SuppliedCredentials>,
@@ -861,14 +862,14 @@ pub async fn revision_client(
         connection.channel(),
         repository,
         connection
-            .repository_authz(auth_url, identity, repository, credentials)
+            .repository_authz(auth_endpoint, identity, repository, credentials)
             .await,
     );
 
     let revision = GRPCRevision {
         connection,
         client: RwLock::new(revision_client),
-        auth_url: auth_url.to_string(),
+        auth_endpoint: auth_endpoint.clone(),
         identity: identity.to_string(),
         credentials: credentials.clone(),
         repository,
@@ -881,7 +882,7 @@ pub async fn revision_client(
 
 pub async fn admin_client(
     connection: Arc<GRPCConnection>,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     repository: RepositoryId,
     credentials: &Arc<SuppliedCredentials>,
@@ -892,14 +893,14 @@ pub async fn admin_client(
         connection.channel(),
         repository,
         connection
-            .repository_authz(auth_url, identity, repository, credentials)
+            .repository_authz(auth_endpoint, identity, repository, credentials)
             .await,
     );
 
     let admin = GRPCAdmin {
         connection,
         client: RwLock::new(admin_client),
-        auth_url: auth_url.to_string(),
+        auth_endpoint: auth_endpoint.clone(),
         identity: identity.to_string(),
         credentials: credentials.clone(),
         repository,
@@ -912,7 +913,7 @@ pub async fn admin_client(
 
 pub async fn repository_client(
     connection: Arc<GRPCConnection>,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Repository>, ProtocolError> {
@@ -921,14 +922,19 @@ pub async fn repository_client(
     let repository_client = repository_client::RepositoryService::new(
         connection.channel(),
         connection
-            .repository_authz(auth_url, identity, RepositoryId::default(), credentials)
+            .repository_authz(
+                auth_endpoint,
+                identity,
+                RepositoryId::default(),
+                credentials,
+            )
             .await,
     );
 
     let repository = GRPCRepository {
         connection,
         client: RwLock::new(repository_client),
-        auth_url: auth_url.to_string(),
+        auth_endpoint: auth_endpoint.clone(),
         identity: identity.to_string(),
         credentials: credentials.clone(),
     };
@@ -940,7 +946,7 @@ pub async fn repository_client(
 
 pub async fn lock_client(
     connection: Arc<GRPCConnection>,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     repository: RepositoryId,
     credentials: &Arc<SuppliedCredentials>,
@@ -951,7 +957,7 @@ pub async fn lock_client(
         connection.channel(),
         repository,
         connection
-            .repository_authz(auth_url, identity, repository, credentials)
+            .repository_authz(auth_endpoint, identity, repository, credentials)
             .await,
     );
 
@@ -959,7 +965,7 @@ pub async fn lock_client(
         connection,
         repository,
         client: RwLock::new(lock_client),
-        auth_url: auth_url.to_string(),
+        auth_endpoint: auth_endpoint.clone(),
         identity: identity.to_string(),
         credentials: credentials.clone(),
     };
@@ -990,7 +996,7 @@ pub fn environment_client(
 pub async fn storage(
     connection: Weak<Connection>,
     remote_url: &str,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     partition: Partition,
     index: usize,
@@ -999,54 +1005,54 @@ pub async fn storage(
     // We open multiple storage connections, only reuse previous connections for the first
     let reuse = index == 0;
     let connection = connect(connection, remote_url, reuse).await?;
-    storage_client(connection, auth_url, identity, partition, credentials).await
+    storage_client(connection, auth_endpoint, identity, partition, credentials).await
 }
 
 pub async fn revision(
     connection: Weak<Connection>,
     remote_url: &str,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     repository: RepositoryId,
     credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Revision>, ProtocolError> {
     let connection = connect(connection, remote_url, true).await?;
-    revision_client(connection, auth_url, identity, repository, credentials).await
+    revision_client(connection, auth_endpoint, identity, repository, credentials).await
 }
 
 pub async fn repository(
     connection: Weak<Connection>,
     remote_url: &str,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Repository>, ProtocolError> {
     let connection = connect(connection, remote_url, true).await?;
-    repository_client(connection, auth_url, identity, credentials).await
+    repository_client(connection, auth_endpoint, identity, credentials).await
 }
 
 pub async fn lock(
     connection: Weak<Connection>,
     remote_url: &str,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     repository: RepositoryId,
     credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Lock>, ProtocolError> {
     let connection = connect(connection, remote_url, true).await?;
-    lock_client(connection, auth_url, identity, repository, credentials).await
+    lock_client(connection, auth_endpoint, identity, repository, credentials).await
 }
 
 pub async fn admin(
     connection: Weak<Connection>,
     remote_url: &str,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     repository: RepositoryId,
     credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Admin>, ProtocolError> {
     let connection = connect(connection, remote_url, true).await?;
-    admin_client(connection, auth_url, identity, repository, credentials).await
+    admin_client(connection, auth_endpoint, identity, repository, credentials).await
 }
 
 pub async fn environment(
@@ -1078,7 +1084,7 @@ impl Drop for RequestScopedCounter {
 struct GRPCAdmin {
     connection: Arc<GRPCConnection>,
     client: RwLock<admin_client::AdminService>,
-    auth_url: String,
+    auth_endpoint: AuthEndpoint,
     identity: String,
     credentials: Arc<SuppliedCredentials>,
     repository: RepositoryId,
@@ -1094,7 +1100,7 @@ impl GRPCAdmin {
             self.repository,
             self.connection
                 .repository_authz(
-                    self.auth_url.as_str(),
+                    &self.auth_endpoint,
                     self.identity.as_str(),
                     self.repository,
                     &self.credentials,
@@ -1124,7 +1130,7 @@ struct GRPCStorage {
     connection: Arc<GRPCConnection>,
     client: storage_client::StorageService,
     /// Auth URL for token exchange.
-    auth_url: String,
+    auth_endpoint: AuthEndpoint,
     /// Identity for token exchange.
     identity: String,
     /// The credentials supplied for the call in progress, shared so a reconnect
@@ -1221,7 +1227,12 @@ impl Storage for GRPCStorage {
     ) -> Result<u32, ProtocolError> {
         let auth = self
             .connection
-            .repository_authz(&self.auth_url, &self.identity, partition, &self.credentials)
+            .repository_authz(
+                &self.auth_endpoint,
+                &self.identity,
+                partition,
+                &self.credentials,
+            )
             .await;
         let token = auth.read().authorization_token.clone();
 
@@ -1388,7 +1399,7 @@ impl Storage for GRPCStorage {
 struct GRPCRevision {
     connection: Arc<GRPCConnection>,
     client: RwLock<revision_client::RevisionService>,
-    auth_url: String,
+    auth_endpoint: AuthEndpoint,
     identity: String,
     credentials: Arc<SuppliedCredentials>,
     repository: RepositoryId,
@@ -1404,7 +1415,7 @@ impl GRPCRevision {
             self.repository,
             self.connection
                 .repository_authz(
-                    self.auth_url.as_str(),
+                    &self.auth_endpoint,
                     self.identity.as_str(),
                     self.repository,
                     &self.credentials,
@@ -1544,7 +1555,7 @@ impl Revision for GRPCRevision {
 struct GRPCRepository {
     connection: Arc<GRPCConnection>,
     client: RwLock<repository_client::RepositoryService>,
-    auth_url: String,
+    auth_endpoint: AuthEndpoint,
     identity: String,
     credentials: Arc<SuppliedCredentials>,
 }
@@ -1558,7 +1569,7 @@ impl GRPCRepository {
             channel,
             self.connection
                 .repository_authz(
-                    self.auth_url.as_str(),
+                    &self.auth_endpoint,
                     self.identity.as_str(),
                     RepositoryId::default(),
                     &self.credentials,
@@ -1670,7 +1681,7 @@ impl Repository for GRPCRepository {
 struct GRPCLock {
     connection: Arc<GRPCConnection>,
     client: RwLock<lock_client::LockService>,
-    auth_url: String,
+    auth_endpoint: AuthEndpoint,
     identity: String,
     credentials: Arc<SuppliedCredentials>,
     repository: RepositoryId,
@@ -1686,7 +1697,7 @@ impl GRPCLock {
             self.repository,
             self.connection
                 .repository_authz(
-                    self.auth_url.as_str(),
+                    &self.auth_endpoint,
                     self.identity.as_str(),
                     self.repository,
                     &self.credentials,

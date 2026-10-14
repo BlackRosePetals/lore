@@ -7,6 +7,17 @@ pub mod discovery;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use lore_base::error::NotSupported;
+use lore_base::types::RepositoryId;
+
+use crate::error::ProtocolError;
+use crate::traits::Authentication;
+use crate::types::AuthSession;
+use crate::types::AuthSessionPoll;
+use crate::types::AuthenticationToken;
+use crate::types::AuthorizationToken;
+use crate::types::Oidc;
 use crate::user_agent;
 
 /// Cap on any document read from an identity provider. Generous
@@ -80,5 +91,106 @@ fn is_permitted_url(url: &url::Url, allow_loopback_http: bool) -> bool {
         "https" => true,
         "http" => allow_loopback_http && super::is_loopback_http_url(url),
         _ => false,
+    }
+}
+
+/// The scheme tag an OIDC endpoint carries in front of its issuer URL, as `git+ssh` names a
+/// route to a repository. The client adds it when it selects the OIDC path, so the endpoint,
+/// and the token store entry under it, cannot be confused with a gRPC auth service the
+/// server advertises under `https`, even one at the same URL as the issuer.
+pub const SCHEME_PREFIX: &str = "oidc+";
+
+pub fn endpoint(issuer: &str) -> String {
+    format!("{SCHEME_PREFIX}{issuer}")
+}
+
+pub fn issuer(endpoint: &str) -> &str {
+    endpoint.strip_prefix(SCHEME_PREFIX).unwrap_or(endpoint)
+}
+
+/// The OAuth 2.0 grants against the provider a server advertises, as the public client the
+/// server names. Bound to that advertisement at selection, since the endpoint string alone
+/// names the issuer and not the client.
+///
+/// The grants are not implemented yet, so every method fails with [`NotSupported`].
+pub struct OidcAuthentication {
+    #[allow(dead_code)] // Read once the grants are implemented.
+    oidc: Oidc,
+}
+
+impl OidcAuthentication {
+    pub fn new(oidc: Oidc) -> Self {
+        OidcAuthentication { oidc }
+    }
+
+    fn not_implemented(operation: &str, endpoint: &str) -> ProtocolError {
+        NotSupported {
+            operation: format!(
+                "{operation} against OIDC issuer {}: not implemented yet",
+                issuer(endpoint)
+            ),
+        }
+        .into()
+    }
+}
+
+#[async_trait]
+impl Authentication for OidcAuthentication {
+    async fn start_auth_session(
+        &self,
+        auth_url: &str,
+        _client_state: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthSession, ProtocolError> {
+        Err(Self::not_implemented("login", auth_url))
+    }
+
+    async fn poll_auth_session(
+        &self,
+        auth_url: &str,
+        _client_state: &str,
+        _session_code: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthSessionPoll, ProtocolError> {
+        Err(Self::not_implemented("login", auth_url))
+    }
+
+    async fn exchange_external_token(
+        &self,
+        auth_url: &str,
+        _token: &str,
+        _token_type: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        Err(Self::not_implemented("token exchange", auth_url))
+    }
+
+    async fn refresh_authentication(
+        &self,
+        auth_url: &str,
+        _refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        Err(Self::not_implemented("token refresh", auth_url))
+    }
+
+    async fn exchange_for_repository(
+        &self,
+        auth_url: &str,
+        _authn_token: &str,
+        _repository: RepositoryId,
+        _correlation_id: &str,
+    ) -> Result<AuthorizationToken, ProtocolError> {
+        Err(Self::not_implemented("authorization", auth_url))
+    }
+
+    async fn exchange_for_custom_resource(
+        &self,
+        auth_url: &str,
+        _authn_token: &str,
+        _resource_id: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthorizationToken, ProtocolError> {
+        Err(Self::not_implemented("authorization", auth_url))
     }
 }

@@ -6,6 +6,7 @@ use std::time::Duration;
 use lore_base::error::*;
 use lore_base::types::*;
 use lore_error_set::ext::ResultExt;
+use lore_transport::auth::AuthMode;
 use lore_transport::connection::*;
 use lore_transport::error::ProtocolError;
 use lore_transport::session::StorageSession;
@@ -24,23 +25,33 @@ use lore_transport::types::*;
 #[test]
 fn the_no_identity_fallback_does_not_cross_credential_modes() {
     let remote = "lores://mode-isolation.test.invalid";
+    let auto = AuthMode::Auto;
     let stored = (
         remote.to_string(),
         "alice".to_string(),
         false,
         String::new(),
+        auto,
     );
-    let supplied = (remote.to_string(), "alice".to_string(), true, String::new());
+    let supplied = (
+        remote.to_string(),
+        "alice".to_string(),
+        true,
+        String::new(),
+        auto,
+    );
 
-    assert!(matches_url_mode_and_store(&stored, remote, false, ""));
-    assert!(matches_url_mode_and_store(&supplied, remote, true, ""));
+    assert!(matches_url_mode_and_store(&stored, remote, false, "", auto));
+    assert!(matches_url_mode_and_store(
+        &supplied, remote, true, "", auto
+    ));
 
     assert!(
-        !matches_url_mode_and_store(&supplied, remote, false, ""),
+        !matches_url_mode_and_store(&supplied, remote, false, "", auto),
         "a store-mode call must not be given a supplied-credential connection"
     );
     assert!(
-        !matches_url_mode_and_store(&stored, remote, true, ""),
+        !matches_url_mode_and_store(&stored, remote, true, "", auto),
         "a supplied-credential call must not be given a store-mode connection"
     );
 
@@ -48,7 +59,69 @@ fn the_no_identity_fallback_does_not_cross_credential_modes() {
         &stored,
         "lores://elsewhere.invalid",
         false,
-        ""
+        "",
+        auto
+    ));
+}
+
+/// The lookup runs before the environment is fetched, so which path a mode
+/// resolves to is unknown at that point. A call in one auth mode must not be
+/// handed a connection opened in another: an `oidc` call after an `auto` one
+/// to the same remote would otherwise run over the gRPC path the first call
+/// selected, and the inverse.
+#[test]
+fn the_no_identity_fallback_does_not_cross_auth_modes() {
+    let remote = "lores://auth-mode-isolation.test.invalid";
+    let opened_auto = (
+        remote.to_string(),
+        "alice".to_string(),
+        false,
+        String::new(),
+        AuthMode::Auto,
+    );
+    let opened_oidc = (
+        remote.to_string(),
+        "alice".to_string(),
+        false,
+        String::new(),
+        AuthMode::Oidc,
+    );
+
+    assert!(matches_url_mode_and_store(
+        &opened_auto,
+        remote,
+        false,
+        "",
+        AuthMode::Auto
+    ));
+    assert!(matches_url_mode_and_store(
+        &opened_oidc,
+        remote,
+        false,
+        "",
+        AuthMode::Oidc
+    ));
+
+    assert!(!matches_url_mode_and_store(
+        &opened_auto,
+        remote,
+        false,
+        "",
+        AuthMode::Oidc
+    ));
+    assert!(!matches_url_mode_and_store(
+        &opened_auto,
+        remote,
+        false,
+        "",
+        AuthMode::Grpc
+    ));
+    assert!(!matches_url_mode_and_store(
+        &opened_oidc,
+        remote,
+        false,
+        "",
+        AuthMode::Auto
     ));
 }
 
@@ -63,16 +136,18 @@ fn the_no_identity_fallback_does_not_cross_token_stores() {
         "alice".to_string(),
         false,
         "/home/alice/tokens".to_string(),
+        AuthMode::Auto,
     );
 
     assert!(matches_url_mode_and_store(
         &alices,
         remote,
         false,
-        "/home/alice/tokens"
+        "/home/alice/tokens",
+        AuthMode::Auto
     ));
     assert!(
-        !matches_url_mode_and_store(&alices, remote, false, "/home/bob/tokens"),
+        !matches_url_mode_and_store(&alices, remote, false, "/home/bob/tokens", AuthMode::Auto),
         "a call reading another store must not be given the connection alice's opened"
     );
 }

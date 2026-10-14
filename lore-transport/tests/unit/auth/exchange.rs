@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use lore_base::types::RepositoryId;
-use lore_transport::auth::authentication;
+use lore_transport::auth::AuthEndpoint;
 use lore_transport::auth::exchange::*;
 
 /// A supplied access token is the authorization token, so the exchange is
@@ -10,7 +10,7 @@ use lore_transport::auth::exchange::*;
 #[tokio::test]
 async fn supplied_access_token_replaces_the_repository_exchange() {
     let token = exchange(
-        "",
+        &AuthEndpoint::none(),
         "",
         RepositoryId::default(),
         "example.com".to_string(),
@@ -24,10 +24,16 @@ async fn supplied_access_token_replaces_the_repository_exchange() {
 
 #[tokio::test]
 async fn supplied_access_token_replaces_the_resource_exchange() {
-    let token =
-        exchange_custom_resource("", "", "", "example.com".to_string(), "", "supplied-authz")
-            .await
-            .expect("the supplied access token is used as given");
+    let token = exchange_custom_resource(
+        &AuthEndpoint::none(),
+        "",
+        "",
+        "example.com".to_string(),
+        "",
+        "supplied-authz",
+    )
+    .await
+    .expect("the supplied access token is used as given");
     assert_eq!(token, "supplied-authz");
 }
 
@@ -41,7 +47,7 @@ async fn access_token_alone_authorizes_without_an_authentication_token() {
         .parse()
         .expect("a valid repository id");
     let (authentication_token, authorization_token, identity) = auth_exchange(
-        "ucs-auth://auth.example.com",
+        &AuthEndpoint::resolve("ucs-auth://auth.example.com").expect("a registered scheme"),
         "example.com",
         "alice",
         repository,
@@ -63,7 +69,7 @@ async fn access_token_alone_authorizes_without_an_authentication_token() {
 #[tokio::test]
 async fn no_supplied_access_token_still_requires_an_auth_url() {
     let result = exchange(
-        "",
+        &AuthEndpoint::none(),
         "",
         RepositoryId::default(),
         "example.com".to_string(),
@@ -83,9 +89,9 @@ async fn no_supplied_access_token_still_requires_an_auth_url() {
 /// stale *stored* identity while picking one, which a supplied credential is
 /// not.
 ///
-/// The auth URL uses a scheme no `Authentication` implementation is registered
-/// for, so the authorization exchange fails without a network call. The
-/// authentication token is what this is about.
+/// The endpoint's implementation refuses every grant, so the authorization
+/// exchange fails without a network call. The authentication token is what
+/// this is about.
 #[tokio::test]
 async fn an_expired_supplied_identity_token_is_still_used() {
     /// The same claims as the fixtures above, with `exp` back in 2001.
@@ -95,8 +101,12 @@ async fn an_expired_supplied_identity_token_is_still_used() {
         .parse()
         .expect("a valid repository id");
 
+    let refusing = AuthEndpoint::new(
+        "stub-auth://auth.expired-token.test.invalid".to_string(),
+        AuthEndpoint::none().auth,
+    );
     let (authentication_token, _authorization_token, identity) = auth_exchange(
-        "no-such-scheme://auth.expired-token.test.invalid",
+        &refusing,
         "example.com",
         "alice",
         repository,
@@ -120,8 +130,8 @@ async fn an_expired_supplied_identity_token_is_still_used() {
 /// A stub `Authentication` returns a distinct authorization per
 /// authentication token, which makes the separation observable: were the
 /// cache shared across credentials, the second caller would come back with
-/// the first one's token and no second exchange would happen. Registering the
-/// stub under its own scheme also keeps this off the network.
+/// the first one's token and no second exchange would happen. Binding the
+/// stub as the endpoint's implementation also keeps this off the network.
 #[tokio::test]
 async fn one_supplied_credential_is_never_served_anothers_authorization() {
     use lore_transport::error::ProtocolError;
@@ -227,9 +237,13 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
         }
     }
 
-    async fn authorize(repository: RepositoryId, identity_token: &str) -> String {
+    async fn authorize(
+        endpoint: &AuthEndpoint,
+        repository: RepositoryId,
+        identity_token: &str,
+    ) -> String {
         exchange(
-            AUTH_URL,
+            endpoint,
             "alice",
             repository,
             "example.com".to_string(),
@@ -243,15 +257,15 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
     let stub = std::sync::Arc::new(StubAuthentication {
         exchanges: std::sync::atomic::AtomicUsize::new(0),
     });
-    authentication::add("stub-auth", stub.clone()).expect("registering the stub");
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
 
     let repository: RepositoryId = "aabbccdd00112233aabbccdd00112233"
         .parse()
         .expect("a valid repository id");
 
-    assert_eq!(authorize(repository, AUTHN_ONE).await, AUTHZ_ONE);
+    assert_eq!(authorize(&endpoint, repository, AUTHN_ONE).await, AUTHZ_ONE);
     assert_eq!(
-        authorize(repository, AUTHN_ONE).await,
+        authorize(&endpoint, repository, AUTHN_ONE).await,
         AUTHZ_ONE,
         "the same credential reuses the authorization it earned"
     );
@@ -262,7 +276,7 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
     );
 
     assert_eq!(
-        authorize(repository, AUTHN_TWO).await,
+        authorize(&endpoint, repository, AUTHN_TWO).await,
         AUTHZ_TWO,
         "a different credential must earn its own authorization"
     );

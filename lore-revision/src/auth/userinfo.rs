@@ -91,7 +91,7 @@ async fn open_user_service(
     repository: RepositoryId,
     identity: &str,
 ) -> Result<UserServiceAccess, UserInfoError> {
-    let auth_url = remote.auth_url();
+    let auth_endpoint = remote.auth_endpoint();
     let user_url = remote.user_url().to_string();
     let execution = execution_context();
     let globals = execution.globals();
@@ -114,11 +114,11 @@ async fn open_user_service(
     }
 
     lore_debug!(
-        "Get authorization token for identity {identity} using auth url {auth_url} for service {user_url}"
+        "Get authorization token for identity {identity} using auth url {auth_endpoint} for service {user_url}"
     );
     let user_domain = get_domain_or_empty(&user_url);
     let token = lore_transport::auth::exchange::exchange(
-        auth_url,
+        auth_endpoint,
         identity,
         repository,
         user_domain.clone(),
@@ -298,7 +298,7 @@ pub async fn repository_access_token(
 
     lore_debug!("Get authorization token for identity {user_id} using auth url {auth_url}");
     let token = lore_transport::auth::exchange::exchange(
-        auth_url.as_str(),
+        remote.auth_endpoint(),
         user_id.as_str(),
         repository.id,
         remote_domain,

@@ -19,6 +19,7 @@ use serde::Serialize;
     Default,
     PartialEq,
     Eq,
+    Hash,
     Serialize,
     Deserialize,
     bitcode::Encode,

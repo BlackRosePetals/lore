@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use lore_revision::auth::AuthMode;
-use lore_revision::auth::AuthPath;
+use lore_transport::auth::AuthMode;
+use lore_transport::auth::AuthPath;
 
 #[test]
 fn the_default_is_auto_and_is_zero() {
