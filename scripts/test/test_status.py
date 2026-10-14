@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: MIT
 import logging
 import os
+import shutil
 import stat
 import sys
+from pathlib import Path
 
 import pytest
 from test_utils import posix_join, to_posix
@@ -1107,3 +1109,24 @@ def test_status_scan_reports_a_mode_only_change(new_lore_repo):
     assert cloned_mode & stat.S_IXUSR, (
         f"the revision must carry the executable bit to a clone: {cloned_mode:o}"
     )
+
+
+@pytest.mark.smoke
+def test_status_scan_over_a_file_replaced_by_a_directory_keeps_the_file(new_lore_repo):
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(None, {"entry": b"file"})
+    file_id = repo.file_info("entry", offline=True)[0].context
+
+    os.remove(repo._fix_path("entry"))
+    os.makedirs(repo._fix_path("entry/sub"))
+    Path(repo._fix_path("entry/inner")).write_bytes(b"inner")
+    Path(repo._fix_path("entry/sub/deep")).write_bytes(b"deep")
+    repo.status(scan=True, offline=True)
+
+    shutil.rmtree(repo._fix_path("entry"))
+    Path(repo._fix_path("entry")).write_bytes(b"changed")
+    assert _status_files_by_path(repo, scan=True)["entry"]["action"] == "keep"
+
+    repo.stage(".", offline=True)
+    repo.commit("Change the file", offline=True)
+    assert repo.file_info("entry", offline=True)[0].context == file_id

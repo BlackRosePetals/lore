@@ -32,7 +32,6 @@ mod tests {
     const SECOND: &[u8] = b"#!/bin/sh\necho second";
 
     /// Syncs `instance` to `revision`, discarding local modifications where `reset` asks it to.
-    #[cfg(target_family = "unix")]
     async fn sync_to(instance: &TestRepository, revision: lore_base::types::Hash, reset: bool) {
         sync::sync_boxed(
             instance.repository.clone(),
@@ -156,6 +155,117 @@ mod tests {
                 assert!(
                     !working_executable(script.as_path()),
                     "a reset leaves the mode the revision names, the local bit with it"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A path that is a file in one revision and a directory in the next. A reset sync back to the
+    /// file diffs the target against the working tree, where the directory and everything under
+    /// it has to be reported so it is deleted before the file is written in its place; reporting
+    /// only the directory left it in the way and the write failed with "Is a directory".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_sync_turns_a_directory_back_into_a_file() {
+        const ENTRY: &str = "entry";
+        const CONTENT: &[u8] = b"entry as a file";
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = Box::pin(test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                ))
+                .await;
+                let entry = instance.path.join(ENTRY);
+
+                test_file_write(entry.as_path(), CONTENT);
+                let as_file = test_commit_tree(&instance, "Entry is a file")
+                    .await
+                    .revision();
+
+                fs::remove_file(entry.as_path()).expect("Failed to remove the file");
+                fs::create_dir_all(entry.join("sub")).expect("Failed to create the directory");
+                test_file_write(entry.join("inner").as_path(), b"inner");
+                test_file_write(entry.join("sub").join("deep").as_path(), b"deep");
+                let as_directory = test_commit_tree(&instance, "Entry is a directory")
+                    .await
+                    .revision();
+
+                sync_to(&instance, as_file, true).await;
+                assert_eq!(
+                    fs::read(entry.as_path()).expect("The entry must be a readable file"),
+                    CONTENT,
+                    "a reset sync has to replace the directory with the file the revision holds"
+                );
+
+                sync_to(&instance, as_directory, true).await;
+                assert_eq!(
+                    fs::read(entry.join("sub").join("deep").as_path())
+                        .expect("The nested file must be readable"),
+                    b"deep",
+                    "a reset sync forward has to bring the directory and its content back"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The directory that replaced the file is the root of a nested repository: the walk never
+    /// descends into one, so a reset sync reports nothing under it, the non-recursive directory
+    /// delete keeps it, and the sync fails without touching the nested repository's working files.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_sync_leaves_a_nested_repository_that_replaced_a_file_alone() {
+        const ENTRY: &str = "entry";
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = Box::pin(test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                ))
+                .await;
+                let entry = instance.path.join(ENTRY);
+
+                test_file_write(entry.as_path(), b"entry as a file");
+                let as_file = test_commit_tree(&instance, "Entry is a file")
+                    .await
+                    .revision();
+
+                fs::remove_file(entry.as_path()).expect("Failed to remove the file");
+                fs::create_dir_all(entry.join(".lore"))
+                    .expect("Failed to mark a nested repository");
+                test_file_write(entry.join("work").as_path(), b"another repository's work");
+
+                let result = sync::sync_boxed(
+                    instance.repository.clone(),
+                    &instance.write_token,
+                    SyncOptions {
+                        revision: Some(as_file.to_string()),
+                        reset: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert!(
+                    result.is_err(),
+                    "a nested repository in the way has to fail the sync rather than be emptied"
+                );
+                assert_eq!(
+                    fs::read(entry.join("work").as_path())
+                        .expect("The nested repository's file must still be there"),
+                    b"another repository's work",
+                    "a reset sync must not delete another repository's working files"
                 );
             }))
             .await

@@ -352,7 +352,7 @@ async fn settle_insisted_directory(
 /// which is how a commit drops the old content and records the new.
 ///
 /// Returns the replacement node, [`INVALID_NODE`] where the intent minted none, so a walk
-/// descends into a directory it created.
+/// knows whether to descend against the node or against an empty listing.
 async fn emit_type_replacement(
     ctx: &FileDiffContext,
     file_path: &RelativePath,
@@ -1455,6 +1455,8 @@ async fn diff_filesystem_directory_walk(
                 item_states,
                 is_file,
                 is_directory,
+                &mut nested_probe,
+                repository_root,
                 tasks,
                 changes,
                 stats,
@@ -1786,6 +1788,8 @@ async fn diff_filesystem_type_change(
     item_states: FilterStates,
     is_file: bool,
     is_directory: bool,
+    nested_probe: &mut Option<std::path::PathBuf>,
+    repository_root: &std::path::Path,
     tasks: &mut SubtreeTasks,
     changes: &ChangeSender,
     stats: &mut FilesystemDiffStats,
@@ -1829,9 +1833,27 @@ async fn diff_filesystem_type_change(
     .await?;
 
     // A directory that replaced a file is walked against the node the replacement
-    // minted, so the content it holds is staged with it. A file that replaced a
+    // minted, so the content it holds is staged with it. A walk that only reports
+    // mints no node and walks it against an empty listing, so the content is reported
+    // as added and a reversed diff deletes it before the directory itself. A marking
+    // walk without a minted node stays out: its chain would resolve the path to the
+    // old file node and queue that node for discard. A nested repository root stays
+    // out too, as it does everywhere else in the walk: reported as added, a reversed
+    // diff would delete another repository's working files. A file that replaced a
     // directory holds none.
-    if is_directory && replacement.is_valid_node_id() {
+    let reports_without_node = !replacement.is_valid_node_id() && !ctx.intent.marks_dirty();
+    let nested_root = is_directory && reports_without_node && {
+        let probe = nested_probe
+            .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
+        is_nested_repository_root(probe, item.name.as_str()).await
+    };
+    if nested_root {
+        lore_trace!(
+            "Not descending into nested repository root {} that replaced a file",
+            entry.path()
+        );
+    }
+    if is_directory && (replacement.is_valid_node_id() || (reports_without_node && !nested_root)) {
         let item_path = entry.to_path();
         diff_filesystem_subtree_dispatch(
             FilesystemDiffContext {
