@@ -2925,7 +2925,7 @@ async fn merge_abort_ignore_links(
             .await
             .forward::<MergeError>("deserializing current and staged state")?;
 
-        state_current.set_parent_self(state_current.revision());
+        state_current.reparent_onto(state_current.revision());
 
         for r in &resolved {
             // Re-read the link reference from the post-abort state to find

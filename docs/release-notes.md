@@ -56,6 +56,25 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- A merge of divergent branch history, such as the one a sync stages when the local and the remote latest have both
+  moved, keeps the remote latest as its first parent and the local latest as its second when something is changed on
+  top of it before it is committed. Marking a file dirty, staging, moving or copying a file, setting revision or file
+  metadata, changing file dependencies or links, and a `lore repository verify` that repairs the staged state replaced
+  the first parent with the local latest, and `lore commit --force` committed the merge as an ordinary revision on the
+  local latest, so the revision did not descend from the remote latest
+- `lore file dependency add`, `lore file dependency remove`, `lore file metadata clear` on a tree with nothing staged,
+  and `lore branch merge abort --ignore-links` that restores link pins, no longer carry the current revision's metadata,
+  such as its reviewer, onto the next revision
+- `lore status --scan` that finds a change in the parent tree while only a layer holds staged changes stages it on top
+  of the current revision. It kept the current revision's parents and metadata, so a commit failed with
+  `Staged state has stale parent`, or once the change was staged carried the current revision's metadata
+- After a merge of divergent branch history is committed, `lore status` reports the branch as ahead of the remote. It
+  reported the branch as diverged and asked for another sync until the merge was pushed
+- A change committed through a link pinned at a merge revision has that revision as its only parent. It carried the
+  pin's second parent, so the linked repository recorded a merge of a revision the pin had already merged
+- A change staged more than once inside a nested link before it is committed is committed on the revision the nested
+  link is pinned at. Each staging became the parent of the next, so the nested repository's history took in the staged
+  states and push uploaded them as revisions
 - A merge reports the conflict on a file both branches changed where one of them added the file at a node a deleted
   file had used. The history the node still held for the deleted file could name a merge of that file from the other
   branch, and the merge then took the other branch's change as already merged and dropped it without a conflict

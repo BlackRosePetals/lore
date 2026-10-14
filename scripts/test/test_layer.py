@@ -18,6 +18,7 @@ from lore_parsers import (
     parse_status_summary_json,
 )
 from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
+from test_utils import revision_metadata_keys
 
 
 logger = logging.getLogger(__name__)
@@ -1385,6 +1386,35 @@ def test_status_unstaged_layer_file_deleted(new_lore_repo):
     assert deleted_entry.get("action") == "delete", (
         f"Expected deleted layer file to be reported as 'delete', got: {deleted_entry}"
     )
+
+
+@pytest.mark.smoke
+def test_status_scan_with_only_a_layer_staged_stages_the_parent_on_the_current_revision(
+    new_lore_repo,
+):
+    """A scan that finds a parent change while only a layer holds staged changes stages the
+    parent on top of the current revision, so the commit of that change descends from it and
+    does not take its metadata.
+    """
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    with repo.open_file(MAIN_FILE, mode="wb") as out:
+        out.write(b"main content v2")
+    repo.stage(MAIN_FILE)
+    repo.revision_metadata_set(["reviewed-by", "first.reviewer@example.com"])
+    repo.commit("First")
+    first = repo.revision_info()
+
+    with repo.open_file(LAYER_FILE, mode="wb") as out:
+        out.write(b"layer content v2")
+    repo.stage(LAYER_FILE)
+    with repo.open_file(MAIN_FILE, mode="wb") as out:
+        out.write(b"main content v3")
+    repo.status(scan=True)
+    repo.stage(MAIN_FILE)
+    repo.commit("Second", non_interactive=True)
+
+    assert repo.revision_info().parent == first.signature
+    assert "reviewed-by" not in revision_metadata_keys(repo)
 
 
 @pytest.mark.smoke

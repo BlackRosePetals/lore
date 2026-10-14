@@ -1962,11 +1962,24 @@ impl State {
         }
     }
 
+    /// Make the state a staged state on top of `current_revision`.
+    ///
+    /// A state that is the committed revision `current_revision` itself drops that revision's
+    /// second parent and metadata, which belong to the revision and not to the one staged on top
+    /// of it. A staged state, numbered 0, is left as it is when `current_revision` is its own
+    /// signature, which is no revision to stage on. A merge that
+    /// [reconciles divergent history](Self::reconciles_divergent_history) keeps its first parent,
+    /// the branch latest it merged; `current_revision` is already its second parent.
     pub fn reparent_onto(&self, current_revision: Hash) {
         let based_on_current = self.revision() == current_revision;
+        if based_on_current && self.revision_number() == 0 {
+            return;
+        }
 
         self.set_revision_number(0);
-        self.set_parent_self(current_revision);
+        if !self.reconciles_divergent_history(current_revision) {
+            self.set_parent_self(current_revision);
+        }
 
         if based_on_current {
             self.set_parent_other(Hash::default());
@@ -1976,6 +1989,13 @@ impl State {
 
     pub fn is_merge(&self) -> bool {
         self.data.read().flags & StateFlags::Merge != 0
+    }
+
+    /// Whether the state is a merge whose second parent is `current_revision`, which is how a
+    /// merge of the branch's latest into `current_revision` is staged: the branch latest is the
+    /// first parent and stays the first-parent line.
+    pub fn reconciles_divergent_history(&self, current_revision: Hash) -> bool {
+        self.is_merge() && self.parent_other() == current_revision
     }
 
     pub fn is_cherry_pick(&self) -> bool {

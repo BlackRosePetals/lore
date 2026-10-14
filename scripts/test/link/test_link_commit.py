@@ -426,6 +426,50 @@ def test_link_commit_partial_link_messages(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_link_commit_on_a_pin_that_is_a_merge_has_the_pin_as_its_only_parent(
+    new_lore_repo,
+):
+    """A change committed through a link pinned at a merge revision is a revision on top of the
+    pin. The pin's own second parent is not carried onto it, so it is not a merge."""
+    link_path = "linked/repo"
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"a.txt": "a\n", "b.txt": "b\n"}, {"p.txt": "p\n"}
+    )
+
+    link_repo.branch_create("side")
+    with link_repo.open_file("b.txt", "w") as f:
+        f.write("side\n")
+    link_repo.stage("b.txt")
+    link_repo.commit("Side change")
+    link_repo.push()
+    link_repo.branch_switch("main")
+    with link_repo.open_file("a.txt", "w") as f:
+        f.write("main\n")
+    link_repo.stage("a.txt")
+    link_repo.commit("Main change")
+    link_repo.push()
+    link_repo.branch_merge("side", message="Merge side")
+    link_repo.push()
+    pin = link_repo.revision_info().signature
+
+    urc.link_update(link_path)
+    urc.commit("Repin the link", non_interactive=True)
+    urc.push()
+
+    with urc.open_file(f"{link_path}/a.txt", "w") as f:
+        f.write("edited through the mount\n")
+    urc.stage(f"{link_path}/a.txt")
+    urc.commit("Edit through the link", non_interactive=True)
+    urc.push()
+
+    link_repo.sync()
+    committed = link_repo.revision_info()
+    assert committed.message == "Edit through the link"
+    assert committed.merge == ""
+    assert committed.parent == pin
+
+
+@pytest.mark.smoke
 def test_link_commit_only_main_changes(new_lore_repo):
     """Test that commit with no link changes works normally even with --non-interactive."""
     urc, _link_repo = make_parent_with_link(

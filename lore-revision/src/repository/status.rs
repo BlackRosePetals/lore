@@ -2096,14 +2096,7 @@ pub(crate) async fn status(
         && state_staged.is_dirty()
         && let Some(token) = repository.try_write_token()
     {
-        // Set up staged state metadata if this is a fresh state (cloned from current)
-        if !has_staged {
-            let current_revision = state_current.revision();
-            state_staged.set_revision_number(0);
-            state_staged.set_parent_self(current_revision);
-            state_staged.set_parent_other(Hash::default());
-            state_staged.set_metadata_hash(Hash::default());
-        }
+        state_staged.reparent_onto(state_current.revision());
         let emptied = settled_links
             && state_staged.parent_other().is_zero()
             && !state_staged

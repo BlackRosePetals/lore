@@ -1267,7 +1267,7 @@ async fn commit_link_only(
         && link_effective_current == link_branch_latest
         && !link_branch_latest.is_zero()
     {
-        link_state_staged.set_parent_self(link_effective_current);
+        link_state_staged.reparent_onto(link_effective_current);
     }
 
     let metadata = build_commit_metadata(
@@ -1369,7 +1369,7 @@ async fn commit_link_only(
         let child_current = State::deserialize(child_repository.clone(), level.old_signature)
             .await
             .forward::<CommitError>("Failed to deserialize intermediate link current state")?;
-        child_state.set_parent_self(level.old_signature);
+        child_state.reparent_onto(level.old_signature);
 
         let child_metadata = build_commit_metadata(
             child_repository.clone(),
@@ -1495,8 +1495,11 @@ async fn build_commit_metadata(
     .await
 }
 
-/// Stores branch latest, deletes staged anchor, updates last sync if merge, and emits the revision
-/// commit event.
+/// Stores branch latest, records the sync point of a merge of divergent history, keeps the dirty
+/// nodes left over in a staged anchor or deletes it, and emits the revision commit event.
+///
+/// The sync point is the merge's first parent, the remote latest it merged. A committed state whose
+/// second parent is the current revision is such a merge; its merge flag is cleared by then.
 ///
 /// `branch_previous` is what the pointer write compares against, so it must be
 /// the tip observed for `branch`, not the revision the caller built on: a prior
@@ -1537,6 +1540,12 @@ async fn finalize_commit(
             );
         }
 
+        if state_staged.parent_other() == state_current.revision()
+            && !state_current.revision().is_zero()
+        {
+            branch::store_last_sync(repository.clone(), branch, state_staged.parent_self()).await;
+        }
+
         // Check if any dirty-only nodes remain in the staged state.
         // If so, preserve them in a new staged anchor re-parented to the new revision.
         let has_dirty = state_staged
@@ -1546,10 +1555,7 @@ async fn finalize_commit(
 
         if has_dirty {
             lore_debug!("Dirty nodes remain after commit, preserving in new staged anchor");
-            state_staged.set_parent_self(signature);
-            state_staged.set_revision_number(0);
-            state_staged.set_parent_other(Hash::default());
-            state_staged.set_metadata_hash(Hash::default());
+            state_staged.reparent_onto(signature);
             state_staged.mark_dirty();
 
             let staged_signature =
@@ -1562,10 +1568,6 @@ async fn finalize_commit(
                 .forward::<CommitError>("Failed to serialize staged anchor")?;
         } else {
             let _ = crate::instance::delete_staged_anchor(&repository).await;
-        }
-
-        if state_staged.parent_other() == state_current.revision() && state_staged.is_merge() {
-            branch::store_last_sync(repository.clone(), branch, state_staged.parent_self()).await;
         }
     }
 
@@ -1653,14 +1655,12 @@ async fn commit_staged_revision(
 
     let revision_current = state_current.revision();
     if state_staged.parent_self() != revision_current {
-        if globals.force() && revision_current == state_current.revision() {
-            // Force commit same revision, reset metadata
+        if state_staged.reconciles_divergent_history(revision_current) {
+            lore_debug!("Merge of divergent branch history, other parent is current revision");
+        } else if globals.force() {
             state_staged.set_parent_self(revision_current);
             state_staged.set_parent_other(Hash::default());
             state_staged.set_metadata_hash(Hash::default());
-        } else if state_staged.parent_other() == revision_current && state_staged.is_merge() {
-            // Merge of a divergent branch history
-            lore_debug!("Merge of divergent branch history, other parent is current revision");
         } else if state_staged.is_cherry_pick() {
             lore_debug!("Cherry-pick, other parent is empty");
         } else {

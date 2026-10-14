@@ -655,17 +655,7 @@ pub async fn stage(
         )
         .await?;
 
-        // Staged states should have no revision number
-        state.set_revision_number(0);
-
-        state.set_parent_self(current_revision);
-
-        // If staged state is the initial stage based on current state, reset other parent. Otherwise
-        // leave it as is, in case previous staged state was a merge/integrate
-        if staged_revision == current_revision {
-            state.set_parent_other(Hash::default());
-            state.set_metadata_hash(Hash::default());
-        }
+        state.reparent_onto(current_revision);
 
         let signature = state
             .serialize(repository.clone(), token)
@@ -702,16 +692,7 @@ pub async fn stage(
             continue;
         }
 
-        state.set_revision_number(0);
-
-        state.set_parent_self(layer_state.state_current.revision());
-
-        // If staged state is the initial stage based on current state, reset other parent. Otherwise
-        // leave it as is, in case previous staged state was a merge/integrate
-        if layer_state.state_current.revision() == layer_state.state_staged.revision() {
-            state.set_parent_other(Hash::default());
-            state.set_metadata_hash(Hash::default());
-        }
+        state.reparent_onto(layer_state.state_current.revision());
 
         let signature = state
             .serialize(layer_state.repository.clone(), token)
@@ -1486,14 +1467,7 @@ pub async fn stage_move(
     let count = LoreFileStageCountData::new(stats.clone());
     event::LoreEvent::FileStageEnd(LoreFileStageEndEventData { count }).send();
 
-    state.set_parent_self(current_revision);
-
-    // If staged state is the initial stage based on current state, reset other parent. Otherwise
-    // leave it as is, in case previous staged state was a merge/integrate
-    if state.revision() == current_revision {
-        state.set_parent_other(Hash::default());
-        state.set_metadata_hash(Hash::default());
-    }
+    state.reparent_onto(current_revision);
 
     // Serialize new staged state
     let signature = state

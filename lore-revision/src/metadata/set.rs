@@ -138,31 +138,25 @@ pub(crate) async fn set_revision(
         }
     }
 
-    state.set_metadata_hash(
-        metadata
-            .serialize(repository.clone())
-            .await
-            .forward::<SetError>("Failed to write metadata")?,
-    );
+    let metadata_hash = metadata
+        .serialize(repository.clone())
+        .await
+        .forward::<SetError>("Failed to write metadata")?;
+
+    // Re-parenting a state of the current revision drops that revision's metadata, so the
+    // metadata built above is set after it.
+    state.reparent_onto(current_revision);
+    state.set_metadata_hash(metadata_hash);
 
     // Serialize the new current state
-    if state.is_dirty() {
-        state.set_revision_number(0);
-        state.set_parent_self(current_revision);
+    let signature = state
+        .serialize(repository.clone(), token)
+        .await
+        .forward_any::<SetError>("Failed to serialize revision state")?;
 
-        if staged_revision == current_revision {
-            state.set_parent_other(Hash::default());
-        }
-
-        let signature = state
-            .serialize(repository.clone(), token)
-            .await
-            .forward_any::<SetError>("Failed to serialize revision state")?;
-
-        crate::instance::store_staged_anchor(&repository, signature)
-            .await
-            .forward::<SetError>("Failed to serialize staged revision anchor")?;
-    }
+    crate::instance::store_staged_anchor(&repository, signature)
+        .await
+        .forward::<SetError>("Failed to serialize staged revision anchor")?;
 
     event::metadata::send(&metadata);
 
@@ -414,13 +408,7 @@ pub async fn set_file(
 
     // Serialize the new current state
     if state.is_dirty() {
-        state.set_revision_number(0);
-        state.set_parent_self(current_revision);
-
-        if staged_revision == current_revision {
-            state.set_parent_other(Hash::default());
-            state.set_metadata_hash(Hash::default());
-        }
+        state.reparent_onto(current_revision);
 
         let signature = state
             .serialize(repository.clone(), token)

@@ -105,14 +105,7 @@ pub async fn remove_file_dependencies(
         .await?;
     }
 
-    flush_state(
-        &repository,
-        token,
-        &state,
-        current_revision,
-        staged_revision,
-    )
-    .await?;
+    flush_state(&repository, token, &state, current_revision).await?;
 
     Ok(RemoveResult { removed })
 }

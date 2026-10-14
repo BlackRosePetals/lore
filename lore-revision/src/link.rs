@@ -788,7 +788,7 @@ pub async fn settle_linked_staged_state(
 /// This is the shared workflow between `process_link_updates` (stage) and
 /// `process_link_unstage_updates` (unstage):
 /// 1. Get linked repository context via `to_link_context`
-/// 2. Set parent on linked state and reset revision number
+/// 2. Reparent the linked state onto `parent_signature` ([`State::reparent_onto`])
 /// 3. Serialize the linked state
 /// 4. Update the block tree hash and link registry via `update_link_pin_by_node`
 ///
@@ -806,8 +806,7 @@ pub async fn reserialize_tracked_link(
         .await;
 
     let linked_state = link_context.link_state.clone();
-    linked_state.set_parent_self(parent_signature);
-    linked_state.set_revision_number(0);
+    linked_state.reparent_onto(parent_signature);
 
     let new_signature = linked_state.serialize(linked_repository, token).await?;
 
@@ -1043,8 +1042,7 @@ pub async fn propagate_link_chain(
         let level = &chain.levels[i];
         let (child_state, child_repository) = chain.child_at(i);
 
-        child_state.set_parent_self(level.old_signature);
-        child_state.set_revision_number(0);
+        child_state.reparent_onto(level.old_signature);
         let new_signature = child_state
             .serialize(child_repository, token)
             .await

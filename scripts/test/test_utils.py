@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from lore_parsers import parse_status_json
+from lore_parsers import parse_jsonl, parse_status_json
 
 if TYPE_CHECKING:
     from lore import Lore
@@ -73,3 +73,9 @@ def status_by_path(repo: "Lore", **kwargs) -> dict[str, dict]:
     return {
         e.get("path"): e for e in parse_status_json(repo.status(json=True, **kwargs))
     }
+
+
+def revision_metadata_keys(repo: "Lore") -> set[str]:
+    """The keys of the current revision's metadata."""
+    events = parse_jsonl(repo.revision_metadata_get(json=True), "metadata")
+    return {event["key"] for event in events}

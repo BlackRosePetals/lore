@@ -404,15 +404,7 @@ async fn dirty_relative_paths_in_masked(
         return Ok(state_staged.revision());
     }
 
-    // Staged states should have no revision number
-    state_staged.set_revision_number(0);
-    state_staged.set_parent_self(current_revision);
-
-    // If this is the first modification of the state (cloned from current), reset other parent
-    if state_staged.revision() == current_revision {
-        state_staged.set_parent_other(Hash::default());
-        state_staged.set_metadata_hash(Hash::default());
-    }
+    state_staged.reparent_onto(current_revision);
 
     let token = repository
         .try_write_token()
@@ -1522,12 +1514,7 @@ pub async fn dirty_move(
     }
 
     // Persist
-    state.set_revision_number(0);
-    state.set_parent_self(current_revision);
-    if state.revision() == current_revision {
-        state.set_parent_other(Hash::default());
-        state.set_metadata_hash(Hash::default());
-    }
+    state.reparent_onto(current_revision);
 
     let token = repository
         .try_write_token()
@@ -1590,12 +1577,7 @@ pub async fn dirty_copy(
         .forward::<DirtyError>("Failed to propagate dirty to destination parent")?;
 
     // Persist
-    state.set_revision_number(0);
-    state.set_parent_self(current_revision);
-    if state.revision() == current_revision {
-        state.set_parent_other(Hash::default());
-        state.set_metadata_hash(Hash::default());
-    }
+    state.reparent_onto(current_revision);
 
     let token = repository
         .try_write_token()

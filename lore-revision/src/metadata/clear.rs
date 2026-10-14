@@ -57,12 +57,7 @@ pub(crate) async fn clear_revision(
 
     // Serialize the new current state
     if state.is_dirty() {
-        state.set_revision_number(0);
-        state.set_parent_self(current_revision);
-
-        if staged_revision == current_revision {
-            state.set_parent_other(Hash::default());
-        }
+        state.reparent_onto(current_revision);
 
         let signature = state
             .serialize(repository.clone(), token)
@@ -147,12 +142,7 @@ pub async fn clear_file(
 
     // Serialize the new current state
     if state.is_dirty() {
-        state.set_revision_number(0);
-        state.set_parent_self(current_revision);
-
-        if staged_revision == current_revision {
-            state.set_parent_other(Hash::default());
-        }
+        state.reparent_onto(current_revision);
 
         let signature = state
             .serialize(repository.clone(), token)

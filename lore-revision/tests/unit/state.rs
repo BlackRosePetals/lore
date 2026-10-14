@@ -20,6 +20,7 @@ use lore_storage::hash;
 use zerocopy::FromZeros;
 
 mod diff;
+mod reparent;
 mod stream;
 
 /// Each action the walk settles on records a dirty flag and the staged flag standing

@@ -16,7 +16,7 @@ from error_types import (
     ProtectedError,
     UnknownLoreError,
 )
-from lore_parsers import parse_status_json, parse_status_summary_json
+from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
 from test_utils import to_posix
 
 from lore import Lore
@@ -1290,6 +1290,147 @@ def test_sync_remote_revision_merged_from_divergence_keeps_latest(new_lore_repo)
     after = other.branch_info("main")
     assert after.local_latest == merge_revision
     assert after.remote_latest == merge_revision
+
+
+def _edit_then_dirty(repo: Lore) -> None:
+    with repo.open_file("other.txt", "w") as f:
+        f.write("edited during the merge")
+    repo.dirty("other.txt")
+
+
+def _edit_then_stage(repo: Lore) -> None:
+    with repo.open_file("other.txt", "w") as f:
+        f.write("edited during the merge")
+    repo.stage("other.txt")
+
+
+def _move_then_dirty(repo: Lore) -> None:
+    repo.move("other.txt", "moved.txt")
+    repo.dirty_move("other.txt", "moved.txt")
+
+
+def _move_then_stage(repo: Lore) -> None:
+    repo.move("other.txt", "moved.txt")
+    repo.file_stage_move("other.txt", "moved.txt")
+
+
+def _set_revision_metadata(repo: Lore) -> None:
+    repo.revision_metadata_set(["co-author", "Co Author <co.author@example.com>"])
+
+
+def _add_file_dependency(repo: Lore) -> None:
+    repo.file_dependency_add("other.txt", "conflict.txt")
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("edit", "force"),
+    [
+        pytest.param(None, False, id="resolve-only"),
+        pytest.param(_edit_then_dirty, False, id="dirty"),
+        pytest.param(_edit_then_stage, False, id="stage"),
+        pytest.param(_move_then_dirty, False, id="dirty-move"),
+        pytest.param(_move_then_stage, False, id="stage-move"),
+        pytest.param(_set_revision_metadata, False, id="revision-metadata"),
+        pytest.param(_add_file_dependency, False, id="file-dependency"),
+        pytest.param(None, True, id="forced-commit"),
+    ],
+)
+def test_sync_merge_of_divergent_history_keeps_the_remote_latest_first(
+    new_lore_repo, edit, force
+):
+    """
+    A sync that merges divergent history takes the remote latest as the merge's first
+    parent and the local latest as its second. Whatever is changed on top of the merge
+    before it is committed keeps both, so the merge revision descends from the remote
+    latest and pushes.
+    """
+    repo = new_lore_repo()
+
+    for name in ("conflict.txt", "other.txt"):
+        with repo.open_file(name, "w+") as f:
+            f.write("base")
+    repo.stage(["conflict.txt", "other.txt"])
+    repo.commit("Base")
+    repo.push()
+
+    clone = repo.clone()
+
+    with repo.open_file("conflict.txt", "w") as f:
+        f.write("remote")
+    repo.stage("conflict.txt")
+    repo.commit("Remote change")
+    repo.push()
+    remote_latest = repo.branch_info("main").local_latest
+
+    with clone.open_file("conflict.txt", "w") as f:
+        f.write("local")
+    clone.stage("conflict.txt")
+    clone.commit("Local change", local=True)
+    local_latest = clone.branch_info("main").local_latest
+
+    # The conflict stops the sync before it commits the merge, which leaves the merge
+    # staged for the change below.
+    clone.sync()
+    with clone.open_file("conflict.txt", "w") as f:
+        f.write("resolved")
+    clone.branch_merge_resolve("conflict.txt")
+
+    if edit:
+        edit(clone)
+    clone.commit("Merge", force=force)
+
+    merge_revision = clone.branch_info("main").local_latest
+    merge_parents = clone.revision_info(merge_revision).merge.split()
+    assert merge_parents == [remote_latest, local_latest]
+
+    clone.push()
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "conflict", [False, True], ids=["sync-commit", "resolved-conflict"]
+)
+def test_sync_merge_of_divergent_history_leaves_the_branch_ahead_of_the_remote(
+    new_lore_repo, conflict
+):
+    """
+    A committed merge of divergent history holds the remote latest, so until it is pushed the
+    branch is ahead of the remote and not behind it.
+    """
+    repo = new_lore_repo()
+
+    for name in ("conflict.txt", "other.txt"):
+        with repo.open_file(name, "w+") as f:
+            f.write("base")
+    repo.stage(["conflict.txt", "other.txt"])
+    repo.commit("Base")
+    repo.push()
+
+    clone = repo.clone()
+
+    with repo.open_file("conflict.txt", "w") as f:
+        f.write("remote")
+    repo.stage("conflict.txt")
+    repo.commit("Remote change")
+    repo.push()
+
+    local_file = "conflict.txt" if conflict else "local.txt"
+    with clone.open_file(local_file, "w") as f:
+        f.write("local")
+    clone.stage(local_file)
+    clone.commit("Local change", local=True)
+
+    clone.sync()
+    if conflict:
+        with clone.open_file("conflict.txt", "w") as f:
+            f.write("resolved")
+        clone.branch_merge_resolve("conflict.txt")
+        clone.commit("Merge")
+
+    [status] = parse_jsonl(clone.status(json=True), "repositoryStatusRevision")
+    assert status["isLocalAhead"] == 1
+    assert status["isRemoteAhead"] == 0
 
 
 @pytest.mark.smoke

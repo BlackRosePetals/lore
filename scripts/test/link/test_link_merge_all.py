@@ -9,6 +9,7 @@ from link_helpers import (
     make_repo,
     setup_link_merge_conflict,
 )
+from test_utils import revision_metadata_keys
 
 
 @pytest.mark.smoke
@@ -222,7 +223,8 @@ def test_link_merge_abort_all(new_lore_repo):
 
 @pytest.mark.smoke
 def test_link_merge_abort_ignore_links(new_lore_repo):
-    """Abort --ignore-links strips merge metadata but preserves link pin updates."""
+    """Abort --ignore-links strips merge metadata but preserves link pin updates, staged on top
+    of the current revision without its metadata."""
     link_path = "linked/repo"
     urc, _link_repo = make_parent_with_link(
         new_lore_repo,
@@ -254,8 +256,10 @@ def test_link_merge_abort_ignore_links(new_lore_repo):
     with urc.open_file(f"{link_path}/main-link-file.txt", "w+") as f:
         f.writelines(["main branch link addition\n"])
     urc.stage(scan=True)
+    urc.revision_metadata_set(["reviewed-by", "first.reviewer@example.com"])
     urc.commit("Main branch changes")
     urc.push()
+    main_latest = urc.revision_info()
 
     # Start merge — should have conflicts in main but link merges cleanly
     urc.branch_merge_start(
@@ -277,6 +281,10 @@ def test_link_merge_abort_ignore_links(new_lore_repo):
 
     # Verify: the staged state is committable (no merge flags)
     urc.commit("Commit link-only changes after selective abort")
+    committed = urc.revision_info()
+    assert committed.parent == main_latest.signature
+    assert committed.merge == ""
+    assert "reviewed-by" not in revision_metadata_keys(urc)
     urc.push()
 
     status = urc.status()

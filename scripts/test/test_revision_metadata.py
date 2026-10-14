@@ -8,6 +8,7 @@ from error_types import ImproperArgumentsError
 from lore_parsers import parse_jsonl
 
 from lore import Lore
+from test_utils import revision_metadata_keys
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,48 @@ def test_revision_metadata_set_and_get(new_lore_repo):
     assert "tester@example.com" in reviewed_by, (
         f"Expected 'tester@example.com' in reviewed-by metadata.\nGot: {reviewed_by}"
     )
+
+
+def _add_file_dependency(repo: Lore) -> None:
+    repo.file_dependency_add("source.txt", "dependency.txt")
+
+
+def _clear_file_metadata(repo: Lore) -> None:
+    repo.file_metadata_clear("source.txt")
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "edit",
+    [
+        pytest.param(_add_file_dependency, id="file-dependency"),
+        pytest.param(_clear_file_metadata, id="file-metadata-clear"),
+    ],
+)
+def test_revision_metadata_is_not_carried_onto_the_next_revision(new_lore_repo, edit):
+    """
+    Revision metadata belongs to the revision it was set on. A change that starts the
+    next revision from a clean tree starts it without that metadata, and so does what is
+    staged on top of it.
+    """
+    repo: Lore = new_lore_repo()
+
+    for name in ("source.txt", "dependency.txt"):
+        with repo.open_file(name, "w") as f:
+            f.write("content\n")
+    repo.stage(["source.txt", "dependency.txt"])
+    repo.file_metadata_set("source.txt", ["owner", "owner@example.com"])
+    repo.revision_metadata_set(["reviewed-by", "first.reviewer@example.com"])
+    repo.commit("First")
+    assert "reviewed-by" in revision_metadata_keys(repo)
+
+    edit(repo)
+    with repo.open_file("dependency.txt", "w") as f:
+        f.write("changed\n")
+    repo.stage("dependency.txt")
+    repo.commit("Second")
+
+    assert "reviewed-by" not in revision_metadata_keys(repo)
 
 
 @pytest.mark.smoke

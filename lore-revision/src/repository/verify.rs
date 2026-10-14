@@ -354,14 +354,7 @@ pub(crate) async fn verify(
         // Healed, serialize new staged state
         lore_info!("Serializing healed state as new staged state");
 
-        state.set_parent_self(state_current.revision());
-        state.set_revision_number(0);
-
-        if !is_staged {
-            // Force commit same revision, reset metadata
-            state.set_parent_other(Hash::default());
-            state.set_metadata_hash(Hash::default());
-        }
+        state.reparent_onto(state_current.revision());
 
         let signature = state
             .serialize(repository.clone(), token)

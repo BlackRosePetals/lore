@@ -146,15 +146,7 @@ pub(crate) async fn remove(
     // Fold nested link revisions up into the top-level state (no-op if flat).
     crate::link::propagate_link_chain(&chain, token).await?;
 
-    state_staged.set_parent_self(state_current.revision());
-    state_staged.set_revision_number(0);
-
-    // If staged state is the initial stage based on current state, reset other parent. Otherwise
-    // leave it as is, in case previous staged state was a merge/integrate
-    if state_staged.revision() == state_current.revision() {
-        state_staged.set_parent_other(Hash::default());
-        state_staged.set_metadata_hash(Hash::default());
-    }
+    state_staged.reparent_onto(state_current.revision());
 
     // Serialize the staged state
     let signature = state_staged

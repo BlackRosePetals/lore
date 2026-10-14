@@ -237,6 +237,33 @@ def test_nested_link_stage_unstage_reset(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_nested_link_change_staged_again_commits_on_the_pinned_revision(new_lore_repo):
+    """A change staged, unstaged and staged again two link levels deep commits as one revision on
+    top of the revision the nested link is pinned at, not on the staged states between."""
+    repo_a, _repo_b, repo_c, _b_mount, nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "vendor/c"
+    )
+    pinned = repo_c.revision_info()
+
+    inner_file = f"{nested_mount}/c-data/inner.txt"
+    new_inner_file = f"{nested_mount}/c-data/added.txt"
+    with repo_a.open_file(inner_file, "w+") as f:
+        f.writelines(["modified content two levels deep\n"])
+    with repo_a.open_file(new_inner_file, "w+") as f:
+        f.writelines(["a brand new file inside C\n"])
+    repo_a.stage(scan=True)
+    repo_a.unstage(new_inner_file)
+    repo_a.stage(scan=True)
+    repo_a.commit("Modify inner file two levels deep", non_interactive=True)
+    repo_a.push()
+
+    repo_c.sync()
+    committed = repo_c.revision_info()
+    assert committed.parent == pinned.signature
+    assert int(committed.revision) == int(pinned.revision) + 1
+
+
+@pytest.mark.smoke
 def test_nested_link_update(new_lore_repo):
     """`link update` re-pins a NESTED link (the B -> C link) to a new revision.
 
