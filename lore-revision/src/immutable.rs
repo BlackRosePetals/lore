@@ -132,11 +132,16 @@ pub fn write_options_from_repository(repository: Arc<RepositoryContext>) -> Writ
 pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptions {
     let sync_data = crate::runtime::try_execution_context()
         .is_some_and(|context| context.globals().sync_data());
-    ReadOptions {
+    let options = ReadOptions {
         cache: !repository.disable_cache(),
         direct_write: repository.direct_file_write(),
         sync_data,
         ..Default::default()
+    };
+    if repository.trust_local() {
+        options.trusting_local()
+    } else {
+        options
     }
 }
 

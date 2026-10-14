@@ -983,6 +983,47 @@ async fn an_unverified_read_skips_the_hash_check() {
     assert_eq!(buffer.as_slice(), payload.as_ref());
 }
 
+/// A load trusting local bytes serves them unhashed, without the check a load that is not verified
+/// makes of them under debug assertions: a local payload that does not hash to its address is
+/// served as stored.
+#[tokio::test]
+async fn a_load_trusting_local_bytes_serves_them_unchecked() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([0x56; 16]);
+    let payload = Bytes::from_static(b"local bytes that do not hash to their address");
+    let address = Address {
+        hash: hash::hash_slice(b"different content"),
+        context: Context::from([0x56; 16]),
+    };
+    store
+        .clone()
+        .put(
+            partition,
+            address,
+            Fragment {
+                flags: FragmentFlags::PayloadStoredLocal.bits(),
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            },
+            Some(payload.clone()),
+            false,
+        )
+        .await
+        .expect("put content under a mismatched address");
+
+    let (_, loaded) = load_fragment(
+        store,
+        partition,
+        address,
+        ReadOptions::default().no_remote().trusting_local(),
+        None,
+    )
+    .await
+    .expect("a load trusting local bytes serves them");
+
+    assert_eq!(loaded, payload);
+}
+
 /// A compressed payload expands into the caller's buffer whether or not the content is hashed
 /// afterwards.
 #[tokio::test]

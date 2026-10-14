@@ -39,8 +39,9 @@ use crate::types::Partition;
 /// Load a single raw fragment from store with retry backoff. How widely the store searches for it
 /// is the store's own business - see [`ImmutableStore::read_scope`].
 ///
-/// `verified_by_caller` states that the payload is hashed once this returns, which reports
-/// corruption as an error to heal from and leaves the debug check here nothing to add.
+/// Under debug assertions the payload is hashed against its address, unless `verified_by_caller`:
+/// the caller hashes it once this returns, which reports corruption as an error to heal from, or
+/// trusts local bytes ([`ReadOptions::trust_local`]).
 pub async fn read_raw(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
@@ -251,7 +252,14 @@ async fn probe_local(
         return Err(LocalFailure::Other);
     }
 
-    match read_raw(store, partition, address, options.verify).await {
+    match read_raw(
+        store,
+        partition,
+        address,
+        options.verify || options.trust_local,
+    )
+    .await
+    {
         Ok((fragment, buffer)) => {
             let durable_oodle = (fragment.flags & FragmentFlags::PayloadCompressedOodle2) != 0
                 && (fragment.flags & FragmentFlags::PayloadStoredDurable) != 0;
@@ -743,9 +751,14 @@ pub async fn read_into(
         let probes = options.local && !address.hash.is_zero();
         let landed = landed_before_probe(address, options);
         let stored = if probes {
-            read_raw(store.clone(), partition, address, options.verify)
-                .await
-                .ok()
+            read_raw(
+                store.clone(),
+                partition,
+                address,
+                options.verify || options.trust_local,
+            )
+            .await
+            .ok()
         } else {
             None
         };

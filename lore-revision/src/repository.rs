@@ -392,6 +392,9 @@ pub struct RepositoryRuntimeSettings {
     pub disable_cache: AtomicBool,
     /// Write directly to target file instead of write to temporary file + move
     pub direct_file_write: AtomicBool,
+    /// Serve local fragments unhashed in read options from the repository; remote payloads are
+    /// checked regardless
+    pub trust_local: AtomicBool,
 }
 
 impl Default for RepositoryRuntimeSettings {
@@ -400,6 +403,7 @@ impl Default for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(true),
             disable_cache: AtomicBool::new(true),
             direct_file_write: AtomicBool::new(false),
+            trust_local: AtomicBool::new(false),
         }
     }
 }
@@ -410,6 +414,7 @@ impl Clone for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(self.disable_upload.load(Ordering::Relaxed)),
             disable_cache: AtomicBool::new(self.disable_cache.load(Ordering::Relaxed)),
             direct_file_write: AtomicBool::new(self.direct_file_write.load(Ordering::Relaxed)),
+            trust_local: AtomicBool::new(self.trust_local.load(Ordering::Relaxed)),
         }
     }
 
@@ -424,6 +429,10 @@ impl Clone for RepositoryRuntimeSettings {
         );
         self.direct_file_write.store(
             source.direct_file_write.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.trust_local.store(
+            source.trust_local.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
     }
@@ -1118,6 +1127,22 @@ impl RepositoryContext {
         self.settings
             .disable_cache
             .store(disable, Ordering::Relaxed);
+    }
+
+    /// Whether [`read_options_from_repository`] answers options that serve local fragments
+    /// unhashed ([`ReadOptions::trust_local`]).
+    ///
+    /// [`read_options_from_repository`]: crate::immutable::read_options_from_repository
+    /// [`ReadOptions::trust_local`]: lore_storage::ReadOptions::trust_local
+    pub fn trust_local(&self) -> bool {
+        self.settings.trust_local.load(Ordering::Relaxed)
+    }
+
+    /// Sets [`Self::trust_local`]. Sound only for a store whose every fragment was checked on its
+    /// way in: a trusting read serves what the store holds. [`crate::immutable::cache`] stores a
+    /// payload unchecked where no read joins its fetch, so a store it fills is not one.
+    pub fn set_trust_local(&self, trust: bool) {
+        self.settings.trust_local.store(trust, Ordering::Relaxed);
     }
 
     pub fn disable_upload(&self) -> bool {

@@ -213,3 +213,32 @@ async fn a_read_handed_the_last_context_reference_reaches_the_pool() {
             .expect_err("the pooled session never resolves");
     assert!(!err.is_address_not_found(), "reported {err:?}");
 }
+
+/// A context trusting local bytes reads with options that serve them unchecked; any other verifies
+/// them.
+#[tokio::test]
+async fn reads_trust_local_bytes_where_the_context_does() {
+    let context = context_with_state(RemoteState::Offline).await;
+    let verifying = read_options_from_repository(&context);
+    assert!(verifying.verify && !verifying.trust_local);
+
+    context.set_trust_local(true);
+    let trusting = read_options_from_repository(&context);
+    assert!(!trusting.verify && trusting.trust_local);
+}
+
+/// Trusting local bytes comes along with the context's other runtime settings, cloned or copied.
+#[test]
+fn trusting_local_bytes_is_copied_with_the_runtime_settings() {
+    use std::sync::atomic::Ordering;
+
+    use lore_revision::repository::RepositoryRuntimeSettings;
+
+    let trusting = RepositoryRuntimeSettings::default();
+    trusting.trust_local.store(true, Ordering::Relaxed);
+    assert!(trusting.clone().trust_local.load(Ordering::Relaxed));
+
+    let mut copied = RepositoryRuntimeSettings::default();
+    copied.clone_from(&trusting);
+    assert!(copied.trust_local.load(Ordering::Relaxed));
+}
