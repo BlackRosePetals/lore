@@ -3,6 +3,7 @@
 use lore_revision::util::path::RelativePath;
 
 mod diff;
+mod last_merged;
 mod sync;
 mod sync_hold;
 

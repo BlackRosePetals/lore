@@ -56,6 +56,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- A merge reports the conflict on a file both branches changed where one of them added the file at a node a deleted
+  file had used. The history the node still held for the deleted file could name a merge of that file from the other
+  branch, and the merge then took the other branch's change as already merged and dropped it without a conflict
 - `lore sync --reset` to a revision where a path is a file, from a working tree where that path is a directory, replaces the directory with the file instead of failing with "Is a directory".
 - The check that prevents the CLI from sending the tokens to 3rd party domains now reads the allowed host list from the following token claims: `root_domains`, `https://lore.org/claims/root_domains`, `aud`. These claims tell which Lore servers are trusted as token receivers. The token's `iss` is no longer added as a trusted domain. Token exchange is implicitly allowed against the same auth server where the token originated from, so the `iss` addition is not needed, and unnecessarily widens the token's allowed domains for non-token-exchange use.
 - `lore repository create` syncs the created repository to disk only under `--sync-data`, as every other command does.

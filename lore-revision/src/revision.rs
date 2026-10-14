@@ -1063,13 +1063,20 @@ async fn find_last_modified_revision(
     Ok((last_modified_revision, last_modified_revision_number))
 }
 
+/// Finds the last revision of `source_branch` that the target branch merged the file of `change`
+/// from, walking the file's history back from the target side of `change` to the branch point.
+///
+/// Each step reads the earlier revision's history at the node ID the history records for the file
+/// there, as a revision need not number the file as its first parent does. The walk ends at a
+/// revision that [adds the file without a merge](added_without_merge), the start revision included.
+#[lore_macro::test_pub]
 async fn find_last_merged_revision(
     change: &NodeChange,
     source_branch: BranchId,
     target_branch: BranchId,
     state_branch_point: Arc<State>,
 ) -> Result<Option<(Hash, u64)>, StateError> {
-    let (state_start, node_current) = if change.to.mapping.node.is_valid_node_id() {
+    let (state_start, mut node_current) = if change.to.mapping.node.is_valid_node_id() {
         (change.to.mapping.state.clone(), change.to.mapping.node)
     } else {
         // TODO(mjansson): Figure out a better way to store this metadata around file deletions
@@ -1127,6 +1134,14 @@ async fn find_last_merged_revision(
     // see if we arrive on source branch along any merge, and if that target revision
     // is later than the last modified revision we identified from the source branch file history
     let repository = change.to.mapping.repository.clone();
+    if node_current.is_valid_node_id()
+        && let Some(delta) = state_start
+            .node_delta(repository.clone(), node_current)
+            .await?
+        && added_without_merge(delta.action, delta.flags)
+    {
+        return Ok(None);
+    }
     let mut state_current = state_start.clone();
     while state_current.revision_number() > state_branch_point.revision_number()
         && node_current.is_valid_node_id()
@@ -1144,8 +1159,8 @@ async fn find_last_merged_revision(
                     "{} branch {} revision {} node {} history is a merge, {:?} check if other parent {} is from branch {}",
                     change.path().as_str(),
                     target_branch,
-                    node_current,
                     state_current.revision(),
+                    node_current,
                     node,
                     node.revision[1],
                     source_branch
@@ -1196,6 +1211,10 @@ async fn find_last_merged_revision(
                 );
             }
 
+            if added_without_merge(node.action[0], node.flags[0]) {
+                break;
+            }
+
             if let Ok(state_previous) =
                 state::State::deserialize(repository.clone(), node.revision[0]).await
             {
@@ -1215,6 +1234,7 @@ async fn find_last_merged_revision(
                         state_previous.revision()
                     );
                     state_current = state_previous;
+                    node_current = node.node[0];
                 }
             } else {
                 lore_warn!("Failed to deserialize state when walking source branch file history");
@@ -1229,6 +1249,13 @@ async fn find_last_merged_revision(
     }
 
     Ok(None)
+}
+
+/// Whether `action` and `flags` record a file added in its revision without a merge, which leaves
+/// no history of the file before that revision: a node reused for the file still holds the history
+/// of the file that had it before.
+fn added_without_merge(action: u16, flags: u16) -> bool {
+    action == FileAction::Add as u16 && flags & change::Flags::Merge.bits() == 0
 }
 
 pub struct TreeResult {
