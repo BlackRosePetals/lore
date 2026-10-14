@@ -849,6 +849,7 @@ impl RepositoryContext {
     /// propagate the field). Used by `load_and_connect` on the disk-backed
     /// path; other construction paths leave `repo_lock` as `None`.
     #[must_use]
+    #[lore_macro::test_pub]
     pub(crate) fn with_repository_lock(mut self, lock: Arc<RepositoryLock>) -> Self {
         self.repo_lock = Some(lock);
         self
@@ -1042,6 +1043,19 @@ impl RepositoryContext {
         mutable_store: Arc<dyn MutableStore>,
     ) -> Self {
         Self::new_server_context(immutable_store, mutable_store, RepositoryId::default())
+    }
+
+    /// This context without the write token and repository lock, for a holder that outlives
+    /// the command it came from: a token held past the command blocks every later write to the
+    /// instance. Its filesystem provider is an invalid one, so the holder never keeps the
+    /// provider alive.
+    pub fn without_command_locks(&self) -> Self {
+        RepositoryContext {
+            write_token: None,
+            repo_lock: None,
+            file_system: crate::fs::invalid_filesystem_provider::InvalidFilesystemProvider::new(),
+            ..self.inherited()
+        }
     }
 
     /// Rebuild this context with a different filter view and remote connection,
@@ -1488,6 +1502,7 @@ pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig
 /// managed via an `Arc` + weak-ref cache so overlapping commands share one
 /// acquisition; the underlying flock drops when the last strong reference is
 /// released.
+#[lore_macro::test_pub]
 pub(crate) struct RepositoryLock {
     _lock: FSLock,
 }
@@ -1511,6 +1526,7 @@ static REPOSITORY_LOCK_INIT_MUTEXES: OnceLock<
 /// reference drops. Concurrent first-time initializers are serialized via a
 /// per-path `tokio::sync::Mutex` so only one thread calls into the OS flock
 /// for a given path at a time; others wait, then observe the cached entry.
+#[lore_macro::test_pub]
 pub(crate) async fn get_or_create_repository_lock(
     dot_path: PathBuf,
 ) -> Result<Arc<RepositoryLock>, RepositoryError> {
