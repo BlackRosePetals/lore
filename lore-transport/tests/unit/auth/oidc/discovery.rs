@@ -13,10 +13,7 @@ use tokio::sync::watch;
 
 const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
 
-#[path = "../../../support/oidc_provider.rs"]
-mod provider;
-
-use provider::*;
+use super::provider::*;
 
 #[tokio::test]
 async fn reads_the_endpoints_from_the_document() {

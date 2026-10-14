@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+mod device;
 mod discovery;
+
+#[path = "../../support/oidc_provider.rs"]
+mod provider;
 
 use lore_transport::auth::oidc::*;
 

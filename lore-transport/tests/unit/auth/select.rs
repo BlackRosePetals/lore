@@ -207,8 +207,8 @@ async fn the_oidc_endpoint_names_the_issuer_under_the_oidc_scheme() {
     assert!(!Arc::ptr_eq(&selected.endpoint.auth, &by_issuer));
     assert!(authentication::find(&selected.endpoint.url).is_err());
 
-    // The OIDC grants are not implemented yet, and say so without touching
-    // the network.
+    // The OIDC exchange grants are not implemented yet, and say so without
+    // touching the network.
     let refused = selected
         .endpoint
         .auth

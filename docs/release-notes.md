@@ -14,6 +14,13 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `lore auth login` against a server that advertises an OIDC issuer logs in through the OAuth 2.0 device authorization
+  grant (RFC 8628). The login asks the provider for the server's default scopes and `offline_access`, opens the
+  verification URL in the browser, or prints it with `--no-browser`, shows the code the provider's page may ask the user
+  to confirm, polls the token endpoint at the cadence the provider sets, and stores the access token and the refresh
+  token it issues. An ID token the provider returns names the user for display and is neither stored nor sent. The
+  OIDC path serves login alone for now: the refresh, token exchange and client credentials grants are not implemented
+  yet
 - `lore-io`: `IoFile::from_std` wraps a `std::fs::File` the caller already holds, so an `IoDriver` runs positional
   reads, writes and syncs on that handle without reopening it by path. On Windows the file must be opened with
   `FILE_FLAG_OVERLAPPED`, and the `iocp` backend binds it to the driver's completion port. The call is `unsafe`: on

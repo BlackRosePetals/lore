@@ -126,6 +126,9 @@ pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8
                     data.url.as_str(),
                     anstyle::Reset
                 );
+                if !data.user_code.as_str().is_empty() {
+                    println!("Code: {}", data.user_code.as_str());
+                }
             }
             LoreEvent::Complete(data) if data.status == 0 => {
                 println!(

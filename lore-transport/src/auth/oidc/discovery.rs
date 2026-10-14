@@ -19,6 +19,7 @@ use super::MAX_RESPONSE_BYTES;
 use super::body_excerpt;
 use super::http_client;
 use super::is_permitted_url;
+use super::read_capped_body;
 
 /// The fields this client reads from a discovery document
 /// (`OpenID` Connect Discovery §3, RFC 8414, RFC 8628 §4).
@@ -320,27 +321,4 @@ async fn fetch(
     }
 
     Ok(document)
-}
-
-/// Reads a response body, or `None` once it passes [`MAX_RESPONSE_BYTES`].
-///
-/// `Content-Length` is a claim, not a fact: it can be absent, understated, or the response
-/// chunked. It refuses a body early, and the accumulating read enforces the cap.
-async fn read_capped_body(
-    response: &mut reqwest::Response,
-) -> Result<Option<Vec<u8>>, reqwest::Error> {
-    if response
-        .content_length()
-        .is_some_and(|declared| declared > MAX_RESPONSE_BYTES as u64)
-    {
-        return Ok(None);
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
-            return Ok(None);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(Some(body))
 }

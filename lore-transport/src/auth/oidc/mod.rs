@@ -2,14 +2,22 @@
 // SPDX-License-Identifier: MIT
 //! Authentication against an `OpenID` Connect provider.
 
+pub mod device;
 pub mod discovery;
+pub mod token;
 
+use std::future::Future;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lore_base::error::Disconnected;
 use lore_base::error::NotSupported;
+use lore_base::lore_spawn_net;
+use lore_base::lore_warn;
 use lore_base::types::RepositoryId;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::error::ProtocolError;
 use crate::traits::Authentication;
@@ -94,6 +102,93 @@ fn is_permitted_url(url: &url::Url, allow_loopback_http: bool) -> bool {
     }
 }
 
+/// Reads a response body, or `None` once it passes [`MAX_RESPONSE_BYTES`].
+///
+/// `Content-Length` is a claim, not a fact: it can be absent, understated, or the response
+/// chunked. It refuses a body early, and the accumulating read enforces the cap.
+async fn read_capped_body(
+    response: &mut reqwest::Response,
+) -> Result<Option<Vec<u8>>, reqwest::Error> {
+    if response
+        .content_length()
+        .is_some_and(|declared| declared > MAX_RESPONSE_BYTES as u64)
+    {
+        return Ok(None);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
+}
+
+/// Runs `request` on the net runtime, where network I/O runs, rather than on the caller's
+/// runtime, which may be short-lived. Dropping the returned future aborts the request, so a
+/// cancelled caller leaves none running.
+async fn on_net_runtime<T: Send + 'static>(
+    request: impl Future<Output = Result<T, ProtocolError>> + Send + 'static,
+) -> Result<T, ProtocolError> {
+    AbortOnDropHandle::new(lore_spawn_net!(request))
+        .await
+        .map_err(|source| {
+            ProtocolError::internal_with_context(source, "requesting from the identity provider")
+        })?
+}
+
+/// A response from an identity provider endpoint, read whole.
+struct FormResponse {
+    status: http::StatusCode,
+    body: Vec<u8>,
+}
+
+impl FormResponse {
+    fn body_text(&self) -> String {
+        body_excerpt(&String::from_utf8_lossy(&self.body))
+    }
+}
+
+/// POSTs `form` to `url` as `application/x-www-form-urlencoded` (RFC 6749 §4.1.3) and
+/// reads the answer. A request that never reaches the provider is [`Disconnected`]; a body
+/// over [`MAX_RESPONSE_BYTES`] is refused.
+async fn post_form(
+    what: &'static str,
+    url: &str,
+    form: &[(&str, &str)],
+) -> Result<FormResponse, ProtocolError> {
+    let request = match http_client() {
+        Ok(client) => client.post(url).form(form).send().await,
+        Err(source) => Err(source),
+    };
+    let mut response = match request {
+        Ok(response) => response,
+        Err(source) => {
+            lore_warn!("OIDC {what} request failed: {source}");
+            return Err(if source.is_connect() || source.is_timeout() {
+                ProtocolError::from(Disconnected)
+            } else {
+                ProtocolError::internal_with_context(source, what)
+            });
+        }
+    };
+    let status = response.status();
+    match read_capped_body(&mut response).await {
+        Ok(Some(body)) => Ok(FormResponse { status, body }),
+        Ok(None) => {
+            lore_warn!("OIDC {what} response exceeds {MAX_RESPONSE_BYTES} bytes");
+            Err(ProtocolError::internal(format!(
+                "OIDC {what} response exceeds {MAX_RESPONSE_BYTES} bytes"
+            )))
+        }
+        Err(source) => {
+            lore_warn!("OIDC {what} response could not be read: {source}");
+            Err(ProtocolError::from(Disconnected))
+        }
+    }
+}
+
 /// The scheme tag an OIDC endpoint carries in front of its issuer URL, as `git+ssh` names a
 /// route to a repository. The client adds it when it selects the OIDC path, so the endpoint,
 /// and the token store entry under it, cannot be confused with a gRPC auth service the
@@ -112,9 +207,9 @@ pub fn issuer(endpoint: &str) -> &str {
 /// server names. Bound to that advertisement at selection, since the endpoint string alone
 /// names the issuer and not the client.
 ///
-/// The grants are not implemented yet, so every method fails with [`NotSupported`].
+/// The interactive login is the device authorization grant (RFC 8628). The other grants
+/// are not implemented yet, and fail with [`NotSupported`].
 pub struct OidcAuthentication {
-    #[allow(dead_code)] // Read once the grants are implemented.
     oidc: Oidc,
 }
 
@@ -132,6 +227,36 @@ impl OidcAuthentication {
         }
         .into()
     }
+
+    /// The provider's endpoints, from its discovery document. The issuer is the one the
+    /// implementation was selected for; `auth_url` is the endpoint naming it.
+    async fn discover(
+        &self,
+        auth_url: &str,
+    ) -> Result<Arc<discovery::DiscoveryDocument>, ProtocolError> {
+        let issuer = issuer(auth_url);
+        if issuer != self.oidc.issuer {
+            return Err(ProtocolError::internal(format!(
+                "auth URL names OIDC issuer {issuer}, but the selected provider is {}",
+                self.oidc.issuer
+            )));
+        }
+        discovery::discover(issuer)
+            .await
+            .map_err(ProtocolError::from)
+    }
+}
+
+impl From<discovery::DiscoveryError> for ProtocolError {
+    fn from(error: discovery::DiscoveryError) -> Self {
+        if let discovery::DiscoveryError::Request { source, .. } = &error
+            && (source.is_connect() || source.is_timeout())
+        {
+            lore_warn!("{error}");
+            return ProtocolError::from(Disconnected);
+        }
+        ProtocolError::internal_with_context(error, "discovering the provider's endpoints")
+    }
 }
 
 #[async_trait]
@@ -142,17 +267,19 @@ impl Authentication for OidcAuthentication {
         _client_state: &str,
         _correlation_id: &str,
     ) -> Result<AuthSession, ProtocolError> {
-        Err(Self::not_implemented("login", auth_url))
+        let document = self.discover(auth_url).await?;
+        device::authorize(&self.oidc, &document).await
     }
 
     async fn poll_auth_session(
         &self,
         auth_url: &str,
         _client_state: &str,
-        _session_code: &str,
+        session_code: &str,
         _correlation_id: &str,
     ) -> Result<AuthSessionPoll, ProtocolError> {
-        Err(Self::not_implemented("login", auth_url))
+        let document = self.discover(auth_url).await?;
+        device::poll(&self.oidc, &document, session_code).await
     }
 
     async fn exchange_external_token(

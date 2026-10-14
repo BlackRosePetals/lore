@@ -260,7 +260,9 @@ pub fn with_token_boxed<'a>(
 ///
 /// Connects to the remote URL's auth endpoint, starts an auth session, and
 /// either opens the login URL in a browser or emits it as an
-/// [`LoreEvent::AuthUrl`] event when `no_browser` is set. Polls the auth
+/// [`LoreEvent::AuthUrl`] event when `no_browser` is set. The event is also
+/// emitted, browser or not, when the session has a code for the user to
+/// enter or confirm. Polls the auth
 /// service at the cadence the session sets until the user approves the
 /// login, reporting each wait as a [`LoreEvent::AuthPending`] event, and
 /// fails when the session ends without one.
@@ -320,17 +322,20 @@ pub async fn interactive(
         .await
         .forward::<InteractiveLoginError>("starting auth session")?;
 
-    lore_debug!(
-        "Got: '{} / {}' from service",
-        session.login_url,
-        session.session_code
-    );
+    // Neither the session code, which redeems the approval, nor the login
+    // URL, which may embed the user code, goes to the log.
+    lore_debug!("Login session opened, valid for {:?}", session.expires_in);
 
     if !no_browser {
         open::that(session.login_url.as_str()).internal("opening authentication URL")?;
-    } else {
+    }
+    // The URL goes to the caller when no browser opens it, and the code
+    // whenever there is one: the page may ask the user to confirm it (RFC
+    // 8628 §3.3.1), and only the caller can show it.
+    if no_browser || !session.user_code.is_empty() {
         event::LoreEvent::AuthUrl(LoreAuthUrlEventData {
             url: (&session.login_url).into(),
+            user_code: (&session.user_code).into(),
         })
         .send();
     }
@@ -368,7 +373,7 @@ pub async fn interactive(
         lore_debug!("Failed to store refresh token for {}: {e}", authn.user_id);
     }
 
-    let Some(user_info) = lore_credential::user_info(
+    let Some(mut user_info) = lore_credential::user_info(
         auth_url.as_str(),
         authn.user_id.as_str(),
         vulnerable_all_tokens(),
@@ -379,6 +384,11 @@ pub async fn interactive(
     else {
         return Err(InteractiveLoginError::internal("Unable to load user info"));
     };
+    // The token may carry no display name; the backend may have named the
+    // user another way, such as an OIDC ID token.
+    if user_info.name.is_empty() {
+        user_info.name = authn.user_name;
+    }
 
     Ok(user_info)
 }

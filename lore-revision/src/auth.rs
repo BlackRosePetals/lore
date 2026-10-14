@@ -30,6 +30,9 @@ pub use lore_transport::auth::UnknownAuthMode;
 pub struct LoreAuthUrlEventData {
     /// Authentication URL
     pub url: LoreString,
+    /// Code the user enters or confirms at `url`. Empty when the login
+    /// doesn't ask for one.
+    pub user_code: LoreString,
 }
 
 /// Event data for one wait in an interactive login: the user has not
