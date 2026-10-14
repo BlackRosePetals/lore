@@ -119,3 +119,23 @@ async fn a_copy_beside_a_nested_file_is_found_and_removed() {
         "the copy beside a nested file was left behind"
     );
 }
+
+/// A filesystem error a sync meets keeps its kind: local modifications and a missing file reach
+/// the caller as themselves, not as an internal error.
+#[test]
+fn a_filesystem_error_keeps_its_kind_through_a_sync() {
+    use lore_base::error::FileNotFound;
+    use lore_base::error::LocalModifications;
+    use lore_revision::fs::filesystem_provider::FsError;
+
+    let modified = SyncError::from(FsError::from(LocalModifications));
+    assert!(
+        matches!(modified, SyncError::LocalModifications(_)),
+        "{modified:?}"
+    );
+
+    let missing = SyncError::from(FsError::from(FileNotFound {
+        resource: "gone.txt".to_string(),
+    }));
+    assert!(matches!(missing, SyncError::FileNotFound(_)), "{missing:?}");
+}
