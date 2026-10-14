@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::future::Future;
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -23,7 +24,9 @@ use lore_telemetry::http_tower_layer::HttpMetricsLayer;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
 use ring::hmac;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
+use tracing::warn;
 
 use super::health_check;
 use super::presigned;
@@ -99,6 +102,7 @@ pub struct PresignSettings {
 
 #[derive(Default)]
 pub struct LoreHttpServerSettings {
+    pub health_only: bool,
     pub host: String,
     pub port: i32,
     pub max_file_size: u64,
@@ -190,6 +194,10 @@ pub fn create_router(
         router = router.nest("/v1/presigned", presigned_router);
     }
 
+    apply_http_middleware(router, settings)
+}
+
+fn apply_http_middleware(router: Router, settings: &LoreHttpServerSettings) -> Router {
     router
         .layer(middleware::from_fn(lore_http_tracing))
         .layer(CorrelationIdLayerBuilder::new().with_http_tracer().build())
@@ -247,6 +255,108 @@ fn build_presign_config(settings: &PresignSettings) -> Result<Option<PresignConf
         )
         .map_err(|err| anyhow!("{} {err}", presign_content_type_field(err.field())))?,
     }))
+}
+
+#[lore_macro::test_pub]
+fn create_health_only_router(health: ServerHealth, settings: &LoreHttpServerSettings) -> Router {
+    let health = Arc::new(health);
+    crate::store::spawn_immutable_store_availability_monitor(health.clone());
+    let router = Router::new().route(
+        "/health_check",
+        routing::get(health_check::handler).with_state(health),
+    );
+    apply_http_middleware(router, settings)
+}
+
+#[lore_macro::test_pub]
+fn build_router(
+    settings: &LoreHttpServerSettings,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+) -> Result<Router> {
+    let health = ServerHealth {
+        immutable_store: Arc::downgrade(&immutable_store),
+        available: AtomicBool::new(true),
+        interval_timeout: if settings.available_interval_seconds > 0
+            && settings.available_timeout_seconds > 0
+        {
+            Some((
+                Duration::from_secs(settings.available_interval_seconds),
+                Duration::from_secs(settings.available_timeout_seconds),
+            ))
+        } else {
+            None
+        },
+        store_health_check: settings.store_health_check,
+    };
+
+    if settings.health_only {
+        return Ok(create_health_only_router(health, settings));
+    }
+
+    let presign_config = build_presign_config(&settings.presign)?;
+    if let Some(cfg) = presign_config.as_ref() {
+        // Log the resolved set so operators can confirm what their config produced.
+        info!(
+            "Presigned URL feature enabled (key_id: {}, allowed content types: {})",
+            cfg.key_id,
+            describe_allowed_types(&cfg.content_type_allowlist.allowed_types())
+        );
+    } else {
+        info!("Presigned URL feature disabled (presigned_url_hmac_key not configured)");
+    }
+
+    let shared_state = ServerState {
+        immutable_store,
+        mutable_store,
+        jwt_verifier,
+        repository_authorizer,
+        max_file_size: settings.max_file_size,
+        presign_config,
+    };
+
+    Ok(create_router(shared_state, health, settings))
+}
+
+async fn serve_health_only(
+    listener: TcpListener,
+    app: Router,
+    store_owner: Arc<dyn lore_storage::ImmutableStore>,
+    signal: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    // Cancellation signals Axum's connection tasks before the serving task releases the store.
+    let server = lore_spawn_net!(async move {
+        let shutdown_cancellation = cancellation.clone();
+        let server = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                tokio::select! {
+                    _ = signal => {},
+                    _ = shutdown_cancellation.cancelled() => {},
+                }
+            })
+            .into_future();
+        tokio::pin!(server);
+        let result = tokio::select! {
+            result = &mut server => result,
+            _ = cancellation.cancelled() => {
+                // The caller can no longer join us; bound the remaining drain.
+                if let Ok(result) = tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+                    result
+                } else {
+                    warn!("HTTP connection drain timed out after cancellation");
+                    Ok(())
+                }
+            },
+        };
+        drop(store_owner);
+        result
+    });
+    server.await??;
+    Ok(())
 }
 
 impl LoreHttpServer {
@@ -309,48 +419,23 @@ impl LoreHttpServer {
             jwt_verifier.as_ref().map_or("no", |_| "yes")
         );
 
-        let health = ServerHealth {
-            immutable_store: Arc::downgrade(&immutable_store),
-            available: AtomicBool::new(true),
-            interval_timeout: if settings.available_interval_seconds > 0
-                && settings.available_timeout_seconds > 0
-            {
-                Some((
-                    Duration::from_secs(settings.available_interval_seconds),
-                    Duration::from_secs(settings.available_timeout_seconds),
-                ))
-            } else {
-                None
-            },
-            store_health_check: settings.store_health_check,
-        };
-
-        let presign_config = build_presign_config(&settings.presign)?;
-        if let Some(cfg) = presign_config.as_ref() {
-            // Log the resolved set so operators can confirm what their config produced.
-            info!(
-                "Presigned URL feature enabled (key_id: {}, allowed content types: {})",
-                cfg.key_id,
-                describe_allowed_types(&cfg.content_type_allowlist.allowed_types())
-            );
-        } else {
-            info!("Presigned URL feature disabled (presigned_url_hmac_key not configured)");
-        }
-
-        let shared_state = ServerState {
+        // The health-only router holds weak references; its serving task owns the store.
+        let store_owner = settings.health_only.then(|| immutable_store.clone());
+        let app = build_router(
+            &settings,
             immutable_store,
             mutable_store,
             jwt_verifier,
             repository_authorizer,
-            max_file_size: settings.max_file_size,
-            presign_config,
-        };
-
-        let app = create_router(shared_state, health, &settings);
+        )?;
 
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|err| anyhow!("Failed to start HTTP server: {err}"))?;
+        if let Some(store_owner) = store_owner {
+            return serve_health_only(listener, app, store_owner, signal).await;
+        }
+
         lore_spawn_net!(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(signal)

@@ -14,6 +14,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- Server: added opt-in HTTP health-only mode for deployments that do not serve repository HTTP routes.
+
 - `lore auth login` against a server that advertises an OIDC issuer logs in through the OAuth 2.0 device authorization
   grant (RFC 8628). The login asks the provider for the server's default scopes and `offline_access`, opens the
   verification URL in the browser, or prints it with `--no-browser`, shows the code the provider's page may ask the user

@@ -2014,3 +2014,10 @@ fn test_config_validation_summary() {
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!("\n");
 }
+
+#[test]
+fn http_health_only_is_opt_in() {
+    assert!(!http_settings("").health_only);
+    assert!(!http_settings("health_only = false").health_only);
+    assert!(http_settings("health_only = true").health_only);
+}

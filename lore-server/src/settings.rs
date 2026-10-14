@@ -502,6 +502,9 @@ pub struct HttpSettings {
     #[allow(dead_code)]
     pub certificate: Option<CertificateSettings>,
     pub enabled: bool,
+    /// Serve only the health route, without repository HTTP endpoints.
+    #[serde(default)]
+    pub health_only: bool,
     pub host: String,
     pub max_file_size: u64,
     pub port: i32,

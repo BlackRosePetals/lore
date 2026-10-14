@@ -389,6 +389,14 @@ mod http_settings_mapping {
         toml::from_str(&config).expect("[server.http] should deserialize")
     }
 
+    #[test]
+    fn health_only_is_carried_from_config() {
+        let settings =
+            build_lore_http_settings(&http_settings("health_only = true"), Arc::default());
+        assert!(settings.health_only);
+        assert!(!build_lore_http_settings(&http_settings(""), Arc::default()).health_only);
+    }
+
     /// The whole read path: TOML to the policy the allowlist is built from.
     #[test]
     fn content_type_policy_is_carried_from_config() {
