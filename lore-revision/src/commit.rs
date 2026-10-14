@@ -81,6 +81,7 @@ use crate::repository::RepositoryWriteToken;
 use crate::repository::verify::verify_state_for_commit;
 use crate::revision::sync;
 use crate::state;
+use crate::state::LinkReference;
 use crate::state::NodeMapping;
 use crate::state::RecordedModifiedTimes;
 use crate::state::State;
@@ -1736,7 +1737,13 @@ async fn commit_staged_revision(
             lore_debug!("Force commit of identical merkle tree");
         }
 
-        weave_history(repository.clone(), state_staged.clone()).await?;
+        let based_on = if state_staged.parent_other() == revision_current && state_staged.is_merge()
+        {
+            BasedOn::Other
+        } else {
+            BasedOn::FirstParent
+        };
+        weave_history(repository.clone(), state_staged.clone(), based_on).await?;
 
         // Reset conflict/merge flags and transient link merge state
         state_staged.reset_merge_conflict_flags();
@@ -2852,6 +2859,7 @@ async fn commit_link_node(
         .forward::<CommitError>("Commit of link node failed")?;
 
     let branch_id = link_reference.resolve_branch(parent_branch);
+    let based_on = link_based_on(&repository, &state, &link_reference, &link_state).await?;
 
     let link_metadata = if let Some(link_msg) = link_messages.get(relative_path.as_str()) {
         let mut overridden = (*metadata).clone();
@@ -2871,6 +2879,7 @@ async fn commit_link_node(
         relative_path,
         link_node,
         branch_id,
+        based_on,
         link_metadata,
         link_messages,
         stats,
@@ -2930,6 +2939,32 @@ async fn commit_link_node(
     Ok(())
 }
 
+/// The revision the tree of the linked state `link_state` was built from. A merge of the link's
+/// divergent history is staged on the pin the link held before the merge, which the parent `state`
+/// keeps in its link merge state, and takes that pin as its second parent.
+async fn link_based_on(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    link_reference: &LinkReference,
+    link_state: &State,
+) -> Result<BasedOn, CommitError> {
+    if !link_state.is_merge() {
+        return Ok(BasedOn::FirstParent);
+    }
+    let pinned = state
+        .deserialize_link_merge_state(repository.clone())
+        .await
+        .forward::<CommitError>("Failed reading link merge state")?
+        .into_iter()
+        .find(|entry| entry.local_node == link_reference.local_node)
+        .map(|entry| entry.base.signature);
+    Ok(if pinned == Some(link_state.parent_other()) {
+        BasedOn::Other
+    } else {
+        BasedOn::FirstParent
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn commit_link(
     operation: Arc<InstanceOperationImpl>,
@@ -2939,6 +2974,7 @@ async fn commit_link(
     relative_path: RelativePath,
     node_id: NodeID,
     branch: BranchId,
+    based_on: BasedOn,
     metadata: Arc<Metadata>,
     link_messages: Arc<HashMap<String, String>>,
     stats: Arc<CommitStats>,
@@ -3087,7 +3123,7 @@ async fn commit_link(
                     .forward::<CommitError>("Failed to write commit metadata")?,
             );
 
-            weave_history(repository.clone(), state.clone()).await?;
+            weave_history(repository.clone(), state.clone(), based_on).await?;
 
             state.reset_merge_conflict_flags();
             state.clear_link_merge_state();
@@ -3430,9 +3466,34 @@ async fn generate_delta_block(
     Ok(())
 }
 
+/// The revision the tree of a revision was built from, which the tree shares node IDs with.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BasedOn {
+    /// The first parent, as for a revision committed on top of it.
+    FirstParent,
+    /// Another revision: the second parent of a merge reconciling divergent history, which is
+    /// staged on the current revision and takes it as the second parent. The nodes the first
+    /// parent added since the two diverged can have other IDs in the tree.
+    Other,
+}
+
+/// Records in the file metadata of `state` what its parents changed. A node the first parent's
+/// own delta changed records the first parent as its last change on the first-parent line. A
+/// node the merge changed records the second parent's history of it, and a node the second
+/// parent's own delta changed records the second parent on the second-parent line. Every other
+/// node keeps the history of the tree `state` was built from.
+///
+/// The first parent's delta is recorded by node ID when the tree of `state` is
+/// [based on](BasedOn) the first parent. Otherwise it is recorded on the
+/// [counterpart](find_counterpart_node) of each node, and a node the merge changed first takes
+/// the first parent's history of its counterpart. The second parent's history is recorded on the
+/// node at the same path.
+#[lore_macro::test_pub]
 pub(crate) async fn weave_history(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
+    based_on: BasedOn,
 ) -> Result<(), CommitError> {
     let [parent_self, parent_other] = state.parents();
     let mut history_count = 0;
@@ -3457,57 +3518,39 @@ pub(crate) async fn weave_history(
             .to_aligned::<NodeDelta>();
 
         let delta_slice = delta_buffer.as_type_slice::<NodeDelta>();
-        let mut idelta = 1;
 
         lore_debug!("Weaving {} delta entries", delta_slice.len());
-        for delta in delta_slice.iter() {
-            if delta.action == FileAction::Delete as u16 {
-                // Deleted files no longer exist in the tree node
-                continue;
-            }
+        if based_on == BasedOn::Other {
+            history_count += Box::pin(weave_first_parent_counterparts(
+                &repository,
+                &state,
+                &state_parent,
+                delta_slice,
+            ))
+            .await?;
+        } else {
+            for delta in delta_slice.iter() {
+                if delta.action == FileAction::Delete as u16 {
+                    // Deleted files no longer exist in the tree node
+                    continue;
+                }
 
-            let node_id = delta.node;
-
-            let metadata_node = node::node_to_file_metadata(node_id);
-            let block_index = NodeFileMetadataBlock::index(metadata_node);
-            let node_index = NodeFileMetadata::index(metadata_node);
-
-            let file_metadata_block = state
-                .block_file_metadata(repository.clone(), block_index)
-                .await
-                .forward::<CommitError>("Failed deserializing file metadata block")?;
-
-            let dirtied = {
-                let mut block_writer = file_metadata_block.write();
-                let node = block_writer.node(node_index);
-
-                node.revision[0] = parent_self;
-                node.revision[1] = Hash::default();
-                node.node[0] = node_id;
-                node.node[1] = 0;
-                node.action[0] = delta.action;
-                node.flags[0] = delta.flags;
-                node.action[1] = change::FileAction::Keep as u16;
-                node.flags[1] = NodeFileMetadataFlags::NoFlag.bits();
-                history_count += 1;
-
-                lore_trace!(
-                    "History {}/{}: node {} {:?}",
-                    idelta,
-                    delta_slice.len(),
-                    node_id,
-                    node
+                let metadata_node = node::node_to_file_metadata(delta.node);
+                let block_index = NodeFileMetadataBlock::index(metadata_node);
+                let file_metadata_block = state
+                    .block_file_metadata(repository.clone(), block_index)
+                    .await
+                    .forward::<CommitError>("Failed deserializing file metadata block")?;
+                record_first_parent_change(
+                    &state,
+                    file_metadata_block,
+                    block_index,
+                    NodeFileMetadata::index(metadata_node),
+                    parent_self,
+                    delta,
                 );
-
-                block_writer.mark_dirty()
-            };
-
-            if dirtied {
-                state.block_file_metadata_modified(file_metadata_block, block_index);
-                state.mark_dirty();
+                history_count += 1;
             }
-
-            idelta += 1;
         }
     }
 
@@ -3544,16 +3587,15 @@ pub(crate) async fn weave_history(
                     .await
                     .forward::<CommitError>("Failed constructing node path when weaving history")?;
 
-                let node_parent = state_parent
-                    .find_node_link(repository.clone(), node_path.as_str())
-                    .await
-                    .unwrap_or_default();
-                if !node_parent.is_valid() {
-                    // Node does not exist in the branch being merged in
+                let Some(node_parent) =
+                    node_at_path(&repository, &state_parent, node_path.as_str())
+                        .await
+                        .unwrap_or_default()
+                else {
                     continue;
-                }
+                };
 
-                let metadata_node = node::node_to_file_metadata(node_parent.node);
+                let metadata_node = node::node_to_file_metadata(node_parent);
                 let block_index = NodeFileMetadataBlock::index(metadata_node);
                 let node_index = NodeFileMetadata::index(metadata_node);
 
@@ -3578,7 +3620,7 @@ pub(crate) async fn weave_history(
                     let node = block_writer.node(node_index);
 
                     node.revision[1] = merge_metadata.revision[0];
-                    node.node[1] = node_parent.node;
+                    node.node[1] = merge_metadata.node[0];
                     node.flags[1] |= merge_metadata.flags[0] | change::Flags::Merge.bits();
                     node.action[1] = merge_metadata.action[0];
 
@@ -3628,11 +3670,10 @@ pub(crate) async fn weave_history(
                 continue;
             };
 
-            let node_link = state
-                .find_node_link(repository.clone(), node_path.as_str())
+            let Some(current_node_id) = node_at_path(&repository, &state, node_path.as_str())
                 .await
-                .unwrap_or_default();
-            if !node_link.node.is_valid_node_id() {
+                .unwrap_or_default()
+            else {
                 // This node does not exist in the current state, it was deleted as part of the
                 // merge conflict resolution, or deleted in the incoming branch revision.
                 // TODO(mjansson): For the rename case where the node as renamed/moved as part
@@ -3642,9 +3683,8 @@ pub(crate) async fn weave_history(
                     "Ignore weaving history for path that does not exist in current state: {node_path}"
                 );
                 continue;
-            }
+            };
 
-            let current_node_id = node_link.node;
             let metadata_node = node::node_to_file_metadata(current_node_id);
             let block_index = NodeFileMetadataBlock::index(metadata_node);
             let node_index = NodeFileMetadata::index(metadata_node);
@@ -3694,6 +3734,224 @@ pub(crate) async fn weave_history(
     state.set_revision_number(revision_number + 1);
 
     Ok(())
+}
+
+/// Records the first parent's history on a tree of `state` built from another revision. A node the
+/// merge changed takes the history the first parent `state_parent` holds for its
+/// [counterpart](find_counterpart_node), and a node `delta_slice`, the first parent's own delta,
+/// changed records the first parent on its counterpart. A node either delta deletes is skipped.
+/// Returns the count of nodes recorded.
+///
+/// Boxed by the caller: a tree is built from another revision than its first parent only for a
+/// merge reconciling divergent history.
+async fn weave_first_parent_counterparts(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    state_parent: &State,
+    delta_slice: &[NodeDelta],
+) -> Result<u32, CommitError> {
+    let block_count = state
+        .tree(repository.clone())
+        .await
+        .forward::<CommitError>("Failed reading tree when weaving history")?
+        .block_count;
+    let parent_block_count = state_parent
+        .tree(repository.clone())
+        .await
+        .forward::<CommitError>("Failed reading parent tree when weaving history")?
+        .block_count;
+    let mut history_count = 0;
+
+    let merge_buffer = state
+        .delta_block(repository.clone())
+        .await
+        .forward::<CommitError>("Failed deserializing state delta block when weaving history")?
+        .to_aligned::<NodeDelta>();
+    for delta in merge_buffer.as_type_slice::<NodeDelta>() {
+        if delta.flags & change::Flags::Merge == 0 || delta.action == FileAction::Delete as u16 {
+            continue;
+        }
+
+        let Some(parent_node) = find_counterpart_node(
+            repository,
+            state,
+            delta.node,
+            state_parent,
+            parent_block_count,
+        )
+        .await?
+        else {
+            continue;
+        };
+        copy_first_parent_history(repository, state, delta.node, state_parent, parent_node).await?;
+        history_count += 1;
+    }
+
+    for delta in delta_slice {
+        if delta.action == FileAction::Delete as u16 {
+            continue;
+        }
+
+        let Some(node_id) =
+            find_counterpart_node(repository, state_parent, delta.node, state, block_count).await?
+        else {
+            continue;
+        };
+        let metadata_node = node::node_to_file_metadata(node_id);
+        let block_index = NodeFileMetadataBlock::index(metadata_node);
+        let file_metadata_block = state
+            .block_file_metadata(repository.clone(), block_index)
+            .await
+            .forward::<CommitError>("Failed deserializing file metadata block")?;
+        record_first_parent_change(
+            state,
+            file_metadata_block,
+            block_index,
+            NodeFileMetadata::index(metadata_node),
+            state_parent.revision(),
+            delta,
+        );
+        history_count += 1;
+    }
+    Ok(history_count)
+}
+
+/// Sets the first-parent history of node `node_id` of `state` to the first-parent history `parent`
+/// holds for its node `parent_node`.
+async fn copy_first_parent_history(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    node_id: NodeID,
+    parent: &State,
+    parent_node: NodeID,
+) -> Result<(), CommitError> {
+    let metadata_node = node::node_to_file_metadata(parent_node);
+    let history = *parent
+        .block_file_metadata(
+            repository.clone(),
+            NodeFileMetadataBlock::index(metadata_node),
+        )
+        .await
+        .forward::<CommitError>("Failed deserializing parent file metadata block")?
+        .read()
+        .node(NodeFileMetadata::index(metadata_node));
+
+    let metadata_node = node::node_to_file_metadata(node_id);
+    let block_index = NodeFileMetadataBlock::index(metadata_node);
+    let block = state
+        .block_file_metadata(repository.clone(), block_index)
+        .await
+        .forward::<CommitError>("Failed deserializing file metadata block")?;
+    let dirtied = {
+        let mut block_writer = block.write();
+        let node = block_writer.node(NodeFileMetadata::index(metadata_node));
+        node.revision[0] = history.revision[0];
+        node.node[0] = history.node[0];
+        node.action[0] = history.action[0];
+        node.flags[0] = history.flags[0];
+        block_writer.mark_dirty()
+    };
+    if dirtied {
+        state.block_file_metadata_modified(block, block_index);
+        state.mark_dirty();
+    }
+    Ok(())
+}
+
+/// Records in the node at `node_index` of `block`, block `block_index` of `state`, that the node
+/// last changed in `parent_self` as `delta` describes, which names the node by its ID there, and
+/// clears its second-parent history.
+fn record_first_parent_change(
+    state: &State,
+    block: Arc<NodeFileMetadataBlock>,
+    block_index: usize,
+    node_index: usize,
+    parent_self: Hash,
+    delta: &NodeDelta,
+) {
+    let dirtied = {
+        let mut block_writer = block.write();
+        let node = block_writer.node(node_index);
+
+        node.revision[0] = parent_self;
+        node.revision[1] = Hash::default();
+        node.node[0] = delta.node;
+        node.node[1] = 0;
+        node.action[0] = delta.action;
+        node.flags[0] = delta.flags;
+        node.action[1] = change::FileAction::Keep as u16;
+        node.flags[1] = NodeFileMetadataFlags::NoFlag.bits();
+
+        lore_trace!("History of block {block_index} node {node_index}: {node:?}");
+
+        block_writer.mark_dirty()
+    };
+
+    if dirtied {
+        state.block_file_metadata_modified(block, block_index);
+        state.mark_dirty();
+    }
+}
+
+/// Finds the node of `to`, whose tree has `block_count` blocks, that is node `node_id` of `from`,
+/// for trees that do not share node IDs.
+///
+/// The node with the same ID is the counterpart when both are the same file, which keeps a file
+/// renamed since the two trees diverged. Any other node is [found at the path](node_at_path)
+/// `from` holds it at.
+async fn find_counterpart_node(
+    repository: &Arc<RepositoryContext>,
+    from: &State,
+    node_id: NodeID,
+    to: &State,
+    block_count: u32,
+) -> Result<Option<NodeID>, CommitError> {
+    if NodeBlock::index(node_id) < block_count as usize {
+        let from_node = from
+            .node(repository.clone(), node_id)
+            .await
+            .forward::<CommitError>("Failed reading node when weaving history")?;
+        let to_node = to
+            .node(repository.clone(), node_id)
+            .await
+            .forward::<CommitError>("Failed reading counterpart node when weaving history")?;
+        if from_node.is_file()
+            && to_node.is_file()
+            && !from_node.address.context.is_zero()
+            && from_node.address.context == to_node.address.context
+        {
+            return Ok(Some(node_id));
+        }
+    }
+
+    let path = from
+        .node_path(repository.clone(), node_id)
+        .await
+        .forward::<CommitError>("Failed constructing node path when weaving history")?;
+    node_at_path(repository, to, path.as_str())
+        .await
+        .forward::<CommitError>("Failed locating node when weaving history")
+}
+
+/// The node of `state` at `path`. `None` where `state` holds nothing at `path`, or holds it in a
+/// linked repository, whose history belongs to that repository's revisions.
+async fn node_at_path(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    path: &str,
+) -> Result<Option<NodeID>, state::StateError> {
+    let node_link = match state.find_node_link(repository.clone(), path).await {
+        Ok(node_link) => node_link,
+        Err(state::StateError::NodeNotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !node_link.node.is_valid_node_id()
+        || node_link.repository != repository.id
+        || node_link.revision != state.revision()
+    {
+        return Ok(None);
+    }
+    Ok(Some(node_link.node))
 }
 
 pub async fn prepare_commit_metadata(
@@ -4235,7 +4493,12 @@ pub async fn commit_in_memory_revision(
                 .forward::<CommitError>("Failed to write commit metadata")?,
         );
 
-        weave_history(work_repository.clone(), state_staged.clone()).await?;
+        weave_history(
+            work_repository.clone(),
+            state_staged.clone(),
+            BasedOn::FirstParent,
+        )
+        .await?;
 
         state_staged.reset_merge_conflict_flags();
         state_staged.clear_link_merge_state();

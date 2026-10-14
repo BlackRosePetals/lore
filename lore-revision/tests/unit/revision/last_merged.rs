@@ -5,109 +5,30 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
-use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_revision::change;
 use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
 use lore_revision::change::NodeChangeState;
-use lore_revision::commit::commit_in_memory_revision;
+use lore_revision::commit::BasedOn;
+use lore_revision::commit::weave_history;
 use lore_revision::lore::BranchId;
-use lore_revision::metadata::Metadata;
 use lore_revision::node::*;
-use lore_revision::repository::InMemoryContext;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::revision::find_last_merged_revision;
 use lore_revision::state::NodeMapping;
 use lore_revision::state::State;
 use lore_revision::util::path::RelativePathBuf;
-use lore_storage::hash::hash_string;
 
-use crate::helper::default_repository_creation_args;
+use crate::helper::in_memory;
+use crate::helper::in_memory::add;
+use crate::helper::in_memory::add_staged;
+use crate::helper::in_memory::branch_id;
+use crate::helper::in_memory::commit;
+use crate::helper::in_memory::file;
+use crate::helper::in_memory::revision_state;
+use crate::helper::in_memory::token;
 use crate::helper::test_store_create;
-
-struct InMemoryMarker;
-impl InMemoryContext for InMemoryMarker {}
-const IN_MEMORY_MARKER: InMemoryMarker = InMemoryMarker;
-
-fn token() -> RepositoryWriteToken {
-    RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)
-}
-
-/// A path-less repository on the stores.
-fn in_memory_repository(
-    immutable: Arc<dyn lore_storage::ImmutableStore>,
-    mutable: Arc<dyn lore_storage::MutableStore>,
-) -> Arc<RepositoryContext> {
-    Arc::new(
-        RepositoryContext::new(default_repository_creation_args(immutable, mutable))
-            .with_write_token(token()),
-    )
-}
-
-fn file(name: &str) -> Node {
-    Node {
-        flags: NodeFlags::File.bits(),
-        mode: 0o644,
-        size: 10,
-        address: Address {
-            hash: Hash::from_u64(0x5a),
-            context: Context::from(uuid::Uuid::now_v7()),
-        },
-        name_hash: hash_string(name),
-        ..Default::default()
-    }
-}
-
-fn branch() -> BranchId {
-    Context::from(uuid::Uuid::now_v7())
-}
-
-/// Adds `node` as `name` at the root, staged as an add.
-async fn add(state: &State, repository: &Arc<RepositoryContext>, node: Node, name: &str) -> NodeID {
-    let node_id = state
-        .node_add(repository.clone(), ROOT_NODE, node, name)
-        .await
-        .expect("adding the node");
-    state
-        .node_mark_staged(
-            repository.clone(),
-            node_id,
-            NodeFlags::StagedAdd,
-            NodeFlags::DirtyAdd,
-        )
-        .await
-        .expect("staging the add");
-    node_id
-}
-
-/// Commits `state` on top of `current` on `branch`.
-async fn commit(
-    repository: &Arc<RepositoryContext>,
-    state: &Arc<State>,
-    current: Hash,
-    branch: BranchId,
-) -> Hash {
-    let mut metadata = Metadata::new();
-    metadata.set_branch(branch).expect("setting the branch");
-    commit_in_memory_revision(
-        repository.clone(),
-        &token(),
-        state.clone(),
-        metadata,
-        current,
-        branch,
-    )
-    .await
-    .expect("committing the revision")
-}
-
-async fn revision_state(repository: &Arc<RepositoryContext>, revision: Hash) -> Arc<State> {
-    State::deserialize(repository.clone(), revision)
-        .await
-        .expect("deserializing the revision")
-}
 
 /// Sets the history of `node_id` in `state` to `first` along the first parent and `second` along
 /// the second, each a revision and the file's node ID there, both as modifications, and serializes
@@ -179,23 +100,45 @@ fn change_at(
 async fn the_last_merged_revision_is_found_past_a_merge_that_gives_the_file_another_node_id() {
     let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
     lore_spawn!(LORE_CONTEXT.scope(execution, async move {
-        let repository = in_memory_repository(immutable, mutable);
-        let target = branch();
-        let source = branch();
-        let local = branch();
+        let repository = in_memory::repository(immutable, mutable);
+        let target = branch_id();
+        let source = branch_id();
+        let local = branch_id();
 
         let state = State::new();
-        add(&state, &repository, file("base.txt"), "base.txt").await;
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            file("base.txt"),
+            "base.txt",
+        )
+        .await;
         let branch_point = commit(&repository, &state, Hash::default(), target).await;
 
         let shared = file("shared.txt");
         let source_state = revision_state(&repository, branch_point).await;
-        let shared_in_source = add(&source_state, &repository, shared, "shared.txt").await;
+        let shared_in_source = add(
+            &source_state,
+            repository.clone(),
+            ROOT_NODE,
+            shared,
+            "shared.txt",
+        )
+        .await;
         let merged_from_source = commit(&repository, &source_state, branch_point, source).await;
 
         let remote = revision_state(&repository, branch_point).await;
-        add(&remote, &repository, file("earlier.txt"), "earlier.txt").await;
-        let shared_in_remote = add(&remote, &repository, shared, "shared.txt").await;
+        add(
+            &remote,
+            repository.clone(),
+            ROOT_NODE,
+            file("earlier.txt"),
+            "earlier.txt",
+        )
+        .await;
+        let shared_in_remote =
+            add(&remote, repository.clone(), ROOT_NODE, shared, "shared.txt").await;
         commit(&repository, &remote, branch_point, target).await;
         remote.set_parent_other(merged_from_source);
         let remote_latest = with_history(
@@ -208,12 +151,26 @@ async fn the_last_merged_revision_is_found_past_a_merge_that_gives_the_file_anot
         .await;
 
         let local_state = revision_state(&repository, branch_point).await;
-        let shared_in_local = add(&local_state, &repository, shared, "shared.txt").await;
+        let shared_in_local = add(
+            &local_state,
+            repository.clone(),
+            ROOT_NODE,
+            shared,
+            "shared.txt",
+        )
+        .await;
         let local_latest = commit(&repository, &local_state, branch_point, local).await;
         assert_ne!(shared_in_local, shared_in_remote);
 
         let merge = revision_state(&repository, local_latest).await;
-        add(&merge, &repository, file("merge.txt"), "merge.txt").await;
+        add(
+            &merge,
+            repository.clone(),
+            ROOT_NODE,
+            file("merge.txt"),
+            "merge.txt",
+        )
+        .await;
         let merged = commit(&repository, &merge, local_latest, local).await;
         let merge = revision_state(&repository, merged).await;
         merge.set_parent_self(remote_latest);
@@ -256,7 +213,14 @@ async fn source_add(
     source: BranchId,
 ) -> (Hash, NodeID) {
     let state = revision_state(repository, branch_point).await;
-    let node_id = add(&state, repository, file("old.txt"), "old.txt").await;
+    let node_id = add(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        file("old.txt"),
+        "old.txt",
+    )
+    .await;
     (
         commit(repository, &state, branch_point, source).await,
         node_id,
@@ -270,18 +234,32 @@ async fn source_add(
 async fn a_file_the_target_adds_in_the_start_revision_has_no_last_merge() {
     let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
     lore_spawn!(LORE_CONTEXT.scope(execution, async move {
-        let repository = in_memory_repository(immutable, mutable);
-        let target = branch();
-        let source = branch();
+        let repository = in_memory::repository(immutable, mutable);
+        let target = branch_id();
+        let source = branch_id();
 
         let state = State::new();
-        add(&state, &repository, file("base.txt"), "base.txt").await;
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            file("base.txt"),
+            "base.txt",
+        )
+        .await;
         let branch_point = commit(&repository, &state, Hash::default(), target).await;
         let (merged_from_source, old_in_source) =
             source_add(&repository, branch_point, source).await;
 
         let state = revision_state(&repository, branch_point).await;
-        let added = add(&state, &repository, file("new.txt"), "new.txt").await;
+        let added = add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            file("new.txt"),
+            "new.txt",
+        )
+        .await;
         let adding = commit(&repository, &state, branch_point, target).await;
         let start = with_history(
             &repository,
@@ -315,18 +293,32 @@ async fn a_file_the_target_adds_in_the_start_revision_has_no_last_merge() {
 async fn the_walk_stops_at_the_revision_the_target_added_the_file_in() {
     let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
     lore_spawn!(LORE_CONTEXT.scope(execution, async move {
-        let repository = in_memory_repository(immutable, mutable);
-        let target = branch();
-        let source = branch();
+        let repository = in_memory::repository(immutable, mutable);
+        let target = branch_id();
+        let source = branch_id();
 
         let state = State::new();
-        add(&state, &repository, file("base.txt"), "base.txt").await;
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            file("base.txt"),
+            "base.txt",
+        )
+        .await;
         let branch_point = commit(&repository, &state, Hash::default(), target).await;
         let (merged_from_source, old_in_source) =
             source_add(&repository, branch_point, source).await;
 
         let state = revision_state(&repository, branch_point).await;
-        let added = add(&state, &repository, file("new.txt"), "new.txt").await;
+        let added = add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            file("new.txt"),
+            "new.txt",
+        )
+        .await;
         let adding = commit(&repository, &state, branch_point, target).await;
         let adding = with_history(
             &repository,
@@ -338,8 +330,15 @@ async fn the_walk_stops_at_the_revision_the_target_added_the_file_in() {
         .await;
 
         let state = revision_state(&repository, adding).await;
-        add(&state, &repository, file("later.txt"), "later.txt").await;
-        let latest = commit(&repository, &state, adding, branch()).await;
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            file("later.txt"),
+            "later.txt",
+        )
+        .await;
+        let latest = commit(&repository, &state, adding, branch_id()).await;
 
         let latest = revision_state(&repository, latest).await;
         let found = find_last_merged_revision(
@@ -352,6 +351,129 @@ async fn the_walk_stops_at_the_revision_the_target_added_the_file_in() {
         .expect("walking the history");
 
         assert_eq!(found, None);
+    }))
+    .await
+    .expect("Task failed");
+}
+
+/// The remote side merges `shared.txt` from the source branch at another node ID than the merge
+/// of divergent history after it gives the file, and `weave_history` records both. The walk from
+/// that merge follows the node ID the history records and finds the merge from the source branch.
+#[tokio::test]
+async fn the_last_merged_revision_is_found_past_a_woven_merge_of_divergent_history() {
+    let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
+    lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+        let repository = in_memory::repository(immutable, mutable);
+        let target = branch_id();
+        let source = branch_id();
+        let local = branch_id();
+        let merged_in = NodeFlags::StagedAdd | NodeFlags::StagedMerge;
+
+        let state = State::new();
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            file("base.txt"),
+            "base.txt",
+        )
+        .await;
+        let branch_point = commit(&repository, &state, Hash::default(), target).await;
+
+        let shared = file("shared.txt");
+        let source_state = revision_state(&repository, branch_point).await;
+        add(
+            &source_state,
+            repository.clone(),
+            ROOT_NODE,
+            shared,
+            "shared.txt",
+        )
+        .await;
+        let merged_from_source = commit(&repository, &source_state, branch_point, source).await;
+
+        let remote = revision_state(&repository, branch_point).await;
+        add(
+            &remote,
+            repository.clone(),
+            ROOT_NODE,
+            file("earlier.txt"),
+            "earlier.txt",
+        )
+        .await;
+        add(
+            &remote,
+            repository.clone(),
+            ROOT_NODE,
+            file("later.txt"),
+            "later.txt",
+        )
+        .await;
+        let shared_in_remote = add_staged(
+            &remote,
+            repository.clone(),
+            ROOT_NODE,
+            shared,
+            "shared.txt",
+            merged_in,
+        )
+        .await;
+        let remote_commit = commit(&repository, &remote, branch_point, target).await;
+        let remote = revision_state(&repository, remote_commit).await;
+        remote.set_parent_other(merged_from_source);
+        weave_history(repository.clone(), remote.clone(), BasedOn::FirstParent)
+            .await
+            .expect("weaving the merge from the source branch");
+        let remote_latest = remote
+            .serialize(repository.clone(), &token())
+            .await
+            .expect("serializing the merge from the source branch");
+
+        let local_state = revision_state(&repository, branch_point).await;
+        add(
+            &local_state,
+            repository.clone(),
+            ROOT_NODE,
+            file("local.txt"),
+            "local.txt",
+        )
+        .await;
+        let local_latest = commit(&repository, &local_state, branch_point, local).await;
+
+        let merge = revision_state(&repository, local_latest).await;
+        let shared_in_merge = add_staged(
+            &merge,
+            repository.clone(),
+            ROOT_NODE,
+            shared,
+            "shared.txt",
+            merged_in,
+        )
+        .await;
+        let merged = commit(&repository, &merge, local_latest, local).await;
+        assert_ne!(shared_in_merge, shared_in_remote);
+
+        let merge = revision_state(&repository, merged).await;
+        merge.set_parent_self(remote_latest);
+        merge.set_parent_other(local_latest);
+        weave_history(repository.clone(), merge.clone(), BasedOn::Other)
+            .await
+            .expect("weaving the merge of divergent history");
+
+        let found = find_last_merged_revision(
+            &change_at(&repository, &merge, shared_in_merge, "shared.txt"),
+            source,
+            target,
+            revision_state(&repository, branch_point).await,
+        )
+        .await
+        .expect("walking the history");
+
+        let source_revision = revision_state(&repository, merged_from_source).await;
+        assert_eq!(
+            found,
+            Some((merged_from_source, source_revision.revision_number()))
+        );
     }))
     .await
     .expect("Task failed");

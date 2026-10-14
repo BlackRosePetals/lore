@@ -547,3 +547,138 @@ pub async fn children_named(
     }
     named
 }
+
+/// Fixtures for revisions built in memory, on a path-less repository writing through an in-memory
+/// token, which is the shape the memory-based revision tree handle runs on.
+#[allow(dead_code)]
+pub mod in_memory {
+    use std::sync::Arc;
+
+    use lore_base::types::Address;
+    use lore_base::types::BranchId;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_revision::commit::commit_in_memory_revision;
+    use lore_revision::metadata::Metadata;
+    use lore_revision::node::Node;
+    use lore_revision::node::NodeFlags;
+    use lore_revision::node::NodeID;
+    use lore_revision::repository::InMemoryContext;
+    use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::state::State;
+    use lore_storage::hash::hash_string;
+
+    struct Marker;
+    impl InMemoryContext for Marker {}
+    const MARKER: Marker = Marker;
+
+    pub fn token() -> RepositoryWriteToken {
+        RepositoryWriteToken::in_memory(&MARKER)
+    }
+
+    /// A path-less repository on the stores, writing through [`token`].
+    pub fn repository(
+        immutable: Arc<dyn lore_storage::ImmutableStore>,
+        mutable: Arc<dyn lore_storage::MutableStore>,
+    ) -> Arc<RepositoryContext> {
+        Arc::new(
+            RepositoryContext::new(super::default_repository_creation_args(immutable, mutable))
+                .with_write_token(token()),
+        )
+    }
+
+    pub fn file(name: &str) -> Node {
+        Node {
+            flags: NodeFlags::File.bits(),
+            mode: 0o644,
+            size: 10,
+            address: Address {
+                hash: Hash::from_u64(0x5a),
+                context: Context::from(uuid::Uuid::now_v7()),
+            },
+            name_hash: hash_string(name),
+            ..Default::default()
+        }
+    }
+
+    pub fn directory(name: &str) -> Node {
+        Node {
+            flags: NodeFlags::NoFlags.bits(),
+            mode: 0o755,
+            name_hash: hash_string(name),
+            ..Default::default()
+        }
+    }
+
+    pub fn branch_id() -> BranchId {
+        Context::from(uuid::Uuid::now_v7())
+    }
+
+    /// Adds `node` as `name` under `parent`, staged as an add. Every write verb marks its staged
+    /// action and dirties the ancestors, which is what the freeze walks; `node_add` alone leaves
+    /// neither.
+    pub async fn add(
+        state: &State,
+        repository: Arc<RepositoryContext>,
+        parent: NodeID,
+        node: Node,
+        name: &str,
+    ) -> NodeID {
+        add_staged(state, repository, parent, node, name, NodeFlags::StagedAdd).await
+    }
+
+    /// Adds `node` as `name` under `parent`, staged with `staged`, such as an add a merge takes
+    /// from its other side.
+    pub async fn add_staged(
+        state: &State,
+        repository: Arc<RepositoryContext>,
+        parent: NodeID,
+        node: Node,
+        name: &str,
+        staged: NodeFlags,
+    ) -> NodeID {
+        let node_id = state
+            .node_add(repository.clone(), parent, node, name)
+            .await
+            .expect("adding the node must succeed");
+        state
+            .node_mark_staged(repository, node_id, staged, NodeFlags::DirtyAdd)
+            .await
+            .expect("marking the addition must succeed");
+        node_id
+    }
+
+    pub fn metadata_on(branch: BranchId) -> Metadata {
+        let mut metadata = Metadata::new();
+        metadata
+            .set_branch(branch)
+            .expect("setting the branch must succeed");
+        metadata
+    }
+
+    /// Commits `state` on top of `current` on `branch`.
+    pub async fn commit(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        current: Hash,
+        branch: BranchId,
+    ) -> Hash {
+        commit_in_memory_revision(
+            repository.clone(),
+            &token(),
+            state.clone(),
+            metadata_on(branch),
+            current,
+            branch,
+        )
+        .await
+        .expect("committing the revision must succeed")
+    }
+
+    pub async fn revision_state(repository: &Arc<RepositoryContext>, revision: Hash) -> Arc<State> {
+        State::deserialize(repository.clone(), revision)
+            .await
+            .expect("deserializing the revision must succeed")
+    }
+}

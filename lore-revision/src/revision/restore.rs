@@ -465,9 +465,13 @@ pub(crate) async fn restore(
             .forward::<RestoreError>("serializing metadata")?,
     );
 
-    commit::weave_history(repository.clone(), new_state.clone())
-        .await
-        .forward::<RestoreError>("weaving history")?;
+    commit::weave_history(
+        repository.clone(),
+        new_state.clone(),
+        commit::BasedOn::FirstParent,
+    )
+    .await
+    .forward::<RestoreError>("weaving history")?;
 
     let signature = new_state
         .serialize(repository.clone(), token)

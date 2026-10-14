@@ -4,8 +4,8 @@ import re
 
 import pytest
 from error_types import LinkPinDivergedError, UnresolvedConflictError
-from link_helpers import assert_crr_clean, link_pin, make_repo
-from lore_parsers import parse_status_json
+from link_helpers import assert_crr_clean, link_pin, make_parent_with_link, make_repo
+from lore_parsers import parse_jsonl, parse_status_json
 
 from lore import Lore
 
@@ -706,3 +706,43 @@ def test_merge_of_a_link_replacing_a_deleted_folder_conflicts(new_lore_repo):
     assert not parent.path_exists("shared"), (
         "aborting the merge must leave the deleted folder deleted"
     )
+
+
+@pytest.mark.smoke
+def test_link_merge_of_divergent_history_keeps_the_remote_history_off_a_local_file(
+    new_lore_repo,
+):
+    """
+    Both sides of a branch add a file inside a link after they diverge, and each takes the
+    same node ID in the linked repository. Merging the branch's remote latest with links
+    builds the link's merge from the local pin, and the remote's addition is not recorded
+    on the local file, whose history is its own addition.
+    """
+    link_path = "linked/repo"
+    repo, link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"a.txt": "a\n"}, {"p.txt": "p\n"}
+    )
+    clone = repo.clone()
+
+    with repo.open_file(f"{link_path}/remote.txt", "w+") as f:
+        f.write("remote\n")
+    repo.stage(f"{link_path}/remote.txt")
+    repo.commit("Add a remote file in the link", non_interactive=True)
+    repo.push()
+
+    with clone.open_file(f"{link_path}/local.txt", "w+") as f:
+        f.write("local\n")
+    clone.stage(f"{link_path}/local.txt")
+    clone.commit("Add a local file in the link", non_interactive=True, local=True)
+    local_pin = link_pin(clone, link_repo.get_id())
+
+    clone.branch_merge(
+        "main", message="Merge divergent history with links", non_interactive=True
+    )
+
+    history = parse_jsonl(
+        clone.file_history(f"{link_path}/local.txt", json=True), "fileHistory"
+    )
+    assert [(e["revision"], e["path"], e["action"]) for e in history] == [
+        (local_pin, "local.txt", "add")
+    ]

@@ -56,6 +56,16 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- A merge of divergent branch history, such as the one a sync commits when the local and the remote latest have both
+  moved, records the remote's history in the files it changed, and so does the merge of a linked repository whose
+  history diverged in a same-branch `lore branch merge`. The merge is built from the local latest, which can give a
+  file another node ID than the remote latest does when both sides added files after they diverged, and the remote's
+  change was recorded on whichever file had its node ID in the merge. `lore file history` listed the change, under the
+  remote file's path, for an unrelated local file, a file both sides added lost the remote's addition, and a file the
+  remote changed before its latest lost that change. A remote latest that numbers a file past the local tree's last
+  node block failed the commit of the merge
+- `lore file history` of a file the local side added before a merge of divergent history lists that addition. It
+  listed nothing, as the file's history before the merge is on the local, second-parent line
 - A merge of divergent branch history, such as the one a sync stages when the local and the remote latest have both
   moved, keeps the remote latest as its first parent and the local latest as its second when something is changed on
   top of it before it is committed. Marking a file dirty, staging, moving or copying a file, setting revision or file

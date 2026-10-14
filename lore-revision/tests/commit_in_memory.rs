@@ -9,7 +9,6 @@ mod tests {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
-    use lore_base::types::BranchId;
     use lore_base::types::BranchPoint;
     use lore_base::types::Context;
     use lore_base::types::Hash;
@@ -19,9 +18,7 @@ mod tests {
     use lore_revision::metadata::CREATED_BY;
     use lore_revision::metadata::Metadata;
     use lore_revision::node::*;
-    use lore_revision::repository::InMemoryContext;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::state::State;
     use lore_revision::state::StateNodeChildrenIterator;
     use lore_storage::hash::hash_string;
@@ -29,9 +26,12 @@ mod tests {
 
     include!("helper.rs");
 
-    struct InMemoryMarker;
-    impl InMemoryContext for InMemoryMarker {}
-    const IN_MEMORY_MARKER: InMemoryMarker = InMemoryMarker;
+    use in_memory::add;
+    use in_memory::branch_id;
+    use in_memory::directory;
+    use in_memory::file;
+    use in_memory::metadata_on;
+    use in_memory::token;
 
     /// A path-less context, as the memory-based revision tree handle builds, so the
     /// primitive is exercised against the shape it actually runs on.
@@ -44,77 +44,7 @@ mod tests {
         )
         .await
         .expect("Failed to create store");
-        Arc::new(
-            RepositoryContext::new(default_repository_creation_args(
-                immutable_store,
-                mutable_store,
-            ))
-            .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
-        )
-    }
-
-    fn file(name: &str) -> Node {
-        Node {
-            flags: NodeFlags::File.bits(),
-            mode: 0o644,
-            size: 10,
-            address: Address {
-                hash: Hash::from_u64(0x5a),
-                context: Context::from(uuid::Uuid::now_v7()),
-            },
-            name_hash: hash_string(name),
-            ..Default::default()
-        }
-    }
-
-    fn directory(name: &str) -> Node {
-        Node {
-            flags: NodeFlags::NoFlags.bits(),
-            mode: 0o755,
-            name_hash: hash_string(name),
-            ..Default::default()
-        }
-    }
-
-    /// Every write verb marks its staged action and dirties the ancestors, which is
-    /// what the freeze walks; `node_add` alone leaves neither.
-    async fn add(
-        state: &State,
-        repository: Arc<RepositoryContext>,
-        parent: NodeID,
-        node: Node,
-        name: &str,
-    ) -> NodeID {
-        let node_id = state
-            .node_add(repository.clone(), parent, node, name)
-            .await
-            .expect("adding the node must succeed");
-        state
-            .node_mark_staged(
-                repository,
-                node_id,
-                NodeFlags::StagedAdd,
-                NodeFlags::DirtyAdd,
-            )
-            .await
-            .expect("marking the addition must succeed");
-        node_id
-    }
-
-    fn metadata_on(branch: BranchId) -> Metadata {
-        let mut metadata = Metadata::new();
-        metadata
-            .set_branch(branch)
-            .expect("setting the branch must succeed");
-        metadata
-    }
-
-    fn token() -> RepositoryWriteToken {
-        RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)
-    }
-
-    fn branch_id() -> BranchId {
-        Context::from(uuid::Uuid::now_v7())
+        in_memory::repository(immutable_store, mutable_store)
     }
 
     /// The directory is checked apart from the file: its flags are cleared by

@@ -1911,9 +1911,13 @@ async fn create_linked_branches(
             .forward::<BranchError>("Failed to write revision metadata")?,
     );
 
-    commit::weave_history(repository.clone(), state.clone())
-        .await
-        .forward::<BranchError>("Failed to weave history")?;
+    commit::weave_history(
+        repository.clone(),
+        state.clone(),
+        commit::BasedOn::FirstParent,
+    )
+    .await
+    .forward::<BranchError>("Failed to weave history")?;
 
     let signature = state
         .serialize(repository.clone(), token)

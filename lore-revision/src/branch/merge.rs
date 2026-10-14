@@ -4248,9 +4248,13 @@ async fn merge_into_link(
             .forward::<MergeError>("serializing metadata")?,
     );
 
-    commit::weave_history(repository.clone(), state_new.clone())
-        .await
-        .forward::<MergeError>("weaving history")?;
+    commit::weave_history(
+        repository.clone(),
+        state_new.clone(),
+        commit::BasedOn::FirstParent,
+    )
+    .await
+    .forward::<MergeError>("weaving history")?;
 
     let signature = state_new
         .serialize(repository.clone(), token)
@@ -4601,9 +4605,13 @@ pub async fn merge_into(
             .forward::<MergeError>("serializing metadata")?,
     );
 
-    commit::weave_history(repository.clone(), state_new.clone())
-        .await
-        .forward::<MergeError>("weaving history")?;
+    commit::weave_history(
+        repository.clone(),
+        state_new.clone(),
+        commit::BasedOn::FirstParent,
+    )
+    .await
+    .forward::<MergeError>("weaving history")?;
 
     let signature = state_new
         .serialize(repository.clone(), token)
