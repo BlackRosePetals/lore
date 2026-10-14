@@ -56,6 +56,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore commit` with changes staged in a layer commits the layer while the parent tree holds only changes marked dirty,
+  and leaves those changes dirty. It failed with `Nothing staged for commit` before committing any layer
 - A merge of divergent branch history, such as the one a sync commits when the local and the remote latest have both
   moved, records the remote's history in the files it changed, and so does the merge of a linked repository whose
   history diverged in a same-branch `lore branch merge`. The merge is built from the local latest, which can give a

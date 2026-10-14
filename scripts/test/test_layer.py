@@ -18,7 +18,7 @@ from lore_parsers import (
     parse_status_summary_json,
 )
 from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
-from test_utils import revision_metadata_keys
+from test_utils import revision_metadata_keys, status_by_path
 
 
 logger = logging.getLogger(__name__)
@@ -1386,6 +1386,36 @@ def test_status_unstaged_layer_file_deleted(new_lore_repo):
     assert deleted_entry.get("action") == "delete", (
         f"Expected deleted layer file to be reported as 'delete', got: {deleted_entry}"
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("mark", ["dirty", "scan"])
+def test_commit_with_a_layer_staged_keeps_a_parent_change_that_is_only_dirty(
+    new_lore_repo, mark
+):
+    """A commit with changes staged in a layer while the parent holds only a change marked
+    dirty, by `lore dirty` or by a scan, commits the layer and leaves the parent's change
+    dirty and unstaged.
+    """
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    (layer_before,) = parse_layer_list_json(repo.layer_list(json=True))
+
+    with repo.open_file(LAYER_FILE, mode="wb") as out:
+        out.write(b"layer content v2")
+    repo.stage(LAYER_FILE)
+    with repo.open_file(MAIN_FILE, mode="wb") as out:
+        out.write(b"main content v2")
+    if mark == "dirty":
+        repo.dirty(MAIN_FILE)
+    else:
+        repo.status(scan=True)
+    repo.commit("Layer change", non_interactive=True)
+
+    (layer_after,) = parse_layer_list_json(repo.layer_list(json=True))
+    assert layer_after["revision"] != layer_before["revision"]
+    main_entry = status_by_path(repo)[MAIN_FILE]
+    assert main_entry.get("flagDirty") is True
+    assert not main_entry.get("flagStaged")
 
 
 @pytest.mark.smoke

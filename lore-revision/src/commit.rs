@@ -665,6 +665,9 @@ async fn commit_with_metadata_in_operation(
 
 /// Commits the staged revision, then each layer staged beside it.
 ///
+/// A staged revision with nothing to commit while a layer has changes, such as one holding only
+/// dirty nodes, stays staged as it is, and the layers commit.
+///
 /// Its own future: inline, what it holds across its awaits would be reserved in the states of
 /// [`commit_with_metadata_in_operation`] that commit a link or a layer alone.
 #[allow(clippy::too_many_arguments)]
@@ -785,47 +788,54 @@ async fn commit_staged_with_layers(
 
     prune_dirty_for_commit(state_staged.clone(), repository.clone()).await?;
 
-    let mut signature = staged_revision;
+    let mut signature = current_revision;
     if current_revision != staged_revision {
         lore_debug!(
             "Committing revision, current revision {}, staged revision {}",
             state_current.revision(),
             state_staged.revision()
         );
-        let (committed, modified_times) = commit_staged_revision(
-            operation,
-            repository.clone(),
-            token.share(),
-            state_current.clone(),
-            state_staged.clone(),
-            RelativePath::new(),
-            ROOT_NODE,
-            metadata.clone(),
-            link_messages.clone(),
-            current_branch,
-            reporting.clone(),
-        )
-        .await?;
-        signature = committed;
+        'parent: {
+            let (committed, modified_times) = match commit_staged_revision(
+                operation,
+                repository.clone(),
+                token.share(),
+                state_current.clone(),
+                state_staged.clone(),
+                RelativePath::new(),
+                ROOT_NODE,
+                metadata.clone(),
+                link_messages.clone(),
+                current_branch,
+                reporting.clone(),
+            )
+            .await
+            {
+                Ok(committed) => committed,
+                Err(err) if layer_staged && err.is_nothing_staged() => break 'parent,
+                Err(err) => return Err(err),
+            };
+            signature = committed;
 
-        finalize_commit(
-            repository.clone(),
-            &state_current,
-            &state_staged,
-            branch_latest,
-            signature,
-            current_branch,
-            token,
-            Some(operation),
-        )
-        .await?;
+            finalize_commit(
+                repository.clone(),
+                &state_current,
+                &state_staged,
+                branch_latest,
+                signature,
+                current_branch,
+                token,
+                Some(operation),
+            )
+            .await?;
 
-        modified_times.store(repository.clone()).await;
+            modified_times.store(repository.clone()).await;
 
-        event::metadata::send(&metadata);
+            event::metadata::send(&metadata);
+        }
     }
 
-    if !dry_run && !dirty_paths.is_empty() {
+    if !dry_run && signature != current_revision && !dirty_paths.is_empty() {
         crate::file::dirty::dirty_relative_paths_in_operation(
             operation,
             repository.clone(),
