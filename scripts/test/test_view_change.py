@@ -226,10 +226,11 @@ def test_sync_view_narrows_then_widens_an_instance(new_lore_repo, scratch_dir):
     assert realized == Realized(files_written=0, bytes_written=0, files_deleted=3), (
         "a narrowing writes nothing and removes the two files and their directory"
     )
-    assert reported_files(output) == set(), (
-        "a successful delete reports no per-file event, which a narrowing makes "
-        "visible: the success arm of the unlink clears the flag the event is gated on"
-    )
+    assert reported_files(output) == {
+        "delete assets/drop",
+        "delete assets/drop/one.uasset",
+        "delete assets/drop/two.uasset",
+    }, "the directory and the files leaving the view are each reported once"
     assert current_revision(instance) == before, "a view change mints no revision"
     assert stored_view(instance) == "assets/drop\n", (
         "the view the tree stands under is published as the instance's own, written "

@@ -354,9 +354,13 @@ mod tests {
                 );
                 assert_eq!(
                     recorded.reported(),
-                    Vec::<String>::new(),
-                    "a successful delete reports no per-file event, which a view narrowing makes \
-                     visible: the success arm of the unlink clears the flag the event is gated on"
+                    vec![
+                        "Delete drop/dropped.txt".to_string(),
+                        "Delete drop/also-dropped.txt".to_string(),
+                        "Delete drop".to_string(),
+                    ],
+                    "each path leaving the view is reported once, the files before the directory \
+                     that held them"
                 );
             }))
             .await

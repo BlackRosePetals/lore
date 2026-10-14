@@ -1479,8 +1479,7 @@ async fn realize_changes_delete(
                         break;
                     }
                 } else {
-                    // Directory unlink failed, keep it and the locally added/modified files
-                    deleted = false;
+                    // Success.
                     break;
                 }
             }

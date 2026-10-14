@@ -190,6 +190,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   directory it was given and another for every change below each, all live at the same time, so peak memory followed the
   size of the resolved tree; the directory tasks and the change tasks below them now draw on one budget of 1,000 in
   flight
+- A sync, branch switch, reset, merge or view change sends a `LORE_EVENT_REVISION_SYNC_FILE` event for each file and
+  directory it deletes. A delete that succeeded sent none, so a caller tracking the working tree through those events,
+  such as an editor updating its asset registry, kept every deleted path. The progress totals counted the deletes all
+  along
 
 ## v0.10.1 (Oct 5th 2026) [#1475]
 
