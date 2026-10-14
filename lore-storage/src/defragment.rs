@@ -167,13 +167,19 @@ async fn walk_fragment_tree(
 /// to where the next entry starts, and for the last entry to the end of the level.
 ///
 /// Derived from the list alone rather than from the fragment the entry names, which is what
-/// lets a ranged walk decide an entry is not wanted before paying to load it.
+/// lets a ranged walk decide an entry is not wanted before paying to load it. A zero hash is
+/// rejected here: it addresses zero-length content, never an entry.
 fn entry_window(
     fragment_list: &[FragmentReference],
     index: usize,
     level_end: u64,
 ) -> Result<Range<u64>, StorageError> {
     let start = fragment_list[index].offset_content;
+    if fragment_list[index].hash.is_zero() {
+        return Err(StorageError::internal(format!(
+            "fragment list entry {index} at content offset {start} has a zero hash"
+        )));
+    }
     let end = if index + 1 < fragment_list.len() {
         fragment_list[index + 1].offset_content
     } else {
@@ -198,17 +204,10 @@ fn clip_to_window(entry: &Range<u64>, window: &Range<u64>) -> Option<Range<u64>>
     (start < end).then(|| (start - entry.start)..(end - entry.start))
 }
 
-/// The entries of a level whose content the read asked for, or `None` when the level holds
-/// none of it.
-///
-/// One contiguous index range, because entries are strictly increasing and tile the level
-/// while the window is itself contiguous — so the entries a window reaches cannot have a gap.
-/// That is what lets the caller size its work from the ends alone.
-///
-/// Walks the whole list rather than stopping at the last hit: an entry's arithmetic is checked
-/// whether or not its content is wanted, so reading one part of a malformed list cannot
-/// succeed where reading another part fails.
-fn wanted_entries(
+/// The contiguous index range of a level's entries that `window` reaches, or `None` when it
+/// reaches none. Every entry is checked, wanted or not: offsets strictly increasing up to
+/// `level_end`, no empty entry, no zero hash.
+pub fn wanted_entries(
     fragment_list: &[FragmentReference],
     level_end: u64,
     window: &Range<u64>,
@@ -391,13 +390,6 @@ async fn walk_leaf_level(
                 crate::FRAGMENT_SIZE_THRESHOLD
             )));
         }
-        if frag_ref.hash.is_zero() {
-            return Err(StorageError::internal(format!(
-                "fragment list entry {i} at content offset {} has a zero hash",
-                frag_ref.offset_content
-            )));
-        }
-
         let Some(clip) = clip_to_window(&entry, window) else {
             continue;
         };
@@ -416,28 +408,11 @@ async fn walk_leaf_level(
     Ok(())
 }
 
-/// Verifies that one sublist covers exactly the window its parent's list gives it.
-///
-/// Sublist offsets are absolute in the whole content, so in a well-formed tree a parent
-/// entry's `offset_content` equals its sublist's own first offset, and the sublist expands to
-/// exactly the distance to the next sibling — or, for the last entry, to the end of the level.
-/// A sublist that falls short leaves a gap: the output is sized to the whole range before the
-/// walk starts, so a range no leaf ever writes reads back as zeros and the file is renamed
-/// into place as complete. One that overruns is the same fault from the other side, which is
-/// why this compares against the window rather than only bounding it.
-///
-/// Checked against the window the parent's list derives rather than against a running total of
-/// what previous siblings covered. The two say the same thing for a whole-content read — a
-/// sibling's window ends where the next one begins — but only the window form survives a
-/// ranged read, which visits some siblings and not others.
-///
-/// A sublist that is empty or expands to zero bytes is invalid outright: zero-length content
-/// is addressed by the zero hash, so no valid tree contains a list standing in for nothing.
-/// The zero hash itself is just as invalid as an entry, and is checked here rather than in a
-/// pass of its own — `load_fragment` resolves it to a default `Fragment` instead of an error,
-/// and that carries no `PayloadFragmented` flag and zero `size_content`, so an unchecked one
-/// turns a level of intermediate references into leaves.
-fn sublist_coverage(
+/// Checks that `sub_list`, expanding to `sub_content_size` bytes, covers exactly `window`, the
+/// window its `parent` entry's list gives it: the window and the sublist start at the parent's
+/// offset, and the sublist ends at the window's end. A zero-hash parent, a reversed window, an
+/// empty sublist and one expanding to nothing are rejected.
+pub fn sublist_coverage(
     parent: &FragmentReference,
     sub_list: &[FragmentReference],
     sub_content_size: usize,
@@ -447,6 +422,12 @@ fn sublist_coverage(
         return Err(StorageError::internal(format!(
             "fragment list entry at content offset {} has a zero hash",
             window.start
+        )));
+    }
+    if parent.offset_content != window.start || window.end < window.start {
+        return Err(StorageError::internal(format!(
+            "fragment list entry at content offset {} is given the window {window:?}",
+            parent.offset_content
         )));
     }
     if sub_list.is_empty() {
