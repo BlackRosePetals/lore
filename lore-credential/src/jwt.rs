@@ -36,20 +36,57 @@ pub struct JWTUserInfo {
     #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(rename = "aud")]
     pub audience: Vec<String>,
+    #[serde_as(as = "Option<OneOrMany<_, PreferMany>>")]
+    #[serde(default)]
+    pub root_domains: Option<Vec<String>>,
+    #[serde_as(as = "Option<OneOrMany<_, PreferMany>>")]
+    #[serde(default, rename = "https://lore.org/claims/root_domains")]
+    pub root_domains_namespaced: Option<Vec<String>>,
 }
 
 impl JWTUserInfo {
-    /// All the root domains this token are intended for
+    /// The root domains this token may be sent to, read from claims the issuer signed.
+    ///
+    /// The `root_domains` claim, or its namespaced alias, wins. Otherwise `aud` entries with a
+    /// usable shape contribute: an `https` URI its host, a domain-shaped entry a suffix. Names
+    /// are fixed so an environment response cannot point the client at a different claim.
     pub fn acceptable_root_domains(&self) -> Vec<String> {
-        [
-            // Whoever issued it already knows about the token and thus
-            // the token can be given back to that endpoint.
-            std::slice::from_ref(&self.issuer),
-            // The Auth Service defines audienes as a list of root domains
-            self.audience.as_slice(),
-        ]
-        .concat()
+        let from_claim: Vec<String> = [&self.root_domains, &self.root_domains_namespaced]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|domain| !domain.is_empty())
+            .cloned()
+            .collect();
+        if !from_claim.is_empty() {
+            return from_claim;
+        }
+
+        self.audience
+            .iter()
+            .filter_map(|aud| domain_from_audience(aud))
+            .collect()
     }
+}
+
+fn domain_from_audience(aud: &str) -> Option<String> {
+    if aud.contains("://") {
+        let url = url::Url::parse(aud).ok()?;
+        if url.scheme() != "https" {
+            return None;
+        }
+        return url.host_str().map(str::to_string);
+    }
+
+    let apex = aud.strip_prefix('.').unwrap_or(aud);
+    let domain_shaped = apex.contains('.')
+        && apex.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    domain_shaped.then(|| aud.to_string())
 }
 
 pub async fn user_info<P>(
@@ -132,6 +169,12 @@ pub fn verify_jwt_usage_for_remote(
     remote_domain: &str,
 ) -> Result<(), JwtUsageError> {
     let root_domains = jwt.acceptable_root_domains();
+    if root_domains.is_empty() {
+        return Err(JwtUsageError::internal(
+            "JWT names no domain it may be sent to: have the issuer add a 'root_domains' claim, \
+             or set the token audience to the deployment's https URL or domain",
+        ));
+    }
     if domain_in_root_domains(remote_domain, &root_domains) {
         return Ok(());
     }
@@ -140,6 +183,6 @@ pub fn verify_jwt_usage_for_remote(
         "JWT acceptable domains '{root_domains:?}' does not contain '{remote_domain}' - forbidding JWT leak"
     );
     Err(JwtUsageError::internal(format!(
-        "JWT 'aud' does not specify remote domain '{remote_domain}'"
+        "JWT does not specify remote domain '{remote_domain}'"
     )))
 }

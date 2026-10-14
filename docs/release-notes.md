@@ -54,6 +54,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- The check that prevents the CLI from sending the tokens to 3rd party domains now reads the allowed host list from the following token claims: `root_domains`, `https://lore.org/claims/root_domains`, `aud`. These claims tell which Lore servers are trusted as token receivers. The token's `iss` is no longer added as a trusted domain. Token exchange is implicitly allowed against the same auth server where the token originated from, so the `iss` addition is not needed, and unnecessarily widens the token's allowed domains for non-token-exchange use.
 - `lore repository create` syncs the created repository to disk only under `--sync-data`, as every other command does.
   It previously always forced a sync
 - Opening a repository lists each store's index directory once to find the groups it has written, rather than checking

@@ -56,3 +56,41 @@ fn an_expired_nameless_token_still_reports_its_expiry() {
         .as_millis() as u64;
     assert!(info.expires < now_ms, "the token reads as expired");
 }
+
+fn domains_of(claims: &str) -> Vec<String> {
+    let token = token_with_claims(claims);
+    lore_credential::insecure_decode_token(&token)
+        .expect("the token decodes")
+        .claims
+        .acceptable_root_domains()
+}
+
+#[test]
+fn root_domains_claim_decodes_as_an_array_or_a_scalar() {
+    let array = r#"{"iss":"i","sub":"s","exp":1,"aud":"lore-api","root_domains":["a.example.com","b.example.com"]}"#;
+    assert_eq!(domains_of(array), vec!["a.example.com", "b.example.com"]);
+
+    let scalar = r#"{"iss":"i","sub":"s","exp":1,"aud":"lore-api","root_domains":"a.example.com"}"#;
+    assert_eq!(domains_of(scalar), vec!["a.example.com"]);
+}
+
+#[test]
+fn namespaced_root_domains_claim_decodes_as_an_array_or_a_scalar() {
+    let array = r#"{"iss":"i","sub":"s","exp":1,"aud":"lore-api","https://lore.org/claims/root_domains":["a.example.com","b.example.com"]}"#;
+    assert_eq!(domains_of(array), vec!["a.example.com", "b.example.com"]);
+
+    let scalar = r#"{"iss":"i","sub":"s","exp":1,"aud":"lore-api","https://lore.org/claims/root_domains":"a.example.com"}"#;
+    assert_eq!(domains_of(scalar), vec!["a.example.com"]);
+}
+
+#[test]
+fn root_domains_claim_wins_over_audience_on_the_wire() {
+    let claims = r#"{"iss":"i","sub":"s","exp":1,"aud":["other.example.org"],"root_domains":["a.example.com"]}"#;
+    assert_eq!(domains_of(claims), vec!["a.example.com"]);
+}
+
+#[test]
+fn a_token_without_the_claims_falls_back_to_audience() {
+    let claims = r#"{"iss":"i","sub":"s","exp":1,"aud":["URC",".epicgames.net"]}"#;
+    assert_eq!(domains_of(claims), vec![".epicgames.net"]);
+}
