@@ -26,6 +26,7 @@ use crate::compress::COMPRESSION_MODE;
 use crate::concurrency::file_count_limit_acquire;
 use crate::content::ContentHandle;
 use crate::content::ContentSource;
+use crate::content::VirtualContent;
 use crate::content::WindowRead;
 use crate::error::StorageError;
 use crate::errors::SlowDown;
@@ -1808,7 +1809,8 @@ pub enum FileMatch {
 /// along with its header.
 ///
 /// A stored object that cannot be read falls back to [`hashed_under_current_chunking`],
-/// which reads nothing but the file.
+/// which reads nothing but the file. Virtual immutable content is settled by the hash of the
+/// address it names, reading nothing.
 pub async fn file_matches(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
@@ -1834,6 +1836,14 @@ pub async fn file_matches(
         file_size as u64,
     ) {
         return Ok(settled);
+    }
+
+    if let ContentSource::Virtual(VirtualContent::Immutable { address, .. }) = source {
+        return Ok(if address.hash == previous.hash {
+            FileMatch::Match
+        } else {
+            FileMatch::Differs
+        });
     }
 
     if file_size <= crate::concurrency::FRAGMENT_SIZE_MINIMUM

@@ -9,6 +9,7 @@ use std::path::Path;
 
 use bytes::Bytes;
 use bytes::BytesMut;
+use lore_base::types::Address;
 
 use crate::error::StorageError;
 use crate::errors::InvalidArguments;
@@ -62,13 +63,16 @@ pub enum ContentSource<'a> {
     Virtual(VirtualContent),
 }
 
-/// What reads content a virtualizing library holds.
+/// Content a virtualizing library holds.
 ///
-/// Uninhabited until such a library's read primitive lives below this crate, so nothing can
-/// construct one and every arm reading one is unreachable. The variants that read content are
-/// where that primitive plugs in.
-#[derive(Clone)]
-pub enum VirtualContent {}
+/// Nothing in this crate reads it: a virtual source answers its declared size, a comparison
+/// settles it by the address it names ([`crate::write::file_matches`]), and opening or reading one
+/// is refused.
+#[derive(Clone, Debug)]
+pub enum VirtualContent {
+    /// Content addressed in the immutable store, named by its content hash and declared size.
+    Immutable { address: Address, size: u64 },
+}
 
 impl<'a> ContentSource<'a> {
     /// Content at a path the caller already holds.
@@ -81,8 +85,18 @@ impl<'a> ContentSource<'a> {
         ContentSource::File(std::borrow::Cow::Owned(path))
     }
 
-    /// How large the content is, which settles a comparison before any of it is read.
+    /// Content addressed in the immutable store, not backed by any host path.
+    pub fn virtual_immutable(address: Address, size: u64) -> ContentSource<'static> {
+        ContentSource::Virtual(VirtualContent::Immutable { address, size })
+    }
+
+    /// How large the content is, which settles a comparison before any of it is read. Virtual
+    /// immutable content answers its declared size.
+    #[lore_macro::test_pub]
     pub(crate) async fn size(&self) -> Result<u64, StorageError> {
+        if let ContentSource::Virtual(VirtualContent::Immutable { size, .. }) = self {
+            return Ok(*size);
+        }
         let path = self.host_path();
         lore_io::IoDriver::global()
             .metadata(path)
@@ -100,8 +114,14 @@ impl<'a> ContentSource<'a> {
     /// dispatch. A caller already holding a handle reads through [`ContentHandle::read_all`]
     /// instead of naming the content twice.
     ///
-    /// The caller budgets for holding the content resident.
+    /// The caller budgets for holding the content resident. Virtual content is
+    /// `InvalidArguments`: this crate does not read it.
     pub async fn read_all(&self) -> Result<Bytes, StorageError> {
+        if matches!(self, ContentSource::Virtual(_)) {
+            return Err(StorageError::from(InvalidArguments {
+                reason: format!("read: {self}: virtual content is not read here"),
+            }));
+        }
         let path = self.host_path();
         lore_io::IoDriver::global()
             .read_file_bytes(path)
@@ -117,11 +137,10 @@ impl<'a> ContentSource<'a> {
     /// Content that does not exist, or that does not name a regular file, will not open on any
     /// attempt, so spending the back-off on it costs the caller ten seconds and reports an
     /// internal fault for what is an argument error. Both are `InvalidArguments` on the first
-    /// attempt. Everything else keeps the back-off, which is there for a reader holding the file
-    /// open on Windows.
+    /// attempt, as is virtual content, which this crate does not open. Everything else keeps the
+    /// back-off, which is there for a reader holding the file open on Windows.
     #[lore_macro::test_pub]
     pub(crate) async fn open(&self) -> Result<(ContentHandle, u64), StorageError> {
-        let path = self.host_path();
         let mut retry = crate::retry(10, 10_000, 10);
         loop {
             match self.open_once().await {
@@ -129,18 +148,20 @@ impl<'a> ContentSource<'a> {
                 Err(err)
                     if matches!(
                         err.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::InvalidInput
+                            | std::io::ErrorKind::Unsupported
                     ) =>
                 {
                     return Err(StorageError::from(InvalidArguments {
-                        reason: format!("open file: {}: {err}", path.display()),
+                        reason: format!("open file: {self}: {err}"),
                     }));
                 }
                 Err(err) => {
                     if !retry.wait().await {
                         return Err(StorageError::internal_with_context(
                             err,
-                            &format!("open file: {}", path.display()),
+                            &format!("open file: {self}"),
                         ));
                     }
                 }
@@ -154,6 +175,9 @@ impl<'a> ContentSource<'a> {
     /// A scan reporting content it cannot read as clean spends nothing on a back-off it will
     /// discard the outcome of, and one running per path in a walk would spend it per path.
     pub async fn open_once(&self) -> std::io::Result<(ContentHandle, u64)> {
+        if matches!(self, ContentSource::Virtual(_)) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        }
         let (file, size) = open_read(self.host_path()).await?;
         Ok((ContentHandle::File(file), size))
     }
@@ -162,18 +186,16 @@ impl<'a> ContentSource<'a> {
     pub fn file_path(&self) -> Option<&Path> {
         match self {
             ContentSource::File(path) => Some(path),
-            ContentSource::Virtual(content) => match *content {},
+            ContentSource::Virtual(_) => None,
         }
     }
 
-    /// The host path a file's content is read from.
-    ///
-    /// Every reader here is the file variant's, so the match is where a second kind of content
-    /// stops sharing them.
+    /// The host path a file's content is read from. Virtual content has none; every reader
+    /// refuses it before asking.
     fn host_path(&self) -> &Path {
         match self {
             ContentSource::File(path) => path,
-            ContentSource::Virtual(content) => match *content {},
+            ContentSource::Virtual(_) => Path::new(""),
         }
     }
 }
@@ -182,7 +204,9 @@ impl std::fmt::Display for ContentSource<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ContentSource::File(path) => write!(formatter, "{}", path.display()),
-            ContentSource::Virtual(content) => match *content {},
+            ContentSource::Virtual(VirtualContent::Immutable { address, .. }) => {
+                write!(formatter, "immutable:{address}")
+            }
         }
     }
 }
@@ -199,7 +223,7 @@ impl std::fmt::Display for ContentSource<'_> {
 pub enum ContentHandle {
     /// A file on the host, read through the IO driver.
     File(lore_io::IoFile),
-    /// Content a virtualizing library holds, open. Unreachable until one is named.
+    /// Content a virtualizing library holds, open. Never produced: no virtual content opens here.
     #[allow(dead_code)]
     Virtual(VirtualContent),
 }
@@ -228,7 +252,7 @@ impl ContentHandle {
             ContentHandle::File(file) => {
                 Ok(file.read_exact_vectored_at(window, offset).await?.buffer)
             }
-            ContentHandle::Virtual(content) => match *content {},
+            ContentHandle::Virtual(_) => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         }
     }
 }

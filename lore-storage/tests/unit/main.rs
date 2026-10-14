@@ -9,6 +9,7 @@
 mod chunker;
 mod compress;
 mod concurrency;
+mod content;
 mod deduplicated_gc;
 mod defragment;
 mod fragment_engine;

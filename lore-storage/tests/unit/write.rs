@@ -1770,6 +1770,53 @@ async fn content_that_cannot_be_read_answers_unreadable() {
     assert_eq!(FileMatch::Unreadable, compared);
 }
 
+/// Virtual immutable content is settled by the address it names, reading neither it nor the store,
+/// at any size: an address with its hash matches, under any context, and one with another hash
+/// differs.
+#[tokio::test]
+async fn virtual_content_is_settled_by_the_address_it_names() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([0x5a; 16]);
+    for size in [SINGLE_FRAGMENT_SIZE, LISTED_SIZE] {
+        let address = Address {
+            hash: lore_storage::hash::hash_slice(&size.to_le_bytes()),
+            context: Context::from([0x5a; 16]),
+        };
+        let source = ContentSource::virtual_immutable(address, size as u64);
+        for (previous, expected) in [
+            (address, FileMatch::Match),
+            (
+                Address {
+                    context: Context::from([0x5b; 16]),
+                    ..address
+                },
+                FileMatch::Match,
+            ),
+            (
+                Address {
+                    hash: lore_storage::hash::hash_slice(b"other content"),
+                    ..address
+                },
+                FileMatch::Differs,
+            ),
+        ] {
+            let compared = file_matches(
+                store.clone(),
+                partition,
+                previous,
+                Some(size),
+                None,
+                &source,
+                &ContentHashes::default(),
+            )
+            .await
+            .expect("comparing virtual content must not error");
+
+            assert_eq!(compared, expected, "at {size} bytes against {previous}");
+        }
+    }
+}
+
 /// Bigger than the minimum cut and smaller than the threshold, which is the band a
 /// file is stored as a list in and its own hash answers nothing for.
 const FRAGMENTED_SIZE: usize = 150 * 1024;
