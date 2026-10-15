@@ -1,8 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
+use std::time::Duration;
+
 use bytes::Bytes;
 use lore_base::test_util::TempDir;
 use lore_storage::packstore::PackStore;
+use lore_storage::test_util::PausePoint;
+use lore_storage::test_util::fail_packfile_writes;
+use lore_storage::test_util::hold_packfile_write;
+use lore_storage::test_util::limit_packfile_size;
+use lore_storage::test_util::pause_at;
+
+use crate::store_fixture::wait_until;
 
 fn payload(byte: u8) -> Bytes {
     Bytes::from(vec![byte; 64])
@@ -234,4 +244,259 @@ async fn a_missing_packfile_loads_empty() {
 
     assert_eq!(packstore.sizes().await.unwrap(), vec![64, 0, 64]);
     assert_eq!(packstore.load(3, 0, 64).await.unwrap(), payload(3));
+}
+
+/// Stores in flight together on one packfile each reserve their own range, so that none
+/// overlaps another and each reads back.
+#[tokio::test]
+async fn concurrent_stores_take_disjoint_ranges() {
+    let dir = TempDir::new("packstore-concurrent-");
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    let payloads: Vec<Bytes> = (0..32u8)
+        .map(|byte| Bytes::from(vec![byte; 100 + byte as usize]))
+        .collect();
+
+    let stored = futures::future::join_all(
+        payloads
+            .iter()
+            .map(|payload| packstore.store(payload.clone())),
+    )
+    .await;
+
+    let mut ranges = vec![];
+    for (payload, stored) in payloads.iter().zip(stored) {
+        let stored = stored.unwrap();
+        assert_eq!(stored.id, 1);
+        let size = payload.len() as u32;
+        assert_eq!(
+            packstore.load(1, stored.offset, size).await.unwrap(),
+            *payload
+        );
+        ranges.push((stored.offset, stored.offset + size));
+    }
+    ranges.sort_unstable();
+    assert!(
+        ranges.windows(2).all(|pair| pair[0].1 == pair[1].0),
+        "the ranges are disjoint and leave no gap"
+    );
+    assert_eq!(
+        packstore.sizes().await.unwrap(),
+        vec![ranges.last().unwrap().1 as usize]
+    );
+}
+
+/// A load from a packfile, and another write to it, do not wait for a write to it that is still in
+/// flight.
+#[tokio::test]
+async fn a_load_and_a_write_go_on_during_a_write_to_their_packfile() {
+    let dir = TempDir::new("packstore-load-during-write-");
+    let packstore = Arc::new(PackStore::new(Some(dir.to_path_buf()), 1, None));
+    let first = packstore.store(payload(1)).await.unwrap();
+
+    let reserved = pause_at(PausePoint::Reserved);
+    let writer = {
+        let packstore = packstore.clone();
+        lore_base::lore_spawn!(async move { packstore.store(payload(2)).await })
+    };
+    reserved.reached.notified().await;
+
+    let loaded =
+        tokio::time::timeout(Duration::from_secs(10), packstore.load(1, first.offset, 64)).await;
+    let third = tokio::time::timeout(Duration::from_secs(10), packstore.store(payload(3))).await;
+    reserved.resume.notify_one();
+    assert_eq!(
+        loaded
+            .expect("the load does not wait for the write")
+            .unwrap(),
+        payload(1)
+    );
+    let third = third
+        .expect("the other write does not wait for the write")
+        .unwrap();
+    assert_eq!((third.id, third.offset), (1, 128));
+    let second = writer.await.unwrap().unwrap();
+    assert_eq!((second.id, second.offset), (1, 64));
+    assert_eq!(packstore.load(1, 64, 64).await.unwrap(), payload(2));
+    assert_eq!(packstore.load(1, 128, 64).await.unwrap(), payload(3));
+}
+
+/// A sync that claims the dirty mark while a write is in flight does not cover the write, so the
+/// packfile is dirty again once the write lands, for the next sync to cover it.
+#[tokio::test]
+async fn a_write_landing_after_a_sync_leaves_the_packfile_dirty() {
+    let dir = TempDir::new("packstore-dirty-after-sync-");
+    let packstore = Arc::new(PackStore::new(Some(dir.to_path_buf()), 1, None));
+    packstore.store(payload(1)).await.unwrap();
+    packstore.flush(1, true).await.unwrap();
+    assert!(!packstore.is_dirty(1).await);
+
+    let reserved = pause_at(PausePoint::Reserved);
+    let writer = {
+        let packstore = packstore.clone();
+        lore_base::lore_spawn!(async move { packstore.store(payload(2)).await })
+    };
+    reserved.reached.notified().await;
+    packstore.flush(1, true).await.unwrap();
+    reserved.resume.notify_one();
+    writer.await.unwrap().unwrap();
+
+    assert!(
+        packstore.is_dirty(1).await,
+        "the write is left for the next sync"
+    );
+}
+
+/// A failed write gives back the range it reserved, so the next write takes it.
+#[tokio::test]
+async fn a_failed_write_gives_its_range_back() {
+    let dir = TempDir::new("packstore-failed-write-");
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    packstore.store(payload(1)).await.unwrap();
+
+    fail_packfile_writes(1);
+    assert!(packstore.store(payload(2)).await.is_err());
+
+    assert_eq!(packstore.sizes().await.unwrap(), vec![64]);
+    let stored = packstore.store(payload(3)).await.unwrap();
+    assert_eq!((stored.id, stored.offset), (1, 64));
+    assert_eq!(packstore.load(1, 64, 64).await.unwrap(), payload(3));
+}
+
+/// A failed write with another range reserved after it keeps its range, as a hole, so that the
+/// later write stays where it landed.
+#[tokio::test]
+async fn a_failed_write_before_another_leaves_a_hole() {
+    let dir = TempDir::new("packstore-failed-write-hole-");
+    let packstore = Arc::new(PackStore::new(Some(dir.to_path_buf()), 1, None));
+
+    let reserved = pause_at(PausePoint::Reserved);
+    let failing = {
+        let packstore = packstore.clone();
+        lore_base::lore_spawn!(async move { packstore.store(payload(1)).await })
+    };
+    reserved.reached.notified().await;
+    let later = packstore.store(payload(2)).await.unwrap();
+    assert_eq!((later.id, later.offset), (1, 64));
+
+    fail_packfile_writes(1);
+    reserved.resume.notify_one();
+    assert!(failing.await.unwrap().is_err());
+
+    assert_eq!(packstore.sizes().await.unwrap(), vec![128]);
+    assert_eq!(packstore.load(1, 64, 64).await.unwrap(), payload(2));
+}
+
+/// A packfile at the size limit takes no reservation, even before it is marked full: with a write
+/// reserved across the limit still in flight, the next write goes to a new packfile rather than
+/// further past the limit. The packfile is a sparse file just under the limit.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_packfile_at_the_size_limit_takes_no_reservation() {
+    const LIMIT: u64 = 3 * 1024 * 1024 * 1024;
+    let dir = TempDir::new("packstore-size-limit-");
+    let pack = dir.join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::File::create(pack.join("1"))
+        .unwrap()
+        .set_len(LIMIT - 32)
+        .unwrap();
+    let packstore = Arc::new(PackStore::new(Some(dir.to_path_buf()), 1, None));
+
+    let reserved = pause_at(PausePoint::Reserved);
+    let crossing = {
+        let packstore = packstore.clone();
+        lore_base::lore_spawn!(async move { packstore.store(payload(1)).await })
+    };
+    reserved.reached.notified().await;
+    let next = {
+        let packstore = packstore.clone();
+        lore_base::lore_spawn!(async move { packstore.store(payload(2)).await })
+    };
+    wait_until(|| packstore.list_change_pending(), &next).await;
+    assert!(
+        !next.is_finished(),
+        "the next write marks packfile 1 full, behind the crossing write"
+    );
+    reserved.resume.notify_one();
+
+    let crossing = crossing.await.unwrap().unwrap();
+    assert_eq!((crossing.id, u64::from(crossing.offset)), (1, LIMIT - 32));
+    let next = next.await.unwrap().unwrap();
+    assert_eq!((next.id, next.offset), (2, 0));
+}
+
+/// A packfile held in memory stops taking writes at the size limit, as one on disk does: the write
+/// that reaches the limit lands in it, and the next goes to a new packfile, rather than past the
+/// limit, where its offset would no longer fit an entry's 32 bits.
+#[tokio::test]
+async fn a_packfile_in_memory_stops_at_the_size_limit() {
+    limit_packfile_size(128);
+    let packstore = PackStore::new(None, 1, None);
+
+    let mut stored = vec![];
+    for byte in 1..=3 {
+        stored.push((packstore.store(payload(byte)).await.unwrap(), byte));
+    }
+    limit_packfile_size(0);
+
+    let locations: Vec<_> = stored.iter().map(|(at, _)| (at.id, at.offset)).collect();
+    assert_eq!(locations, vec![(1, 0), (1, 64), (2, 0)]);
+    for (at, byte) in stored {
+        assert_eq!(
+            packstore.load(at.id, at.offset, 64).await.unwrap(),
+            payload(byte)
+        );
+    }
+}
+
+/// A write abandoned in flight holds the packfile list until the driver is done with its buffer,
+/// so that stopping writes to the packfile, which a truncate follows, waits for the write and not
+/// for the store that issued it.
+#[tokio::test]
+async fn an_abandoned_write_holds_the_packfile_list_until_it_completes() {
+    let dir = TempDir::new("packstore-abandoned-write-");
+    let packstore = Arc::new(PackStore::new(Some(dir.to_path_buf()), 1, None));
+
+    let in_flight = hold_packfile_write();
+    let store = {
+        let packstore = packstore.clone();
+        lore_base::lore_spawn!(async move { packstore.store(payload(1)).await })
+    };
+    in_flight.issued.notified().await;
+    store.abort();
+    assert!(store.await.unwrap_err().is_cancelled());
+
+    let stop = {
+        let packstore = packstore.clone();
+        lore_base::lore_spawn!(async move { packstore.stop_writes(&[1]).await })
+    };
+    wait_until(|| packstore.list_change_pending(), &stop).await;
+    assert!(
+        !stop.is_finished(),
+        "stopping writes waits for the write in flight"
+    );
+    in_flight.complete();
+    assert_eq!(stop.await.unwrap().unwrap(), vec![64]);
+}
+
+/// Obliterating a range overwrites it with zeros and syncs the packfile, leaving the payloads
+/// beside it as they were.
+#[tokio::test]
+async fn obliterating_a_range_zeroes_and_syncs_it() {
+    let dir = TempDir::new("packstore-obliterate-");
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    let doomed = packstore.store(payload(1)).await.unwrap();
+    let kept = packstore.store(payload(2)).await.unwrap();
+
+    packstore.obliterate(1, doomed.offset, 64).await.unwrap();
+
+    assert_eq!(
+        packstore.load(1, doomed.offset, 64).await.unwrap(),
+        Bytes::from(vec![0; 64])
+    );
+    assert_eq!(
+        packstore.load(1, kept.offset, 64).await.unwrap(),
+        payload(2)
+    );
+    assert!(!packstore.is_dirty(1).await, "the zeros are synced");
 }

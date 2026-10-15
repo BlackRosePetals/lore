@@ -9,6 +9,10 @@ pub mod info;
 mod oodle_migration;
 #[cfg(all(feature = "oodle", feature = "test-util"))]
 pub mod oodle_migration;
+#[cfg(not(feature = "test-util"))]
+mod payload_gate;
+#[cfg(feature = "test-util")]
+pub mod payload_gate;
 use std::backtrace::Backtrace;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -81,6 +85,7 @@ use crate::local::immutable_store::info::ImmutableStoreInfo;
 use crate::local::immutable_store::info::get_or_init_disk_info;
 use crate::local::immutable_store::info::info_path_for_store_root;
 use crate::local::immutable_store::info::write_info_file;
+use crate::local::immutable_store::payload_gate::PayloadGate;
 use crate::store_types::PayloadRead;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
@@ -270,6 +275,40 @@ enum Rewrite {
     Interrupted,
 }
 
+/// What [`LocalImmutableStore::store_entry`] did with an entry.
+#[derive(Clone, Copy)]
+enum StoreOutcome {
+    /// The entry already held its payload, or the store carried none, so it was kept. Its stored
+    /// flags changed to `changed_flags`, when set.
+    Kept { changed_flags: Option<u32> },
+    /// The entry was inserted or updated to hold `flags` and point at packfile `pack_file`, 0 for
+    /// no payload.
+    Stored { flags: u32, pack_file: u32 },
+    /// The entry needs a payload written for it, which the caller writes before storing again.
+    NeedsPayload,
+}
+
+impl StoreOutcome {
+    /// The flags to schedule the group's index flush for, when the bucket changed.
+    fn flush_flags(self) -> Option<u32> {
+        match self {
+            Self::Kept { changed_flags } => changed_flags,
+            Self::Stored { flags, .. } => Some(flags),
+            Self::NeedsPayload => None,
+        }
+    }
+}
+
+/// The payload a store carries, as [`LocalImmutableStore::store_entry`] takes it.
+enum StorePayload {
+    /// None: the entry is recorded without one.
+    Absent,
+    /// One not written to a packfile yet.
+    Unwritten,
+    /// One written at this location.
+    Written(crate::PackStoreRef),
+}
+
 impl ImmutableStoreBucket {
     fn clone_for_compaction(&self) -> (Vec<ImmutableStoreEntry>, Vec<u32>) {
         (self.entry.to_vec(), self.sorted_index.to_vec())
@@ -325,6 +364,12 @@ pub struct ImmutableStoreGroup {
     pub flush_lock: Arc<Mutex<()>>,
     pub packstore: crate::PackStore,
     pub flush: Mutex<JoinSet<()>>,
+    /// Held by a store from before its packfile write until its entry is in the bucket, and by a
+    /// read from its lookup until it has loaded the payload. Compaction drains it between reading
+    /// the packfile sizes and measuring the bytes the index references, once it has stopped
+    /// writes to the packfiles it rewrites, and before it truncates one, so that it neither misses
+    /// a payload written but not yet indexed nor truncates one a read is loading.
+    pub payload_gate: PayloadGate,
 }
 
 impl ImmutableStoreGroup {
@@ -597,25 +642,37 @@ impl lore_io::StableBufListMut for ImmutableBucketSegments {
     }
 }
 
-/// Gather segments for a bucket write: the serialized header plus the
-/// bucket's sorted-index and entry chunks, written with one vectored
-/// operation and no staging copy. Owning the bucket's read guard keeps the
-/// chunk memory alive and unmodified for the operation's whole kernel
-/// flight, which is the stability contract vectored writes require.
-struct ImmutableBucketWriteSegments {
-    /// The serialized header, in a fixed-size allocation rather than a `Vec`: its length is a
-    /// compile-time constant. It stays behind a pointer because [`lore_io::StableBufList`]
-    /// requires a segment to keep its address when the value moves, and the ring backend moves
-    /// the segment list into its operation entry after taking the pointers.
-    header: Box<[u8; size_of::<ImmutableStoreHeader>()]>,
-    bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
+/// A bucket's file contents, the serialized header then the bucket's sorted-index and entry
+/// chunks, copied out of the bucket so that its read lock is released before the file is created
+/// and written. Writeback throttling can stall those for seconds, and an insert waiting for the
+/// write lock would hold every later lookup in the bucket behind it. The copy is one allocation
+/// of the file's size.
+struct ImmutableBucketWrite {
+    bytes: Vec<u8>,
 }
 
-impl lore_io::StableBufList for ImmutableBucketWriteSegments {
+impl ImmutableBucketWrite {
+    fn copy(header: &ImmutableStoreHeader, bucket: &ImmutableStoreBucket) -> Self {
+        let chunks = || {
+            bucket
+                .sorted_index
+                .byte_segments()
+                .chain(bucket.entry.byte_segments())
+        };
+        let mut bytes = Vec::with_capacity(
+            size_of::<ImmutableStoreHeader>() + chunks().map(<[u8]>::len).sum::<usize>(),
+        );
+        bytes.extend_from_slice(header.as_bytes());
+        for chunk in chunks() {
+            bytes.extend_from_slice(chunk);
+        }
+        Self { bytes }
+    }
+}
+
+impl lore_io::StableBufList for ImmutableBucketWrite {
     fn byte_segments(&self) -> impl Iterator<Item = &[u8]> {
-        std::iter::once(self.header.as_ref().as_slice())
-            .chain(self.bucket.sorted_index.byte_segments())
-            .chain(self.bucket.entry.byte_segments())
+        std::iter::once(self.bytes.as_slice())
     }
 }
 
@@ -887,8 +944,10 @@ impl ImmutableStoreBucket {
     }
 
     /// Write the bucket to a temporary file renamed over `path`, so that a process stopped during
-    /// the write leaves the file it last wrote. With `sync_data`, the file is synced before the
-    /// rename and its directory after.
+    /// the write leaves the file it last wrote. The bucket is copied and its lock released before
+    /// the write, see [`ImmutableBucketWrite`]. With `sync_data`, the group's packfiles are synced
+    /// between the copy and the write, so that the file points only at payload bytes stored, and
+    /// the file is synced before the rename and its directory after.
     async fn serialize_files(
         bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
         group: Arc<ImmutableStoreGroup>,
@@ -899,14 +958,6 @@ impl ImmutableStoreBucket {
         let temporary_path = crate::local::fan_out::temporary_path(&path);
         let mut temporary_guard =
             SerializeFailureGuard::new(&group.dirty[bucket_index], &temporary_path);
-
-        if let Some(parent_path) = temporary_path.parent()
-            && !parent_path.exists()
-        {
-            let _ = lore_io::IoDriver::global()
-                .create_dir_all(parent_path)
-                .await;
-        }
 
         let count = bucket.entry.len();
         if bucket.sorted_index.len() != count {
@@ -920,21 +971,28 @@ impl ImmutableStoreBucket {
         header.version = group.serialize_version.load(atomic::Ordering::Relaxed);
         header.count = count as u32;
 
-        let segments = ImmutableBucketWriteSegments {
-            header: {
-                let mut bytes = Box::new([0u8; size_of::<ImmutableStoreHeader>()]);
-                bytes.copy_from_slice(header.as_bytes());
-                bytes
-            },
-            bucket,
-        };
+        let contents = ImmutableBucketWrite::copy(&header, &bucket);
+        drop(bucket);
+        #[cfg(feature = "test-util")]
+        crate::test_util::pause_point(crate::test_util::PausePoint::Serializing).await;
+        if sync_data {
+            group.flush_packstore(true).await?;
+        }
+
+        if let Some(parent_path) = temporary_path.parent()
+            && !parent_path.exists()
+        {
+            let _ = lore_io::IoDriver::global()
+                .create_dir_all(parent_path)
+                .await;
+        }
 
         let file_options = lore_io::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true);
         lore_io::IoDriver::global()
-            .write_file_segments_atomic(&temporary_path, &path, &file_options, segments, sync_data)
+            .write_file_segments_atomic(&temporary_path, &path, &file_options, contents, sync_data)
             .await
             .internal("Failed to serialize storage bucket")?;
         temporary_guard.success();
@@ -984,6 +1042,8 @@ impl ImmutableStoreBucket {
         Ok(())
     }
 
+    /// Claim the bucket's dirty mark and write it, see [`Self::serialize_files`]. A bucket whose
+    /// mark another write claimed is left to that write.
     async fn serialize(
         bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
         group: Arc<ImmutableStoreGroup>,
@@ -1336,6 +1396,7 @@ impl LocalImmutableStore {
                     Some(store.gc_counters.clone()),
                 ),
                 flush: Mutex::new(JoinSet::new()),
+                payload_gate: PayloadGate::default(),
             }));
         }
 
@@ -1782,8 +1843,9 @@ impl LocalImmutableStore {
         representation_only
     }
 
-    // Assumes that payload has been validated to match the given hash prior to
-    // calling this function to store the content payload - no hash validation done
+    /// Insert the entry for `address`, see `store_entry`, writing its payload first, outside the
+    /// bucket's lock, when the entry needs one written, see `store_payload`. The payload is taken
+    /// to match the address's hash, which is not checked.
     pub async fn store(
         self: Arc<Self>,
         partition: Partition,
@@ -1815,6 +1877,141 @@ impl LocalImmutableStore {
             )));
         }
 
+        let carried = if payload.is_some() {
+            StorePayload::Unwritten
+        } else {
+            StorePayload::Absent
+        };
+        let mut outcome = self
+            .store_entry(&partition, &address, &fragment, carried, force)
+            .await?;
+        if let (StoreOutcome::NeedsPayload, Some(payload)) = (outcome, payload) {
+            outcome = self
+                .store_payload(&partition, &address, &fragment, payload, force)
+                .await?;
+        }
+        if let Some(flags) = outcome.flush_flags() {
+            self.flush_later(group_index, flags).await;
+        }
+
+        let StoreOutcome::Stored {
+            flags: fragment_flags,
+            pack_file,
+        } = outcome
+        else {
+            return Ok(());
+        };
+        if self.settings.verify_write
+            && pack_file != 0
+            && fragment_flags & FragmentFlags::PayloadObliterated == 0
+        {
+            let gate = self.group[group_index].payload_gate.hold();
+            let find = self
+                .find(partition, address)
+                .await
+                .inspect_err(|err| {
+                    lore_base::lore_warn!(
+                        "Store write verify failed: {err}\n{}",
+                        Backtrace::force_capture()
+                    );
+                })
+                .forward::<LocalImmutableStoreError>("Failed to verify written data")?;
+
+            #[cfg(feature = "test-util")]
+            crate::test_util::pause_point(crate::test_util::PausePoint::Located).await;
+            let data = Self::load(&self.group[find.group].packstore, find.data)
+                .await
+                .inspect_err(|err| {
+                    lore_base::lore_warn!(
+                        "Store write verify failed: {err}\n{}",
+                        Backtrace::force_capture()
+                    );
+                })
+                .forward::<LocalImmutableStoreError>("Failed to verify written data")?;
+            drop(gate);
+
+            let hash = if fragment_flags & FragmentFlags::PayloadCompressed != 0 {
+                let (_fragment, data) = compress::decompress(fragment, &data)
+                    .inspect_err(|err| {
+                        lore_base::lore_warn!(
+                            "Store write verify failed: {err}\n{}",
+                            Backtrace::force_capture()
+                        );
+                    })
+                    .forward::<LocalImmutableStoreError>("Failed to verify written data")?;
+                hash::hash_slice(&data)
+            } else {
+                hash::hash_slice(&data)
+            };
+            if hash != address.hash {
+                lore_base::lore_warn!(
+                    "Store write verify failed: Hash verification failed {} != {}\n{}",
+                    hash,
+                    address.hash,
+                    Backtrace::force_capture()
+                );
+                return Err(LocalImmutableStoreError::internal(
+                    "Failed to verify written data",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write `payload` to the group's packstore outside any bucket lock, then insert the entry for
+    /// `address` pointing at it, see [`Self::store_entry`]. The group's payload gate is held from
+    /// before the write until the entry is in the bucket, see
+    /// [`ImmutableStoreGroup::payload_gate`].
+    ///
+    /// Stores of a hash not yet stored each write the payload, since none holds the bucket during
+    /// its write. Unless forced, the entry takes the payload of the first to insert, and the bytes
+    /// the others wrote stay unreferenced until compaction reclaims them, as do those of a store
+    /// dropped once its write has landed. One dropped during the write leaves the write to land,
+    /// see [`crate::PackStore::store`].
+    async fn store_payload(
+        &self,
+        partition: &Partition,
+        address: &Address,
+        fragment: &Fragment,
+        payload: Bytes,
+        force: bool,
+    ) -> Result<StoreOutcome, LocalImmutableStoreError> {
+        let group = &self.group[address.hash.data()[0] as usize];
+        let _gate = group.payload_gate.hold();
+        let written = group
+            .packstore
+            .store(payload)
+            .await
+            .forward::<LocalImmutableStoreError>(
+                "Failed storing immutable data, packstore write failed",
+            )?;
+        #[cfg(feature = "test-util")]
+        crate::test_util::pause_point(crate::test_util::PausePoint::Written).await;
+        self.store_entry(
+            partition,
+            address,
+            fragment,
+            StorePayload::Written(written),
+            force,
+        )
+        .await
+    }
+
+    /// Insert or update the entry for `address` under its bucket's write lock. An entry needing a
+    /// payload, which the best match for its hash does not hold or `force` replaces, takes the one
+    /// `payload` was written to, and is reported as [`StoreOutcome::NeedsPayload`] while it is
+    /// unwritten. A written payload the entry does not take stays unreferenced.
+    async fn store_entry(
+        &self,
+        partition: &Partition,
+        address: &Address,
+        fragment: &Fragment,
+        payload: StorePayload,
+        force: bool,
+    ) -> Result<StoreOutcome, LocalImmutableStoreError> {
+        let has_payload = !matches!(payload, StorePayload::Absent);
+        let group_index = address.hash.data()[0] as usize;
         let group = &self.group[group_index];
         let (bucket_index, mut bucket) = loop {
             let n = group.bucket_count.load(atomic::Ordering::Relaxed);
@@ -1838,7 +2035,7 @@ impl LocalImmutableStore {
         }
 
         let (match_slot, insert_slot, match_made) =
-            Self::lookup(&bucket, partition, address, StoreMatch::MatchFull);
+            Self::lookup(&bucket, *partition, *address, StoreMatch::MatchFull);
 
         let matched_hash = match_made != StoreMatch::MatchNone;
         let matched_partition =
@@ -1876,43 +2073,39 @@ impl LocalImmutableStore {
                     data.size_payload,
                     data.size_content
                 );
-                if fragment_flags != data.flags {
-                    // Update stored upstream/local flags
-                    if (fragment_flags & FragmentFlags::PayloadStored)
-                        != (current_flags & FragmentFlags::PayloadStored)
-                    {
-                        let previous_flags = current_flags;
+                let keeps_payload = (!force && data.pack_file != 0) || !has_payload;
+                if keeps_payload {
+                    if fragment_flags != data.flags {
+                        // Update stored upstream/local flags
+                        if (fragment_flags & FragmentFlags::PayloadStored)
+                            != (current_flags & FragmentFlags::PayloadStored)
                         {
-                            let entry = &mut bucket.entry[entry_index];
-                            entry.data.flags &= !FragmentFlags::PayloadStored;
-                            entry.data.flags |= fragment_flags & FragmentFlags::PayloadStored;
-                            current_flags = entry.data.flags;
+                            let previous_flags = current_flags;
+                            {
+                                let entry = &mut bucket.entry[entry_index];
+                                entry.data.flags &= !FragmentFlags::PayloadStored;
+                                entry.data.flags |= fragment_flags & FragmentFlags::PayloadStored;
+                                current_flags = entry.data.flags;
+                            }
+
+                            group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+
+                            lore_base::lore_trace!(
+                                "Immutable store updated flags for {} from {} to {}",
+                                address,
+                                previous_flags,
+                                current_flags
+                            );
                         }
-
-                        group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-
-                        lore_base::lore_trace!(
-                            "Immutable store updated flags for {} from {} to {}",
-                            address,
-                            previous_flags,
-                            current_flags
-                        );
                     }
-                }
-                // If we have a previous payload or if no payload was given there is
-                // no update to do and we can early out - unless force write payload
-                if (!force && data.pack_file != 0) || payload.is_none() {
-                    let updated = current_flags != data.flags;
-                    drop(bucket);
-                    if updated {
-                        self.flush_later(group_index, current_flags).await;
-                    }
-                    return Ok(());
+                    return Ok(StoreOutcome::Kept {
+                        changed_flags: (current_flags != data.flags).then_some(current_flags),
+                    });
                 }
             }
 
             // Deduplicate payload if it already exist and not forced overwrite
-            if !force || payload.is_none() {
+            if !force || !has_payload {
                 pack_file = data.pack_file;
                 pack_offset = data.pack_offset;
 
@@ -1926,29 +2119,14 @@ impl LocalImmutableStore {
         }
 
         // If there was no matching entry in the same partition, we must have payload data
-        // If there was no existing data and payload given, then store the data
-        if !matched_partition || (pack_file == 0 && payload.is_some()) {
-            if let Some(payload) = payload {
+        if !matched_partition || (pack_file == 0 && has_payload) {
+            if has_payload {
                 if pack_file == 0 {
-                    if payload.len() < fragment.size_payload as usize {
-                        lore_base::lore_error!(
-                            "Failed storing immutable data, payload length {} does not match fragment payload size {} for {}",
-                            payload.len(),
-                            fragment.size_payload,
-                            address
-                        );
-                        return Err(LocalImmutableStoreError::internal("Invalid payload"));
-                    }
-
-                    let packref = group
-                        .packstore
-                        .store(payload.slice(..fragment.size_payload as usize))
-                        .await
-                        .forward::<LocalImmutableStoreError>(
-                            "Failed storing immutable data, packstore write failed",
-                        )?;
-                    pack_file = packref.id;
-                    pack_offset = packref.offset;
+                    let StorePayload::Written(written) = payload else {
+                        return Ok(StoreOutcome::NeedsPayload);
+                    };
+                    pack_file = written.id;
+                    pack_offset = written.offset;
                 }
             } else {
                 lore_base::lore_trace!("Storing partial fragment {address}");
@@ -1978,8 +2156,8 @@ impl LocalImmutableStore {
                 "Inject new immutable store entry for {address} (last access {last_access}"
             );
             bucket.entry.push(ImmutableStoreEntry {
-                address,
-                partition,
+                address: *address,
+                partition: *partition,
                 data,
             });
         }
@@ -2021,62 +2199,10 @@ impl LocalImmutableStore {
         }
 
         group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-        drop(bucket);
-        self.flush_later(group_index, fragment_flags).await;
-
-        if self.settings.verify_write
-            && pack_file != 0
-            && fragment_flags & FragmentFlags::PayloadObliterated == 0
-        {
-            let find = self
-                .clone()
-                .find(partition, address)
-                .await
-                .inspect_err(|err| {
-                    lore_base::lore_warn!(
-                        "Store write verify failed: {err}\n{}",
-                        Backtrace::force_capture()
-                    );
-                })
-                .forward::<LocalImmutableStoreError>("Failed to verify written data")?;
-
-            let data = Self::load(&self.group[find.group].packstore, find.data)
-                .await
-                .inspect_err(|err| {
-                    lore_base::lore_warn!(
-                        "Store write verify failed: {err}\n{}",
-                        Backtrace::force_capture()
-                    );
-                })
-                .forward::<LocalImmutableStoreError>("Failed to verify written data")?;
-
-            let hash = if fragment_flags & FragmentFlags::PayloadCompressed != 0 {
-                let (_fragment, data) = compress::decompress(fragment, &data)
-                    .inspect_err(|err| {
-                        lore_base::lore_warn!(
-                            "Store write verify failed: {err}\n{}",
-                            Backtrace::force_capture()
-                        );
-                    })
-                    .forward::<LocalImmutableStoreError>("Failed to verify written data")?;
-                hash::hash_slice(&data)
-            } else {
-                hash::hash_slice(&data)
-            };
-            if hash != address.hash {
-                lore_base::lore_warn!(
-                    "Store write verify failed: Hash verification failed {} != {}\n{}",
-                    hash,
-                    address.hash,
-                    Backtrace::force_capture()
-                );
-                return Err(LocalImmutableStoreError::internal(
-                    "Failed to verify written data",
-                ));
-            }
-        }
-
-        Ok(())
+        Ok(StoreOutcome::Stored {
+            flags: fragment_flags,
+            pack_file,
+        })
     }
 
     /// Resolve an address to the best match the bucket holds, at full strength. Callers gate the
@@ -2978,13 +3104,14 @@ impl LocalImmutableStore {
     /// Evict the group toward `target_size`, then rewrite the packfiles
     /// [`Self::reclaimable_packfiles`] names, one at a time, with [`Self::rewrite_packfile`].
     /// They are closed to writes before any is rewritten, so each referenced payload is copied
-    /// once, into a packfile the pass does not rewrite. A stop request ends the pass only between
-    /// packfiles, so that a packfile's sweep, once started, reaches its truncate rather than
-    /// starting over on the next pass. A packfile kept for an entry still pointing into it lets
-    /// the pass go on to the next; a rewrite that fails or that a fan-out interrupts ends the
-    /// pass, as the next would fail alike or sweep a stale layout. Those the pass ends before
-    /// rewriting, and those it keeps, take writes again. An in-memory store is evicted but not
-    /// rewritten.
+    /// once, into a packfile the pass does not rewrite, and the payload gate is drained after, so
+    /// that every entry written into one of them is indexed when the rewrite reads the buckets. A
+    /// stop request ends the pass only between packfiles, so that a packfile's sweep, once
+    /// started, reaches its truncate rather than starting over on the next pass. A packfile kept
+    /// for an entry still pointing into it lets the pass go on to the next; a rewrite that fails
+    /// or that a fan-out interrupts ends the pass, as the next would fail alike or sweep a stale
+    /// layout. Those the pass ends before rewriting, and those it keeps, take writes again. An
+    /// in-memory store is evicted but not rewritten.
     ///
     /// Returns whether the group was left complete, or the error that ended a rewrite. `false`
     /// means a stop request or a fan-out ended the pass with work left, eviction included, and
@@ -3060,6 +3187,8 @@ impl LocalImmutableStore {
         else {
             return Ok(true);
         };
+        #[cfg(feature = "test-util")]
+        crate::test_util::pause_point(crate::test_util::PausePoint::Selected).await;
         let original_sizes = match group.packstore.stop_writes(&reclaimable).await {
             Ok(sizes) => sizes,
             Err(err) => {
@@ -3069,6 +3198,9 @@ impl LocalImmutableStore {
                 return Ok(true);
             }
         };
+        group.payload_gate.drain().await;
+        #[cfg(feature = "test-util")]
+        crate::test_util::pause_point(crate::test_util::PausePoint::Stopped).await;
 
         let mut group_reclaimed: u64 = 0;
         let mut completed = true;
@@ -3281,7 +3413,8 @@ impl LocalImmutableStore {
     /// The packfiles of the group that hold unreferenced bytes, when the group stores at least
     /// `target_size` bytes and at least [`COMPACTION_MIN_UNREFERENCED_PERCENTAGE`] of them are
     /// unreferenced, and `None` otherwise, or when the sizes cannot be read. The packfile sizes
-    /// are read before the referenced bytes, as [`Self::referenced_sizes`] requires.
+    /// are read before the referenced bytes, and the group's payload gate drained in between, as
+    /// [`Self::referenced_sizes`] requires.
     async fn reclaimable_packfiles(
         group: &ImmutableStoreGroup,
         group_index: usize,
@@ -3304,6 +3437,7 @@ impl LocalImmutableStore {
             return None;
         }
 
+        group.payload_gate.drain().await;
         let referenced = Self::referenced_sizes(group, sizes.len()).await;
         let mut unreferenced_size = 0;
         let mut reclaimable = vec![];
@@ -3329,10 +3463,11 @@ impl LocalImmutableStore {
     /// packfiles, the packfile with id `n` at index `n - 1`, each payload counted once, as
     /// [`Self::compact_bucket_packfile`] copies it.
     ///
-    /// A store writes a payload and inserts its entry under one bucket write lock. With the
-    /// packfile sizes read before this, a payload stored meanwhile is counted here whenever a size
-    /// includes it, so a fully referenced packfile never looks reclaimable. A fan-out during the
-    /// scan can leave entries uncounted, which costs a rewrite that reclaims nothing.
+    /// A store holds the group's payload gate from before it writes a payload until its entry is
+    /// in the bucket. With the packfile sizes read, then the gate drained, before this, a payload
+    /// stored meanwhile is counted here whenever a size includes it, so a fully referenced
+    /// packfile never looks reclaimable. A fan-out during the scan can leave entries uncounted,
+    /// which costs a rewrite that reclaims nothing.
     async fn referenced_sizes(group: &ImmutableStoreGroup, packfile_count: usize) -> Vec<usize> {
         let mut referenced = vec![0; packfile_count];
         let mut run = vec![];
@@ -3355,10 +3490,12 @@ impl LocalImmutableStore {
     /// point into it: every copy and bucket file write succeeded, no bucket kept an entry in it,
     /// and the bucket count did not change, which a fan-out moving entries out of the sweep
     /// would. Every bucket file is written durably first, whatever `sync_data` the store uses,
-    /// after the group's packfiles are synced, so that no index file left on disk points into
-    /// the truncated packfile or at payload bytes not yet stored. A fan-out, or a failed bucket
-    /// write, sync or truncate, which is returned, ends the rewrite, and the buckets it moved stay
-    /// dirty for the next flush.
+    /// from a copy taken before the group's packfiles are synced and written after, so that no
+    /// index file left on disk points into the truncated packfile or at payload bytes not yet
+    /// stored, and the sync holds up no lookup or insert in the bucket. The payload gate is drained
+    /// before the truncate, so that a read that found a location in `packfile` before its entry
+    /// moved has loaded it. A fan-out, or a failed bucket write, sync or truncate, which is
+    /// returned, ends the rewrite, and the buckets it moved stay dirty for the next flush.
     async fn rewrite_packfile(
         self: &Arc<Self>,
         group_index: usize,
@@ -3381,12 +3518,6 @@ impl LocalImmutableStore {
                 return Ok(Rewrite::Interrupted);
             }
             let bucket = bucket.read_owned().await;
-            group
-                .flush_packstore(true)
-                .await
-                .forward_with::<StoreError, _>(|| {
-                    format!("Failed syncing group {group_index} packfiles")
-                })?;
             group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
             ImmutableStoreBucket::serialize(
                 bucket,
@@ -3437,6 +3568,7 @@ impl LocalImmutableStore {
         lore_base::lore_debug!(
             "Packstore compactor group {group_index} truncating packfile {packfile}"
         );
+        group.payload_gate.drain().await;
         group
             .packstore
             .truncate(packfile)
@@ -3864,6 +3996,9 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             return Err(StoreError::from(SlowDown));
         }
 
+        let gate = self.group[address.hash.data()[0] as usize]
+            .payload_gate
+            .hold();
         // Resolved at full strength and then gated on scope, the same way `get_metadata` does it,
         // so the level reported back is the one actually found rather than the one searched at.
         let find = self
@@ -3897,9 +4032,12 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         }
 
         crate::validate_fragment_payload(&fragment, find.data.size_payload as usize)?;
+        #[cfg(feature = "test-util")]
+        crate::test_util::pause_point(crate::test_util::PausePoint::Located).await;
         let payload = Self::load(&self.group[find.group].packstore, find.data)
             .await
             .forward::<StoreError>("Failed to load payload from local storage.")?;
+        drop(gate);
         crate::validate_fragment_payload(&fragment, payload.len())?;
 
         Ok(StoreGetData {
@@ -3919,6 +4057,9 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         address: Address,
         dst: &mut crate::CallerBuffer,
     ) -> Result<(Fragment, PayloadRead), StoreError> {
+        let _gate = self.group[address.hash.data()[0] as usize]
+            .payload_gate
+            .hold();
         let find = self
             .find(partition, address)
             .await
@@ -3951,6 +4092,8 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             return Err(StoreError::from(PayloadNotFound::from(address.hash)));
         }
 
+        #[cfg(feature = "test-util")]
+        crate::test_util::pause_point(crate::test_util::PausePoint::Located).await;
         if !crate::payload_is_content(&fragment) {
             let payload = Self::load(&self.group[find.group].packstore, find.data)
                 .await
@@ -4142,6 +4285,8 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 // The fan-out level sets the odds: one child in 65,536 at 256
                 // buckets to a group, one in 256 at one bucket, where every child
                 // in the parent's group collides.
+                let group = &self.group[address.hash.data()[0] as usize];
+                let gate = group.payload_gate.hold();
                 let found = self
                     .find(partition, address)
                     .await
@@ -4154,31 +4299,38 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 }
                 let data = found.data;
 
-                if (data.flags & FragmentFlags::PayloadFragmented) != 0 {
+                let references = if (data.flags & FragmentFlags::PayloadFragmented) != 0 {
                     lore_base::lore_debug!("Payload fragmented, obliterating subfragments");
+                    #[cfg(feature = "test-util")]
+                    crate::test_util::pause_point(crate::test_util::PausePoint::Located).await;
+                    Some(Self::load(&group.packstore, data).await)
+                } else {
+                    None
+                };
+                drop(gate);
 
-                    let group = &self.group[address.hash.data()[0] as usize];
-                    if let Ok(payload) = Self::load(&group.packstore, data).await.inspect_err(|e| {
+                if let Some(references) = references
+                    && let Ok(payload) = references.inspect_err(|e| {
                         lore_base::lore_warn!(
                             "Failed to load fragment while obliterating address {address}: {e:?}"
                         );
-                    }) {
-                        let payload = payload.to_aligned::<FragmentReference>();
-                        for reference in payload.as_type_slice::<FragmentReference>().iter() {
-                            self.clone()
-                                .obliterate(
-                                    partition,
-                                    Address {
-                                        context: address.context,
-                                        hash: reference.hash,
-                                    },
-                                    stats.clone(),
-                                )
-                                .await
-                                .forward_with::<StoreError, _>(|| {
-                                    format!("Failed to obliterate immutable {address}.")
-                                })?;
-                        }
+                    })
+                {
+                    let payload = payload.to_aligned::<FragmentReference>();
+                    for reference in payload.as_type_slice::<FragmentReference>().iter() {
+                        self.clone()
+                            .obliterate(
+                                partition,
+                                Address {
+                                    context: address.context,
+                                    hash: reference.hash,
+                                },
+                                stats.clone(),
+                            )
+                            .await
+                            .forward_with::<StoreError, _>(|| {
+                                format!("Failed to obliterate immutable {address}.")
+                            })?;
                     }
                 }
 
@@ -4610,6 +4762,7 @@ impl LocalImmutableStore {
         let group = &self.group[group_index];
         result.group_index = group_index;
 
+        let gate = group.payload_gate.hold();
         let (bucket_index, bucket_ref, bucket) = loop {
             let n = group.bucket_count.load(atomic::Ordering::Relaxed);
             let idx = crate::local::fan_out::bucket_index_for(&address.hash, n);
@@ -4773,6 +4926,8 @@ impl LocalImmutableStore {
                 continue;
             }
 
+            #[cfg(feature = "test-util")]
+            crate::test_util::pause_point(crate::test_util::PausePoint::Located).await;
             let packstore_bytes = self.group[group_index]
                 .packstore
                 .load(data.pack_file, data.pack_offset, data.size_payload)
@@ -4821,6 +4976,7 @@ impl LocalImmutableStore {
                 failed_data.push(data);
             }
         }
+        drop(gate);
 
         if heal && (!failed_data.is_empty() || missing_payload) {
             // An entry left behind without a payload still answers a full match, so it has to go
