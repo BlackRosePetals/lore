@@ -7,7 +7,6 @@ use lore_base::types::Hash;
 use lore_revision::change::FileAction;
 use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
-use lore_revision::immutable;
 use lore_revision::instance::InstanceId;
 use lore_revision::link::LinkFlags;
 use lore_revision::lore::*;
@@ -1833,15 +1832,18 @@ async fn tree_readers_hold_its_fields_not_the_tree() {
         .scope(setup_test_execution(), async {
             let repository = null_repository().await;
             let state = State::new();
-            let options = immutable::read_options_from_repository(&repository);
 
-            let list_read = immutable::read(repository.clone(), Address::default(), None, options);
+            let block_read = NodeFileMetadataBlockData::read_box_from_immutable_compat(
+                repository.clone(),
+                Address::default(),
+                true,
+            );
             let name_table_read = NameTable::deserialize(repository.clone(), Hash::default());
             let load = state.block_file_metadata_load(repository.clone(), 0);
             let name_table = state.nametable_load(repository);
 
             for (what, future, read) in [
-                ("load", size_of_val(&load), size_of_val(&list_read)),
+                ("load", size_of_val(&load), size_of_val(&block_read)),
                 (
                     "name table load",
                     size_of_val(&name_table),

@@ -164,18 +164,8 @@ impl ReadOptions {
         self
     }
 
-    pub fn with_remote(mut self) -> Self {
-        self.remote = true;
-        self
-    }
-
     pub fn no_remote(mut self) -> Self {
         self.remote = false;
-        self
-    }
-
-    pub fn with_local(mut self) -> Self {
-        self.local = true;
         self
     }
 
@@ -194,16 +184,6 @@ impl ReadOptions {
         self
     }
 
-    pub fn no_cache(mut self) -> Self {
-        self.cache = false;
-        self
-    }
-
-    pub fn with_direct_write(mut self) -> Self {
-        self.direct_write = true;
-        self
-    }
-
     pub fn with_priority(mut self) -> Self {
         self.priority = true;
         self
@@ -217,11 +197,6 @@ impl ReadOptions {
 
     pub fn with_max_content_size(mut self, max: u64) -> Self {
         self.max_content_size = Some(max);
-        self
-    }
-
-    pub fn no_max_content_size(mut self) -> Self {
-        self.max_content_size = None;
         self
     }
 }

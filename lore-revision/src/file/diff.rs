@@ -1227,9 +1227,7 @@ async fn diff_read_file(
         repository.clone(),
         node.address,
         None,
-        read_options_from_repository(&repository)
-            .with_decompress()
-            .with_remote(),
+        read_options_from_repository(&repository).with_decompress(),
     )
     .await
     .forward::<DiffError>("Failed reading data for diff")?;

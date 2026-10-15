@@ -24,6 +24,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   `verify` argument and `RepositoryContext` its `trust_local` setting
 - C API: `skip_verify` on `lore_storage_open_args_t` is now an alias of `trust_remote` for its handle, so a handle that
   sets it takes payloads fetched from its remote unhashed. Local reads no longer hash either way
+- `lore-storage`: `ReadOptions` loses the unused `with_local`, `no_cache`, `with_direct_write` and
+  `no_max_content_size`, and `with_remote`, which restated the default; `load_raw_local` is removed. `read_into` reports
+  a slice shorter than its content as `Oversized`, as `read_into_buffer` does
 
 ### Features
 
@@ -88,6 +91,12 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   read caches, as a read by address does, where it kept the broken copy and fetched the root on every read
 - A write of content the local store holds and the remote does not reuses the stored payload as it is, its sizes
   checked, where it decoded and hashed it first, as the local store is trusted
+- `lore-storage`: `read_stream`, `read_into_file` and `read_resolved_into_file` refuse content larger than
+  `ReadOptions::max_content_size`, as every other read does, and the root load enforces the cap for each, refusing a
+  remote resolve over the cap before storing it. A buffer read by address that misses locally with no remote in reach
+  probes the local store once rather than twice, a placement the store answers `SlowDown` is read through the retrying
+  local load before the remote, and local content over the cap is refused without being read again. A read into a
+  slice shorter than its content is refused before any leaf is read
 - `lore repository store immutable query` checks the payload the remote serves against its address, unless the command
   trusts the remote, and logs one that fails. The query reports it as served and does not walk it
 - `lore commit` with changes staged in a layer commits the layer while the parent tree holds only changes marked dirty,

@@ -437,16 +437,8 @@ pub trait ImmutableStore: Any + Send + Sync {
             return Ok((fragment, PayloadRead::Returned(payload)));
         }
 
-        let capacity = dst.len();
-        let Some(target) = dst.as_mut_slice().get_mut(..payload.len()) else {
-            return Err(StoreError::from(Oversized {
-                context: format!(
-                    "payload of {} bytes exceeds the {capacity} byte destination buffer",
-                    payload.len()
-                ),
-            }));
-        };
-        target.copy_from_slice(&payload);
+        validate_buffer_capacity(payload.len(), dst.len())?;
+        dst.as_mut_slice()[..payload.len()].copy_from_slice(&payload);
         Ok((fragment, PayloadRead::IntoBuffer))
     }
 

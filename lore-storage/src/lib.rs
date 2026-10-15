@@ -132,7 +132,6 @@ pub use packstore::PackfileSize;
 pub use read::REMOTE_FETCH_INFLIGHT;
 pub use read::expand_payload;
 pub use read::load_fragment;
-pub use read::load_raw_local;
 pub use read::read;
 pub use read::read_into;
 pub use read::read_into_buffer;
