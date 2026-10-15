@@ -2056,7 +2056,8 @@ async fn a_fetched_list_is_checked_unless_the_remote_is_trusted() {
     let address = store_current_chunking(&written, partition, &path).await;
     let (fragment, list) = lore_storage::read::read_raw(written, partition, address)
         .await
-        .expect("the stored list");
+        .expect("the stored list")
+        .raw;
     lore_storage::test_util::serve_remote(address, fragment, list);
     let (_empty_dir, empty) = make_test_store().await;
     let session = Arc::new(StorageSession::pending(|| async {

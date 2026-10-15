@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use bytes::Bytes;
 use lore_base::types::Context;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
+use lore_base::types::Fragment;
 use lore_revision::fragment;
 use lore_server::protocol::replication_store::header::ReplicationHeader;
 use lore_server::protocol::replication_store::put::*;
@@ -80,6 +82,48 @@ fn parsing_fails_if_too_small() {
     let output = parse(input_bytes.slice(0..input_bytes.len() - 1)).expect_err("parse should fail");
 
     assert_eq!(output, MessageParseError::InvalidFieldLength);
+}
+
+/// A peer is trusted, and a replicated payload still has its sizes checked: one longer than its
+/// fragment gives, and a plain one claiming more content than it holds, are refused.
+#[test]
+fn parsing_fails_if_the_payload_sizes_disagree() {
+    let (fragment, address, payload) = fragment::generate_random();
+    let mut longer = payload.to_vec();
+    longer.push(0);
+    for (label, fragment, payload) in [
+        (
+            "a payload longer than its fragment",
+            fragment,
+            Bytes::from(longer),
+        ),
+        (
+            "a plain payload claiming more content",
+            Fragment {
+                size_content: fragment.size_content + 1,
+                ..fragment
+            },
+            payload,
+        ),
+    ] {
+        let input = Put {
+            header: ReplicationHeader {
+                correlation_id: Uuid::new_v4(),
+                repository: random::<Context>(),
+            },
+            address,
+            fragment,
+            flags: 0,
+            payload: Some(payload),
+        };
+        let input_bytes = collapse_bytes_without_header(&input.to_quic_chunks());
+
+        assert_eq!(
+            parse(input_bytes),
+            Err(MessageParseError::InvalidFieldLength),
+            "{label}"
+        );
+    }
 }
 
 #[test]

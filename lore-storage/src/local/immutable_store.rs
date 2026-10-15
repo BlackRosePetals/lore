@@ -4250,6 +4250,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             match_made: find.matching,
             partition: find.partition,
             payload: Some(payload),
+            content: None,
         })
     }
 

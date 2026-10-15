@@ -127,6 +127,11 @@ separate concern, left to the data store integrity feature.
   command waits on.
 - Bad, because a payload is checked by decoding it: a machine built without the codec a payload
   from an untrusted source is stored in refuses that payload.
+- Bad, because a server's own reads through a remote store take a payload that still fails its
+  check after the heal as missing, as they take any failure of that store other than
+  `NotSupported`, so its HTTP endpoints answer a root that fails as not found, and a leaf that
+  fails as an error in the content stream. A client fetching through the server receives a store
+  failure, which it retries as a lost session and then reports as not connected.
 
 ## More Information
 

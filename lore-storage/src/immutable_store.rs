@@ -168,9 +168,9 @@ const FRAGMENT_FLAGS_DEFINED_COMPRESSORS: u32 = FragmentFlags::PayloadCompressed
 /// - Compressed fragments have `size_content <= FRAGMENT_SIZE_THRESHOLD`
 /// - Uncompressed, unfragmented fragments have `size_payload == size_content`
 ///
-/// All three Put protocols (QUIC, gRPC storage v1, legacy gRPC storage) and
-/// the replication-store Put call this at ingress so malformed metadata fails
-/// fast with a specific error rather than propagating into the store layer.
+/// All three Put protocols (QUIC, gRPC storage v1, legacy gRPC storage) call
+/// this at ingress so malformed metadata fails fast with a specific error
+/// rather than propagating into the store layer.
 pub fn validate_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError> {
     validate_fragment_size(fragment)?;
 
@@ -409,17 +409,19 @@ pub trait ImmutableStore: Any + Send + Sync {
         address: Address,
     ) -> Result<StoreGetData, StoreError>;
 
-    /// Read the payload stored under `address`, into `dst` when the payload is the content itself
-    /// and into a buffer of its own otherwise, reporting the fragment that describes it.
+    /// Read the payload stored under `address`, or the content a store expanded from it on receipt
+    /// ([`StoreGetData::content`]), into `dst` when it is the content itself and into a buffer of
+    /// its own otherwise, reporting the fragment that describes what was read.
     ///
-    /// One lookup settles where the payload belongs and reads it there, so a reader that already
-    /// has somewhere for the content to go pays no second lookup either way. What a returned
-    /// payload has to become — expanded, or walked as a fragment list — is the reader's to do; this
-    /// only decides where the stored bytes land. A payload `dst` has no room for is [`Oversized`];
-    /// a returned one is the reader's to size.
+    /// One lookup settles where the bytes belong and reads them there, so a reader that already has
+    /// somewhere for the content to go pays no second lookup either way. What returned bytes have
+    /// to become — expanded, or walked as a fragment list — is the reader's to do; this only
+    /// decides where they land. Bytes `dst` has no room for are [`Oversized`]; returned ones are
+    /// the reader's to size.
     ///
-    /// The default implementation goes through [`get`](ImmutableStore::get) and copies. A store
-    /// overrides it to read its index once and have the read itself land in `dst`.
+    /// The default implementation goes through [`get`](ImmutableStore::get) and copies the content
+    /// where the store expanded one, and the payload otherwise. A store overrides it to read its
+    /// index once and have the read itself land in `dst`.
     async fn get_into(
         self: Arc<Self>,
         partition: Partition,
@@ -427,10 +429,14 @@ pub trait ImmutableStore: Any + Send + Sync {
         dst: &mut crate::CallerBuffer,
     ) -> Result<(Fragment, PayloadRead), StoreError> {
         let data = self.get(partition, address).await?;
-        let fragment = data.fragment;
-        let payload = data
-            .payload
-            .ok_or_else(|| StoreError::from(PayloadNotFound::from(address.hash)))?;
+        let (fragment, payload) = match data.content {
+            Some(content) => content,
+            None => (
+                data.fragment,
+                data.payload
+                    .ok_or_else(|| StoreError::from(PayloadNotFound::from(address.hash)))?,
+            ),
+        };
         validate_fragment_payload(&fragment, payload.len())?;
 
         if !payload_is_content(&fragment) {

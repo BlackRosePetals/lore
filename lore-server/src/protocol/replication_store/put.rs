@@ -68,6 +68,9 @@ impl From<PutFlags> for u8 {
     }
 }
 
+/// Parses a replicated put, refusing one whose payload's sizes disagree with its fragment
+/// ([`lore_storage::check_payload_sizes`]): a peer is trusted, and every payload still has its
+/// sizes checked (ADR-00023).
 pub fn parse(mut bytes: Bytes) -> Result<Put, MessageParseError> {
     if bytes.len() < BASE_REQUEST_SIZE {
         return Err(MessageParseError::InvalidFieldLength);
@@ -82,15 +85,11 @@ pub fn parse(mut bytes: Bytes) -> Result<Put, MessageParseError> {
         flags
     };
     let payload = if !bytes.is_empty() { Some(bytes) } else { None };
-
-    // Defense-in-depth: even though peers are expected to pre-validate,
-    // enforce fragment size bounds at this ingress too.
-    if (fragment.size_payload as usize) > lore_base::types::FRAGMENT_SIZE_THRESHOLD {
-        return Err(MessageParseError::InvalidFieldLength);
-    }
-    if let Some(payload) = payload.as_ref()
-        && payload.len() != fragment.size_payload as usize
-    {
+    let sizes = match payload.as_ref() {
+        Some(payload) => lore_storage::check_payload_sizes(&fragment, payload.len()).is_ok(),
+        None => lore_storage::validate_fragment_size(&fragment).is_ok(),
+    };
+    if !sizes {
         return Err(MessageParseError::InvalidFieldLength);
     }
 

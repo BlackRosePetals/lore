@@ -18,15 +18,18 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   `lore-storage`: `ReadOptions` loses `verify` and `trust_local` with `with_verify`, `no_verify` and `trusting_local`,
   and gains `trust_remote` with `trusting_remote`; `decompress_and_verify` is replaced by `expand_payload`. `read_raw`
   loses its `verified_by_caller` argument, `fetch_remote` takes `ReadOptions` for its `priority`, `trust_remote` and
-  `decompress`, and `check_fetched` is removed and `fetch_payload` made private. `Fetched::content` is optional,
+  `decompress`, and `check_fetched` is removed and `fetch_payload` made private. `Loaded::content` is optional,
   `Flown::take` returns a `Result`, `Flown::Unverified` and `Flown::Rejected` are removed, and a `fetch_single_flight`
-  fetch answers `Fetched`. `file_matches` takes the reader's `trust_remote`. `lore-revision`: `cache_counted` loses its
+  fetch answers `Loaded`. `file_matches` takes the reader's `trust_remote`. `lore-revision`: `cache_counted` loses its
   `verify` argument and `RepositoryContext` its `trust_local` setting
 - C API: `skip_verify` on `lore_storage_open_args_t` is now an alias of `trust_remote` for its handle, so a handle that
   sets it takes payloads fetched from its remote unhashed. Local reads no longer hash either way
 - `lore-storage`: `ReadOptions` loses the unused `with_local`, `no_cache`, `with_direct_write` and
   `no_max_content_size`, and `with_remote`, which restated the default; `load_raw_local` is removed. `read_into` reports
   a slice shorter than its content as `Oversized`, as `read_into_buffer` does
+- `lore-storage`: `StoreGetData` gains `content`, the content a store expanded where it checked a payload on receipt, so
+  a struct literal names it. `read::Fetched` is `read::Loaded`, which `read_raw` also returns, and `read_raw` forwards a
+  store's error with its variant rather than as internal
 
 ### Features
 
@@ -37,7 +40,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   and its other fields' offsets are unchanged. A caller must zero the whole struct, padding included: any non-zero byte
   there trusts the remote, so a caller built against the earlier header that sets the fields one by one may skip the
   check
-- `lore-storage`: `read::check_receipt`, the check on receipt by the remote's trust, `read::Fetched::take` and
+- `lore-storage`: `read::check_payload_sizes`, the size check every payload takes, `read::check_receipt`, the check on
+  receipt by the remote's trust, `read::heal_on_receipt`, the heal after a check that fails, `read::Loaded::take` and
   `defragment::MAX_FRAGMENT_TREE_DEPTH` are public
 - Server: added opt-in HTTP health-only mode for deployments that do not serve repository HTTP routes.
 
@@ -99,6 +103,18 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   slice shorter than its content is refused before any leaf is read
 - `lore repository store immutable query` checks the payload the remote serves against its address, unless the command
   trusts the remote, and logs one that fails. The query reports it as served and does not walk it
+- A server reaching its backend through the storage protocol (a `remote` store) checks every payload it fetches against
+  its address on receipt, and asks the backend to heal one that fails, where it checked only the payload's sizes. A
+  read of it takes the content the check expanded rather than decompressing the payload again. A buffer read probes a
+  failed placement again only where the store answers `SlowDown`, whatever the store, so a payload failing its check is
+  fetched and heal-requested once rather than twice; a placement the store answers `Oversized` or `NotSupported` fails
+  the read, and any other failure is a miss. A payload stored in a codec the server is built without, such as Oodle, is
+  refused rather than relayed unchecked, and reads as `NotSupported` rather than as missing. To the server's own reads,
+  such as its HTTP content and presigned redeem endpoints, a payload still failing its check after the heal reads as
+  missing, as does a backend it cannot reach or that refuses the connection or the request as unsupported
+- A server checks the sizes of every payload a replica serves it or a peer replicates to it, over QUIC or gRPC, against
+  its fragment, as it does for every other payload, and refuses one whose sizes disagree. A replica's `get` or
+  `get_metadata` response too short to hold its header is refused rather than ending the request in a panic
 - `lore commit` with changes staged in a layer commits the layer while the parent tree holds only changes marked dirty,
   and leaves those changes dirty. It failed with `Nothing staged for commit` before committing any layer
 - A merge of divergent branch history, such as the one a sync commits when the local and the remote latest have both

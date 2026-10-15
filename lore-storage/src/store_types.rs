@@ -24,10 +24,12 @@ use crate::immutable_store::StoreError;
 ///
 /// [`ImmutableStore::get_into`]: crate::immutable_store::ImmutableStore::get_into
 pub enum PayloadRead {
-    /// The stored payload is the content itself, and the caller's buffer holds it.
+    /// The caller's buffer holds the content: the stored payload where it is the content, or the
+    /// content the store expanded on receipt.
     IntoBuffer,
-    /// The stored payload, read into a buffer of its own, for a reader that has to expand it or
-    /// walk it as a list of further fragments. The caller's buffer is untouched.
+    /// The stored payload, or the content the store expanded from it, read into a buffer of its
+    /// own, for a reader that has to expand it or walk it as a list of further fragments. The
+    /// caller's buffer is untouched.
     Returned(Bytes),
 }
 
@@ -135,6 +137,10 @@ pub struct StoreGetData {
     /// The bytes, when they were asked for. `get_metadata` never carries them; a `get` that matched
     /// always does.
     pub payload: Option<Bytes>,
+    /// The content `payload` expands to, and the fragment describing it, where the store expanded
+    /// it to check it against its address on receipt, so a reader takes it rather than expanding
+    /// the payload again. Only a store fetching from an untrusted source fills it.
+    pub content: Option<(Fragment, Bytes)>,
 }
 
 impl StoreGetData {
@@ -154,6 +160,7 @@ impl StoreGetData {
             match_made,
             partition,
             payload: None,
+            content: None,
         }
     }
 

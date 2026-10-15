@@ -13,6 +13,7 @@ use lore_proto::ReplicationPutRequest;
 use lore_proto::rpc::replication_service_server::ReplicationService;
 use lore_revision::runtime::execution_context;
 use lore_storage::ImmutableStore;
+use lore_storage::StoreError;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::create_operation_context_attribute;
 use opentelemetry::KeyValue;
@@ -157,15 +158,26 @@ impl ReplicationService for LoreReplicationService {
                             // normally do when storing new fragments like hash validation. We're relying on
                             // the fact that these requests are coming from trusted callers who have already
                             // performed this validation.
-                            let put_result = immutable_store
-                                .put(
-                                    repository_id.into(),
-                                    address,
-                                    fragment,
-                                    payload,
-                                    false, /* force */
-                                )
-                                .await;
+                            let sizes = payload.as_ref().map_or(Ok(()), |payload| {
+                                lore_storage::check_payload_sizes(&fragment, payload.len())
+                            });
+                            let put_result = match sizes {
+                                Ok(()) => {
+                                    immutable_store
+                                        .put(
+                                            repository_id.into(),
+                                            address,
+                                            fragment,
+                                            payload,
+                                            false, /* force */
+                                        )
+                                        .await
+                                }
+                                Err(error) => Err(StoreError::internal_with_context(
+                                    error,
+                                    "replicated payload sizes disagree with its fragment",
+                                )),
+                            };
 
                             let metrics_code = match &put_result {
                                 Ok(_) => Code::Ok,

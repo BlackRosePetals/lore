@@ -27,8 +27,12 @@ mod remote_store_tests {
     use lore_server::quic::quinn::QuinnServer;
     use lore_server::quic::tests::TestHandlerFactory;
     use lore_server::settings::BaselineAccess;
+    use lore_storage::CallerBuffer;
+    use lore_storage::CompressionMode;
     use lore_storage::ImmutableStore;
     use lore_storage::MutableStore;
+    use lore_storage::PayloadRead;
+    use lore_storage::ReadOptions;
     use lore_storage::StoreGetData;
     use lore_storage::StoreMatch;
     use lore_storage::StoreMatchResult;
@@ -46,6 +50,8 @@ mod remote_store_tests {
     struct TestServer {
         immutable_store: Arc<RemoteImmutableStore>,
         mutable_store: Arc<RemoteMutableStore>,
+        /// The store behind the server, written directly to plant what the protocol would refuse.
+        backend: Arc<dyn ImmutableStore>,
         _shutdown: tokio::sync::oneshot::Sender<()>,
     }
 
@@ -161,12 +167,13 @@ mod remote_store_tests {
         // gRPC only, so no UDP half is needed: bind TCP and hand it straight over.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
-        let (_immutable, _mutable, shutdown_tx) = start_backend(listener, addr).await;
+        let (backend, _mutable, shutdown_tx) = start_backend(listener, addr).await;
 
         let url = format!("grpc://127.0.0.1:{}", addr.port());
         TestServer {
             immutable_store: Arc::new(RemoteImmutableStore::new(&url, None)),
             mutable_store: Arc::new(RemoteMutableStore::new(&url, None)),
+            backend,
             _shutdown: shutdown_tx,
         }
     }
@@ -412,6 +419,240 @@ mod remote_store_tests {
                 )
                 .await?;
                 assert_eq!(content, payload);
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// A compressed payload is served as the remote stored it, with the content its check on
+    /// receipt expanded. A read placing it, a load and a read into a slice through the store, as a
+    /// server whose store is a remote store makes them, take that content, decoding the payload
+    /// once each.
+    #[tokio::test]
+    async fn a_remote_payload_is_served_with_the_content_its_check_expanded() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let repository = random::<RepositoryId>();
+                let content: Vec<u8> = (0..4096).map(|index| (index / 64) as u8).collect();
+                let plain = lore_base::types::Fragment {
+                    flags: 0,
+                    size_payload: content.len() as u32,
+                    size_content: content.len() as u64,
+                };
+                let (fragment, payload) =
+                    lore_storage::compress::compress(plain, &content, CompressionMode::Lz4)?;
+                let address = lore_base::types::Address {
+                    hash: lore_storage::hash::hash_slice(&content),
+                    context: random(),
+                };
+                server
+                    .immutable_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload.clone()), false)
+                    .await?;
+                lore_storage::test_util::reset_counts();
+
+                let got = server
+                    .immutable_store
+                    .clone()
+                    .get(repository, address)
+                    .await?;
+                assert_eq!(got.payload.as_ref(), Some(&payload));
+                assert_ne!(
+                    got.fragment.flags & FragmentFlags::PayloadCompressed.bits(),
+                    0,
+                    "the payload is served as stored"
+                );
+                let (content_fragment, checked) = got.content.expect("the checked content");
+                assert_eq!(checked.as_ref(), content.as_slice());
+                let (_, decodes, hashes) = lore_storage::test_util::counts();
+                assert_eq!((decodes, hashes), (1, 1), "checked once on receipt");
+
+                lore_storage::test_util::reset_counts();
+                let mut buffer = vec![0u8; content.len()];
+                // SAFETY: the buffer outlives the read and nothing else touches it.
+                let mut dst = unsafe { CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+                let (placed, read) = server
+                    .immutable_store
+                    .clone()
+                    .get_into(repository, address, &mut dst)
+                    .await?;
+                assert!(
+                    matches!(read, PayloadRead::IntoBuffer),
+                    "the checked content is placed, not the payload returned to expand again"
+                );
+                assert_eq!(placed, content_fragment);
+                assert_eq!(buffer, content);
+                assert_eq!(
+                    lore_storage::test_util::counts().1,
+                    1,
+                    "decoded once to place"
+                );
+
+                let store: Arc<dyn ImmutableStore> = server.immutable_store.clone();
+                lore_storage::test_util::reset_counts();
+                let (_, loaded) = lore_storage::read::load_fragment(
+                    store.clone(),
+                    repository,
+                    address,
+                    ReadOptions::default().no_remote(),
+                    None,
+                )
+                .await?;
+                assert_eq!(loaded.as_ref(), content.as_slice());
+                assert_eq!(
+                    lore_storage::test_util::counts().1,
+                    1,
+                    "decoded once to load"
+                );
+
+                lore_storage::test_util::reset_counts();
+                let mut slice = vec![0u8; content.len()];
+                lore_storage::read_into(
+                    store,
+                    repository,
+                    address,
+                    None,
+                    &mut slice,
+                    ReadOptions::default().no_remote(),
+                    None,
+                )
+                .await?;
+                assert_eq!(slice, content);
+                assert_eq!(
+                    lore_storage::test_util::counts().1,
+                    1,
+                    "decoded once to read into a slice"
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// A payload the backend holds under an address it does not hash to fails the remote store's
+    /// check on receipt rather than being served. The in-memory backend's verify refuses the heal
+    /// before it hashes, so the one hash counted on the test's thread is the store's.
+    #[tokio::test]
+    async fn a_remote_payload_not_matching_its_address_is_refused() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let repository = random::<RepositoryId>();
+                let (fragment, address, _) = fragment::generate_random();
+                let (_, _, other_payload) = fragment::generate_random();
+                server
+                    .backend
+                    .clone()
+                    .put(repository, address, fragment, Some(other_payload), false)
+                    .await?;
+                lore_storage::test_util::reset_counts();
+
+                let err = server
+                    .immutable_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect_err("a payload not matching its address is refused");
+                assert!(
+                    err.is_internal(),
+                    "the check on receipt refuses it, got: {err}"
+                );
+                assert_eq!(
+                    lore_storage::test_util::counts().2,
+                    1,
+                    "the payload was hashed on receipt"
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// A payload the backend stores in a codec this build cannot decode, one no build assigns,
+    /// fails the check on receipt as `NotSupported`, and a load, a read into a slice and a read
+    /// into a buffer through the store report it so rather than as missing.
+    #[tokio::test]
+    async fn an_undecodable_remote_payload_is_not_supported() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let repository = random::<RepositoryId>();
+                let (plain, address, payload) = fragment::generate_random();
+                let unassigned = FragmentFlags::PayloadCompressed
+                    & !(FragmentFlags::PayloadCompressedLZ4
+                        | FragmentFlags::PayloadCompressedOodle2
+                        | FragmentFlags::PayloadCompressedZstd);
+                let undecodable = lore_base::types::Fragment {
+                    flags: plain.flags | unassigned.bits(),
+                    ..plain
+                };
+                server
+                    .backend
+                    .clone()
+                    .put(repository, address, undecodable, Some(payload), false)
+                    .await?;
+
+                let got = server
+                    .immutable_store
+                    .clone()
+                    .get(repository, address)
+                    .await;
+                assert!(
+                    got.as_ref().is_err_and(|err| err.is_not_supported()),
+                    "got {got:?}"
+                );
+                let store: Arc<dyn ImmutableStore> = server.immutable_store.clone();
+                let loaded = lore_storage::read::load_fragment(
+                    store.clone(),
+                    repository,
+                    address,
+                    ReadOptions::default().no_remote(),
+                    None,
+                )
+                .await;
+                assert!(
+                    loaded.as_ref().is_err_and(|err| err.is_not_supported()),
+                    "got {loaded:?}"
+                );
+                let size = plain.size_content as usize;
+                let mut slice = vec![0u8; size];
+                let sliced = lore_storage::read_into(
+                    store.clone(),
+                    repository,
+                    address,
+                    None,
+                    &mut slice,
+                    ReadOptions::default().no_remote(),
+                    None,
+                )
+                .await;
+                assert!(
+                    sliced.as_ref().is_err_and(|err| err.is_not_supported()),
+                    "got {sliced:?}"
+                );
+                let mut buffer = vec![0u8; size];
+                // SAFETY: the buffer outlives the read and nothing else touches it.
+                let mut dst = unsafe { CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+                let placed = lore_storage::read_into_buffer(
+                    store,
+                    repository,
+                    address,
+                    None,
+                    &mut dst,
+                    ReadOptions::default().no_remote(),
+                    None,
+                )
+                .await;
+                assert!(
+                    placed.as_ref().is_err_and(|err| err.is_not_supported()),
+                    "got {placed:?}"
+                );
 
                 Ok(())
             })

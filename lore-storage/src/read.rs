@@ -31,14 +31,14 @@ use crate::immutable_store::StoreError;
 use crate::mutable_store::MutableStore;
 use crate::options::ReadOptions;
 use crate::store_types::PayloadRead;
-use crate::store_types::StoreGetData;
 use crate::types::Address;
 use crate::types::Fragment;
 use crate::types::Partition;
 
 /// Load a single raw fragment from store with retry backoff. How widely the store searches for it
 /// is the store's own business - see [`ImmutableStore::read_scope`]. The payload is returned as
-/// stored, unhashed.
+/// stored, with the content the store expanded where it checked the payload on receipt; nothing
+/// here hashes it.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -46,7 +46,7 @@ pub fn read_raw(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
-) -> impl Future<Output = Result<(Fragment, Bytes), StorageError>> {
+) -> impl Future<Output = Result<Loaded, StorageError>> {
     async move {
         let mut retry = crate::store_retry();
         loop {
@@ -58,22 +58,21 @@ pub fn read_raw(
                 .clone()
                 .get(partition, address)
                 .await
-                .and_then(StoreGetData::into_payload)
-            {
-                Ok((fragment, payload)) => return Ok((fragment, payload)),
-                Err(StoreError::SlowDown(_)) => {
-                    if !retry.wait().await {
-                        return Err(StorageError::from(SlowDown));
-                    }
-                }
+                .and_then(|mut data| {
+                    let content = data.content.take();
+                    data.into_payload().map(|raw| Loaded { content, raw })
+                }) {
+                Ok(loaded) => return Ok(loaded),
+                Err(StoreError::SlowDown(_)) => {}
                 Err(StoreError::AddressNotFound(_) | StoreError::PayloadNotFound(_)) => {
                     return Err(StorageError::from(crate::errors::AddressNotFound::from(
                         address,
                     )));
                 }
-                Err(err) => {
-                    return Err(StorageError::internal_with_context(err, "store get failed"));
-                }
+                Err(err) => return Err(err).forward::<StorageError>("store get failed"),
+            }
+            if !retry.wait().await {
+                return Err(StorageError::from(SlowDown));
             }
         }
     }
@@ -206,8 +205,11 @@ enum LocalFailure {
 }
 
 /// Probe the local store for `address`: read, check the payload's sizes ([`check_payload_sizes`]),
-/// and decompress when `options.decompress` asks. The payload is trusted as stored, never hashed. A
-/// caller disables it via `options.local`: a remote-only handle, or a read that has probed already.
+/// and decompress when `options.decompress` asks, taking the content the store expanded where it
+/// checked the payload. The payload is trusted as stored: nothing here hashes it. A payload the
+/// store answers `NotSupported` for is fatal, as a non-durable payload this build cannot decode is,
+/// and any other store failure is a miss. A caller disables it via `options.local`: a remote-only
+/// handle, or a read that has probed already.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -223,13 +225,14 @@ fn probe_local(
         }
 
         match read_raw(store, partition, address).await {
-            Ok((fragment, buffer)) => {
-                let durable_oodle = (fragment.flags & FragmentFlags::PayloadCompressedOodle2) != 0
-                    && (fragment.flags & FragmentFlags::PayloadStoredDurable) != 0;
+            Ok(loaded) => {
+                let flags = loaded.raw.0.flags;
+                let durable_oodle = (flags & FragmentFlags::PayloadCompressedOodle2) != 0
+                    && (flags & FragmentFlags::PayloadStoredDurable) != 0;
                 let loaded = if options.decompress {
-                    expand_payload(fragment, buffer)
+                    loaded.take(true)
                 } else {
-                    check_payload_sizes(&fragment, buffer.len()).map(|()| (fragment, buffer))
+                    check_payload_sizes(&loaded.raw.0, loaded.raw.1.len()).map(|()| loaded.raw)
                 };
                 match loaded {
                     Ok((fragment, buffer)) => Ok((fragment, buffer)),
@@ -247,6 +250,7 @@ fn probe_local(
                     }
                 }
             }
+            Err(err) if err.is_not_supported() => Err(LocalFailure::Fatal(err)),
             Err(e) => {
                 lore_base::lore_trace!(
                     "Fragment {} failed loading from local store: {e:?}",
@@ -306,7 +310,7 @@ pub fn verify_receipt(
 /// Checks the sizes `fragment` gives against the payload's length `len` and, for a plain payload,
 /// which is the content, against each other. Only the fragment is inspected, never the content, so
 /// every payload has its sizes checked, whatever its source and however far that is trusted.
-pub(crate) fn check_payload_sizes(fragment: &Fragment, len: usize) -> Result<(), StorageError> {
+pub fn check_payload_sizes(fragment: &Fragment, len: usize) -> Result<(), StorageError> {
     crate::validate_fragment_payload(fragment, len)
         .and_then(|()| crate::immutable_store::validate_plain_payload_size(fragment))
         .forward::<StorageError>("fragment sizes disagree with its payload")
@@ -345,7 +349,7 @@ fn fetch_and_store(
     options: ReadOptions,
     session: Arc<StorageSession>,
     local_replace: bool,
-) -> impl Future<Output = Result<Fetched, StorageError>> {
+) -> impl Future<Output = Result<Loaded, StorageError>> {
     async move {
         let fetched = fetch_remote(session.as_ref(), address, options).await?;
         let (fragment, payload) = &fetched.raw;
@@ -382,10 +386,49 @@ async fn fetch_payload(
     Ok((fragment, buffer))
 }
 
+/// Asks the remote to heal `address`, whose payload failed the check on receipt with `err`, once
+/// per fetch: `heal_attempted` is whether this fetch already did. Answers whether it healed, and so
+/// whether to fetch the payload again. A payload this build cannot decode (`NotSupported`) is not
+/// corrupt, and is not healed.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn heal_on_receipt(
+    session: &StorageSession,
+    address: Address,
+    err: &StorageError,
+    heal_attempted: bool,
+) -> impl Future<Output = bool> {
+    async move {
+        if err.is_not_supported() {
+            return false;
+        }
+        if heal_attempted {
+            lore_base::lore_error!(
+                "Fragment {} still corrupt after heal: {}",
+                address.hash,
+                err
+            );
+            return false;
+        }
+        lore_base::lore_warn!("Fragment {}: {}. Attempting heal.", address.hash, err);
+        let healed = session
+            .verify(&address, true)
+            .await
+            .is_ok_and(|r| r.healed == lore_base::types::HealResult::Healed);
+        if healed {
+            lore_base::lore_debug!("Server healed fragment {}, retrying fetch", address.hash);
+        } else {
+            lore_base::lore_error!("Server did not heal fragment {}", address.hash);
+        }
+        healed
+    }
+}
+
 /// Fetches `address` as [`fetch_payload`] does, with `options.priority`, and checks it on receipt
-/// as `options` asks ([`check_receipt`]). A payload that fails the check is asked of the server to
-/// heal once, and fetched again. The content the check expands is handed back, so no caller decodes
-/// or hashes a fetched payload again.
+/// as `options` asks ([`check_receipt`]). A payload that fails the check is fetched again once
+/// where the server heals it ([`heal_on_receipt`]). The content the check expands is handed back,
+/// so no caller decodes or hashes a fetched payload again.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -393,45 +436,19 @@ pub fn fetch_remote(
     session: &StorageSession,
     address: Address,
     options: ReadOptions,
-) -> impl Future<Output = Result<Fetched, StorageError>> {
+) -> impl Future<Output = Result<Loaded, StorageError>> {
     async move {
         lore_base::lore_trace!("Fetch immutable fragment {} from remote", address);
-        let mut raw = fetch_payload(session, address, options.priority).await?;
         let mut heal_attempted = false;
         loop {
+            let raw = fetch_payload(session, address, options.priority).await?;
             match check_receipt(&raw, address, options) {
-                Ok(content) => return Ok(Fetched { content, raw }),
+                Ok(content) => return Ok(Loaded { content, raw }),
                 Err(err) => {
-                    if matches!(err, StorageError::NotSupported(_)) {
+                    if !heal_on_receipt(session, address, &err, heal_attempted).await {
                         return Err(err);
                     }
-                    if heal_attempted {
-                        lore_base::lore_error!(
-                            "Fragment {} still corrupt after heal: {}",
-                            address.hash,
-                            err
-                        );
-                        return Err(err);
-                    }
-
-                    lore_base::lore_warn!("Fragment {}: {}. Attempting heal.", address.hash, err);
-
-                    let healed = session
-                        .verify(&address, true)
-                        .await
-                        .is_ok_and(|r| r.healed == lore_base::types::HealResult::Healed);
-
-                    if !healed {
-                        lore_base::lore_error!("Server did not heal fragment {}", address.hash);
-                        return Err(err);
-                    }
-
-                    lore_base::lore_debug!(
-                        "Server healed fragment {}, retrying fetch",
-                        address.hash
-                    );
                     heal_attempted = true;
-                    raw = fetch_payload(session, address, options.priority).await?;
                 }
             }
         }
@@ -443,9 +460,11 @@ pub fn fetch_remote(
 ///
 /// The local copy is trusted as stored, and only its sizes are checked. When `remote_session` is
 /// `Some`, the session is used for remote fetch if the local load fails (miss, or a payload that
-/// fails its size check or does not decompress, which the fetched payload overwrites). The remote
-/// payload is checked on receipt as `options` asks ([`check_receipt`]), and if it fails, heal is
-/// attempted once via `session.verify()` before retrying.
+/// fails its size check or does not decompress, which the fetched payload overwrites); a payload
+/// the store answers `NotSupported` for fails the load, and a store failing for any other reason is
+/// a miss, `AddressNotFound` with no remote in reach ([`probe_local`]). The remote payload is
+/// checked on receipt as `options` asks ([`check_receipt`]), and if it fails, heal is attempted
+/// once via `session.verify()` before retrying.
 ///
 /// For local-only loading, pass `None`.
 ///
@@ -528,19 +547,24 @@ pub fn load_fragment(
     }
 }
 
-/// A remote fetch's result ([`fetch_remote`]).
+/// A payload as loaded, from a store ([`read_raw`]) or a remote ([`fetch_remote`]), with the
+/// content it expands to where the load expanded it.
 #[derive(Clone, Debug)]
-pub struct Fetched {
+pub struct Loaded {
     /// The content the check on receipt expanded, and the fragment describing it: always from an
-    /// untrusted remote, verified, and from a trusted one only where the fetch asked to decompress.
+    /// untrusted remote, verified, from a trusted one only where the fetch asked to decompress, and
+    /// from a store where it checked the payload ([`StoreGetData::content`]).
+    ///
+    /// [`StoreGetData::content`]: crate::store_types::StoreGetData::content
     pub content: Option<(Fragment, Bytes)>,
-    /// The payload as fetched, and its fragment, marked durable: the stored form.
+    /// The payload in its stored form, and its fragment, marked durable where [`fetch_remote`]
+    /// fetched it.
     pub raw: (Fragment, Bytes),
 }
 
-impl Fetched {
-    /// The content when `decompress`, expanded here where the check on receipt did not, and the
-    /// payload as fetched otherwise.
+impl Loaded {
+    /// The content when `decompress`, expanded here where the load did not, and the payload as
+    /// stored otherwise.
     pub fn take(self, decompress: bool) -> Result<(Fragment, Bytes), StorageError> {
         match (decompress, self.content) {
             (false, _) => Ok(self.raw),
@@ -554,14 +578,14 @@ impl Fetched {
 #[derive(Debug)]
 pub enum Flown {
     /// A fetch checked on receipt, the caller's own or the one it followed.
-    Fetched(Fetched),
+    Fetched(Loaded),
     /// The local store's copy, in the form `options` asks, found after the leader failed on another
     /// address.
     Local((Fragment, Bytes)),
 }
 
 impl Flown {
-    /// The fetch taken as [`Fetched::take`] does, or the local copy as found.
+    /// The fetch taken as [`Loaded::take`] does, or the local copy as found.
     pub fn take(self, decompress: bool) -> Result<(Fragment, Bytes), StorageError> {
         match self {
             Self::Fetched(fetched) => fetched.take(decompress),
@@ -591,7 +615,7 @@ pub async fn fetch_single_flight<F, Fut, G>(
 ) -> Result<Flown, StorageError>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<Fetched, StorageError>>,
+    Fut: std::future::Future<Output = Result<Loaded, StorageError>>,
     G: FnOnce(),
 {
     let isolate_partitions = store.isolates_partitions();
@@ -745,12 +769,13 @@ pub fn read(
 ///
 /// Every write into `slice` happens within this future, so one dropped part-way leaves nothing
 /// writing to it. A local compressed payload whose sizes check ([`check_payload_sizes`]) and whose
-/// whole content the range covers is decompressed into `slice` ([`decompress_whole_into`]); any
-/// other content is read as [`read`] reads it, into memory of its own, and copied in once. A
-/// payload that expands is read from the local store once. The root is loaded again
-/// ([`load_fragment`]) only for a miss or a payload that does not expand, and that load probes the
-/// local store again for a held payload, or where a store of it may have landed since
-/// ([`stored_since`]). The zero hash names empty content and asks no store.
+/// whole content the range covers is decompressed into `slice` ([`decompress_whole_into`]), unless
+/// the store expanded it already; any other content is read as [`read`] reads it, into memory of
+/// its own, and copied in once. A payload that expands is read from the local store once. The root
+/// is loaded again ([`load_fragment`]) only for a miss or a payload that does not expand, and that
+/// load probes the local store again for a held payload, or where a store of it may have landed
+/// since ([`stored_since`]). A payload the store answers `NotSupported` for fails the read, as it
+/// fails [`load_fragment`]. The zero hash names empty content and asks no store.
 ///
 /// The contents of `slice` are unspecified when this fails.
 ///
@@ -770,28 +795,37 @@ pub fn read_into(
             return Ok(());
         }
         let landed = landed_before_probe(address, options);
-        let stored = if options.local {
-            read_raw(store.clone(), partition, address).await.ok()
-        } else {
-            None
+        let (held, expanded) = {
+            let stored = if options.local {
+                match read_raw(store.clone(), partition, address).await {
+                    Err(err) if err.is_not_supported() => return Err(err),
+                    loaded => loaded.ok(),
+                }
+            } else {
+                None
+            };
+            if let Some(loaded) = &stored
+                && check_payload_sizes(&loaded.raw.0, loaded.raw.1.len()).is_ok()
+            {
+                let (fragment, payload) = &loaded.raw;
+                check_max_content_size(fragment, options.max_content_size)?;
+                if !fills_slice(
+                    slice,
+                    resolve_content_range(range.clone(), fragment.size_content).len(),
+                )? {
+                    return Ok(());
+                }
+                if loaded.content.is_none()
+                    && decompress_whole_into(*fragment, payload, range.clone(), slice)
+                {
+                    return Ok(());
+                }
+            }
+            (
+                stored.is_some(),
+                stored.and_then(|loaded| loaded.take(true).ok()),
+            )
         };
-        let held = stored.is_some();
-        if let Some((fragment, payload)) = &stored
-            && check_payload_sizes(fragment, payload.len()).is_ok()
-        {
-            check_max_content_size(fragment, options.max_content_size)?;
-            if !fills_slice(
-                slice,
-                resolve_content_range(range.clone(), fragment.size_content).len(),
-            )? {
-                return Ok(());
-            }
-            if decompress_whole_into(*fragment, payload, range.clone(), slice) {
-                return Ok(());
-            }
-        }
-        let expanded =
-            stored.and_then(|(fragment, payload)| expand_payload(fragment, payload).ok());
         let (fragment, buffer) = if let Some(content) = expanded {
             content
         } else {
@@ -887,7 +921,8 @@ pub(crate) enum RootSource {
 enum BufferPayload {
     /// `dst` holds the content.
     Placed,
-    /// The payload as the local store holds it, still to be turned into content.
+    /// The bytes the store returned, as stored or as it expanded them on receipt, still to be
+    /// turned into content.
     Stored(Bytes),
     /// Content [`load_fragment`] expanded: read locally again ([`content_payload_for_buffer`]), or
     /// fetched and checked on receipt.
@@ -895,17 +930,18 @@ enum BufferPayload {
 }
 
 /// The payload stored under `address`, put in `dst` when the local store could place it there, and
-/// handed back otherwise: as the local store holds it, or as content [`load_fragment`] expanded.
+/// handed back otherwise: as the store returned it, or as content [`load_fragment`] expanded.
 /// `None` for a root only the local store may supply ([`RootSource::LocalOnly`]) that it did not
 /// place or return, with no wait and no second probe.
 ///
 /// For any other root, a local miss waits for a store of the address in flight, as [`stored_since`]
 /// describes, and probes the local store again through [`load_fragment`] only where one may have
-/// landed, fetching from the remote otherwise where one is in reach. A placement that fails for any
-/// other reason, such as one the store answers `SlowDown`, is probed again through it as well,
-/// which retries. That load is boxed, as only a miss or a failed placement takes it. A miss with no
-/// remote in reach is `AddressNotFound`, and a remote fetch that fails is an error, since it
-/// already checked and healed.
+/// landed, fetching from the remote otherwise where one is in reach. A placement the store answers
+/// `SlowDown` is probed again through it as well, which retries; one it answers `Oversized` or
+/// `NotSupported` fails the read, and one that fails for any other reason is a miss. That load is
+/// boxed, as only a miss or a failed placement takes it. A miss with no remote in reach is
+/// `AddressNotFound`, and a remote fetch that fails is an error, since it already checked and
+/// healed.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -931,7 +967,7 @@ fn content_payload_for_buffer(
                 }
                 // Forwarded, not rebuilt, so the error's text appears once rather than nested in a
                 // context of its own.
-                Err(err) if err.is_oversized() => {
+                Err(err) if err.is_oversized() || err.is_not_supported() => {
                     return Err(err).forward("reading the content into the caller's buffer");
                 }
                 Err(err) => {
@@ -939,7 +975,7 @@ fn content_payload_for_buffer(
                         "Fragment {} failed loading into caller buffer: {err:?}",
                         address.hash
                     );
-                    reprobe = !(err.is_address_not_found() || err.is_payload_not_found());
+                    reprobe = err.is_slow_down();
                 }
             }
         }
@@ -972,8 +1008,8 @@ fn content_payload_for_buffer(
 /// `None` leaves the read to the assembling path, which loads the root itself and so refetches and
 /// heals: the local store did not place or return a root only it may supply, or what it held fails
 /// its size check or did not survive expansion. A miss with no remote in reach, a remote fetch that
-/// fails, content larger than `options.max_content_size` allows, and a destination too small for
-/// the content, fail the read.
+/// fails, a payload the store answers `NotSupported` for, content larger than
+/// `options.max_content_size` allows, and a destination too small for the content, fail the read.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -1674,9 +1710,9 @@ fn load_resolved_local(
 /// exist only remotely.
 ///
 /// Checks every remote root on receipt as `options` asks ([`check_receipt`]). A failed check gets
-/// one heal attempt then a re-resolve, as [`load_fragment`] does. The retry re-resolves rather than
-/// re-reads, since the heal targets the resolved address and a fresh resolve costs the same
-/// single round trip.
+/// one heal attempt ([`heal_on_receipt`]) then a re-resolve, as [`load_fragment`] does. The retry
+/// re-resolves rather than re-reads, since the heal targets the resolved address and a fresh
+/// resolve costs the same single round trip.
 ///
 /// The root is expanded when `options.decompress` is set, and left as stored otherwise. Content
 /// larger than `options.max_content_size` allows fails.
@@ -1786,33 +1822,13 @@ fn resolve_root(
                             .store(partition, key, resolved, KeyType::Resolve)
                             .await;
                     }
-                    let (fragment, buffer) = Fetched { content, raw }.take(options.decompress)?;
+                    let (fragment, buffer) = Loaded { content, raw }.take(options.decompress)?;
                     break (resolved, address, fragment, buffer);
                 }
                 Err(err) => {
-                    if matches!(err, StorageError::NotSupported(_)) {
+                    if !heal_on_receipt(session.as_ref(), address, &err, heal_attempted).await {
                         return Err(err);
                     }
-                    if heal_attempted {
-                        lore_base::lore_error!(
-                            "Key {key} resolved to {resolved}, still corrupt after heal: {err}"
-                        );
-                        return Err(err);
-                    }
-
-                    lore_base::lore_warn!(
-                        "Key {key} resolved to {resolved}: {err}. Attempting heal."
-                    );
-                    let healed = session
-                        .verify(&address, true)
-                        .await
-                        .is_ok_and(|r| r.healed == lore_base::types::HealResult::Healed);
-                    if !healed {
-                        lore_base::lore_error!("Server did not heal fragment {resolved}");
-                        return Err(err);
-                    }
-
-                    lore_base::lore_debug!("Server healed fragment {resolved}, resolving again");
                     heal_attempted = true;
                 }
             }

@@ -130,6 +130,7 @@ pub use packstore::PackStoreRef;
 pub use packstore::PackfileError;
 pub use packstore::PackfileSize;
 pub use read::REMOTE_FETCH_INFLIGHT;
+pub use read::check_payload_sizes;
 pub use read::expand_payload;
 pub use read::load_fragment;
 pub use read::read;

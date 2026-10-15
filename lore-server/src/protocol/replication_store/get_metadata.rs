@@ -69,6 +69,11 @@ fn serialize_response(data: StoreGetData) -> Vec<Bytes> {
 }
 
 pub fn parse_response(mut bytes: Bytes) -> Result<StoreGetData, ReplicationStoreClientError> {
+    if bytes.len() < super::get::RESPONSE_HEADER_SIZE {
+        return Err(ReplicationStoreClientError::ResponseError(
+            "get_metadata response shorter than its header",
+        ));
+    }
     let fragment: Fragment = bytes.split_to(size_of::<Fragment>()).into();
     let match_made: StoreMatch = bytes[0].try_into().map_err(|error| {
         warn!(?error, "failed to parse match_made");
@@ -83,6 +88,7 @@ pub fn parse_response(mut bytes: Bytes) -> Result<StoreGetData, ReplicationStore
         match_made,
         partition,
         payload: None,
+        content: None,
     })
 }
 

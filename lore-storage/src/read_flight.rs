@@ -9,7 +9,7 @@ use dashmap::Entry;
 use tokio::sync::watch;
 
 use crate::error::StorageError;
-use crate::read::Fetched;
+use crate::read::Loaded;
 use crate::types::Address;
 use crate::types::Hash;
 use crate::types::Partition;
@@ -18,7 +18,7 @@ use crate::write::StoreInFlightKey;
 /// Outcome the read single-flight leader publishes to its followers: `None`
 /// while the read is still running, `Some(result)` once it finishes.
 #[lore_macro::test_pub]
-type ReadFlightResult = Option<Result<Fetched, StorageError>>;
+type ReadFlightResult = Option<Result<Loaded, StorageError>>;
 
 type Channel = (
     watch::Sender<ReadFlightResult>,
@@ -154,7 +154,7 @@ impl ReadFlightGuard {
     /// End the flight and publish `result` to the followers subscribed to it, cloned only where
     /// one is.
     #[lore_macro::test_pub]
-    pub(crate) fn complete(mut self, result: &Result<Fetched, StorageError>) {
+    pub(crate) fn complete(mut self, result: &Result<Loaded, StorageError>) {
         if let Some(sender) = self.key.take().and_then(close) {
             sender.send_replace(Some(result.clone()));
         }

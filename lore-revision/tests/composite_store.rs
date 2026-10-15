@@ -74,6 +74,7 @@ mod tests {
                     match_made: StoreMatch::MatchFull,
                     partition: Partition::default(),
                     payload: Some(payload),
+                    content: None,
                 }),
                 ..Default::default()
             }
@@ -96,6 +97,7 @@ mod tests {
                 match_made: StoreMatch::MatchFull,
                 partition: Partition::default(),
                 payload: Some(payload.clone()),
+                content: None,
             });
             self
         }
@@ -1336,6 +1338,66 @@ mod tests {
                     .await
                     .expect("local confirmation failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchFull));
+            })
+            .await;
+    }
+
+    /// A composite store passes on the content a durable store expanded where it checked a payload
+    /// on receipt, so a read into a buffer through the composite places that content.
+    #[tokio::test]
+    async fn a_durable_stores_checked_content_is_placed_through_the_composite() {
+        let content = Bytes::from_static(b"content a durable store expanded to check its payload");
+        let plain = Fragment {
+            flags: 0,
+            size_payload: content.len() as u32,
+            size_content: content.len() as u64,
+        };
+        let payload = Bytes::from_static(b"payload");
+        let durable = TestStore {
+            get_immutable_result: Some(StoreGetData {
+                fragment: Fragment {
+                    flags: FragmentFlags::PayloadCompressedLZ4.bits(),
+                    size_payload: payload.len() as u32,
+                    size_content: content.len() as u64,
+                },
+                match_made: StoreMatch::MatchFull,
+                partition: Partition::default(),
+                payload: Some(payload),
+                content: Some((plain, content.clone())),
+            }),
+            ..TestStore::succeeding()
+        };
+
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let store = CompositeStoreBuilder::default()
+                    .with_local("failing, local".to_string(), Arc::new(TestStore::failing()))
+                    .expect("Failed add local")
+                    .with_durable("checking, durable".to_string(), Arc::new(durable))
+                    .expect("Failed add durable")
+                    .build()
+                    .expect("Failed store build");
+                let address = Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                };
+                let mut buffer = vec![0u8; content.len()];
+                // SAFETY: the buffer outlives the read and nothing else touches it.
+                let mut dst =
+                    unsafe { lore_storage::CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+
+                let (fragment, read) = Arc::new(store)
+                    .get_into(random::<RepositoryId>(), address, &mut dst)
+                    .await
+                    .expect("the composite reads the durable store's content");
+
+                assert!(matches!(
+                    read,
+                    lore_storage::store_types::PayloadRead::IntoBuffer
+                ));
+                assert_eq!(fragment, plain);
+                assert_eq!(buffer, content.as_ref());
             })
             .await;
     }
@@ -3240,6 +3302,7 @@ mod tests {
                         match_made: lore_storage::StoreMatch::MatchFull,
                         partition: Partition::default(),
                         payload: Some(payload),
+                        content: None,
                     })),
                     get_count: AtomicU32::new(0),
                     get_metadata_count: AtomicU32::new(0),

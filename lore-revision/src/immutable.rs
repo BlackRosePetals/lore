@@ -221,8 +221,11 @@ pub fn load_raw_store_retry(
     repository: Partition,
     address: Address,
 ) -> impl Future<Output = Result<(Fragment, Bytes), ImmutableError>> {
-    lore_storage::read::read_raw(store, repository, address)
-        .map(|loaded| loaded.forward::<ImmutableError>("loading raw fragment from store"))
+    lore_storage::read::read_raw(store, repository, address).map(|loaded| {
+        loaded
+            .map(|loaded| loaded.raw)
+            .forward::<ImmutableError>("loading raw fragment from store")
+    })
 }
 
 /// Write a single raw fragment to local store with retry backoff.
@@ -863,12 +866,11 @@ async fn push_local_list_children(
     address: Address,
     children: &mut Vec<Address>,
 ) -> bool {
-    let Ok((fragment, payload)) =
-        lore_storage::read::read_raw(repository.immutable_store(), repository.id, address).await
+    let Ok((_, list)) =
+        lore_storage::read::read_raw(repository.immutable_store(), repository.id, address)
+            .await
+            .and_then(|loaded| loaded.take(true))
     else {
-        return false;
-    };
-    let Ok((_, list)) = lore_storage::expand_payload(fragment, payload) else {
         return false;
     };
     push_subfragments(list, address.context, children);

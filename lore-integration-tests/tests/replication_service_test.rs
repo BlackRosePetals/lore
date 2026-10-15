@@ -98,10 +98,12 @@ mod replication_service_tests {
         })
     }
 
-    /// A running replication server and the material needed to talk to it.
+    /// A running replication server, the store it replicates into, and the material needed to talk
+    /// to it.
     struct TestServer {
         addr: SocketAddr,
         certs: TestCerts,
+        store: Arc<dyn lore_storage::ImmutableStore>,
         _shutdown: tokio::sync::oneshot::Sender<()>,
     }
 
@@ -146,6 +148,7 @@ mod replication_service_tests {
         let signal = async {
             shutdown_rx.await.ok();
         };
+        let store = immutable.clone();
         let server = GrpcInternalServerBuilder::new()
             .with_components(
                 immutable.clone(),
@@ -174,6 +177,7 @@ mod replication_service_tests {
         Ok(TestServer {
             addr,
             certs,
+            store,
             _shutdown: shutdown_tx,
         })
     }
@@ -249,6 +253,45 @@ mod replication_service_tests {
 
         assert_eq!(addresses, seen);
 
+        Ok(())
+    }
+
+    /// A peer is trusted, and a payload it replicates still has its sizes checked: a plain payload
+    /// claiming more content than it holds is answered, as every replicated put is, and not stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replicated_put_whose_sizes_disagree_is_not_stored() -> Result<(), Box<dyn Error>> {
+        let server = start_server().await?;
+        let mut channel = get_channel(&server).await?;
+        let repository = rand::random::<Context>();
+        let (fragment, address, payload) = generate_random();
+        let claims_more = lore_base::types::Fragment {
+            size_content: fragment.size_content + 1,
+            ..fragment
+        };
+        let (tx, rx) = mpsc::channel::<ReplicationPutRequest>(1);
+        tx.send(ReplicationPutRequest {
+            repository_id: repository.into(),
+            put_request: Some(PutRequest {
+                address: Some(address.into()),
+                fragment: Some(claims_more.into()),
+                payload: Some(payload),
+            }),
+        })
+        .await?;
+        drop(tx);
+
+        let mut response = channel.put(ReceiverStream::new(rx)).await?.into_inner();
+        let answered = response
+            .message()
+            .await?
+            .and_then(|message| message.address);
+        let stored = server.store.clone().get(repository.into(), address).await;
+
+        assert_eq!(answered.map(Address::from), Some(address));
+        assert!(
+            stored.as_ref().is_err_and(|err| err.is_address_not_found()),
+            "{stored:?}"
+        );
         Ok(())
     }
 

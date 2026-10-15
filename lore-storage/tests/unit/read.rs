@@ -229,15 +229,14 @@ struct CountingReadStore {
     pad: bool,
 }
 
-/// What a [`CountingReadStore`] does around its first read: answer it `SlowDown` where it is a
-/// placement and `slow_placement` is set, then notify `release`, and land `landing` by putting its
-/// payload and dropping its in-flight guard, as a tracker leader finishing during a reader's probe
-/// would.
+/// What a [`CountingReadStore`] does around its first read: answer it `placement_error` where it is
+/// a placement and one is set, then notify `release`, and land `landing` by putting its payload and
+/// dropping its in-flight guard, as a tracker leader finishing during a reader's probe would.
 #[derive(Default)]
 struct ReadHooks {
     release: Option<Arc<tokio::sync::Notify>>,
     landing: Option<Landing>,
-    slow_placement: bool,
+    placement_error: Option<StoreError>,
 }
 
 type Landing = (
@@ -348,10 +347,10 @@ impl ImmutableStore for CountingReadStore {
     ) -> Result<(Fragment, PayloadRead), StoreError> {
         self.gets_into
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let got = if self.hooks.lock().expect("hooks").slow_placement {
-            Err(StoreError::from(lore_storage::errors::SlowDown))
-        } else {
-            self.inner.clone().get_into(partition, address, dst).await
+        let placement_error = self.hooks.lock().expect("hooks").placement_error.clone();
+        let got = match placement_error {
+            Some(err) => Err(err),
+            None => self.inner.clone().get_into(partition, address, dst).await,
         };
         self.after_read().await;
         got.map(|(fragment, read)| match read {
@@ -1888,7 +1887,7 @@ async fn a_placement_answered_slow_down_is_read_through_the_retrying_load() {
         let (store, counts) = CountingReadStore::with_hooks(
             inner.clone(),
             ReadHooks {
-                slow_placement: true,
+                placement_error: Some(StoreError::from(lore_storage::errors::SlowDown)),
                 ..ReadHooks::default()
             },
         );
@@ -1910,6 +1909,40 @@ async fn a_placement_answered_slow_down_is_read_through_the_retrying_load() {
         assert_eq!(buffer.as_slice(), payload.as_ref());
         assert_eq!((counts.gets_into(), counts.gets()), (1, 1));
     }
+}
+
+/// A placement that fails for any other reason than `SlowDown`, `Oversized` or `NotSupported` is a
+/// miss: the read neither probes the local store again nor reports anything but the miss, with no
+/// remote in reach.
+#[tokio::test]
+async fn a_placement_failing_otherwise_is_a_miss() {
+    let (_dir, inner) = make_test_store().await;
+    let partition = Partition::from([0xa0; 16]);
+    let payload = Bytes::from((0u8..64).map(|byte| byte ^ 0xa0).collect::<Vec<u8>>());
+    let address = put_whole(&inner, partition, Context::from([0xa0; 16]), &payload).await;
+    let (store, counts) = CountingReadStore::with_hooks(
+        inner,
+        ReadHooks {
+            placement_error: Some(StoreError::internal("a store failing the placement")),
+            ..ReadHooks::default()
+        },
+    );
+
+    let read = read_into_vec(
+        store,
+        partition,
+        address,
+        None,
+        payload.len(),
+        ReadOptions::default().no_remote(),
+    )
+    .await;
+
+    assert!(
+        matches!(read, Err(StorageError::AddressNotFound(_))),
+        "got {read:?}"
+    );
+    assert_eq!(counts.probes(), 1, "the failed placement was probed again");
 }
 
 /// [`a_never_waiting_miss_answers_at_once_while_a_store_is_in_flight`], for a read into a slice.
@@ -2795,7 +2828,7 @@ async fn followers_get_the_leaders_bytes_when_nothing_is_cached() {
                         async move {
                             fetches.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            Ok(Fetched {
+                            Ok(Loaded {
                                 content: Some((fragment, payload.clone())),
                                 raw: (fragment, payload),
                             })
@@ -2862,7 +2895,7 @@ async fn concurrent_misses_of_one_content_under_different_addresses_fetch_once()
                         async move {
                             fetches.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            Ok(Fetched {
+                            Ok(Loaded {
                                 content: Some((fragment, payload.clone())),
                                 raw: (fragment, payload),
                             })
@@ -2922,7 +2955,7 @@ async fn only_a_follower_of_the_leaders_address_takes_its_error() {
                         fetches.fetch_add(1, Ordering::SeqCst);
                         let raw = raw.clone();
                         async move {
-                            Ok(Fetched {
+                            Ok(Loaded {
                                 content: Some(raw.clone()),
                                 raw,
                             })
@@ -2984,7 +3017,7 @@ async fn an_untrusting_fetch_never_follows_a_trusting_flight() {
                 fetches.fetch_add(1, Ordering::SeqCst);
                 let raw = (fragment, payload.clone());
                 async move {
-                    Ok(Fetched {
+                    Ok(Loaded {
                         content: Some(raw.clone()),
                         raw,
                     })
@@ -3028,7 +3061,7 @@ async fn an_isolating_store_never_shares_a_flight_across_partitions() {
                 fetches.fetch_add(1, Ordering::SeqCst);
                 let raw = (fragment, payload.clone());
                 async move {
-                    Ok(Fetched {
+                    Ok(Loaded {
                         content: Some(raw.clone()),
                         raw,
                     })
@@ -3076,7 +3109,7 @@ async fn a_local_only_miss_never_follows_a_remote_flight() {
                         async move {
                             started.notify_one();
                             released.notified().await;
-                            Ok(Fetched {
+                            Ok(Loaded {
                                 content: Some((fragment, payload.clone())),
                                 raw: (fragment, payload),
                             })
@@ -3270,7 +3303,7 @@ async fn never_wait_with_a_session_never_follows_a_flight() {
                     async move {
                         started.notify_one();
                         released.notified().await;
-                        Ok(Fetched {
+                        Ok(Loaded {
                             content: Some((fragment, payload.clone())),
                             raw: (fragment, payload),
                         })
@@ -3395,7 +3428,7 @@ async fn a_never_waiting_whole_read_into_a_buffer_never_follows_a_flight() {
                     async move {
                         started.notify_one();
                         released.notified().await;
-                        Ok(Fetched {
+                        Ok(Loaded {
                             content: Some((fragment, payload.clone())),
                             raw: (fragment, payload),
                         })
@@ -4333,7 +4366,7 @@ fn a_fetch_not_expanded_on_receipt_expands_where_its_content_is_taken() {
         lore_storage::compress::CompressionMode::Lz4,
     )
     .expect("compress test content");
-    let fetched = Fetched {
+    let fetched = Loaded {
         content: None,
         raw: raw.clone(),
     };
