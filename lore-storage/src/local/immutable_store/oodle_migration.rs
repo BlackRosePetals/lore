@@ -75,7 +75,7 @@ async fn migrate_bucket(
 ) -> Result<MigrationCounts, LocalImmutableStoreError> {
     if !bucket.deserialized {
         Box::pin(bucket.deserialize(
-            &group.dirty[bucket_index],
+            &group,
             path.as_path(),
             group_index,
             bucket_index,
