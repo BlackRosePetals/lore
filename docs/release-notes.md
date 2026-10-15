@@ -155,6 +155,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Local stores: a process stopped while writing an index bucket no longer leaves the bucket empty, which discarded
   every entry in it, such as local-only content or branch state
 - Local stores: a failed packfile load, fan-out commit or bucket read no longer discards stored entries or payloads
+- Local stores: an index entry that a machine failure left pointing past the end of its packfile is detected when its
+  bucket loads, and its payload is stored again when next fetched, rather than read back as other content or
+  overwritten by later writes. A packfile whose sync fails takes no more writes
 - `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of
   `Recursion task failed`
 - `lore clone` reports the error that stopped it, such as a file it failed to fetch or write, in place of

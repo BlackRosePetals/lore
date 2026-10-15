@@ -6,7 +6,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use lore_base::test_util::TempDir;
 use lore_storage::packstore::PackStore;
+use lore_storage::packstore::PackfileSize;
 use lore_storage::test_util::PausePoint;
+use lore_storage::test_util::fail_packfile_syncs;
 use lore_storage::test_util::fail_packfile_writes;
 use lore_storage::test_util::hold_packfile_write;
 use lore_storage::test_util::limit_packfile_size;
@@ -499,4 +501,164 @@ async fn obliterating_a_range_zeroes_and_syncs_it() {
         payload(2)
     );
     assert!(!packstore.is_dirty(1).await, "the zeros are synced");
+}
+
+/// A failed sync leaves the packfile dirty and fails every later sync of it, as a later sync could
+/// succeed without the writes the failed one dropped, and takes the packfile out of writes.
+#[tokio::test]
+async fn a_failed_sync_fails_every_later_sync_of_the_packfile_and_stops_its_writes() {
+    let dir = TempDir::new("packstore-failed-sync-");
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    assert_eq!(packstore.store(payload(1)).await.unwrap().id, 1);
+
+    fail_packfile_syncs(1);
+    assert!(packstore.flush_all(true).await.is_err());
+    assert!(
+        packstore.flush_all(true).await.is_err(),
+        "a later sync fails too"
+    );
+    assert!(packstore.is_dirty(1).await);
+    assert!(!packstore.writeable_ids().await.contains(&1));
+    assert_eq!(packstore.store(payload(2)).await.unwrap().id, 2);
+}
+
+/// A failed sync of one packfile, as a flush of it or an obliterate in it runs, takes the packfile
+/// out of writes.
+#[tokio::test]
+async fn a_failed_sync_of_one_packfile_stops_its_writes() {
+    let dir = TempDir::new("packstore-failed-flush-");
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    packstore.store(payload(1)).await.unwrap();
+    fail_packfile_syncs(1);
+    assert!(packstore.flush(1, true).await.is_err());
+    assert!(!packstore.writeable_ids().await.contains(&1));
+
+    assert_eq!(packstore.store(payload(2)).await.unwrap().id, 2);
+    fail_packfile_syncs(1);
+    packstore.obliterate(2, 0, 64).await.unwrap();
+    assert!(!packstore.writeable_ids().await.contains(&2));
+}
+
+/// Restarting writes leaves out a packfile whose sync failed.
+#[tokio::test]
+async fn restarting_writes_leaves_out_a_packfile_whose_sync_failed() {
+    let dir = TempDir::new("packstore-restart-failed-");
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    packstore.store(payload(1)).await.unwrap();
+    packstore.stop_writes(&[1]).await.unwrap();
+    fail_packfile_syncs(1);
+    assert!(packstore.flush(1, true).await.is_err());
+
+    packstore.restart_writes(&[1]).await;
+    assert!(!packstore.writeable_ids().await.contains(&1));
+}
+
+/// A packfile that fills is synced and then settled, so that a bucket file need not record its
+/// size, while the packfile opened in its place is recorded. The packfile is a sparse file just
+/// under the limit.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_packfile_that_fills_is_synced_and_settled() {
+    const LIMIT: u64 = 3 * 1024 * 1024 * 1024;
+    let dir = TempDir::new("packstore-settle-");
+    let pack = packfiles_on_disk(&dir, &[]);
+    std::fs::File::create(pack.join("1"))
+        .unwrap()
+        .set_len(LIMIT - 32)
+        .unwrap();
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    assert_eq!(packstore.store(payload(1)).await.unwrap().id, 1);
+
+    for _ in 0..10_000 {
+        if packstore.is_settled(1).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(packstore.is_settled(1).await);
+    assert!(!packstore.is_dirty(1).await, "the sync covers the write");
+    let mut sizes = [PackfileSize::default(); 4];
+    assert_eq!(packstore.unsettled_sizes(&mut sizes).await, Some(1));
+    assert_eq!(sizes[0], PackfileSize { id: 2, size: 0 });
+}
+
+/// A packfile opened at the size limit is taken to be settled, until it is truncated.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_packfile_opened_at_the_size_limit_is_settled() {
+    const LIMIT: u64 = 3 * 1024 * 1024 * 1024;
+    let dir = TempDir::new("packstore-opened-full-");
+    let pack = packfiles_on_disk(&dir, &[]);
+    std::fs::File::create(pack.join("1"))
+        .unwrap()
+        .set_len(LIMIT)
+        .unwrap();
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    packstore.resume().await.unwrap();
+
+    let mut sizes = [PackfileSize::default(); 4];
+    assert_eq!(packstore.unsettled_sizes(&mut sizes).await, Some(1));
+    assert_eq!(sizes[0], PackfileSize { id: 2, size: 0 });
+
+    packstore.truncate(1).await.unwrap();
+    assert_eq!(packstore.unsettled_sizes(&mut sizes).await, Some(1));
+    assert_eq!(sizes[0], PackfileSize { id: 1, size: 0 });
+}
+
+/// The sizes of the packfiles not settled are the bytes reserved in them, and a slice too short
+/// to hold them gets none.
+#[tokio::test]
+async fn unsettled_sizes_are_the_bytes_reserved_in_the_packfiles_not_settled() {
+    let dir = TempDir::new("packstore-unsettled-");
+    packfiles_on_disk(&dir, &[&[1; 64], &[2; 32]]);
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    assert_eq!(packstore.store(payload(3)).await.unwrap().id, 1);
+
+    let mut sizes = [PackfileSize::default(); 2];
+    assert_eq!(packstore.unsettled_sizes(&mut sizes).await, Some(2));
+    assert_eq!(
+        sizes,
+        [
+            PackfileSize { id: 1, size: 128 },
+            PackfileSize { id: 2, size: 32 }
+        ]
+    );
+    assert_eq!(packstore.unsettled_sizes(&mut sizes[..1]).await, None);
+}
+
+/// Packfiles not yet loaded are left out of the sizes, and stay unloaded: no write in the process
+/// went to them. Loaded, the store would open a packfile to take writes.
+#[tokio::test]
+async fn unsettled_sizes_leave_out_packfiles_not_loaded() {
+    let dir = TempDir::new("packstore-unloaded-");
+    let pack = packfiles_on_disk(&dir, &[]);
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+
+    let mut sizes = [PackfileSize::default(); 2];
+    assert_eq!(packstore.unsettled_sizes(&mut sizes).await, Some(0));
+    assert!(!pack.join("1").exists(), "no packfile is opened");
+}
+
+/// A packfile shorter when opened than recorded, or missing, is short of the recorded size, and a
+/// truncated packfile counts as opened empty.
+#[tokio::test]
+async fn a_packfile_shorter_when_opened_than_recorded_is_short_of_it() {
+    let dir = TempDir::new("packstore-short-");
+    packfiles_on_disk(&dir, &[&[1; 64], &[2; 64]]);
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    assert_eq!(packstore.store(payload(3)).await.unwrap().id, 1);
+
+    let recorded = |id, size| [PackfileSize { id, size }];
+    assert!(!packstore.short_of(recorded(1, 64)).await.unwrap());
+    assert!(
+        packstore.short_of(recorded(1, 128)).await.unwrap(),
+        "a write after opening does not count"
+    );
+    assert!(packstore.short_of(recorded(3, 1)).await.unwrap());
+    assert!(!packstore.short_of(recorded(3, 0)).await.unwrap());
+    assert_eq!(packstore.opened_lengths().await.unwrap(), vec![64, 64]);
+
+    packstore.stop_writes(&[1]).await.unwrap();
+    packstore.truncate(1).await.unwrap();
+    assert_eq!(packstore.opened_lengths().await.unwrap(), vec![0, 64]);
 }

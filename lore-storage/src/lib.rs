@@ -128,6 +128,7 @@ pub use packstore::CallerBuffer;
 pub use packstore::PackStore;
 pub use packstore::PackStoreRef;
 pub use packstore::PackfileError;
+pub use packstore::PackfileSize;
 pub use read::REMOTE_FETCH_INFLIGHT;
 pub use read::expand_payload;
 pub use read::load_fragment;

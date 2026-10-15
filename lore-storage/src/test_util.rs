@@ -3,7 +3,7 @@
 //! Counters, served remote payloads and hooks the read and write paths consult under
 //! `test-util`, so a test can count the decodes, hashes and fetches a read costs, answer a remote
 //! fetch without a remote, order what concurrent reads, stores and compactions do, fail packfile
-//! writes or keep them in flight, and interrupt a payload gate hold.
+//! writes and syncs or keep writes in flight, and interrupt a payload gate hold.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -28,6 +28,7 @@ thread_local! {
     static MIDPOINT: RefCell<Option<Midpoint>> = const { RefCell::new(None) };
     static PAUSES: RefCell<Vec<(PausePoint, Arc<Pause>)>> = const { RefCell::new(Vec::new()) };
     static FAILED_WRITES: Cell<usize> = const { Cell::new(0) };
+    static FAILED_SYNCS: Cell<usize> = const { Cell::new(0) };
     static IN_FLIGHT: RefCell<Option<Arc<InFlight>>> = const { RefCell::new(None) };
     static HOLD_INTERRUPT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static PACKFILE_SIZE_LIMIT: Cell<u64> = const { Cell::new(0) };
@@ -88,7 +89,25 @@ pub fn fail_packfile_writes(count: usize) {
 
 /// Whether this packfile write fails, as [`fail_packfile_writes`] asked.
 pub(crate) fn take_packfile_write_failure() -> bool {
-    FAILED_WRITES.with(|failed| {
+    take_failure(&FAILED_WRITES)
+}
+
+/// Makes the next `count` packfile syncs on this thread fail, each once it has synced.
+pub fn fail_packfile_syncs(count: usize) {
+    FAILED_SYNCS.with(|failed| failed.set(count));
+}
+
+/// The result of this packfile sync, a failure if [`fail_packfile_syncs`] asked for one.
+pub(crate) fn packfile_sync_result() -> std::io::Result<()> {
+    if take_failure(&FAILED_SYNCS) {
+        return Err(std::io::Error::other("packfile sync failed as asked"));
+    }
+    Ok(())
+}
+
+/// Whether this operation fails, taking one of the failures `failures` counts.
+fn take_failure(failures: &'static std::thread::LocalKey<Cell<usize>>) -> bool {
+    failures.with(|failed| {
         let count = failed.get();
         failed.set(count.saturating_sub(1));
         count > 0

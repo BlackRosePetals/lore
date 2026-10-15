@@ -17,6 +17,9 @@ use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::RwLock;
 use tokio::sync::RwLockReadGuard;
 use tokio::sync::RwLockWriteGuard;
+use zerocopy::FromBytes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
 
 #[error_set]
 pub enum PackfileError {}
@@ -27,12 +30,30 @@ pub struct PackStoreRef {
     pub offset: u32,
 }
 
+/// A packfile's id and the bytes reserved in it, as a bucket file records it, see
+/// [`PackStore::unsettled_sizes`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, IntoBytes, FromBytes, Immutable)]
+pub struct PackfileSize {
+    pub id: u32,
+    pub size: u32,
+}
+
 struct PackFile {
     id: u32,
     file: Option<IoFile>,
+    /// The length of the file when the packfile was opened, or emptied.
+    opened: u32,
     /// Marks writes not yet synced: set by a write once it lands, and claimed by the sync that
     /// covers it.
     dirty: AtomicBool,
+    /// Set once the packfile takes no more writes and a sync covers every write to it, so that a
+    /// crash cannot leave it shorter than an entry pointing into it. A packfile opened at the
+    /// size limit is taken to be settled, by the sync that followed its last write.
+    settled: AtomicBool,
+    /// Set by a failed sync. A later sync could report success without the writes the failed one
+    /// dropped, so every later sync fails, see [`PackStore::sync_packfile`].
+    sync_failed: AtomicBool,
     syncing: Mutex<()>,
     contents: RwLock<Contents>,
 }
@@ -50,7 +71,10 @@ impl PackFile {
         PackFile {
             id,
             file,
+            opened: u32::try_from(size).unwrap_or(u32::MAX),
             dirty: AtomicBool::default(),
+            settled: AtomicBool::new(size as u64 >= PACKSTORE_SIZE_LIMIT),
+            sync_failed: AtomicBool::default(),
             syncing: Mutex::default(),
             contents: RwLock::new(Contents {
                 size,
@@ -350,14 +374,38 @@ impl PackStore {
         Ok(PackFile::new(id, Some(file), size as usize))
     }
 
-    /// Take packfile `id` off the writeable list, which more than one store finding it full may
-    /// do, and open packfiles to keep the minimum count taking writes.
+    /// Take packfile `id` off the writeable list, as when it is full or a sync of it failed, which
+    /// more than one caller may do, and open packfiles to keep the minimum count taking writes.
+    /// The caller that takes it off settles it, see [`PackStore::settle`].
     async fn mark_full(&self, id: u32) {
         let packfile = self.packfile.write().await;
         let mut writeable = self.writeable.write().await;
-        writeable.retain(|writeable_id| *writeable_id != id);
+        let taken_off = writeable
+            .iter()
+            .position(|writeable_id| *writeable_id == id)
+            .map(|position| writeable.remove(position))
+            .is_some();
 
         let _ = self.fill_writeable(packfile, writeable).await;
+        if taken_off {
+            self.settle(id);
+        }
+    }
+
+    /// Sync packfile `id`, taken off the writeable list, in a task of its own, and mark it settled
+    /// once the sync succeeds, see [`PackFile::settled`]. Taking it off waited for every write to
+    /// it in flight, so the sync covers them all. The task holds the packfile list, so that no
+    /// truncate empties the packfile before it is marked.
+    fn settle(&self, id: u32) {
+        let packfiles = self.packfile.clone();
+        lore_base::lore_spawn_guarded!(async move {
+            let packfiles = packfiles.read_owned().await;
+            if let Some(packfile) = packfiles.get(id as usize - 1)
+                && Self::sync_packfile(packfile).await.is_ok()
+            {
+                packfile.settled.store(true, Ordering::Release);
+            }
+        });
     }
 
     /// Open packfiles after the last until the minimum count take writes. A file already at the
@@ -423,6 +471,55 @@ impl PackStore {
             sizes.push(packfile.contents.read().await.size);
         }
         Ok(sizes)
+    }
+
+    /// Write the bytes reserved in each packfile not settled, see [`PackFile::settled`], to the
+    /// start of `sizes`, and return how many, or `None` when `sizes` cannot hold them. Every entry
+    /// added before this call points below the size written for its packfile, or into a settled
+    /// packfile, which a crash cannot leave shorter than the entry. Packfiles not yet loaded are
+    /// left out, and not loaded: no write in this process went to them, since a write loads them
+    /// first, and no entry that points into them was loaded from a file recording sizes, since
+    /// loading one compares the sizes with them, see [`PackStore::short_of`].
+    pub async fn unsettled_sizes(&self, sizes: &mut [PackfileSize]) -> Option<usize> {
+        let packfiles = self.packfile.read().await;
+        let mut count = 0;
+        for packfile in packfiles
+            .iter()
+            .filter(|packfile| !packfile.settled.load(Ordering::Acquire))
+        {
+            let recorded = sizes.get_mut(count)?;
+            let size = packfile.contents.read().await.size;
+            *recorded = PackfileSize {
+                id: packfile.id,
+                size: u32::try_from(size).unwrap_or(u32::MAX),
+            };
+            count += 1;
+        }
+        Some(count)
+    }
+
+    /// Whether the packfile of one of `sizes` was shorter when opened than recorded, a missing
+    /// packfile taken to be empty, as when a crash lost the end of a packfile that a bucket file
+    /// recording `sizes` points into, see [`PackFile::opened`].
+    pub async fn short_of(
+        &self,
+        sizes: impl IntoIterator<Item = PackfileSize>,
+    ) -> Result<bool, PackfileError> {
+        let packfiles = self.loaded_packfiles().await?;
+        Ok(sizes.into_iter().any(|recorded| {
+            let opened = (recorded.id as usize)
+                .checked_sub(1)
+                .and_then(|index| packfiles.get(index))
+                .map_or(0, |packfile| packfile.opened);
+            opened < recorded.size
+        }))
+    }
+
+    /// The length of each packfile's file when it was opened, see [`PackFile::opened`], the
+    /// packfile with id `n` at index `n - 1`.
+    pub async fn opened_lengths(&self) -> Result<Vec<u32>, PackfileError> {
+        let packfiles = self.loaded_packfiles().await?;
+        Ok(packfiles.iter().map(|packfile| packfile.opened).collect())
     }
 
     /// Stop writes to the packfiles `ids` and return their sizes in bytes, in the same order,
@@ -496,9 +593,10 @@ impl PackStore {
         Ok(())
     }
 
-    /// Truncate `packfile`'s file to zero bytes and sync it, then record the packfile empty. A
-    /// failed truncate leaves the packfile as it was. A failed sync after it records the packfile
-    /// empty, as its file now is, and is reported.
+    /// Truncate `packfile`'s file to zero bytes and sync it, then record the packfile empty and not
+    /// settled. A failed truncate leaves the packfile as it was. A failed sync after it records the
+    /// packfile empty, as its file now is, and is reported, and fails later syncs of it, see
+    /// [`PackFile::sync_failed`].
     async fn empty_packfile(packfile: &mut PackFile) -> Result<(), PackfileError> {
         let synced = match packfile.file.as_ref() {
             Some(file) => {
@@ -509,6 +607,9 @@ impl PackStore {
             }
             None => Ok(()),
         };
+        packfile.opened = 0;
+        *packfile.settled.get_mut() = false;
+        *packfile.sync_failed.get_mut() = synced.is_err();
         packfile.dirty.store(false, Ordering::Release);
         let contents = packfile.contents.get_mut();
         contents.buffer.clear();
@@ -540,9 +641,9 @@ impl PackStore {
         }
     }
 
-    /// Let those of the packfiles `ids` under the size limit take writes again after
-    /// [`PackStore::stop_writes`], then discard the empty packfiles at the end, see
-    /// [`PackStore::discard_empty_tail`]. A packstore not loaded is left alone.
+    /// Let those of the packfiles `ids` under the size limit, whose syncs have not failed, take
+    /// writes again after [`PackStore::stop_writes`], then discard the empty packfiles at the end,
+    /// see [`PackStore::discard_empty_tail`]. A packstore not loaded is left alone.
     pub async fn restart_writes(&self, ids: &[u32]) {
         let mut packfile = self.packfile.write().await;
         let mut writeable = self.writeable.write().await;
@@ -556,7 +657,9 @@ impl PackStore {
             else {
                 continue;
             };
-            if restarted.contents.get_mut().size >= PACKSTORE_SIZE_LIMIT as usize {
+            if restarted.contents.get_mut().size >= PACKSTORE_SIZE_LIMIT as usize
+                || *restarted.sync_failed.get_mut()
+            {
                 continue;
             }
             if let Err(position) = writeable.binary_search(id) {
@@ -767,7 +870,9 @@ impl PackStore {
     }
 
     /// Overwrite `size` bytes at `offset` in packfile `id` with zeros, then sync the packfile. A
-    /// failed sync is not reported. A packfile held in memory is left as it is.
+    /// failed sync is not reported, and takes the packfile off the writeable list, see
+    /// [`PackStore::sync_packfile`], in a call boxed as it runs only after a failure. A packfile
+    /// held in memory is left as it is.
     pub async fn obliterate(&self, id: u32, offset: u32, size: u32) -> Result<(), PackfileError> {
         let packfiles = self.loaded_packfiles_owned().await?;
 
@@ -787,13 +892,17 @@ impl PackStore {
         let write = PackfileWrite::new(BytesMut::zeroed(size as usize).freeze(), packfiles, index);
         write.write_at(offset as usize).await?;
         write.packfile().dirty.store(true, Ordering::Release);
-        let _ = Self::sync_packfile(write.packfile()).await;
+        if Self::sync_packfile(write.packfile()).await.is_err() {
+            drop(write);
+            Box::pin(self.mark_full(id)).await;
+        }
 
         Ok(())
     }
 
     /// With `sync_data`, sync packfile `id` when it holds writes not yet synced, see
-    /// [`PackStore::sync_packfile`].
+    /// [`PackStore::sync_packfile`]. A failed sync takes the packfile off the writeable list, see
+    /// [`PackStore::stop_writes_after_failed_sync`].
     pub async fn flush(&self, id: u32, sync_data: bool) -> Result<(), PackfileError> {
         let packfiles = self.packfile.read().await;
 
@@ -808,11 +917,16 @@ impl PackStore {
         if !sync_data {
             return Ok(());
         }
-        Self::sync_packfile(packfile).await
+        let Err(err) = Self::sync_packfile(packfile).await else {
+            return Ok(());
+        };
+        drop(packfiles);
+        Err(Box::pin(self.stop_writes_after_failed_sync([id], err)).await)
     }
 
     /// With `sync_data`, sync every packfile holding writes not yet synced, see
-    /// [`PackStore::sync_packfile`]. Returns the first error.
+    /// [`PackStore::sync_packfile`]. Returns the first error. A failed sync takes its packfile off
+    /// the writeable list, see [`PackStore::stop_writes_after_failed_sync`].
     pub async fn flush_all(&self, sync_data: bool) -> Result<(), PackfileError> {
         if !sync_data {
             return Ok(());
@@ -820,19 +934,47 @@ impl PackStore {
         #[cfg(feature = "test-util")]
         crate::test_util::pause_point(crate::test_util::PausePoint::Syncing).await;
         let packfiles = self.packfile.read().await;
-        futures::future::join_all(packfiles.iter().map(Self::sync_packfile))
-            .await
-            .into_iter()
-            .collect()
+        let synced = futures::future::join_all(packfiles.iter().map(Self::sync_packfile)).await;
+        let failed: Vec<u32> = packfiles
+            .iter()
+            .zip(&synced)
+            .filter(|(_, synced)| synced.is_err())
+            .map(|(packfile, _)| packfile.id)
+            .collect();
+        drop(packfiles);
+        let Err(err) = synced.into_iter().collect::<Result<(), _>>() else {
+            return Ok(());
+        };
+        Err(Box::pin(self.stop_writes_after_failed_sync(failed, err)).await)
+    }
+
+    /// Take the packfiles `ids`, whose sync failed with `err`, off the writeable list, and return
+    /// `err`. Its callers box it, as it runs only after a failure, and pass `ids` and `err` in so
+    /// that they hold nothing across it.
+    async fn stop_writes_after_failed_sync(
+        &self,
+        ids: impl IntoIterator<Item = u32>,
+        err: PackfileError,
+    ) -> PackfileError {
+        for id in ids {
+            self.mark_full(id).await;
+        }
+        err
     }
 
     /// Sync `packfile` when it holds writes not yet synced. A sync of it already running is
     /// waited for, so that a flush finding it clean returns only once the writes before it are
-    /// synced. A failed sync leaves it dirty. A write sets the mark once it lands, so a claim sees
-    /// every write that landed before it, and a write landing after it sets the mark again for the
-    /// next sync.
+    /// synced. A write sets the mark once it lands, so a claim sees every write that landed before
+    /// it, and a write landing after it sets the mark again for the next sync. A failed sync
+    /// leaves the packfile dirty and fails every later sync of it, see [`PackFile::sync_failed`],
+    /// and the caller takes the packfile off the writeable list.
     async fn sync_packfile(packfile: &PackFile) -> Result<(), PackfileError> {
         let _syncing = packfile.syncing.lock().await;
+        if packfile.sync_failed.load(Ordering::Relaxed) {
+            return Err(PackfileError::internal(
+                "Packstore file failed an earlier sync",
+            ));
+        }
         if !packfile.dirty.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
@@ -840,8 +982,11 @@ impl PackStore {
             return Ok(());
         };
         let synced = file.sync_data().await;
+        #[cfg(feature = "test-util")]
+        let synced = synced.and_then(|()| crate::test_util::packfile_sync_result());
         if synced.is_err() {
             packfile.dirty.store(true, Ordering::Relaxed);
+            packfile.sync_failed.store(true, Ordering::Relaxed);
         }
         synced.internal("Failed syncing packstore file")?;
         Ok(())
@@ -869,6 +1014,18 @@ pub mod test_util {
             self.packfile.read().await[(id - 1) as usize]
                 .dirty
                 .load(Ordering::Acquire)
+        }
+
+        /// Whether packfile `id` is settled, see `PackFile::settled`.
+        pub async fn is_settled(&self, id: u32) -> bool {
+            self.packfile.read().await[(id - 1) as usize]
+                .settled
+                .load(Ordering::Acquire)
+        }
+
+        /// The ids of the packfiles that take writes, ascending.
+        pub async fn writeable_ids(&self) -> Vec<u32> {
+            self.writeable.read().await.clone()
         }
 
         /// Whether a change to the packfile list, such as marking a packfile full, holds the list

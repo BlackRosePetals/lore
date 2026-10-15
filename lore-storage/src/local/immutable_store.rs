@@ -67,6 +67,7 @@ use crate::Fragment;
 use crate::FragmentFlags;
 use crate::FragmentReference;
 use crate::Hash;
+use crate::PackfileSize;
 use crate::Partition;
 use crate::TypedBytes;
 use crate::compress;
@@ -542,17 +543,110 @@ pub enum ImmutableStoreVersion {
 
 #[lore_macro::test_pub]
 #[repr(C)]
-#[derive(Default, IntoBytes, FromBytes, Immutable)]
+#[derive(Clone, Copy, Default, IntoBytes, FromBytes, Immutable)]
 struct ImmutableStoreHeader {
     version: u32,
-    _unused: u32,
+    /// The packfile sizes the file records, see [`RecordedSizes`]: [`SIZES_RECORDED`], their
+    /// number at [`SIZES_COUNT_SHIFT`], and the id of the first, zero in a file written without.
+    packfile_sizes: u32,
     count: u32,
-    _unused_two: u32,
+    /// The size of the first packfile `packfile_sizes` records.
+    first_packfile_size: u32,
     // Following the index store is
     // Sorted index of entries
     // sorted_index: [u32; count]
     // All entries
     // entry[IndexStoreEntry; count]
+    // The recorded packfile sizes after the first
+    // packfile_size[PackfileSize; recorded - 1]
+}
+
+/// Set in [`ImmutableStoreHeader::packfile_sizes`] by a writer that records packfile sizes.
+#[lore_macro::test_pub]
+const SIZES_RECORDED: u32 = 1 << 31;
+/// Where [`ImmutableStoreHeader::packfile_sizes`] counts the recorded sizes.
+#[lore_macro::test_pub]
+const SIZES_COUNT_SHIFT: u32 = 24;
+/// The bits of [`ImmutableStoreHeader::packfile_sizes`] holding the first packfile's id.
+const SIZES_ID_MASK: u32 = (1 << SIZES_COUNT_SHIFT) - 1;
+/// The most packfile sizes a bucket file holds after its entries. They take fewer bytes than an
+/// entry and its sorted index slot, so that a reader that does not know of them counts the
+/// entries alone and ignores them, see `ImmutableStoreBucket::deserialize_file_content`.
+#[lore_macro::test_pub]
+const TRAILER_SIZES: usize = 12;
+const _: () = assert!(
+    TRAILER_SIZES * size_of::<PackfileSize>() < size_of::<u32>() + size_of::<ImmutableStoreEntry>()
+);
+
+impl ImmutableStoreHeader {
+    /// Record `sizes`, at most one more than [`TRAILER_SIZES`]: the first in the header, the rest
+    /// to follow the entries.
+    fn record_sizes(&mut self, sizes: &[PackfileSize]) {
+        self.packfile_sizes = SIZES_RECORDED | ((sizes.len() as u32) << SIZES_COUNT_SHIFT);
+        if let Some(first) = sizes.first() {
+            self.packfile_sizes |= first.id;
+            self.first_packfile_size = first.size;
+        }
+    }
+
+    /// The packfile sizes the file records, the first from the header and the rest from
+    /// `trailer`, the bytes after the entries.
+    fn recorded_sizes(&self, trailer: Bytes) -> RecordedSizes {
+        if self.packfile_sizes & SIZES_RECORDED == 0 {
+            return RecordedSizes::Unrecorded;
+        }
+        let count = ((self.packfile_sizes & !SIZES_RECORDED) >> SIZES_COUNT_SHIFT) as usize;
+        if count.saturating_sub(1) * size_of::<PackfileSize>() != trailer.len() {
+            return RecordedSizes::Torn;
+        }
+        RecordedSizes::Recorded {
+            first: (count > 0).then_some(PackfileSize {
+                id: self.packfile_sizes & SIZES_ID_MASK,
+                size: self.first_packfile_size,
+            }),
+            rest: trailer,
+        }
+    }
+}
+
+/// The packfile sizes a bucket file records: the bytes reserved, as it was written, in each
+/// packfile a crash could leave shorter than an entry pointing into it, see
+/// [`crate::PackStore::unsettled_sizes`]. A packfile not recorded is settled, or was synced
+/// before the file was written.
+#[lore_macro::test_pub]
+enum RecordedSizes {
+    /// Written by a version that records none. Its entries are taken to point at payloads stored.
+    Unrecorded,
+    /// The first size, from the header, and the bytes of the rest, which follow the entries.
+    Recorded {
+        first: Option<PackfileSize>,
+        rest: Bytes,
+    },
+    /// Fewer sizes follow the entries than the header counts, as when a crash cut the file short.
+    Torn,
+}
+
+/// What a bucket file holds, see [`ImmutableStoreBucket::deserialize_files`].
+#[lore_macro::test_pub]
+struct BucketFile {
+    sorted_index: GrowVec<u32, CHUNK_SIZE_U32>,
+    entry: GrowVec<ImmutableStoreEntry, CHUNK_SIZE_ENTRY>,
+    upgrade_packfile: bool,
+    mark_dirty: bool,
+    sizes: RecordedSizes,
+}
+
+impl BucketFile {
+    /// A bucket file without entries.
+    fn empty() -> Self {
+        Self {
+            sorted_index: GrowVec::new(),
+            entry: GrowVec::new(),
+            upgrade_packfile: false,
+            mark_dirty: false,
+            sizes: RecordedSizes::Unrecorded,
+        }
+    }
 }
 
 pub fn format_bucket_path(path: &Path, group_index: usize, bucket_index: usize) -> PathBuf {
@@ -642,17 +736,18 @@ impl lore_io::StableBufListMut for ImmutableBucketSegments {
     }
 }
 
-/// A bucket's file contents, the serialized header then the bucket's sorted-index and entry
-/// chunks, copied out of the bucket so that its read lock is released before the file is created
-/// and written. Writeback throttling can stall those for seconds, and an insert waiting for the
-/// write lock would hold every later lookup in the bucket behind it. The copy is one allocation
-/// of the file's size.
+/// A bucket's file contents, the serialized header, the bucket's sorted-index and entry chunks,
+/// then the packfile sizes the header has no room for, copied out of the bucket so that its read
+/// lock is released before the file is created and written. Writeback throttling can stall those
+/// for seconds, and an insert waiting for the write lock would hold every later lookup in the
+/// bucket behind it. The copy is one allocation of the file's size.
 struct ImmutableBucketWrite {
     bytes: Vec<u8>,
 }
 
 impl ImmutableBucketWrite {
-    fn copy(header: &ImmutableStoreHeader, bucket: &ImmutableStoreBucket) -> Self {
+    /// Copy `bucket` after room for the header, see [`Self::finish`].
+    fn copy(bucket: &ImmutableStoreBucket) -> Self {
         let chunks = || {
             bucket
                 .sorted_index
@@ -660,13 +755,25 @@ impl ImmutableBucketWrite {
                 .chain(bucket.entry.byte_segments())
         };
         let mut bytes = Vec::with_capacity(
-            size_of::<ImmutableStoreHeader>() + chunks().map(<[u8]>::len).sum::<usize>(),
+            size_of::<ImmutableStoreHeader>()
+                + chunks().map(<[u8]>::len).sum::<usize>()
+                + TRAILER_SIZES * size_of::<PackfileSize>(),
         );
-        bytes.extend_from_slice(header.as_bytes());
+        bytes.resize(size_of::<ImmutableStoreHeader>(), 0);
         for chunk in chunks() {
             bytes.extend_from_slice(chunk);
         }
         Self { bytes }
+    }
+
+    /// Write `header` in the room left for it, recording `sizes`, see
+    /// [`ImmutableStoreHeader::record_sizes`], and append the sizes it has no room for.
+    fn finish(&mut self, mut header: ImmutableStoreHeader, sizes: &[PackfileSize]) {
+        header.record_sizes(sizes);
+        self.bytes[..size_of::<ImmutableStoreHeader>()].copy_from_slice(header.as_bytes());
+        if let Some(rest) = sizes.get(1..) {
+            self.bytes.extend_from_slice(rest.as_bytes());
+        }
     }
 }
 
@@ -716,17 +823,7 @@ impl<'a> Drop for SerializeFailureGuard<'a> {
 
 impl ImmutableStoreBucket {
     #[lore_macro::test_pub]
-    async fn deserialize_files(
-        path: PathBuf,
-    ) -> Result<
-        (
-            GrowVec<u32, CHUNK_SIZE_U32>,
-            GrowVec<ImmutableStoreEntry, CHUNK_SIZE_ENTRY>,
-            bool,
-            bool,
-        ),
-        LocalImmutableStoreError,
-    > {
+    async fn deserialize_files(path: PathBuf) -> Result<BucketFile, LocalImmutableStoreError> {
         let (file, metadata, head) = match lore_io::IoDriver::global()
             .open_read_head(
                 &path,
@@ -738,7 +835,7 @@ impl ImmutableStoreBucket {
             Ok(parts) => parts,
             Err(err) => {
                 if err.kind() == ErrorKind::NotFound {
-                    return Ok((GrowVec::new(), GrowVec::new(), false, false));
+                    return Ok(BucketFile::empty());
                 }
                 return Err(LocalImmutableStoreError::internal_with_context(
                     err,
@@ -750,48 +847,49 @@ impl ImmutableStoreBucket {
         // Recover from corruption by resetting the bucket. Future-version sentinels and
         // unreadable files propagate untouched — deleting a file a newer binary wrote, or one a
         // transient error kept from being read, would destroy its entries.
-        match Self::deserialize_file_content(&path, &file, metadata.len() as usize, &head).await {
-            Ok(result) => Ok(result),
+        // The reason is taken out of the match before the recovery is awaited: a match left open
+        // across it would hold the whole result in the future.
+        let reason = match Self::deserialize_file_content(
+            &path,
+            &file,
+            metadata.len() as usize,
+            &head,
+        )
+        .await
+        {
+            Ok(result) => return Ok(result),
             Err(DeserializeFileError::FutureVersion(version)) => {
-                Err(LocalImmutableStoreError::internal_with_context(
+                return Err(LocalImmutableStoreError::internal_with_context(
                     io::Error::other(format!(
                         "Incompatible store version {version} encountered, please update your client to the latest version"
                     )),
                     "Failed to deserialize storage bucket",
-                ))
+                ));
             }
-            Err(DeserializeFileError::Corrupt(reason)) => {
-                Self::recover_corrupt_bucket(&path, reason).await
-            }
+            Err(DeserializeFileError::Corrupt(reason)) => reason,
             Err(DeserializeFileError::Unreadable(err)) => {
-                Err(LocalImmutableStoreError::internal_with_context(
+                return Err(LocalImmutableStoreError::internal_with_context(
                     err,
                     "Failed to read storage bucket",
-                ))
+                ));
             }
-        }
+        };
+        Self::recover_corrupt_bucket(&path, reason).await
     }
 
     /// Buckets that fit inside the composite open's head bytes — the
     /// common case — parse straight from the head with no further
     /// dispatch. Larger buckets do one vectored read scattering the
     /// sorted index and entries straight into their final chunk
-    /// allocations. Legacy layouts (before `LastAccessInEntry`) parse the
+    /// allocations, and read the packfile sizes after the entries
+    /// separately. Legacy layouts (before `LastAccessInEntry`) parse the
     /// remainder with entry conversion.
     async fn deserialize_file_content(
         path: &Path,
         file: &lore_io::IoFile,
         file_size: usize,
-        head: &[u8],
-    ) -> Result<
-        (
-            GrowVec<u32, CHUNK_SIZE_U32>,
-            GrowVec<ImmutableStoreEntry, CHUNK_SIZE_ENTRY>,
-            bool,
-            bool,
-        ),
-        DeserializeFileError,
-    > {
+        head: &Bytes,
+    ) -> Result<BucketFile, DeserializeFileError> {
         let header_size = size_of::<ImmutableStoreHeader>();
         if head.len() < header_size {
             return Err(DeserializeFileError::Corrupt(format!(
@@ -836,7 +934,7 @@ impl ImmutableStoreBucket {
 
         let expected_count = (file_size - header_size) / per_entry_size;
         if expected_count == 0 {
-            return Ok((GrowVec::new(), GrowVec::new(), false, false));
+            return Ok(BucketFile::empty());
         }
 
         if header.count != expected_count as u32 {
@@ -850,6 +948,7 @@ impl ImmutableStoreBucket {
 
         // LazyFanOut keeps the LastAccessInEntry layout, so any version ≥ LastAccessInEntry uses the new entry layout.
         if header.version >= ImmutableStoreVersion::LastAccessInEntry as u32 {
+            let entries_end = header_size + expected_count * per_entry_size;
             if file_size <= head.len() {
                 let mut reader = &head[header_size..];
                 let sorted_index =
@@ -858,7 +957,13 @@ impl ImmutableStoreBucket {
                     })?;
                 let entry = GrowVec::read_from(&mut reader, expected_count)
                     .map_err(|err| DeserializeFileError::Corrupt(format!("read entries: {err}")))?;
-                return Ok((sorted_index, entry, upgrade_packfile, false));
+                return Ok(BucketFile {
+                    sorted_index,
+                    entry,
+                    upgrade_packfile,
+                    mark_dirty: false,
+                    sizes: header.recorded_sizes(head.slice(entries_end..file_size)),
+                });
             }
             let segments = ImmutableBucketSegments {
                 // SAFETY: the scatter below fills every byte of both vectors or fails, and a
@@ -870,12 +975,21 @@ impl ImmutableStoreBucket {
                 .read_exact_vectored_at(segments, header_size as u64)
                 .await
                 .map_err(|err| bucket_read_error(err, "read bucket data"))?;
-            return Ok((
-                segments.sorted_index,
-                segments.entry,
+            let trailer = if header.packfile_sizes & SIZES_RECORDED != 0 && file_size > entries_end
+            {
+                file.read_exact_at(file_size - entries_end, entries_end as u64)
+                    .await
+                    .map_err(|err| bucket_read_error(err, "read packfile sizes"))?
+            } else {
+                Bytes::new()
+            };
+            return Ok(BucketFile {
+                sorted_index: segments.sorted_index,
+                entry: segments.entry,
                 upgrade_packfile,
-                false,
-            ));
+                mark_dirty: false,
+                sizes: header.recorded_sizes(trailer),
+            });
         }
 
         let remainder;
@@ -911,7 +1025,13 @@ impl ImmutableStoreBucket {
             });
         }
 
-        Ok((sorted_index, entry, upgrade_packfile, true))
+        Ok(BucketFile {
+            sorted_index,
+            entry,
+            upgrade_packfile,
+            mark_dirty: true,
+            sizes: RecordedSizes::Unrecorded,
+        })
     }
 
     /// Drop the corrupt file and return an empty bucket. Pack file payloads survive
@@ -919,15 +1039,7 @@ impl ImmutableStoreBucket {
     async fn recover_corrupt_bucket(
         path: &Path,
         reason: String,
-    ) -> Result<
-        (
-            GrowVec<u32, CHUNK_SIZE_U32>,
-            GrowVec<ImmutableStoreEntry, CHUNK_SIZE_ENTRY>,
-            bool,
-            bool,
-        ),
-        LocalImmutableStoreError,
-    > {
+    ) -> Result<BucketFile, LocalImmutableStoreError> {
         lore_base::lore_warn!(
             "Resetting corrupt immutable bucket {} after deserialize failure: {reason}. Bucket lookup state lost; pack file payloads remain until compaction.",
             path.display()
@@ -940,14 +1052,17 @@ impl ImmutableStoreBucket {
                 "Failed to remove corrupt storage bucket",
             ));
         }
-        Ok((GrowVec::new(), GrowVec::new(), false, false))
+        Ok(BucketFile::empty())
     }
 
     /// Write the bucket to a temporary file renamed over `path`, so that a process stopped during
     /// the write leaves the file it last wrote. The bucket is copied and its lock released before
     /// the write, see [`ImmutableBucketWrite`]. With `sync_data`, the group's packfiles are synced
     /// between the copy and the write, so that the file points only at payload bytes stored, and
-    /// the file is synced before the rename and its directory after.
+    /// the file is synced before the rename and its directory after. Without, the file records the
+    /// sizes of the packfiles a crash could leave shorter than an entry pointing into them, see
+    /// [`crate::PackStore::unsettled_sizes`], or, when it cannot, see [`recordable_sizes`], the
+    /// packfiles are synced as with `sync_data`.
     async fn serialize_files(
         bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
         group: Arc<ImmutableStoreGroup>,
@@ -971,12 +1086,24 @@ impl ImmutableStoreBucket {
         header.version = group.serialize_version.load(atomic::Ordering::Relaxed);
         header.count = count as u32;
 
-        let contents = ImmutableBucketWrite::copy(&header, &bucket);
+        let mut contents = ImmutableBucketWrite::copy(&bucket);
         drop(bucket);
         #[cfg(feature = "test-util")]
         crate::test_util::pause_point(crate::test_util::PausePoint::Serializing).await;
-        if sync_data {
+        // The sizes are held across one await, with no future around it: held across more, or a
+        // larger one, they would make this the largest state of the future.
+        let mut recorded = false;
+        if !sync_data {
+            let mut sizes = [PackfileSize::default(); 1 + TRAILER_SIZES];
+            let unsettled = group.packstore.unsettled_sizes(&mut sizes).await;
+            if let Some(sizes) = recordable_sizes(&sizes, unsettled) {
+                contents.finish(header, sizes);
+                recorded = true;
+            }
+        }
+        if !recorded {
             group.flush_packstore(true).await?;
+            contents.finish(header, &[]);
         }
 
         if let Some(parent_path) = temporary_path.parent()
@@ -1002,7 +1129,7 @@ impl ImmutableStoreBucket {
 
     async fn deserialize(
         &mut self,
-        dirty: &AtomicBool,
+        group: &ImmutableStoreGroup,
         path: &Path,
         group_index: usize,
         bucket_index: usize,
@@ -1021,20 +1148,22 @@ impl ImmutableStoreBucket {
 
         let path = format_bucket_path(path, group_index, bucket_index);
 
-        let (sorted_index, entry, upgrade_packfile, mark_dirty) =
-            Self::deserialize_files(path).await?;
+        let mut file = Self::deserialize_files(path).await?;
+        let cleared = group
+            .clear_lost_payloads(&mut file, group_index, bucket_index)
+            .await?;
 
-        self.sorted_index = sorted_index;
-        self.entry = entry;
-        self.upgrade_packfile = upgrade_packfile;
+        self.sorted_index = file.sorted_index;
+        self.entry = file.entry;
+        self.upgrade_packfile = file.upgrade_packfile;
         self.deserialized = true;
 
         if let Some(gc) = gc_counters {
             gc.add_loaded_fragments(self.entry.len());
         }
 
-        if mark_dirty {
-            dirty.store(true, atomic::Ordering::Relaxed);
+        if file.mark_dirty || cleared {
+            group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
         }
 
         atomic::fence(atomic::Ordering::Release);
@@ -1110,11 +1239,82 @@ impl ImmutableStoreBucket {
     }
 }
 
+/// The packfile sizes a bucket file records, the first `unsettled` of `sizes`, see
+/// [`crate::PackStore::unsettled_sizes`], or `None` when there were more than `sizes` holds, or the
+/// first id has no room in the header, and the group's packfiles are to be synced instead.
+fn recordable_sizes(sizes: &[PackfileSize], unsettled: Option<usize>) -> Option<&[PackfileSize]> {
+    let sizes = &sizes[..unsettled?];
+    sizes
+        .first()
+        .is_none_or(|first| first.id <= SIZES_ID_MASK)
+        .then_some(sizes)
+}
+
 impl ImmutableStoreGroup {
     async fn flush_packstore(&self, sync_data: bool) -> Result<(), LocalImmutableStoreError> {
         self.packstore.flush_all(sync_data).await.map_err(|err| {
             LocalImmutableStoreError::internal_with_context(err, "Failed syncing packfiles")
         })
+    }
+
+    /// Clear the payload location of each entry of `file` that may point past the end of its
+    /// packfile, as after a crash lost the end of a packfile the file points into, so that a later
+    /// store of the payload writes it again rather than reading what a write after the end left
+    /// there. The entries are scanned only when a packfile is shorter, as the store opened it, than
+    /// the file recorded, or its recorded sizes are torn. A file recording none is trusted. Returns
+    /// whether a location was cleared.
+    async fn clear_lost_payloads(
+        &self,
+        file: &mut BucketFile,
+        group_index: usize,
+        bucket_index: usize,
+    ) -> Result<bool, LocalImmutableStoreError> {
+        let packstore_error = |err| {
+            LocalImmutableStoreError::internal_with_context(err, "Failed reading packfile lengths")
+        };
+        let lost = match &file.sizes {
+            RecordedSizes::Unrecorded => false,
+            RecordedSizes::Recorded { first, rest } => {
+                let rest = rest
+                    .as_chunks::<{ size_of::<PackfileSize>() }>()
+                    .0
+                    .iter()
+                    .filter_map(|size| PackfileSize::read_from_bytes(size).ok());
+                self.packstore
+                    .short_of(first.iter().copied().chain(rest))
+                    .await
+                    .map_err(packstore_error)?
+            }
+            RecordedSizes::Torn => true,
+        };
+        if !lost {
+            return Ok(false);
+        }
+        let opened = self
+            .packstore
+            .opened_lengths()
+            .await
+            .map_err(packstore_error)?;
+        let mut cleared = 0;
+        for entry in file.entry.iter_mut() {
+            let data = &mut entry.data;
+            let Some(index) = (data.pack_file as usize).checked_sub(1) else {
+                continue;
+            };
+            let end = u64::from(data.pack_offset) + u64::from(data.size_payload);
+            if end > u64::from(opened.get(index).copied().unwrap_or(0)) {
+                data.pack_file = 0;
+                data.pack_offset = 0;
+                data.flags &= !FragmentFlags::PayloadStoredLocal.bits();
+                cleared += 1;
+            }
+        }
+        if cleared > 0 {
+            lore_base::lore_warn!(
+                "Cleared {cleared} payload locations past the end of their packfile in group {group_index} bucket {bucket_index}, as left by a crash; the payloads are stored again when next fetched"
+            );
+        }
+        Ok(cleared > 0)
     }
 
     /// Whether the group fanned out to a layout that no commit recorded on disk, as after a
@@ -1652,7 +1852,7 @@ impl LocalImmutableStore {
                             let mut bucket = bucket.write().await;
                             bucket
                                 .deserialize(
-                                    &group.dirty[bucket_index],
+                                    &group,
                                     path.as_path(),
                                     group_index,
                                     bucket_index,
@@ -2025,7 +2225,7 @@ impl LocalImmutableStore {
 
         if !bucket.deserialized && self.path.is_some() {
             Box::pin(bucket.deserialize(
-                &group.dirty[bucket_index],
+                group,
                 self.path.clone().unwrap().as_ref(),
                 group_index,
                 bucket_index,
@@ -2232,7 +2432,6 @@ impl LocalImmutableStore {
                 let path = self.path.clone().unwrap();
                 let bucket_ref_for_write = bucket_ref.clone();
                 let group_for_check = group;
-                let dirty = &group.dirty[idx];
                 let gc_counters = self.gc_counters.clone();
                 Box::pin(async move {
                     let mut bucket = bucket_ref_for_write.write_owned().await;
@@ -2242,7 +2441,13 @@ impl LocalImmutableStore {
                         return Ok::<_, LocalImmutableStoreError>(());
                     }
                     bucket
-                        .deserialize(dirty, path.as_ref(), group_index, idx, Some(&gc_counters))
+                        .deserialize(
+                            group_for_check,
+                            path.as_ref(),
+                            group_index,
+                            idx,
+                            Some(&gc_counters),
+                        )
                         .await?;
                     Ok(())
                 })
@@ -2323,7 +2528,7 @@ impl LocalImmutableStore {
 
         if !bucket.deserialized && self.path.is_some() {
             Box::pin(bucket.deserialize(
-                &group.dirty[bucket_index],
+                group,
                 self.path.clone().unwrap().as_ref(),
                 group_index,
                 bucket_index,
@@ -3833,7 +4038,7 @@ impl LocalImmutableStore {
         if !bucket.deserialized && self.path.is_some() {
             let _ = bucket
                 .deserialize(
-                    &group.dirty[bucket_index],
+                    group,
                     self.path.clone().unwrap().as_ref(),
                     group_index,
                     bucket_index,
@@ -4676,7 +4881,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         if !bucket.deserialized && self.path.is_some() {
             bucket
                 .deserialize(
-                    &group.dirty[bucket_index],
+                    group,
                     self.path.clone().unwrap().as_ref(),
                     group_index,
                     bucket_index,
@@ -4783,7 +4988,7 @@ impl LocalImmutableStore {
                     if !bucket.deserialized {
                         bucket
                             .deserialize(
-                                &group.dirty[idx],
+                                group,
                                 path.as_ref(),
                                 group_index,
                                 idx,
@@ -5439,14 +5644,7 @@ async fn maybe_fan_out_immutable_group(
     // Force-deserialize any [0..n] bucket whose entries are still on disk only. Without this, on-disk-only buckets contribute zero entries to the redistribute and their data is lost when serialize overwrites their files with empty buckets at the new layout.
     for (bucket_index, guard) in guards.iter_mut().take(n).enumerate() {
         if !guard.deserialized {
-            Box::pin(guard.deserialize(
-                &group.dirty[bucket_index],
-                path,
-                group_index,
-                bucket_index,
-                None,
-            ))
-            .await?;
+            Box::pin(guard.deserialize(group, path, group_index, bucket_index, None)).await?;
         }
     }
 
