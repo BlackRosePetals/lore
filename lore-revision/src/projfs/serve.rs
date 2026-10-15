@@ -1063,10 +1063,10 @@ async fn get_file_data_async(
                 },
                 // Safety: Ok as buffer is verified non-null and range is clamped above
                 unsafe { slice::from_raw_parts_mut(write_buffer.cast::<u8>(), to_read) },
-                immutable::ReadOptions::default()
-                    .with_decompress()
-                    .with_remote()
-                    .with_verify(),
+                immutable::ReadOptions {
+                    trust_remote: immutable::read_options_from_repository(&repository).trust_remote,
+                    ..immutable::ReadOptions::default()
+                },
             )
             .await
             {

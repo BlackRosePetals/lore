@@ -45,6 +45,14 @@ header = '''// LORE C API
 // free or reuse the argument memory once the call returns. This holds for
 // synchronous and asynchronous calls.
 //
+// Structures
+//
+// Zero every byte of a structure before passing it to the library, padding
+// included, as memset does, then set the fields the call uses. A field left
+// zero selects the default its documentation names. A release can add a field
+// in a structure's padding, which code built against an earlier header leaves
+// unset: such code keeps its behavior only where it zeroed every byte.
+//
 // See lore_event_callback_config_t for how callbacks work.'''
 
 # An optional string of text to output between major sections of the generated

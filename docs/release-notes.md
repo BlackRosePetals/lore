@@ -11,9 +11,31 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   status cross as bitcode under message protocol version 2, where they crossed as JSON, and bitcode carries no field
   names to tell two builds apart. A client and a service on either side of this change refuse each other's messages, so
   restart the service after upgrading
+- Reads trust the local store and check what they fetch by the trust of its source
+  ([ADR-00023](developing/decisions/00023-data-verification-and-trust.md)): no local read hashes its payload, and every
+  payload fetched from a remote is checked against its address on receipt unless the command trusts the remote or a C
+  API reader takes it as stored (`fragments`).
+  `lore-storage`: `ReadOptions` loses `verify` and `trust_local` with `with_verify`, `no_verify` and `trusting_local`,
+  and gains `trust_remote` with `trusting_remote`; `decompress_and_verify` is replaced by `expand_payload`. `read_raw`
+  loses its `verified_by_caller` argument, `fetch_remote` takes `ReadOptions` for its `priority`, `trust_remote` and
+  `decompress`, and `check_fetched` is removed and `fetch_payload` made private. `Fetched::content` is optional,
+  `Flown::take` returns a `Result`, `Flown::Unverified` and `Flown::Rejected` are removed, and a `fetch_single_flight`
+  fetch answers `Fetched`. `file_matches` takes the reader's `trust_remote`. `lore-revision`: `cache_counted` loses its
+  `verify` argument and `RepositoryContext` its `trust_local` setting
+- C API: `skip_verify` on `lore_storage_open_args_t` is now an alias of `trust_remote` for its handle, so a handle that
+  sets it takes payloads fetched from its remote unhashed. Local reads no longer hash either way
 
 ### Features
 
+- `--trust-remote` (C API: `trust_remote` on `lore_global_args_t`) declares the remote a trusted source, for a machine
+  within the remote's own infrastructure where performance comes first, such as a build server streaming from a server
+  in its own backend. A payload fetched from a trusted remote has only its sizes checked against its length, is never
+  hashed, and is decompressed only where its content is read. The field sits in the struct's tail padding, so its size
+  and its other fields' offsets are unchanged. A caller must zero the whole struct, padding included: any non-zero byte
+  there trusts the remote, so a caller built against the earlier header that sets the fields one by one may skip the
+  check
+- `lore-storage`: `read::check_receipt`, the check on receipt by the remote's trust, `read::Fetched::take` and
+  `defragment::MAX_FRAGMENT_TREE_DEPTH` are public
 - Server: added opt-in HTTP health-only mode for deployments that do not serve repository HTTP routes.
 
 - `lore auth login` against a server that advertises an OIDC issuer logs in through the OAuth 2.0 device authorization
@@ -56,6 +78,18 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- Caches and prefetches check every payload they fetch on receipt, as reads do, unless the command trusts the remote,
+  where they stored most payloads unchecked. A cache walk, which trusts the lists the local store holds, fails once it
+  walks deeper than any fragment tree reaches
+- Every payload a read loads locally has its sizes checked against its fragment, as every fetched payload has whether
+  or not the remote is trusted, and one whose sizes disagree is fetched again and overwritten, as one that does not
+  decompress is, where a read that skipped verification read it as the content and panicked
+- A resolved read whose local root does not load overwrites it with the root the remote resolves to, whether or not the
+  read caches, as a read by address does, where it kept the broken copy and fetched the root on every read
+- A write of content the local store holds and the remote does not reuses the stored payload as it is, its sizes
+  checked, where it decoded and hashed it first, as the local store is trusted
+- `lore repository store immutable query` checks the payload the remote serves against its address, unless the command
+  trusts the remote, and logs one that fails. The query reports it as served and does not walk it
 - `lore commit` with changes staged in a layer commits the layer while the parent tree holds only changes marked dirty,
   and leaves those changes dirty. It failed with `Nothing staged for commit` before committing any layer
 - A merge of divergent branch history, such as the one a sync commits when the local and the remote latest have both

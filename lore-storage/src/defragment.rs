@@ -72,13 +72,13 @@ struct LeafReference {
     /// which is the only thing the file sink ever wrote before ranges existed.
     target_offset: u64,
     /// The leaf's whole content size, as its parent list claims it. The fetch checks the
-    /// loaded payload against this rather than against `clip`: a payload is verified against
-    /// the hash that names it, so the whole leaf is what gets loaded and checked whatever
-    /// part of it the caller wants.
+    /// loaded payload against this rather than against `clip`: a payload is stored whole, a
+    /// fetched one is checked whole against the hash that names it, and a compressed one
+    /// expands whole, so the whole leaf is what gets loaded whatever part of it the caller wants.
     expected_size: u64,
     /// The part of this leaf the read asked for, relative to the leaf's own start. Whole
     /// leaves carry `0..expected_size`; only the first and last leaf of a ranged read carry
-    /// anything narrower. Applied after the payload is verified, so it narrows what is
+    /// anything narrower. Applied after the payload is loaded, so it narrows what is
     /// delivered rather than what is read.
     clip: Range<u64>,
     context: Context,
@@ -99,8 +99,9 @@ const PIPELINE_WALKER_LOOKAHEAD: usize = 8;
 /// levels (6553 refs per intermediate × 256 KiB leaves = 1.6 GiB per
 /// intermediate; three levels already reach multi-petabyte). Bounding the
 /// recursion prevents a hostile peer from forcing a large number of fragment
-/// fetches on a deeply nested tree.
-const MAX_FRAGMENT_TREE_DEPTH: usize = 8;
+/// fetches on a deeply nested tree, and ends a walk through a list naming itself
+/// or an ancestor.
+pub const MAX_FRAGMENT_TREE_DEPTH: usize = 8;
 
 /// Walks the fragment tree depth-first with prefetch pipelining, yielding leaf
 /// fragment references into the provided channel.

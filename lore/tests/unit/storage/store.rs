@@ -130,3 +130,24 @@ async fn mark_invalid_and_await_does_not_deadlock_on_already_invalid() {
         .expect("second mark_invalid_and_await must return without blocking");
     handle::unregister(store_handle);
 }
+
+/// The read options a handle's effective flags build carry its trust of the remote, whatever the
+/// handle's local and remote flags and whether a session is in reach.
+#[test]
+fn read_options_carry_the_handles_trust_of_its_remote() {
+    for trust_remote in [false, true] {
+        for (no_remote, no_local) in [(false, false), (true, false), (false, true)] {
+            let flags = EffectiveFlags {
+                no_remote,
+                no_local,
+                trust_remote,
+            };
+            for has_remote_session in [false, true] {
+                assert_eq!(
+                    flags.read_options(has_remote_session).trust_remote,
+                    trust_remote
+                );
+            }
+        }
+    }
+}

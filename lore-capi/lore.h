@@ -40,6 +40,14 @@
 // free or reuse the argument memory once the call returns. This holds for
 // synchronous and asynchronous calls.
 //
+// Structures
+//
+// Zero every byte of a structure before passing it to the library, padding
+// included, as memset does, then set the fields the call uses. A field left
+// zero selects the default its documentation names. A release can add a field
+// in a structure's padding, which code built against an earlier header leaves
+// unset: such code keeps its behavior only where it zeroed every byte.
+//
 // See lore_event_callback_config_t for how callbacks work.
 
 #pragma once
@@ -4051,6 +4059,11 @@ typedef struct lore_event_t {
 } lore_event_t;
 
 // Common options shared by repository operations.
+//
+// Zero every byte of it, padding included, before setting the fields a call
+// uses, as every structure passed to the library: a field left zero selects
+// its default, and a field a release adds in its padding is left unset by
+// code built against an earlier header.
 typedef struct lore_global_args_t {
   // Repository path
   struct lore_string_t repository_path;
@@ -4134,6 +4147,13 @@ typedef struct lore_global_args_t {
   // Which authentication path to take if the server advertises both its
   // gRPC auth service and an OIDC issuer.
   enum lore_auth_mode_t auth_mode;
+  // Treat the remote as a trusted source, for a caller within its
+  // infrastructure where performance comes first: payloads fetched from it
+  // have only their sizes checked against their length, are never hashed,
+  // and are decompressed only where their content is read. A storage handle
+  // takes it from the globals it is opened with. Any non-zero value trusts
+  // the remote, so a caller zeroes the whole struct, padding included
+  uint8_t trust_remote;
 } lore_global_args_t;
 
 // Arguments for resolving user IDs to display names via the remote user service.
@@ -5176,14 +5196,9 @@ typedef struct lore_storage_open_args_t {
   struct lore_storage_remote_config_t remote_config;
   // Activate `remote_config`; otherwise the handle has no remote
   uint8_t has_remote_config;
-  // Skip re-hashing a loaded payload and checking it against the address it was read from.
-  //
-  // Zero keeps the check, which is the default: a store handing back bytes under a content
-  // address should be able to say they are the bytes that address names. A caller whose own
-  // layer already assures integrity - one that scrubs its store on a schedule, say - pays for
-  // the check on every byte of every read and learns nothing new from it, and can set this.
-  //
-  // Applies to every read on the handle.
+  // Alias of `globals.trust_remote` for this handle: the handle trusts its remote when either is
+  // set, so payloads fetched from it have only their sizes checked against their length and are
+  // never hashed. Payloads the local store holds are never hashed either way.
   uint8_t skip_verify;
   // Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
   // incremental background GC for the handle; `0` then selects the default. Shared disk backends

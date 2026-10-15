@@ -4,16 +4,13 @@ use std::hash::BuildHasherDefault;
 use std::hash::Hasher;
 use std::sync::OnceLock;
 
-use bytes::Bytes;
 use dashmap::DashMap;
 use dashmap::Entry;
 use tokio::sync::watch;
 
 use crate::error::StorageError;
 use crate::read::Fetched;
-use crate::read::Flown;
 use crate::types::Address;
-use crate::types::Fragment;
 use crate::types::Hash;
 use crate::types::Partition;
 use crate::write::StoreInFlightKey;
@@ -30,17 +27,18 @@ type Channel = (
 
 /// Reads in flight, keyed by content hash: an address's context does not change its content, so a
 /// read of the same content under any context joins the flight. The partition is part of the key
-/// only where the store isolates partitions.
+/// only where the store isolates partitions, and whether the remote is trusted always is.
 static READ_IN_FLIGHT: OnceLock<
     DashMap<ReadFlightKey, ReadFlightEntry, BuildHasherDefault<PassThroughHasher>>,
 > = OnceLock::new();
 
-/// The content a read single-flight fetches: its hash, and the partition where the store isolates
-/// partitions.
+/// The content a read single-flight fetches: its hash, the partition where the store isolates
+/// partitions, and whether the remote it is fetched from is trusted.
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct ReadFlightKey {
     hash: Hash,
     partition: Option<Partition>,
+    trusted: bool,
 }
 
 impl std::hash::Hash for ReadFlightKey {
@@ -48,7 +46,7 @@ impl std::hash::Hash for ReadFlightKey {
         let partition = self
             .partition
             .map_or(0, |partition| leading_word(partition.as_ref()));
-        state.write_u64(leading_word(self.hash.as_ref()) ^ partition);
+        state.write_u64(leading_word(self.hash.as_ref()) ^ partition ^ u64::from(self.trusted));
     }
 }
 
@@ -59,8 +57,8 @@ fn leading_word(bytes: &[u8]) -> u64 {
 }
 
 /// Hashes a [`ReadFlightKey`] to the first eight bytes of its content hash, folded with the
-/// partition's where the key carries one: the content hash is uniform already. The key writes that
-/// word alone, so nothing writes bytes.
+/// partition's where the key carries one and with its trust: the content hash is uniform already.
+/// The key writes that word alone, so nothing writes bytes.
 #[derive(Default)]
 struct PassThroughHasher(u64);
 
@@ -161,29 +159,6 @@ impl ReadFlightGuard {
             sender.send_replace(Some(result.clone()));
         }
     }
-
-    /// End the flight with `raw`, the payload at `address` as fetched, unchecked. Where a follower
-    /// is subscribed, the payload is checked on receipt ([`crate::read::verify_receipt`]) and the
-    /// content published; one that fails the check is not published, so the followers fetch for
-    /// themselves, as after a leader that vanished, and is handed back rejected. Where none is, the
-    /// payload is handed back unchecked.
-    pub(crate) fn complete_unverified(mut self, address: Address, raw: (Fragment, Bytes)) -> Flown {
-        let Some(sender) = self.key.take().and_then(close) else {
-            return Flown::Unverified(raw);
-        };
-        let (fragment, payload) = raw;
-        match crate::read::verify_receipt(fragment, payload.clone(), address) {
-            Ok(content) => {
-                let fetched = Fetched {
-                    content,
-                    raw: (fragment, payload),
-                };
-                sender.send_replace(Some(Ok(fetched.clone())));
-                Flown::Fetched(fetched)
-            }
-            Err(_) => Flown::Rejected((fragment, payload)),
-        }
-    }
 }
 
 impl Drop for ReadFlightGuard {
@@ -203,11 +178,11 @@ fn close(key: ReadFlightKey) -> Option<watch::Sender<ReadFlightResult>> {
     flight.sender.filter(|sender| sender.receiver_count() > 0)
 }
 
-/// Join the read single-flight for `address`'s content: its hash, and `partition` where
-/// `isolate_partitions` says the store serves each partition only what it holds. The first caller
-/// becomes the leader and must perform the read, then call `ReadFlightGuard::complete`. Later
-/// callers become followers, whatever their context, and should pass the follower to
-/// `await_flight`.
+/// Join the read single-flight for `address`'s content: its hash, `partition` where
+/// `isolate_partitions` says the store serves each partition only what it holds, and whether the
+/// remote is `trusted`. The first caller becomes the leader and must perform the read, then call
+/// `ReadFlightGuard::complete`. Later callers become followers, whatever their context, and should
+/// pass the follower to `await_flight`.
 ///
 /// One shard lock serves each join, held only to insert the flight or subscribe to it, and nothing
 /// is allocated under it. A leader allocates nothing. The first follower of a flight creates its
@@ -217,10 +192,12 @@ pub(crate) fn join_read_flight(
     partition: Partition,
     address: Address,
     isolate_partitions: bool,
+    trusted: bool,
 ) -> ReadFlight {
     let key = ReadFlightKey {
         hash: address.hash,
         partition: isolate_partitions.then_some(partition),
+        trusted,
     };
     let in_flight =
         READ_IN_FLIGHT.get_or_init(|| DashMap::with_hasher(BuildHasherDefault::default()));

@@ -44,8 +44,16 @@ pub(super) async fn context_with_state(state: RemoteState) -> Arc<RepositoryCont
 /// correlation id a session is attributed to comes from. The future is built inside the
 /// context, as a wrapper resolves its session when built.
 pub(super) async fn under_execution_context<F: Future>(body: impl FnOnce() -> F) -> F::Output {
+    under_globals(LoreGlobalArgs::default(), body).await
+}
+
+/// [`under_execution_context`] with the command's `globals`.
+pub(super) async fn under_globals<F: Future>(
+    globals: LoreGlobalArgs,
+    body: impl FnOnce() -> F,
+) -> F::Output {
     let execution = Arc::new(ExecutionContext::new_client(
-        LoreGlobalArgs::default(),
+        globals,
         EventDispatcher::no_dispatch(),
     ));
     LORE_CONTEXT
@@ -214,31 +222,19 @@ async fn a_read_handed_the_last_context_reference_reaches_the_pool() {
     assert!(!err.is_address_not_found(), "reported {err:?}");
 }
 
-/// A context trusting local bytes reads with options that serve them unchecked; any other verifies
-/// them.
+/// A command whose globals trust the remote reads with options that trust it; any other does not.
 #[tokio::test]
-async fn reads_trust_local_bytes_where_the_context_does() {
+async fn reads_trust_the_remote_where_the_globals_do() {
     let context = context_with_state(RemoteState::Offline).await;
-    let verifying = read_options_from_repository(&context);
-    assert!(verifying.verify && !verifying.trust_local);
-
-    context.set_trust_local(true);
-    let trusting = read_options_from_repository(&context);
-    assert!(!trusting.verify && trusting.trust_local);
-}
-
-/// Trusting local bytes comes along with the context's other runtime settings, cloned or copied.
-#[test]
-fn trusting_local_bytes_is_copied_with_the_runtime_settings() {
-    use std::sync::atomic::Ordering;
-
-    use lore_revision::repository::RepositoryRuntimeSettings;
-
-    let trusting = RepositoryRuntimeSettings::default();
-    trusting.trust_local.store(true, Ordering::Relaxed);
-    assert!(trusting.clone().trust_local.load(Ordering::Relaxed));
-
-    let mut copied = RepositoryRuntimeSettings::default();
-    copied.clone_from(&trusting);
-    assert!(copied.trust_local.load(Ordering::Relaxed));
+    let untrusting =
+        under_execution_context(|| async { read_options_from_repository(&context) }).await;
+    let trusting = LoreGlobalArgs {
+        trust_remote: 1,
+        ..LoreGlobalArgs::default()
+    };
+    let trusting = under_globals(trusting, || async {
+        read_options_from_repository(&context)
+    })
+    .await;
+    assert!(!untrusting.trust_remote && trusting.trust_remote);
 }

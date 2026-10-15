@@ -491,7 +491,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -532,7 +532,7 @@ mod defragment_integration {
         }
         let root_address = put_list(&store, partition, context, &refs, offset).await;
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -593,7 +593,7 @@ mod defragment_integration {
             partition,
             leaf_rx,
             data_tx,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         ));
 
@@ -689,7 +689,7 @@ mod defragment_integration {
             partition,
             leaf_rx,
             data_tx,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         ));
 
@@ -821,7 +821,7 @@ mod defragment_integration {
         }
         let root_address = put_list(&store, partition, context, &refs, offset).await;
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -1044,7 +1044,7 @@ mod defragment_integration {
             gets: gets.clone(),
         });
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -1103,7 +1103,7 @@ mod defragment_integration {
             gets: gets.clone(),
         });
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -1175,7 +1175,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1261,7 +1261,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1328,7 +1328,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1372,7 +1372,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1415,7 +1415,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1459,7 +1459,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1526,7 +1526,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1574,7 +1574,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1617,7 +1617,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1663,7 +1663,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1709,7 +1709,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1759,7 +1759,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1803,7 +1803,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1863,7 +1863,7 @@ mod defragment_integration {
             partition,
             leaf_rx,
             data_tx,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         ));
 
@@ -1984,7 +1984,7 @@ mod defragment_integration {
         assert_ne!(leaves[1].0.flags & FragmentFlags::PayloadCompressed, 0);
 
         for options in [
-            ReadOptions::default().no_decompress().no_verify(),
+            ReadOptions::default().no_decompress(),
             ReadOptions::default(),
         ] {
             let (fragment, list) = list_over(&entries, content.len() as u64);
@@ -2039,7 +2039,7 @@ mod defragment_integration {
             fragment,
             list,
             tx,
-            ReadOptions::default().no_decompress().no_verify(),
+            ReadOptions::default().no_decompress(),
             None,
         )
         .await;

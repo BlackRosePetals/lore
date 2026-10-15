@@ -56,7 +56,6 @@ pub enum ImmutableError {
 
 use lore_storage::options::ReadOptions;
 use lore_storage::options::WriteOptions;
-use lore_storage::read::Fetched;
 use lore_storage::read::Flown;
 
 /// Event data reporting a single fragment written or deduplicated.
@@ -128,20 +127,19 @@ pub fn write_options_from_repository(repository: Arc<RepositoryContext>) -> Writ
     }
 }
 
-/// Construct [`ReadOptions`] from a repository context.
+/// Construct [`ReadOptions`] from a repository context and the command's globals.
 pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptions {
-    let sync_data = crate::runtime::try_execution_context()
-        .is_some_and(|context| context.globals().sync_data());
-    let options = ReadOptions {
+    let (sync_data, trust_remote) =
+        crate::runtime::try_execution_context().map_or((false, false), |context| {
+            let globals = context.globals();
+            (globals.sync_data(), globals.trust_remote())
+        });
+    ReadOptions {
         cache: !repository.disable_cache(),
         direct_write: repository.direct_file_write(),
         sync_data,
+        trust_remote,
         ..Default::default()
-    };
-    if repository.trust_local() {
-        options.trusting_local()
-    } else {
-        options
     }
 }
 
@@ -223,7 +221,7 @@ pub fn load_raw_store_retry(
     repository: Partition,
     address: Address,
 ) -> impl Future<Output = Result<(Fragment, Bytes), ImmutableError>> {
-    lore_storage::read::read_raw(store, repository, address, false)
+    lore_storage::read::read_raw(store, repository, address)
         .map(|loaded| loaded.forward::<ImmutableError>("loading raw fragment from store"))
 }
 
@@ -277,9 +275,9 @@ pub async fn store_raw_remote_retry(
 // load_raw -- thin wrapper that resolves session and delegates to lore-storage
 // ---------------------------------------------------------------------------
 
-/// Load a single raw fragment, optionally decompressing and verifying the data.
+/// Load a single raw fragment, optionally decompressing the data.
 /// Resolves the remote session from the repository and delegates to
-/// [`lore_storage::load_fragment`] which handles remote fetch and heal.
+/// [`lore_storage::load_fragment`] which handles remote fetch, check and heal.
 ///
 /// Returns that future with its error forwarded, holding `repository` until it completes, without
 /// a future of its own.
@@ -645,12 +643,14 @@ pub fn file_matches(
     established: &lore_storage::ContentHashes,
 ) -> impl Future<Output = Result<lore_storage::FileMatch, ImmutableError>> {
     let remote_session = resolve_session(&repository);
+    let trust_remote = read_options_from_repository(&repository).trust_remote;
     lore_storage::file_matches(
         repository.immutable_store(),
         repository.id,
         previous,
         previous_size,
         remote_session,
+        trust_remote,
         source,
         established,
     )
@@ -730,11 +730,11 @@ enum Fetch {
 /// What the local store holds at an address [`cache_through`] looks up.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LocalCopy {
-    /// A payload, which for a fragment list reads and verifies.
+    /// A payload, which for a fragment list reads and expands.
     Held,
     /// No entry, or an entry without its payload, as eviction leaves one: nothing to serve or walk.
     Lacking,
-    /// A fragment list that does not read or verify, fetched again to overwrite it.
+    /// A fragment list that does not read or expand, fetched again to overwrite it.
     Corrupt,
 }
 
@@ -772,31 +772,12 @@ fn push_subfragments(list: Bytes, context: Context, into: &mut Vec<Address>) {
     );
 }
 
-/// Fetches `address` for the cache: the payload as fetched and marked durable, unchecked
-/// ([`Flown::Unverified`]), as a read checks what it loads, unless it is a fragment list, which is
-/// checked on receipt and healed once as a read's fetch is
-/// ([`lore_storage::read::check_fetched`]), as walking a list expands it and a corrupt list could
-/// name itself. With `verify`, every payload is checked so, for readers that trust local bytes.
-async fn fetch_checking_lists(
-    session: &StorageSession,
-    address: Address,
-    verify: bool,
-) -> Result<Flown, lore_storage::StorageError> {
-    let raw = lore_storage::read::fetch_payload(session, address, false).await?;
-    if !verify && raw.0.flags & FragmentFlags::PayloadFragmented == 0 {
-        return Ok(Flown::Unverified(raw));
-    }
-    lore_storage::read::check_fetched(session, address, false, raw)
-        .await
-        .map(Flown::Fetched)
-}
-
-/// Fetches `address` through `remote_storage` ([`fetch_checking_lists`], with `verify`) in the read
+/// Fetches `address` through `remote_storage` ([`lore_storage::read::fetch_remote`]) in the read
 /// flight for its content ([`lore_storage::read::fetch_single_flight`]), so a read or a fetch of the
-/// same content in flight shares one get. A payload fetched unchecked is checked only where a
-/// follower joined, which takes the content the check expands; one that fails that check is healed
-/// once, as a read's fetch is ([`lore_storage::read::check_fetched`]). It joins with the local probe
-/// off: the cache looked locally already, and the probe asserts on a corrupt copy in debug builds.
+/// same content in flight shares one get, checked on receipt and healed once as a read's fetch is,
+/// unless the command trusts the remote ([`read_options_from_repository`]), and never decompressed
+/// beyond what that check or a fragment list's walk needs. It joins with the local probe off, as
+/// the cache looked locally already.
 ///
 /// The fetch holds one of `permits`, taken before it joins, so a read following it never waits for
 /// one, and gives it back on joining as a follower, which makes no get of its own; a follower whose
@@ -813,7 +794,6 @@ fn fetch_to_cache(
     permits: CacheGets,
     address: Address,
     replace: bool,
-    verify: bool,
 ) -> impl Future<Output = Fetch> {
     async move {
         let fetched = {
@@ -831,32 +811,30 @@ fn fetch_to_cache(
                     }
                 }
             };
-            let checked = |fetched: Fetched| {
-                let list = (fetched.raw.0.flags & FragmentFlags::PayloadFragmented != 0)
-                    .then_some(fetched.content.1);
-                (fetched.raw, list)
+            let options = ReadOptions {
+                local: false,
+                decompress: false,
+                ..read_options_from_repository(&repository)
             };
             match lore_storage::read::fetch_single_flight(
                 repository.immutable_store(),
                 repository.id,
                 address,
-                ReadOptions {
-                    local: false,
-                    ..ReadOptions::default()
-                },
-                || fetch_checking_lists(&remote_storage, address, verify),
+                options,
+                || lore_storage::read::fetch_remote(&remote_storage, address, options),
                 || drop(permit.take()),
             )
             .await
             {
                 Ok(Flown::Local(_)) => return Fetch::Local(address),
-                Ok(Flown::Unverified(raw)) => Ok((raw, None)),
-                Ok(Flown::Rejected(raw)) => {
-                    lore_storage::read::check_fetched(&remote_storage, address, false, raw)
-                        .await
-                        .map(checked)
+                Ok(Flown::Fetched(fetched)) => {
+                    if fetched.raw.0.flags & FragmentFlags::PayloadFragmented == 0 {
+                        Ok((fetched.raw, None))
+                    } else {
+                        let raw = fetched.raw.clone();
+                        fetched.take(true).map(|(_, list)| (raw, Some(list)))
+                    }
                 }
-                Ok(Flown::Fetched(fetched)) => Ok(checked(fetched)),
                 Err(error) => Err(error),
             }
         };
@@ -878,24 +856,19 @@ fn fetch_to_cache(
 type QueriedBatch = Result<(Bytes, Vec<LocalCopy>, Vec<Address>), StoreError>;
 
 /// Pushes the subfragments of the fragment list the local store holds at `address` onto
-/// `children`, answering whether the list read and verified; one that does not pushes nothing. The
-/// list is read verified, as a corrupt list naming itself or an ancestor would be walked forever,
-/// and raw, as `load_fragment` asserts on a failed local check in debug builds and a list read is
-/// no reason to join a read flight.
+/// `children`, answering whether the list read and expanded; one that does not pushes nothing. The
+/// list is read raw, as a list read is no reason to join a read flight.
 async fn push_local_list_children(
     repository: &Arc<RepositoryContext>,
     address: Address,
     children: &mut Vec<Address>,
 ) -> bool {
     let Ok((fragment, payload)) =
-        lore_storage::read::read_raw(repository.immutable_store(), repository.id, address, true)
-            .await
+        lore_storage::read::read_raw(repository.immutable_store(), repository.id, address).await
     else {
         return false;
     };
-    let options = ReadOptions::default().with_decompress().with_verify();
-    let Ok((_, list)) = lore_storage::decompress_and_verify(fragment, payload, address, options)
-    else {
+    let Ok((_, list)) = lore_storage::expand_payload(fragment, payload) else {
         return false;
     };
     push_subfragments(list, address.context, children);
@@ -905,17 +878,18 @@ async fn push_local_list_children(
 /// Fetches every fragment at `address` the local store lacks from the remote and stores it, then,
 /// when `cache_fragmented` is set, the subfragments of fragment lists, fetched or held locally. A
 /// fragment the store indexes without a local payload counts as lacking, and a local list it
-/// cannot read or verify is fetched again and overwritten, as a read replaces a corrupt fragment,
-/// and the fetched list walked. Once connected, every fragment that can be cached is, and the
-/// answer is the failure to connect, the first failure to query, fetch, verify or store a
-/// fragment, or else how many fragments it fetched, by its own get or one it joined: a fragment
-/// found local after waiting for a cache get permit is not fetched.
+/// cannot read or expand is fetched again and overwritten, as a read replaces a corrupt fragment,
+/// and the fetched list walked. Every fetched payload is checked on receipt as a read's is
+/// ([`fetch_to_cache`]). Once connected, every fragment that can be cached is, and the answer is
+/// the failure to connect, the first failure to query, fetch, check or store a fragment, or else
+/// how many fragments it fetched, by its own get or one it joined: a fragment found local after
+/// waiting for a cache get permit is not fetched.
 pub async fn cache(
     repository: Arc<RepositoryContext>,
     address: Vec<Address>,
     cache_fragmented: bool,
 ) -> Result<usize, ImmutableError> {
-    cache_counted(repository, address, cache_fragmented, false)
+    cache_counted(repository, address, cache_fragmented)
         .await?
         .into_result()
 }
@@ -943,13 +917,11 @@ impl Cached {
 }
 
 /// [`cache`], answering everything it fetched ([`Cached`]) rather than its first failure; only a
-/// failure to connect is an error. With `verify`, every payload is checked on receipt and one that
-/// fails is not stored, for readers that trust local bytes and never check what they load.
+/// failure to connect is an error.
 pub async fn cache_counted(
     repository: Arc<RepositoryContext>,
     address: Vec<Address>,
     cache_fragmented: bool,
-    verify: bool,
 ) -> Result<Cached, ImmutableError> {
     let remote_result: Result<_, ImmutableError> = repository
         .remote()
@@ -973,7 +945,6 @@ pub async fn cache_counted(
         permits,
         address,
         cache_fragmented,
-        verify,
     )
     .await)
 }
@@ -981,8 +952,16 @@ pub async fn cache_counted(
 /// [`cache_counted`] once connected, fetching through `remote_storage`, each get holding one of
 /// `permits`.
 ///
+/// The walk descends one level of the tree a round, and queries a fragment found local after
+/// waiting for its permit once more the round after, so a tree no deeper than a read walks, lists
+/// down to [`MAX_FRAGMENT_TREE_DEPTH`] below the root and their subfragments, is cached within
+/// twice its levels in rounds. A walk that takes more, as one through a list naming itself or an
+/// ancestor would, fails.
+///
 /// A function of its own because its batches live across several awaits: kept in
 /// [`cache_counted`] they would take space in its future while the remote is connected as well.
+///
+/// [`MAX_FRAGMENT_TREE_DEPTH`]: lore_storage::defragment::MAX_FRAGMENT_TREE_DEPTH
 #[lore_macro::test_pub]
 async fn cache_through(
     repository: Arc<RepositoryContext>,
@@ -990,9 +969,9 @@ async fn cache_through(
     permits: CacheGets,
     address: Vec<Address>,
     cache_fragmented: bool,
-    verify: bool,
 ) -> Cached {
     const MAX_REQUEST_COUNT: usize = 1000;
+    const MAX_ROUNDS: usize = 2 * (lore_storage::defragment::MAX_FRAGMENT_TREE_DEPTH + 2);
 
     let mut query_address = address;
     query_address.sort_unstable();
@@ -1009,8 +988,18 @@ async fn cache_through(
     let mut total_bytes = 0;
     let mut total_query_count = 0;
     let mut failure = None;
+    let mut rounds = 0;
 
     while !query_address.is_empty() {
+        if rounds == MAX_ROUNDS {
+            failure.get_or_insert_with(|| {
+                Box::new(ImmutableError::internal(format!(
+                    "fragment tree deeper than {MAX_ROUNDS} cache rounds reach"
+                )))
+            });
+            break;
+        }
+        rounds += 1;
         let query_count = query_address.count::<Address>();
         total_query_count += query_count;
         lore_trace!("Query and cache {query_count} immutable fragments from remote");
@@ -1161,7 +1150,6 @@ async fn cache_through(
                         permits.clone(),
                         address[index],
                         local == LocalCopy::Corrupt,
-                        verify,
                     )
                 );
 

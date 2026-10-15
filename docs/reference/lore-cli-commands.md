@@ -240,6 +240,9 @@ renders as a trailing separator, which the whitespace hook rejects — write the
   writes. `lore repository gc` always runs a full pass regardless
 * `--sync-data` — Force sync data to storage media during flush
 * `--cache` — Cache fragment payloads fetched from remote in the local store
+* `--trust-remote` — Trust the remote as part of this machine's infrastructure: data fetched from it is not hash
+  verified. For machines where performance comes first, such as a build server streaming from a server in its own
+  backend
 * `--non-interactive` — Disable interactive prompts (e.g., per-link commit messages)
 * `--stats <level>` — Report what the operation cost: `--stats` for totals, `--stats=2` to add per-fragment detail
 

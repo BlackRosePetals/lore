@@ -651,6 +651,11 @@ pub enum LoreLoadConfig {
 pub const DEFAULT_EVENT_INTERVAL_MS: u64 = 100;
 
 /// Common options shared by repository operations.
+///
+/// Zero every byte of it, padding included, before setting the fields a call
+/// uses, as every structure passed to the library: a field left zero selects
+/// its default, and a field a release adds in its padding is left unset by
+/// code built against an earlier header.
 #[repr(C)]
 #[derive(Default, Debug, Clone, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub struct LoreGlobalArgs {
@@ -736,7 +741,17 @@ pub struct LoreGlobalArgs {
     /// Which authentication path to take if the server advertises both its
     /// gRPC auth service and an OIDC issuer.
     pub auth_mode: AuthMode,
+    /// Treat the remote as a trusted source, for a caller within its
+    /// infrastructure where performance comes first: payloads fetched from it
+    /// have only their sizes checked against their length, are never hashed,
+    /// and are decompressed only where their content is read. A storage handle
+    /// takes it from the globals it is opened with. Any non-zero value trusts
+    /// the remote, so a caller zeroes the whole struct, padding included
+    pub trust_remote: u8,
 }
+
+// Lock the C ABI size of `LoreGlobalArgs` (`lore_global_args_t`), which callers zero-initialize.
+const _: () = assert!(std::mem::size_of::<LoreGlobalArgs>() == 192);
 
 impl LoreGlobalArgs {
     pub fn repository_path(&self) -> &str {
@@ -864,6 +879,11 @@ impl LoreGlobalArgs {
 
     pub fn cache(&self) -> bool {
         self.cache != 0
+    }
+
+    /// Whether the command trusts its remote.
+    pub fn trust_remote(&self) -> bool {
+        self.trust_remote != 0
     }
 
     /// Whether an operation should emit statistics events at all.

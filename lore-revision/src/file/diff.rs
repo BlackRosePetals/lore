@@ -1229,7 +1229,6 @@ async fn diff_read_file(
         None,
         read_options_from_repository(&repository)
             .with_decompress()
-            .with_verify()
             .with_remote(),
     )
     .await

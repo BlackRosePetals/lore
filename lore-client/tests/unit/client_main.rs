@@ -37,3 +37,17 @@ fn the_commands_that_act_on_the_service_are_sized_for_relaying() {
         );
     }
 }
+
+/// `--trust-remote` reaches the command's globals, and without it the remote is not trusted.
+#[test]
+fn trusting_the_remote_reaches_the_globals() {
+    for (args, trusted) in [
+        (vec!["lore", "status"], 0),
+        (vec!["lore", "status", "--trust-remote"], 1),
+    ] {
+        let cli = LoreCli::try_parse_from(&args).expect("the arguments must parse");
+        let globals =
+            lore_client::cli::lore_globals_from_args(&cli).expect("the globals must resolve");
+        assert_eq!(globals.trust_remote, trusted, "{}", args.join(" "));
+    }
+}

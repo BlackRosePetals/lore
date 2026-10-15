@@ -1114,7 +1114,9 @@ struct Placement {
 }
 
 /// The "work" portion of [`store_fragment`]: optionally duplicate an association the peer already
-/// holds, else load existing local payload, compress and upload, then write the terminal entry.
+/// holds, else load existing local payload where its sizes check out
+/// ([`crate::read::check_payload_sizes`]) or compress the content, and upload, then write the
+/// terminal entry.
 ///
 /// Returns where the payload ended up.
 ///
@@ -1173,19 +1175,10 @@ fn leader_body(
                 .get(partition, address)
                 .await
                 .and_then(StoreGetData::into_payload)
+                && crate::read::check_payload_sizes(&stored_fragment, stored_buffer.len()).is_ok()
             {
-                let loaded_hash = hash::hash_fragment(stored_fragment, stored_buffer.as_ref())
-                    .unwrap_or_default();
-                debug_assert!(
-                    loaded_hash == address.hash,
-                    "Local store had corrupt data when loading previous representation during store_raw"
-                );
-                if address.hash == loaded_hash {
-                    fragment = stored_fragment;
-                    buffer = Payload::Shared(stored_buffer);
-                } else {
-                    stored_local = false;
-                }
+                fragment = stored_fragment;
+                buffer = Payload::Shared(stored_buffer);
             } else {
                 stored_local = false;
             }
@@ -1810,13 +1803,16 @@ pub enum FileMatch {
 ///
 /// A stored object that cannot be read falls back to [`hashed_under_current_chunking`],
 /// which reads nothing but the file. Virtual immutable content is settled by the hash of the
-/// address it names, reading nothing.
+/// address it names, reading nothing. Metadata fetched from the remote is checked on receipt
+/// unless the reader trusts the remote (`trust_remote`).
+#[allow(clippy::too_many_arguments)]
 pub async fn file_matches(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     previous: Address,
     previous_size: Option<usize>,
     remote_session: Option<Arc<StorageSession>>,
+    trust_remote: bool,
     source: &ContentSource<'_>,
     established: &ContentHashes,
 ) -> Result<FileMatch, StorageError> {
@@ -1855,7 +1851,11 @@ pub async fn file_matches(
             .await);
     }
 
-    let options = ReadOptions::default().no_decompress().no_verify();
+    let options = ReadOptions {
+        trust_remote,
+        ..ReadOptions::default()
+    }
+    .no_decompress();
     let Some((fragment, payload)) = load_fragment(
         store.clone(),
         partition,
@@ -1899,6 +1899,7 @@ pub async fn file_matches(
                 partition,
                 context: previous.context,
                 remote_session: &remote_session,
+                trust_remote,
             },
             source,
             &file,
@@ -2254,6 +2255,7 @@ struct SublistSource<'a> {
     partition: Partition,
     context: Context,
     remote_session: &'a Option<Arc<StorageSession>>,
+    trust_remote: bool,
 }
 
 /// Measure the file against `previous_fragmentation` chunk for chunk.
@@ -2320,7 +2322,11 @@ async fn compare_previous_chunks(
 
         if chunk_size > crate::compress::FRAGMENT_SIZE_THRESHOLD as u64 {
             lore_base::lore_trace!("Hash checking recursively fragmented chunks");
-            let sub_options = ReadOptions::default().no_decompress().no_verify();
+            let sub_options = ReadOptions {
+                trust_remote: sublists.trust_remote,
+                ..ReadOptions::default()
+            }
+            .no_decompress();
             let Ok((sub_fragment, sub_payload)) = load_fragment(
                 Arc::clone(sublists.store),
                 sublists.partition,

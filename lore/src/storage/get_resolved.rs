@@ -213,7 +213,7 @@ async fn get_resolved_item(
         return get_resolved_item_streaming(
             store,
             item,
-            read_options.no_decompress().no_verify(),
+            fragments_read_options(read_options),
             remote_session,
             emit_fragment,
         )
@@ -264,6 +264,13 @@ async fn get_resolved_item(
         }
         Err(err) => emit_item_complete(item, Address::default(), Err(err)),
     }
+}
+
+/// The read options of `fragments` delivery: payloads as stored, from a remote trusted, as the
+/// caller checks what it takes, so no leaf is decoded or hashed on its way.
+#[lore_macro::test_pub]
+fn fragments_read_options(options: lore_storage::ReadOptions) -> lore_storage::ReadOptions {
+    options.no_decompress().trusting_remote()
 }
 
 /// Counterpart of [`get_resolved_item`] delivering the content into `data_out`. Emits

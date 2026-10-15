@@ -95,25 +95,25 @@ impl PerCallFlags {
 /// - `no_local` = (bound or per-call) `remote` is set; the local probe is bypassed.
 /// - `no_remote && no_local` is impossible — the per-call combine rejects that case before
 ///   constructing this value.
+#[lore_macro::test_pub]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EffectiveFlags {
     pub no_remote: bool,
     pub no_local: bool,
-    /// Skip re-hashing a loaded payload against the address it was read from. Taken from the
-    /// handle's `skip_verify` at open; no per-call flag moves it.
-    pub skip_verify: bool,
+    /// Whether the handle's remote is a trusted source ([`ReadOptions::trust_remote`]). Taken from
+    /// the handle at open; no per-call flag moves it.
+    pub trust_remote: bool,
 }
 
 impl EffectiveFlags {
     /// Build the base `ReadOptions` for a get-style op given whether a remote session is
     /// available. The per-item `local_cache=1` opt-in is layered by the caller on top of the
     /// returned options.
+    #[lore_macro::test_pub]
     pub(crate) fn read_options(&self, has_remote_session: bool) -> ReadOptions {
-        let opts = ReadOptions::default();
-        let opts = if self.skip_verify {
-            opts.no_verify()
-        } else {
-            opts
+        let opts = ReadOptions {
+            trust_remote: self.trust_remote,
+            ..ReadOptions::default()
         };
         if self.no_remote || !has_remote_session {
             return opts.no_remote();
@@ -140,8 +140,9 @@ pub(crate) struct StoreInternal {
     /// its per-call globals via [`Self::effective_flags`] to decide whether to consult the
     /// remote or bypass the local cache.
     pub bound_flags: BoundFlags,
-    /// Whether reads on this handle skip re-hashing what they loaded. From `skip_verify` at open.
-    pub skip_verify: bool,
+    /// Whether the handle's remote is a trusted source: `globals.trust_remote` or `skip_verify` at
+    /// open.
+    pub trust_remote: bool,
     /// Optional service-mode connection that owns this handle. Populated by the IPC dispatcher
     /// during a server-mode open so that connection teardown can drive
     /// [`crate::storage::handle::close_all_for_connection`] and reclaim handles whose owning
@@ -161,7 +162,7 @@ impl StoreInternal {
         mutable: Arc<dyn MutableStore>,
         remote: Option<Arc<RemoteEndpoint>>,
         bound_flags: BoundFlags,
-        skip_verify: bool,
+        trust_remote: bool,
     ) -> Self {
         Self {
             identity: identity.into(),
@@ -169,7 +170,7 @@ impl StoreInternal {
             mutable,
             remote,
             bound_flags,
-            skip_verify,
+            trust_remote,
             connection_id: None,
             in_flight: AtomicU64::new(0),
             invalid: AtomicBool::new(false),
@@ -222,7 +223,7 @@ impl StoreInternal {
         Ok(EffectiveFlags {
             no_remote: any_local,
             no_local: any_remote,
-            skip_verify: self.skip_verify,
+            trust_remote: self.trust_remote,
         })
     }
 

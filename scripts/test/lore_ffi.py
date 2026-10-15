@@ -112,6 +112,7 @@ class LoreGlobalArgs(Structure):
         ("stats", c_uint32),
         ("event_interval_ms", c_uint64),
         ("auth_mode", c_int),
+        ("trust_remote", c_uint8),
     ]
 
 

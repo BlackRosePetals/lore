@@ -625,6 +625,100 @@ async fn leader_error_surfaces_through_tracker_await_all() {
     assert_eq!(resolved.match_made, StoreMatch::MatchNone);
 }
 
+/// A write of content the local store holds and the remote does not reuses the stored payload as it
+/// is: the local copy is trusted, so it is neither decoded nor hashed. The stand-in remote refuses
+/// the upload that follows.
+#[tokio::test]
+async fn a_write_reuses_the_stored_payload_unhashed() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, buffer) = make_input(0x70);
+    store_fragment(
+        store.clone(),
+        partition,
+        address,
+        fragment,
+        buffer.clone(),
+        false,
+        None,
+        WriteContext::none(),
+        None,
+    )
+    .await
+    .expect("store the content locally");
+    let session = Arc::new(StorageSession::pending(|| async {
+        Err(lore_transport::ProtocolError::internal(
+            "the stand-in remote takes no upload",
+        ))
+    }));
+    lore_storage::test_util::reset_counts();
+
+    let _ = store_fragment(
+        store,
+        partition,
+        address,
+        fragment,
+        buffer,
+        false,
+        Some(session),
+        WriteContext::none(),
+        None,
+    )
+    .await;
+
+    let (_, decodes, hashes) = lore_storage::test_util::counts();
+    assert_eq!((decodes, hashes), (0, 0));
+}
+
+/// A write of content the local store holds under sizes that disagree does not reuse that payload,
+/// which is not the content, and prepares the payload from the content it was given. The stand-in
+/// remote refuses the upload that follows.
+#[tokio::test]
+async fn a_write_does_not_reuse_a_stored_payload_whose_sizes_disagree() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, buffer) = make_input(0x71);
+    let claims_more = Fragment {
+        size_payload: 1,
+        ..fragment
+    };
+    store
+        .clone()
+        .put(
+            partition,
+            address,
+            claims_more,
+            Some(buffer.slice(..1)),
+            false,
+        )
+        .await
+        .expect("store a payload claiming more content than it holds");
+    let session = Arc::new(StorageSession::pending(|| async {
+        Err(lore_transport::ProtocolError::internal(
+            "the stand-in remote takes no upload",
+        ))
+    }));
+    let stats = Arc::new(lore_storage::write_stats::FragmentWriteStats::default());
+
+    let _ = store_fragment(
+        store,
+        partition,
+        address,
+        fragment,
+        buffer,
+        false,
+        Some(session),
+        WriteContext::counted(Some(stats.clone())),
+        None,
+    )
+    .await;
+
+    let prepared = stats.snapshot();
+    assert_eq!(prepared.data_fragments, 1, "one payload is prepared");
+    assert_ne!(
+        prepared.data_payload_bytes, 1,
+        "the stored payload was reused"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_writers_of_same_address_dedup_through_tracker() {
     // Two concurrent store_fragment calls for the same (partition, address)
@@ -1346,6 +1440,7 @@ async fn compare_file(content: &[u8], chunks: &[FragmentReference]) -> FileMatch
             partition: Partition::from([7u8; 16]),
             context: Address::default().context,
             remote_session: &None,
+            trust_remote: false,
         },
         &source,
         &file,
@@ -1615,6 +1710,7 @@ async fn compare(
         address,
         Some(stored_size),
         None,
+        false,
         &ContentSource::file(path),
         &ContentHashes::default(),
     )
@@ -1761,6 +1857,7 @@ async fn content_that_cannot_be_read_answers_unreadable() {
         Address::zero_context_hash(lore_storage::hash::hash_slice(b"content")),
         Some(7),
         None,
+        false,
         &ContentSource::file(&path),
         &ContentHashes::default(),
     )
@@ -1806,6 +1903,7 @@ async fn virtual_content_is_settled_by_the_address_it_names() {
                 previous,
                 Some(size),
                 None,
+                false,
                 &source,
                 &ContentHashes::default(),
             )
@@ -1946,6 +2044,49 @@ async fn a_file_above_the_threshold_matches_through_its_list() {
     assert_eq!(
         compare(store, partition, &path, address, content.len()).await,
         FileMatch::Match
+    );
+}
+
+/// The list of a file above the threshold, fetched from the remote, is checked on receipt unless
+/// the reader trusts the remote, which hashes it once less.
+#[tokio::test]
+async fn a_fetched_list_is_checked_unless_the_remote_is_trusted() {
+    let partition = Partition::from([0x3d; 16]);
+    let (content, _dir, written, path) = compare_case(LISTED_SIZE).await;
+    let address = store_current_chunking(&written, partition, &path).await;
+    let (fragment, list) = lore_storage::read::read_raw(written, partition, address)
+        .await
+        .expect("the stored list");
+    lore_storage::test_util::serve_remote(address, fragment, list);
+    let (_empty_dir, empty) = make_test_store().await;
+    let session = Arc::new(StorageSession::pending(|| async {
+        Err(lore_transport::ProtocolError::internal(
+            "the stand-in remote needs no session",
+        ))
+    }));
+
+    let mut hashes = Vec::new();
+    for trust_remote in [false, true] {
+        lore_storage::test_util::reset_counts();
+        let compared = file_matches(
+            empty.clone(),
+            partition,
+            address,
+            Some(content.len()),
+            Some(session.clone()),
+            trust_remote,
+            &ContentSource::file(&path),
+            &ContentHashes::default(),
+        )
+        .await
+        .expect("comparing against a fetched list");
+        assert_eq!(compared, FileMatch::Match);
+        hashes.push(lore_storage::test_util::counts().2);
+    }
+    assert_eq!(
+        hashes[0],
+        hashes[1] + 1,
+        "the list is hashed on receipt only where the remote is not trusted"
     );
 }
 
@@ -2186,6 +2327,7 @@ async fn compare_recursive(
             partition,
             context: Address::default().context,
             remote_session: &None,
+            trust_remote: false,
         },
         &source,
         &file,

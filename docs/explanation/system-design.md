@@ -318,11 +318,12 @@ use, modification, embedding, or independent reimplementation.
 the remote, not directly.
 
 **Adversarial-server threat model.** Clients hash-validate every fragment they receive, so content
-tampering is detectable end-to-end regardless of who served the bytes. The trust clients place in
-the server is narrower - that it correctly reports the latest revision of a branch, the name-to-ID
-mappings, and the access decisions for the session - and that trust is bounded by the server's
-authentication and authorization model. Lore does not aim to defend against a server that is itself
-adversarial about its own pointers or permissions.
+tampering is detectable end-to-end regardless of who served the bytes; a command that declares its
+server trusted (`--trust-remote`) gives that up. The trust clients place in the server is
+narrower - that it correctly reports the latest revision of a branch, the name-to-ID mappings, and
+the access decisions for the session - and that trust is bounded by the server's authentication
+and authorization model. Lore does not aim to defend against a server that is itself adversarial
+about its own pointers or permissions.
 
 ### 4. Conceptual Model
 
@@ -1832,10 +1833,10 @@ visible to anyone.
 
 Clients depend on this. Hash validation of fetched fragments is end-to-end and free (the
 content address proves the bytes), but graph-level validation is what the server has
-already done. This is the trust boundary in §3.2: clients hash-validate content, and trust
-the server to have validated graph structure. A misbehaving server could in principle
-present a malformed graph; the defense is that the server rejects malformed pushes, so
-clients fetching from a correctly-operating server never see one.
+already done. This is the trust boundary in §3.2: clients hash-validate content, unless a
+command declares its server trusted, and trust the server to have validated graph structure. A
+misbehaving server could in principle present a malformed graph; the defense is that the server
+rejects malformed pushes, so clients fetching from a correctly-operating server never see one.
 
 #### 16.4 What can go wrong and what each failure looks like
 

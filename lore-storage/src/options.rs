@@ -93,16 +93,17 @@ impl From<WriteOptions> for u32 {
 }
 
 /// Options controlling how a fragment is read from storage.
+///
+/// A payload the local store holds is read as stored. One fetched from a remote is checked against
+/// its address on receipt, unless the remote is trusted ([`trust_remote`](Self::trust_remote)).
 #[derive(Copy, Clone, Debug)]
 pub struct ReadOptions {
     /// Decompress data
     pub decompress: bool,
-    /// Verify data
-    pub verify: bool,
-    /// Skip the hash check [`read_raw`](crate::read::read_raw) makes under debug assertions on a
-    /// local load that is not verified. Meaningful only with `verify` off, as
-    /// [`trusting_local`](Self::trusting_local) sets it.
-    pub trust_local: bool,
+    /// Treat the remote as a trusted source, as a client within its infrastructure may: a fetched
+    /// payload has only its sizes checked against its length, is decompressed only where
+    /// `decompress` asks, and is never hashed.
+    pub trust_remote: bool,
     /// Probe the local store before falling through to remote. Setting this to `false` makes
     /// reads bypass the local store entirely; combined with `remote: true` and a session, the
     /// reader always fetches from the peer. Used by handles bound to remote-only mode.
@@ -133,8 +134,7 @@ impl Default for ReadOptions {
     fn default() -> Self {
         ReadOptions {
             decompress: true,
-            verify: true,
-            trust_local: false,
+            trust_remote: false,
             local: true,
             remote: true,
             cache: false,
@@ -158,20 +158,9 @@ impl ReadOptions {
         self
     }
 
-    pub fn with_verify(mut self) -> Self {
-        self.verify = true;
-        self
-    }
-
-    pub fn no_verify(mut self) -> Self {
-        self.verify = false;
-        self
-    }
-
-    /// Serve local bytes unhashed, under debug assertions too. See [`ReadOptions::trust_local`].
-    pub fn trusting_local(mut self) -> Self {
-        self.verify = false;
-        self.trust_local = true;
+    /// See [`ReadOptions::trust_remote`].
+    pub fn trusting_remote(mut self) -> Self {
+        self.trust_remote = true;
         self
     }
 

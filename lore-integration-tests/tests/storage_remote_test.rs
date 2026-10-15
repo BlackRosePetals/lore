@@ -1828,6 +1828,121 @@ mod storage_remote_tests {
             .await
     }
 
+    /// The diagnostic immutable query checks the payload the remote serves as the command's trust of
+    /// its remote asks: a list that does not hash to its address is reported as served and not
+    /// walked, and a command trusting the remote walks it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_immutable_query_walks_a_remote_list_only_where_it_passes_its_check() -> TestResult
+    {
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Fragment;
+        use lore_base::types::FragmentReference;
+        use lore_base::types::Hash;
+        use lore_base::types::fragment_flags::FragmentFlags;
+        use lore_revision::event::LoreEndEventData;
+        use lore_revision::interface::ExecutionContext;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::relay::EventDispatcher;
+
+        for (trust_remote, walked) in [(0u8, false), (1, true)] {
+            let subfragments: Arc<Mutex<Vec<u8>>> = Arc::default();
+            let ended = Arc::new(tokio::sync::Notify::new());
+            let (queried, end) = (subfragments.clone(), ended.clone());
+            let callback: LoreEventCallback =
+                Some(Box::new(move |event: &LoreEvent| match event {
+                    LoreEvent::RepositoryStoreImmutableQuery(data) => {
+                        queried.lock().unwrap().push(data.subfragment);
+                    }
+                    LoreEvent::End(_) => end.notify_one(),
+                    _ => {}
+                }));
+            let execution = Arc::new(ExecutionContext::new_server(
+                LoreGlobalArgs {
+                    trust_remote,
+                    ..LoreGlobalArgs::default()
+                },
+                EventDispatcher::new(callback),
+                "storage-remote-immutable-query".to_string(),
+            ));
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository_id = RepositoryId::from([0xd6 + trust_remote; 16]);
+                    let test = CacheTest::start(Transport::Grpc, repository_id).await?;
+                    let context = Context::from([0xd6; 16]);
+                    let leaf = b"a leaf named by a list the remote serves altered";
+                    let leaf_address = Address {
+                        hash: lore_storage::hash::hash_slice(leaf),
+                        context,
+                    };
+                    let plain = Fragment {
+                        flags: 0,
+                        size_payload: leaf.len() as u32,
+                        size_content: leaf.len() as u64,
+                    };
+                    test.server
+                        .backend_immutable
+                        .clone()
+                        .put(
+                            repository_id,
+                            leaf_address,
+                            plain,
+                            Some(bytes::Bytes::from_static(leaf)),
+                            false,
+                        )
+                        .await?;
+                    let reference = FragmentReference {
+                        hash: leaf_address.hash,
+                        offset_content: 0,
+                    };
+                    let list =
+                        bytes::Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(&reference));
+                    let list_address = Address {
+                        hash: Hash::from([0xd6u8; 32]),
+                        context,
+                    };
+                    let fragmented = Fragment {
+                        flags: FragmentFlags::PayloadFragmented.bits(),
+                        size_payload: list.len() as u32,
+                        size_content: leaf.len() as u64,
+                    };
+                    test.server
+                        .backend_immutable
+                        .clone()
+                        .put(repository_id, list_address, fragmented, Some(list), false)
+                        .await?;
+
+                    lore_revision::repository::store::immutable_query(
+                        test.client_repository.clone(),
+                        list_address.to_string(),
+                        false,
+                        true,
+                    )
+                    .await?;
+                    LoreEvent::End(LoreEndEventData::default()).send();
+                    Ok::<(), Box<dyn Error>>(())
+                })
+                .await?;
+
+            tokio::time::timeout(Duration::from_secs(10), ended.notified()).await?;
+            let subfragments = subfragments.lock().unwrap().clone();
+            assert_eq!(
+                subfragments
+                    .iter()
+                    .filter(|&&subfragment| subfragment == 0)
+                    .count(),
+                2,
+                "the list is queried locally and remotely"
+            );
+            assert_eq!(
+                subfragments.contains(&1),
+                walked,
+                "the list is walked, trust_remote {trust_remote}"
+            );
+        }
+        Ok(())
+    }
+
     /// `local_cache=1` on a put item tags the resulting fragment with
     /// `PayloadLocalCachePriority`. A subsequent local query of the address shows the flag
     /// is preserved so future remote reads of this content cache regardless of the reader's

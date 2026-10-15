@@ -176,23 +176,18 @@ async fn observed(
 }
 
 /// The content behind `address`: the bytes the store serves, put through the read path's own
-/// decode-and-verify rather than decoded by hand. The stored bytes, the recorded codec, the
-/// recorded sizes and the address all have to agree for this to return.
+/// receipt check rather than decoded by hand. The stored bytes, the recorded codec, the recorded
+/// sizes and the address all have to agree for this to return.
 async fn content(store: &Arc<LocalImmutableStore>, address: Address) -> Bytes {
     let dyn_store: Arc<dyn ImmutableStore> = store.clone();
     let stored = dyn_store
         .get(partition(), address)
         .await
         .expect("the stored bytes read");
-    let (_, content) = lore_storage::read::decompress_and_verify(
+    let (_, content) = lore_storage::read::verify_receipt(
         stored.fragment,
         stored.payload.expect("a stored payload is served"),
         address,
-        lore_storage::ReadOptions {
-            decompress: true,
-            verify: true,
-            ..Default::default()
-        },
     )
     .expect("the stored bytes decode to the content the address names");
     content

@@ -144,6 +144,12 @@ pub struct LoreCli {
     #[clap(global = true, long, action)]
     pub cache: bool,
 
+    /// Trust the remote as part of this machine's infrastructure: data fetched from it is not hash
+    /// verified. For machines where performance comes first, such as a build server streaming from
+    /// a server in its own backend
+    #[clap(global = true, long, action)]
+    trust_remote: bool,
+
     /// Disable interactive prompts (e.g., per-link commit messages)
     #[clap(global = true, long, action)]
     pub non_interactive: bool,
@@ -446,6 +452,7 @@ pub fn lore_globals_from_args(cli: &LoreCli) -> Result<LoreGlobalArgs, LoreCliEr
         no_gc: cli.no_gc.into(),
         sync_data: cli.sync_data.into(),
         cache: cli.cache.into(),
+        trust_remote: cli.trust_remote.into(),
 
         identity: cli.identity.clone().into(),
         identity_token: cli.identity_token.clone().into(),
