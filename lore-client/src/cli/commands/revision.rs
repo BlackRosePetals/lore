@@ -923,19 +923,10 @@ fn resolve_link_messages(
     globals: &LoreGlobalArgs,
     args: &RevisionCommitArgs,
 ) -> Result<(Vec<LoreString>, Vec<LoreString>), u8> {
-    let mut link_paths: Vec<LoreString> = Vec::new();
-    let mut link_msgs: Vec<LoreString> = Vec::new();
-
-    let link_message_values = &args.link_messages;
-    for pair in link_message_values.chunks(2) {
-        if pair.len() == 2 {
-            link_paths.push(LoreString::from(pair[0].as_str()));
-            link_msgs.push(LoreString::from(pair[1].as_str()));
-        }
-    }
+    let (mut link_paths, mut link_msgs) = util::split_path_messages(&args.link_messages);
 
     let is_interactive = !config().non_interactive && !config().json;
-    let has_explicit_flags = !link_message_values.is_empty();
+    let has_explicit_flags = !args.link_messages.is_empty();
     let is_link_scoped = args.link.is_some();
 
     if is_interactive && !has_explicit_flags && !is_link_scoped {
@@ -1063,15 +1054,7 @@ fn resolve_layer_messages(
     globals: &LoreGlobalArgs,
     args: &RevisionCommitArgs,
 ) -> Result<(Vec<LoreString>, Vec<LoreString>), u8> {
-    let mut layer_paths: Vec<LoreString> = Vec::new();
-    let mut layer_msgs: Vec<LoreString> = Vec::new();
-
-    for pair in args.layer_messages.chunks(2) {
-        if pair.len() == 2 {
-            layer_paths.push(LoreString::from(pair[0].as_str()));
-            layer_msgs.push(LoreString::from(pair[1].as_str()));
-        }
-    }
+    let (mut layer_paths, mut layer_msgs) = util::split_path_messages(&args.layer_messages);
 
     let is_interactive = !config().non_interactive && !config().json;
     let has_explicit_flags = !args.layer_messages.is_empty();

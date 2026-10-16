@@ -223,6 +223,8 @@ mod store_keep_alive_tests {
                 branch: "feature/second".into(),
                 message: "Merge feature/second into feature/first".into(),
                 no_commit: 0,
+                link_paths: Default::default(),
+                link_messages: Default::default(),
                 link: Default::default(),
                 ignore_links: 0,
                 inherit_metadata: Default::default(),

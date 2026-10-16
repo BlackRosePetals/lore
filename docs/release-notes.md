@@ -30,6 +30,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore-storage`: `StoreGetData` gains `content`, the content a store expanded where it checked a payload on receipt, so
   a struct literal names it. `read::Fetched` is `read::Loaded`, which `read_raw` also returns, and `read_raw` forwards a
   store's error with its variant rather than as internal
+- C API: `lore_branch_merge_start_args_t` appends `link_paths` and `link_messages`, taking the struct from 80 to 112
+  bytes. Rebuild against the new `lore.h`; a zero-initialized struct keeps today's behavior
 
 ### Features
 
@@ -59,6 +61,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   token it issues. An ID token the provider returns names the user for display and is neither stored nor sent. The
   OIDC path serves login alone for now: the refresh, token exchange and client credentials grants are not implemented
   yet
+- `lore branch merge` and `lore branch merge start` accept `--link-message <PATH> <MESSAGE>`, as `lore commit` does,
+  giving the linked repository at `PATH` its own message on the revision a merge auto-commits. A path that is not a
+  link fails the merge before it starts
 - `lore-io`: `IoFile::from_std` wraps a `std::fs::File` the caller already holds, so an `IoDriver` runs positional
   reads, writes and syncs on that handle without reopening it by path. On Windows the file must be opened with
   `FILE_FLAG_OVERLAPPED`, and the `iocp` backend binds it to the driver's completion port. The call is `unsafe`: on

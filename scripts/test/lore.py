@@ -175,6 +175,14 @@ def _inherit_metadata_args(keys: list[str] | None) -> list[str]:
     return [arg for key in keys or [] for arg in ("--inherit-metadata", key)]
 
 
+def _link_message_args(link_messages: dict[str, str] | None) -> list[str]:
+    return [
+        arg
+        for path, message in (link_messages or {}).items()
+        for arg in ("--link-message", path, message)
+    ]
+
+
 class Lore:
     def __init__(
         self,
@@ -640,6 +648,7 @@ class Lore:
         repo_id: str | None = None,
         message: str | None = None,
         inherit_metadata: list[str] | None = None,
+        link_messages: dict[str, str] | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
@@ -647,7 +656,8 @@ class Lore:
             + ([name] if name else [])
             + (["--id", repo_id] if repo_id else [])
             + (["--message", message] if message else [])
-            + _inherit_metadata_args(inherit_metadata),
+            + _inherit_metadata_args(inherit_metadata)
+            + _link_message_args(link_messages),
             **kwargs,
         )
 
@@ -699,6 +709,7 @@ class Lore:
         link: str | None = None,
         dry_run: bool = False,
         ignore_links: bool = False,
+        link_messages: dict[str, str] | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
@@ -709,7 +720,8 @@ class Lore:
             + (["--no-commit"] if no_commit else [])
             + (["--link", link] if link else [])
             + (["--dry-run"] if dry_run else [])
-            + (["--ignore-links"] if ignore_links else []),
+            + (["--ignore-links"] if ignore_links else [])
+            + _link_message_args(link_messages),
             **kwargs,
         )
 
@@ -2259,10 +2271,6 @@ class Lore:
         if message is None:
             message = f"Test commit {self.test_commit_id}"
             self.test_commit_id += 1
-        link_args = []
-        if link_messages:
-            for path, msg in link_messages.items():
-                link_args.extend(["--link-message", path, msg])
         layer_args = []
         if layer_messages:
             for path, msg in layer_messages.items():
@@ -2270,7 +2278,7 @@ class Lore:
         return self.run(
             ["commit", message if message else ""]
             + (["--link", link] if link else [])
-            + link_args
+            + _link_message_args(link_messages)
             + (["--layer", layer] if layer else [])
             + layer_args,
             **kwargs,

@@ -107,6 +107,8 @@ impl LoreInterface {
                 branch: other_branch.clone(),
                 message: Default::default(),
                 no_commit: 0,
+                link_paths: Default::default(),
+                link_messages: Default::default(),
                 link: Default::default(),
                 ignore_links: 0,
                 inherit_metadata: Default::default(),

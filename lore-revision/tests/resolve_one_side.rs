@@ -214,6 +214,7 @@ mod tests {
                     feature_branch,
                     branch::merge::MergeStartOptions {
                         message: "merge feature into main".to_string(),
+                        link_messages: std::collections::HashMap::new(),
                         no_commit: true,
                         scope: branch::merge::MergeScope::MainOnly,
                         inherit_metadata: MetadataInherit::default(),

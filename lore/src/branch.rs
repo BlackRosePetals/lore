@@ -35,6 +35,7 @@ use crate::call::repository_call_write;
 use crate::call_delegation::dispatch_call;
 use crate::interface::Context;
 use crate::interface::LoreString;
+use crate::util::path_messages;
 
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
@@ -313,6 +314,10 @@ pub struct LoreBranchMergeStartArgs {
     /// revision. Empty carries nothing; the single entry `*` carries every
     /// key that is not reserved to the merge itself.
     pub inherit_metadata: LoreArray<LoreString>,
+    /// Array of link relative paths that have specific auto commit messages
+    pub link_paths: LoreArray<LoreString>,
+    /// Array of messages corresponding to each link path (parallel array with `link_paths`)
+    pub link_messages: LoreArray<LoreString>,
 }
 
 /// Begins merging a source branch into the current branch, auto-committing if there are no conflicts.
@@ -374,19 +379,21 @@ fn merge_start_local(
                 MergeScope::Link(link_str)
             };
 
-            let options = MergeStartOptions {
-                message: args.message.to_string(),
-                no_commit: args.no_commit != 0,
-                scope,
-                inherit_metadata: MetadataInherit::from_keys(
-                    args.inherit_metadata
-                        .as_slice()
-                        .iter()
-                        .map(LoreString::as_str),
-                ),
-            };
-
             async move {
+                let options = MergeStartOptions {
+                    message: args.message.to_string(),
+                    link_messages: path_messages("link", &args.link_paths, &args.link_messages)
+                        .forward::<MergeError>("Invalid link message path")?,
+                    no_commit: args.no_commit != 0,
+                    scope,
+                    inherit_metadata: MetadataInherit::from_keys(
+                        args.inherit_metadata
+                            .as_slice()
+                            .iter()
+                            .map(LoreString::as_str),
+                    ),
+                };
+
                 let branch = branch::resolve(repository.clone(), args.branch.as_str())
                     .await
                     .forward::<MergeError>("resolving branch")?;

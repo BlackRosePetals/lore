@@ -398,6 +398,8 @@ pub enum MergeScope {
 pub struct MergeStartOptions {
     /// Message to use for an auto commit if no conflicts arise
     pub message: String,
+    /// Per-link auto commit messages, keyed by mount path.
+    pub link_messages: std::collections::HashMap<String, String>,
     /// Disable auto commits, even if no conflicts arise.
     pub no_commit: bool,
     /// Which repositories to include in the merge.
@@ -682,6 +684,8 @@ pub async fn merge_start(
             .await
             .forward::<MergeError>("deserializing current and staged state")?;
 
+    validate_link_messages(&repository, &state_current, &options).await?;
+
     match &options.scope {
         MergeScope::Link(link_path) => {
             // Link-scoped merges work on the staged state if one exists,
@@ -758,7 +762,7 @@ pub async fn merge_start(
             .forward::<MergeError>("comparing link pins")?;
 
             if !has_conflicts && !dry_run && !options.no_commit {
-                signature = auto_commit_merge(repository, token, options.message).await?;
+                signature = auto_commit_merge(repository, token, options).await?;
             }
 
             Ok(signature)
@@ -976,17 +980,7 @@ async fn merge_start_link(
 
     // Auto-commit if no conflicts
     if !result.has_conflicts && !options.no_commit {
-        let commit_options = CommitOptions {
-            message: options.message,
-            link_messages: std::collections::HashMap::new(),
-            link: None,
-            layer_messages: std::collections::HashMap::new(),
-            layer: None,
-        };
-        let signature = commit::commit_boxed(repository, token, commit_options)
-            .await
-            .forward::<MergeError>("auto-committing merge")?;
-        return Ok(signature);
+        return auto_commit_merge(repository, token, options).await;
     }
 
     Ok(signature)
@@ -1667,21 +1661,58 @@ async fn finalize_main_merge(
     }
 
     if !has_conflicts && !dry_run && !options.no_commit {
-        return auto_commit_merge(repository, token, options.message).await;
+        return auto_commit_merge(repository, token, options).await;
     }
 
     Ok(state_staged.revision())
+}
+
+async fn validate_link_messages(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    options: &MergeStartOptions,
+) -> Result<(), MergeError> {
+    if options.link_messages.is_empty() {
+        return Ok(());
+    }
+    if matches!(options.scope, MergeScope::MainOnly) {
+        return Err(InvalidArguments {
+            reason: "Per-link messages need a merge that includes linked repositories".into(),
+        }
+        .into());
+    }
+    futures::future::try_join_all(options.link_messages.keys().map(|path| async move {
+        match link::resolve_link_at_path(state, repository.clone(), path).await {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error.is_node_not_found()
+                    || error.is_invalid_path()
+                    || error.is_not_a_link() =>
+            {
+                Err(InvalidArguments {
+                    reason: format!(
+                        "Link message path '{path}' does not match any linked repository"
+                    ),
+                }
+                .into())
+            }
+            Err(error) => Err(error)
+                .forward_with::<MergeError, _>(|| format!("resolving link message path {path}")),
+        }
+    }))
+    .await?;
+    Ok(())
 }
 
 /// Auto-commit a merge with no conflicts.
 async fn auto_commit_merge(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
-    message: String,
+    options: MergeStartOptions,
 ) -> Result<Hash, MergeError> {
     let commit_options = CommitOptions {
-        message,
-        link_messages: std::collections::HashMap::new(),
+        message: options.message,
+        link_messages: options.link_messages,
         link: None,
         layer_messages: std::collections::HashMap::new(),
         layer: None,

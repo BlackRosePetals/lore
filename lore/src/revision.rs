@@ -7,6 +7,7 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::branch::merge::MergeError;
+use lore_revision::commit::CommitError;
 use lore_revision::commit::CommitOptions;
 use lore_revision::find::FindError;
 use lore_revision::find::FindOptions;
@@ -38,6 +39,7 @@ use crate::call_delegation::dispatch_call;
 use crate::interface::LoreMetadataType;
 use crate::interface::LoreString;
 use crate::util::convert_user_paths;
+use crate::util::path_messages;
 
 /// Arguments for committing staged changes into a new revision.
 #[repr(C)]
@@ -113,40 +115,16 @@ fn commit_local(
             } else {
                 Some(link_str)
             };
-            let paths = args.link_paths.as_slice();
-            let messages = args.link_messages.as_slice();
-            if paths.len() != messages.len() {
-                lore_revision::lore_warn!(
-                    "link_paths length ({}) does not match link_messages length ({}), ignoring per-link messages",
-                    paths.len(),
-                    messages.len()
-                );
-            }
-            let link_messages: std::collections::HashMap<String, String> = paths
-                .iter()
-                .zip(messages.iter())
-                .map(|(path, msg)| (path.to_string(), msg.to_string()))
-                .collect();
+            let link_messages = path_messages("link", &args.link_paths, &args.link_messages)
+                .forward::<CommitError>("Invalid link message path")?;
             let layer_str = args.layer.to_string();
             let layer = if layer_str.is_empty() {
                 None
             } else {
                 Some(layer_str)
             };
-            let layer_paths = args.layer_paths.as_slice();
-            let layer_msg_values = args.layer_messages.as_slice();
-            if layer_paths.len() != layer_msg_values.len() {
-                lore_revision::lore_warn!(
-                    "layer_paths length ({}) does not match layer_messages length ({}), ignoring per-layer messages",
-                    layer_paths.len(),
-                    layer_msg_values.len()
-                );
-            }
-            let layer_messages: std::collections::HashMap<String, String> = layer_paths
-                .iter()
-                .zip(layer_msg_values.iter())
-                .map(|(path, msg)| (path.to_string(), msg.to_string()))
-                .collect();
+            let layer_messages = path_messages("layer", &args.layer_paths, &args.layer_messages)
+                .forward::<CommitError>("Invalid layer message path")?;
             let options = CommitOptions {
                 message,
                 link,

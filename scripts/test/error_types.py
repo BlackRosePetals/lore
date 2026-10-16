@@ -257,6 +257,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
         "Attempting to create an SWFS instance outside the service",
         SwfsOutsideServiceError,
     ),
+    ("invalid arguments:", ImproperArgumentsError),
 ]
 
 

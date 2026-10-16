@@ -161,6 +161,10 @@ pub struct BranchMergeArgs {
     /// to the merge itself. Carries nothing when not given.
     #[clap(long = "inherit-metadata", value_name = "KEY")]
     inherit_metadata: Vec<String>,
+
+    /// Per-link auto commit message. Takes two values: <path> <message>. Can be specified multiple times.
+    #[clap(long = "link-message", num_args = 2, value_names = ["PATH", "MESSAGE"])]
+    link_messages: Vec<String>,
 }
 
 #[derive(Args)]
@@ -194,6 +198,15 @@ pub struct BranchMergeStartArgs {
     /// to the merge itself. Carries nothing when not given.
     #[clap(long = "inherit-metadata", value_name = "KEY")]
     inherit_metadata: Vec<String>,
+
+    /// Per-link auto commit message. Takes two values: <path> <message>. Can be specified multiple times.
+    #[clap(
+        long = "link-message",
+        num_args = 2,
+        value_names = ["PATH", "MESSAGE"],
+        conflicts_with = "ignore_links"
+    )]
+    link_messages: Vec<String>,
 }
 
 #[derive(Args)]
@@ -1079,10 +1092,13 @@ fn handle_branch_merge_into(globals: LoreGlobalArgs, args: &BranchMergeIntoArgs)
 }
 
 fn handle_branch_merge_start(globals: LoreGlobalArgs, args: &BranchMergeStartArgs) -> u8 {
+    let (link_paths, link_messages) = util::split_path_messages(&args.link_messages);
     let merge_start_args = LoreBranchMergeStartArgs {
         branch: LoreString::from(&args.branch),
         message: LoreString::from(&args.message),
         no_commit: args.no_commit as u8,
+        link_paths: LoreArray::from_vec(link_paths),
+        link_messages: LoreArray::from_vec(link_messages),
         link: LoreString::from(&args.link),
         ignore_links: args.ignore_links as u8,
         inherit_metadata: LoreArray::from_vec(util::convert_to_lore_string_vec(
@@ -1322,6 +1338,7 @@ pub fn handle_branch_merge(globals: LoreGlobalArgs, args: &BranchMergeArgs) -> u
             link: None,
             ignore_links: false,
             inherit_metadata: args.inherit_metadata.clone(),
+            link_messages: args.link_messages.clone(),
         };
 
         return handle_branch_merge_start(globals, &sub_args);

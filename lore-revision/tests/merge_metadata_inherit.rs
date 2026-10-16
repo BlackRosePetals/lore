@@ -262,6 +262,7 @@ mod tests {
             feature_branch,
             branch::merge::MergeStartOptions {
                 message: MERGE_MESSAGE.to_string(),
+                link_messages: std::collections::HashMap::new(),
                 no_commit: false,
                 scope: branch::merge::MergeScope::MainOnly,
                 inherit_metadata: inherit,

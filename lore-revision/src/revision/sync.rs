@@ -830,6 +830,7 @@ pub(crate) async fn sync(
             lore_info!("Remote and local branch have diverged, performing merge",);
             let merge_options = merge::MergeStartOptions {
                 message: String::new(),
+                link_messages: std::collections::HashMap::new(),
                 no_commit: false,
                 scope: merge::MergeScope::MainOnly,
                 inherit_metadata: crate::metadata::MetadataInherit::default(),

@@ -4375,6 +4375,10 @@ typedef struct lore_branch_merge_start_args_t {
   // revision. Empty carries nothing; the single entry `*` carries every
   // key that is not reserved to the merge itself.
   struct lore_string_array_t inherit_metadata;
+  // Array of link relative paths that have specific auto commit messages
+  struct lore_string_array_t link_paths;
+  // Array of messages corresponding to each link path (parallel array with `link_paths`)
+  struct lore_string_array_t link_messages;
 } lore_branch_merge_start_args_t;
 
 // Arguments for switching the working directory to a different branch or revision.

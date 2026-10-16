@@ -1643,3 +1643,76 @@ def test_link_merge_abort_all_then_resume_multiple_links(new_lore_repo):
     assert urc.file_exists(f"{path_b}/feature-b.txt"), (
         "Link B feature file should persist after sync (pin is correct)"
     )
+
+
+_MERGE_LINKS = ["linked/repo", "linked/other"]
+
+
+def _diverged_link_branches(new_lore_repo):
+    urc, first_link = make_parent_with_link(new_lore_repo, _MERGE_LINKS[0])
+    link_repos = [first_link]
+    for link_path in _MERGE_LINKS[1:]:
+        link_repo = make_repo(new_lore_repo, {"linked.txt": "linked content\n"})
+        urc.link_add(link_path, link_repo.get_id(), "/")
+        link_repos.append(link_repo)
+    urc.commit("Add more links")
+    urc.push()
+
+    urc.branch_create("feature-branch")
+    urc.write_commit_push(
+        "Feature changes",
+        {"feature.txt": "feature\n"}
+        | {f"{link_path}/feature.txt": "feature\n" for link_path in _MERGE_LINKS},
+    )
+    urc.branch_switch("main")
+    urc.write_commit_push(
+        "Main changes",
+        {"main.txt": "main\n"}
+        | {f"{link_path}/main.txt": "main\n" for link_path in _MERGE_LINKS},
+    )
+    return urc, link_repos
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "link_scoped, message_paths",
+    [(False, _MERGE_LINKS), (True, ["./linked/repo/"])],
+    ids=["all-links", "link-scoped-unnormalized-path"],
+)
+def test_link_merge_per_link_message(new_lore_repo, link_scoped, message_paths):
+    """An auto-committed merge gives each linked repository its own message."""
+    urc, link_repos = _diverged_link_branches(new_lore_repo)
+    link_messages = {path: f"Merge into {path}" for path in message_paths}
+
+    urc.branch_merge_start(
+        "feature-branch",
+        message="Merge parent",
+        link=_MERGE_LINKS[0] if link_scoped else None,
+        link_messages=link_messages,
+    )
+    urc.push()
+
+    assert urc.revision_info(check=True, no_pager=True).message == "Merge parent"
+    for link_repo, message in zip(link_repos, link_messages.values()):
+        link_repo.sync()
+        assert link_repo.revision_info(check=True, no_pager=True).message == message
+        assert link_repo.file_exists("feature.txt") and link_repo.file_exists(
+            "main.txt"
+        )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("message_path", ["not/a/link", "main.txt"])
+def test_link_merge_rejects_unknown_link_message_path(new_lore_repo, message_path):
+    """A per-link message for a path that is not a link fails before merging."""
+    urc, _link_repos = _diverged_link_branches(new_lore_repo)
+    revision_before = urc.revision_info(check=True, no_pager=True).revision
+
+    with pytest.raises(ImproperArgumentsError):
+        urc.branch_merge_start(
+            "feature-branch",
+            message="Merge parent",
+            link_messages={message_path: "Merge link"},
+        )
+
+    assert urc.revision_info(check=True, no_pager=True).revision == revision_before

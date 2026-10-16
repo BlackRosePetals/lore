@@ -151,6 +151,15 @@ pub fn convert_to_lore_string_vec(paths: &[String]) -> Vec<LoreString> {
     paths.iter().map(LoreString::from).collect()
 }
 
+pub fn split_path_messages(values: &[String]) -> (Vec<LoreString>, Vec<LoreString>) {
+    values
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[path, message]| (LoreString::from(path), LoreString::from(message)))
+        .unzip()
+}
+
 pub fn convert_paths_and_targets(
     paths: &Option<Vec<String>>,
     targets: &Option<String>,

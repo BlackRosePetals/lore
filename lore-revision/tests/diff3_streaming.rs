@@ -479,6 +479,7 @@ mod tests {
                     main_branch,
                     lore_revision::branch::merge::MergeStartOptions {
                         message: "merge main into feature (sparse view)".to_string(),
+                        link_messages: std::collections::HashMap::new(),
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
                         inherit_metadata: Default::default(),
@@ -576,6 +577,7 @@ mod tests {
             main_branch,
             lore_revision::branch::merge::MergeStartOptions {
                 message: message.to_string(),
+                link_messages: std::collections::HashMap::new(),
                 no_commit: false,
                 scope: lore_revision::branch::merge::MergeScope::MainOnly,
                 inherit_metadata: Default::default(),
@@ -1292,6 +1294,7 @@ mod tests {
                     target_branch,
                     lore_revision::branch::merge::MergeStartOptions {
                         message: "merge target into source".to_string(),
+                        link_messages: std::collections::HashMap::new(),
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
                         inherit_metadata: Default::default(),
