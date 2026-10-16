@@ -7,6 +7,7 @@ use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
@@ -291,6 +292,68 @@ pub trait ServiceClient: Send + Sync {
     fn v4_protocol(&self) -> bool {
         false
     }
+
+    /// The session `session_id` names, as a `request_type` request carries it on this client's
+    /// connection. The default sends every id on any connection, for a service whose server keeps
+    /// no sessions per connection.
+    fn bind_session(&self, request_type: Self::RequestType, session_id: u32) -> BoundSession {
+        let _ = request_type;
+        BoundSession::any(session_id)
+    }
+
+    /// Issues the session `session_id` names again on the current connection, once
+    /// [`bind_session`](Self::bind_session) bound it to an earlier one or to none. It leaves the
+    /// next `bind_session` naming the current connection, or fails: [`send_with_reconnect`] binds
+    /// and sends again after it. The default does nothing, as the default `bind_session` binds no
+    /// session to a connection.
+    fn rebind_session(
+        &self,
+        request_type: Self::RequestType,
+        session_id: u32,
+    ) -> impl Future<Output = Result<(), Self::ErrorType>> + Send {
+        let _ = (request_type, session_id);
+        std::future::ready(Ok(()))
+    }
+}
+
+/// A session id as a command carries it, and the generation of the connection the server issued it
+/// on ([`QuicConnection::generation`]). A server numbers each connection's sessions from 1, so an
+/// id from one connection names another session or none on the next, and a command is written
+/// only on the connection whose generation it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoundSession {
+    pub id: u32,
+    pub generation: u32,
+}
+
+/// The generation of a [`BoundSession`] whose id no connection's sessions hold, sent on any
+/// connection.
+const ANY_GENERATION: u32 = u32::MAX;
+
+/// The generation of a [`BoundSession`] bound to no connection, written on none.
+pub(crate) const NO_GENERATION: u32 = u32::MAX - 1;
+
+impl BoundSession {
+    /// `id`, sent on any connection.
+    pub const fn any(id: u32) -> Self {
+        Self {
+            id,
+            generation: ANY_GENERATION,
+        }
+    }
+
+    /// The session packed in one word, the generation in the high half.
+    pub(crate) const fn pack(self) -> u64 {
+        ((self.generation as u64) << 32) | self.id as u64
+    }
+
+    /// The session [`pack`](Self::pack) packed.
+    pub(crate) const fn unpack(packed: u64) -> Self {
+        Self {
+            id: packed as u32,
+            generation: (packed >> 32) as u32,
+        }
+    }
 }
 
 struct QuicQuinnConnection {
@@ -325,6 +388,10 @@ impl QuicQuinnConnection {
 
 pub struct QuicConnection {
     connection: RwLock<QuicQuinnConnection>,
+    /// The generation of the connection `connection` holds, counted up each time a reconnect
+    /// replaces it. Written only while `connection` is held for writing, so a command holding it
+    /// for reading is written to the connection of the generation it reads.
+    generation: AtomicU32,
     created: Instant,
     last_send: AtomicU64,
     last_recv: Arc<AtomicU64>,
@@ -350,6 +417,7 @@ impl QuicConnection {
                 writer: vec![],
                 reader: vec![],
             }),
+            generation: AtomicU32::new(0),
             created: Instant::now(),
             last_send: AtomicU64::new(0),
             last_recv: Arc::new(AtomicU64::new(0)),
@@ -392,6 +460,11 @@ impl QuicConnection {
 
     pub async fn has_streams(&self) -> bool {
         !self.connection.read().await.reader.is_empty()
+    }
+
+    /// The generation of the connection held now ([`BoundSession`]).
+    pub(crate) fn generation(&self) -> u32 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     pub async fn close(&self) {
@@ -455,10 +528,14 @@ pub enum ReconnectError {
 
 /// Send a command to the QUIC server, automatically reconnecting on transient failures.
 ///
-/// Acquires a rate-limiting permit, sends the command via [`send_command`], and handles
-/// the response. On transient errors (`Terminated`, `StreamOpen`), triggers a reconnect
-/// and retries. On ambiguous errors, checks whether a concurrent reconnect already
-/// occurred (via the epoch counter) and retries if so, otherwise propagates the error.
+/// Acquires a rate-limiting permit, binds the command's session to a connection
+/// ([`ServiceClient::bind_session`]), sends the command via [`send_command`], and handles the
+/// response. On transient errors (`Terminated`, `StreamOpen`), triggers a reconnect and retries. A
+/// session bound to an earlier connection than the current one is issued again on it
+/// ([`ServiceClient::rebind_session`]) and the command sent under it. On ambiguous errors, checks
+/// whether a concurrent reconnect already occurred (via the epoch counter) and retries if so,
+/// otherwise propagates the error. The wait for the session's issue is boxed, a cold path kept out
+/// of every command's future, and `dyn`, as the issue sends its request through this function.
 ///
 /// `HIGH_PRIORITY` is a const generic rather than a runtime parameter to keep it out of
 /// the async future state. Because this function contains a retry loop with multiple await
@@ -468,92 +545,105 @@ pub enum ReconnectError {
 /// cost. Using a const generic resolves the priority value at compile time through
 /// monomorphization, adding zero bytes to the future. This is validated by the
 /// `test_futures_size` test which enforces a strict upper bound on the get future size.
-pub async fn send_with_reconnect<ServiceClientType, const LEN: usize, const HIGH_PRIORITY: bool>(
-    service_client: &ServiceClientType,
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn send_with_reconnect<'a, ServiceClientType, const LEN: usize, const HIGH_PRIORITY: bool>(
+    service_client: &'a ServiceClientType,
     request_type: ServiceClientType::RequestType,
     session_id: u32,
-    chunks: impl Fn() -> [Bytes; LEN],
-) -> Result<Bytes, ServiceClientType::ErrorType>
+    chunks: impl Fn() -> [Bytes; LEN] + Send + 'a,
+) -> impl Future<Output = Result<Bytes, ServiceClientType::ErrorType>> + Send + 'a
 where
     ServiceClientType: ServiceClient,
 {
-    loop {
-        let Some(permit) = service_client.acquire_command_permit().await else {
-            return Err(
-                service_client.map_send_error(request_type, SendWithReconnectError::PermitAcquire)
-            );
-        };
+    async move {
+        loop {
+            let Some(permit) = service_client.acquire_command_permit().await else {
+                return Err(service_client
+                    .map_send_error(request_type, SendWithReconnectError::PermitAcquire));
+            };
 
-        let epoch = service_client.quic().epoch.load(Ordering::Relaxed);
-        match send_command::<HIGH_PRIORITY, true>(
-            service_client.quic().clone(),
-            request_type.into(),
-            session_id,
-            service_client.v4_protocol(),
-            &mut chunks(),
-        )
-        .await
-        {
-            Ok(payload) => return Ok(payload),
-            // error handling for things that cannot be recovered by reconnecting
-            // and should be bubbled up to the caller immediately
-            Err(err)
-                if matches!(
-                    err,
-                    QuicClientError::SlowDown
-                        | QuicClientError::NotAuthorized
-                        | QuicClientError::NotFound
-                        | QuicClientError::ClientMessageTooBig
-                ) =>
+            let epoch = service_client.quic().epoch.load(Ordering::Relaxed);
+            let stale = match send_command::<HIGH_PRIORITY, true>(
+                service_client.quic().clone(),
+                request_type.into(),
+                service_client.bind_session(request_type, session_id),
+                service_client.v4_protocol(),
+                &mut chunks(),
+            )
+            .await
             {
-                return Err(service_client
-                    .map_send_error(request_type, SendWithReconnectError::ClientError(err)));
-            }
-            // error handling for things that should trigger a reconnect
-            Err(QuicClientError::Terminated | QuicClientError::StreamOpen) => {
-                // Fall through to reconnect
-                drop(permit);
-            }
-            // a non retryable connection error - so just mark as disconnected immediately
-            Err(QuicClientError::CrytpoError) => {
-                return Err(service_client
-                    .map_send_error(request_type, SendWithReconnectError::Disconnected));
-            }
-            // error handling for things that have indicated an error, but the error could
-            // be related to something else that triggered a reconnect. We should see if we are
-            // reconnecting, and if we are then retry the message again otherwise bubble it up
-            Err(err) => {
-                drop(permit);
-
-                let epoch_current = service_client.quic().epoch.load(Ordering::Relaxed);
-                if epoch_current == 0 {
-                    return Err(service_client
-                        .map_send_error(request_type, SendWithReconnectError::Disconnected));
-                }
-                if epoch >= epoch_current {
-                    // Not reconnected, return failure
+                Ok(payload) => return Ok(payload),
+                // error handling for things that cannot be recovered by reconnecting
+                // and should be bubbled up to the caller immediately
+                Err(err)
+                    if matches!(
+                        err,
+                        QuicClientError::SlowDown
+                            | QuicClientError::NotAuthorized
+                            | QuicClientError::NotFound
+                            | QuicClientError::ClientMessageTooBig
+                    ) =>
+                {
                     return Err(service_client
                         .map_send_error(request_type, SendWithReconnectError::ClientError(err)));
                 }
+                Err(QuicClientError::StaleSession) => true,
+                // error handling for things that should trigger a reconnect
+                Err(QuicClientError::Terminated | QuicClientError::StreamOpen) => false,
+                // a non retryable connection error - so just mark as disconnected immediately
+                Err(QuicClientError::CrytpoError) => {
+                    return Err(service_client
+                        .map_send_error(request_type, SendWithReconnectError::Disconnected));
+                }
+                // error handling for things that have indicated an error, but the error could
+                // be related to something else that triggered a reconnect. We should see if we are
+                // reconnecting, and if we are then retry the message again otherwise bubble it up
+                Err(err) => {
+                    drop(permit);
 
-                // Reconnected, loop and retry
+                    let epoch_current = service_client.quic().epoch.load(Ordering::Relaxed);
+                    if epoch_current == 0 {
+                        return Err(service_client
+                            .map_send_error(request_type, SendWithReconnectError::Disconnected));
+                    }
+                    if epoch >= epoch_current {
+                        // Not reconnected, return failure
+                        return Err(service_client.map_send_error(
+                            request_type,
+                            SendWithReconnectError::ClientError(err),
+                        ));
+                    }
+
+                    // Reconnected, loop and retry
+                    continue;
+                }
+            };
+            drop(permit);
+
+            if stale {
+                let rebind: Pin<
+                    Box<dyn Future<Output = Result<(), ServiceClientType::ErrorType>> + Send + 'a>,
+                > = Box::pin(service_client.rebind_session(request_type, session_id));
+                rebind.await?;
                 continue;
             }
-        };
 
-        if Box::pin(reconnect(
-            service_client.endpoint_config(),
-            service_client.alpn(),
-            service_client.auth_adapter().clone(),
-            service_client.transport_config(),
-            service_client.quic().clone(),
-            epoch,
-        ))
-        .await
-        .is_err()
-        {
-            return Err(service_client
-                .map_send_error(request_type, SendWithReconnectError::ReconnectFailed));
+            if Box::pin(reconnect(
+                service_client.endpoint_config(),
+                service_client.alpn(),
+                service_client.auth_adapter().clone(),
+                service_client.transport_config(),
+                service_client.quic().clone(),
+                epoch,
+            ))
+            .await
+            .is_err()
+            {
+                return Err(service_client
+                    .map_send_error(request_type, SendWithReconnectError::ReconnectFailed));
+            }
         }
     }
 }
@@ -1084,14 +1174,15 @@ where
                 let connection_id = quic_connection.stable_id();
 
                 {
-                    let mut connection = connection.connection.write().await;
-                    for reader in connection.reader.drain(..) {
+                    let mut held = connection.connection.write().await;
+                    for reader in held.reader.drain(..) {
                         let _ = reader.task.await;
                     }
 
-                    connection.reader = vec![];
-                    connection.writer = vec![];
-                    connection.connection = quic_connection;
+                    held.reader = vec![];
+                    held.writer = vec![];
+                    held.connection = quic_connection;
+                    connection.generation.fetch_add(1, Ordering::Relaxed);
                 }
 
                 let restart_flow = connection
@@ -1270,14 +1361,14 @@ fn select_stream(stream_inflight: &[AtomicU64], reader_count: u32, high_priority
     min_stream
 }
 
-pub async fn send_normal(
+pub fn send_normal(
     connection: Arc<QuicConnection>,
     command: QuicOpCode,
-    session_id: u32,
+    session: BoundSession,
     v4: bool,
     chunks: &mut [Bytes],
-) -> Result<Bytes, QuicClientError> {
-    send_command::<false, true>(connection, command, session_id, v4, chunks).await
+) -> impl Future<Output = Result<Bytes, QuicClientError>> + '_ {
+    send_command::<false, true>(connection, command, session, v4, chunks)
 }
 
 /// Announces the client's user agent for a connection, sent once on connect and again on each
@@ -1313,14 +1404,14 @@ pub async fn send_client_identify(
     .await
 }
 
-pub async fn send_high_priority(
+pub fn send_high_priority(
     connection: Arc<QuicConnection>,
     command: QuicOpCode,
-    session_id: u32,
+    session: BoundSession,
     v4: bool,
     chunks: &mut [Bytes],
-) -> Result<Bytes, QuicClientError> {
-    send_command::<true, true>(connection, command, session_id, v4, chunks).await
+) -> impl Future<Output = Result<Bytes, QuicClientError>> + '_ {
+    send_command::<true, true>(connection, command, session, v4, chunks)
 }
 
 pub fn send_normal_with_reconnect<'a, ServiceClientType, const LEN: usize>(
@@ -1367,91 +1458,104 @@ where
 /// Either way the command is registered with the stream's [`ResponseReader`] before the bytes go
 /// out. Dropping the receiver unread is expected and handled; leaving the command unregistered is
 /// not, and would make the reader treat the response as unexpected and tear the stream down.
-pub async fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
+///
+/// A command whose session is bound to another connection than the one held is not written, and
+/// answers `StaleSession` ([`BoundSession`]).
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
     connection: Arc<QuicConnection>,
     command: QuicOpCode,
-    session_id: u32,
+    session: BoundSession,
     v4: bool,
     chunks: &mut [Bytes],
-) -> Result<Bytes, QuicClientError> {
-    {
-        let stream_index = connection.counter.fetch_add(1, Ordering::Relaxed) % STREAM_COUNT;
-        let stream_count = connection.stream_count.load(Ordering::Relaxed);
+) -> impl Future<Output = Result<Bytes, QuicClientError>> + '_ {
+    async move {
+        {
+            let stream_index = connection.counter.fetch_add(1, Ordering::Relaxed) % STREAM_COUNT;
+            let stream_count = connection.stream_count.load(Ordering::Relaxed);
 
-        if stream_count != 0 && stream_index >= stream_count {
-            // Box the rare path to avoid increasing send_command future size
-            Box::pin(add_stream(connection.clone())).await?;
-        }
-    }
-
-    connection.last_send.store(
-        connection.created.elapsed().as_millis() as u64,
-        Ordering::Relaxed,
-    );
-
-    let (command_id, writer, rx, _inflight) = {
-        let connection_lock = connection.connection.read().await;
-        if connection_lock.reader.is_empty() {
-            lore_debug!("No quic stream available when sending command");
-            return Err(QuicClientError::StreamOpen);
-        }
-
-        // Select stream based on priority, computed inside lock to avoid living across await points
-        let reader_count = connection_lock.reader.len() as u32;
-        let stream_index = select_stream(
-            connection.stream_inflight.as_slice(),
-            reader_count,
-            HIGH_PRIORITY,
-        ) as usize
-            % connection_lock.reader.len();
-        let inflight = StreamInflightGuard::new(&connection.stream_inflight[stream_index]);
-
-        let (tx, rx) = oneshot::channel();
-        let command_id = connection_lock.reader[stream_index].wait_for(tx)?;
-        let writer = connection_lock.writer[stream_index].clone();
-        (command_id, writer, rx, inflight)
-    };
-
-    {
-        // Skip any previous header in case this is a resend
-        let total_size: usize = chunks.iter().skip(1).map(|buffer| buffer.len()).sum();
-        if total_size > connection.max_chunk_size {
-            lore_debug!(
-                "Client '{command}' message too big - message size '{total_size}' exceeds {}",
-                connection.max_chunk_size
-            );
-            return Err(QuicClientError::ClientMessageTooBig);
-        }
-        if v4 {
-            let header =
-                CommandHeader::new_with_session(command, command_id, total_size, session_id);
-            chunks[0] = Bytes::from_owner(header.to_bytes_v4());
-        } else {
-            let header = CommandHeader::new(command, command_id, total_size);
-            chunks[0] = Bytes::from_owner(header.to_bytes());
-        }
-    }
-
-    {
-        let mut stream = writer.lock_owned().await;
-        stream.write_all_chunks(chunks).await.map_err(|err| {
-            if let quinn::WriteError::ConnectionLost(_) = err {
-                QuicClientError::Terminated
-            } else {
-                lore_warn!("{}: {err}", QuicClientError::WriteChunks);
-                QuicClientError::WriteChunks
+            if stream_count != 0 && stream_index >= stream_count {
+                // Box the rare path to avoid increasing send_command future size
+                Box::pin(add_stream(connection.clone())).await?;
             }
-        })?;
-    }
+        }
 
-    if !AWAIT_RESPONSE {
-        return Ok(Bytes::default());
-    }
+        connection.last_send.store(
+            connection.created.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
 
-    rx.await.map_err(|err| {
-        lore_warn!("{}: {err}", QuicClientError::Read);
-        QuicClientError::Read
-    })?
+        let (command_id, writer, rx, _inflight) = {
+            let connection_lock = connection.connection.read().await;
+            if connection_lock.reader.is_empty() {
+                lore_debug!("No quic stream available when sending command");
+                return Err(QuicClientError::StreamOpen);
+            }
+            if session.generation != ANY_GENERATION && session.generation != connection.generation()
+            {
+                return Err(QuicClientError::StaleSession);
+            }
+
+            // Select stream based on priority, computed inside lock to avoid living across await
+            // points
+            let reader_count = connection_lock.reader.len() as u32;
+            let stream_index = select_stream(
+                connection.stream_inflight.as_slice(),
+                reader_count,
+                HIGH_PRIORITY,
+            ) as usize
+                % connection_lock.reader.len();
+            let inflight = StreamInflightGuard::new(&connection.stream_inflight[stream_index]);
+
+            let (tx, rx) = oneshot::channel();
+            let command_id = connection_lock.reader[stream_index].wait_for(tx)?;
+            let writer = connection_lock.writer[stream_index].clone();
+            (command_id, writer, rx, inflight)
+        };
+
+        {
+            // Skip any previous header in case this is a resend
+            let total_size: usize = chunks.iter().skip(1).map(|buffer| buffer.len()).sum();
+            if total_size > connection.max_chunk_size {
+                lore_debug!(
+                    "Client '{command}' message too big - message size '{total_size}' exceeds {}",
+                    connection.max_chunk_size
+                );
+                return Err(QuicClientError::ClientMessageTooBig);
+            }
+            if v4 {
+                let header =
+                    CommandHeader::new_with_session(command, command_id, total_size, session.id);
+                chunks[0] = Bytes::from_owner(header.to_bytes_v4());
+            } else {
+                let header = CommandHeader::new(command, command_id, total_size);
+                chunks[0] = Bytes::from_owner(header.to_bytes());
+            }
+        }
+
+        {
+            let mut stream = writer.lock_owned().await;
+            stream.write_all_chunks(chunks).await.map_err(|err| {
+                if let quinn::WriteError::ConnectionLost(_) = err {
+                    QuicClientError::Terminated
+                } else {
+                    lore_warn!("{}: {err}", QuicClientError::WriteChunks);
+                    QuicClientError::WriteChunks
+                }
+            })?;
+        }
+
+        if !AWAIT_RESPONSE {
+            return Ok(Bytes::default());
+        }
+
+        rx.await.map_err(|err| {
+            lore_warn!("{}: {err}", QuicClientError::Read);
+            QuicClientError::Read
+        })?
+    }
 }
 
 /// Send a command and return once its bytes are written, discarding the response.
@@ -1466,7 +1570,13 @@ pub async fn send_without_response(
     v4: bool,
     chunks: &mut [Bytes],
 ) -> Result<(), QuicClientError> {
-    send_command::<false, false>(connection, command, session_id, v4, chunks)
-        .await
-        .map(|_| ())
+    send_command::<false, false>(
+        connection,
+        command,
+        BoundSession::any(session_id),
+        v4,
+        chunks,
+    )
+    .await
+    .map(|_| ())
 }

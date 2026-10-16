@@ -118,6 +118,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   connection to the remote. Each storage call used to leave one session open per storage connection on the connection
   every handle to the remote shares, so a process that made about 10,000 storage calls to one remote had every later
   call refused until it restarted, the server allowing that many sessions per connection
+- A QUIC storage session lost with its connection is started again on the connection that replaces it, before the
+  command that found it lost is sent again. The server keeps sessions per connection, so after a reconnect every
+  command on a session started before it failed, and a push that had reconnected failed on its query for the fragments
+  the server holds. A command is now sent under a session id only on the connection that issued it, where an id from a
+  lost connection could name another session on its replacement
 - A storage session pool whose start fails on one of its connections, or is cancelled, stops every session it started,
   those still starting included. They stayed open on the server for the life of their connection, so once
   one connection reached the server's session limit, every retry moved the others towards it as well

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! A loopback QUIC server speaking just enough of lore-storage/0.4 for client tests: session
-//! start and stop, the client's user agent, and `get` of any address on a live session.
+//! start and stop, the client's user agent, and `get` of any address on a live session, recording
+//! the partition of the session each `get` ran under.
 //!
 //! Each connection serves one `get` at a time. How the server answers is its [`Answering`].
 
@@ -70,10 +71,14 @@ pub(crate) struct TestStorageServer {
 }
 
 /// The sessions one connection has started and not stopped, numbered from 1 as a server's
-/// session map numbers them.
+/// session map numbers them, each with its partition, the session starts it was asked for, the
+/// `get`s it received, and the partition of the session each `get` ran under.
 struct SessionMap {
     next: u32,
-    live: Vec<u32>,
+    live: Vec<(u32, Partition)>,
+    requested: u32,
+    received: u64,
+    served: Vec<Partition>,
 }
 
 impl Default for SessionMap {
@@ -81,8 +86,21 @@ impl Default for SessionMap {
         Self {
             next: 1,
             live: Vec::new(),
+            requested: 0,
+            received: 0,
+            served: Vec::new(),
         }
     }
+}
+
+/// How a server a test controls answers a session start.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum SessionStarts {
+    Accept,
+    /// With `SlowDown`.
+    Refuse,
+    /// Answers none until the test says how to.
+    Hold,
 }
 
 /// How a server answers its requests.
@@ -96,6 +114,8 @@ enum Answering {
     /// Every session start with `SlowDown`, as a server does once a connection holds as many
     /// sessions as it allows.
     RefusingSessions,
+    /// Every session start as the receiver reads.
+    Controlling(tokio::sync::watch::Receiver<SessionStarts>),
     /// Every session start once the receiver reads `true`, having started the session at once.
     HoldingSessionStarts(tokio::sync::watch::Receiver<bool>),
 }
@@ -123,6 +143,13 @@ impl TestStorageServer {
     /// Serves on a loopback port, answering every session start with `SlowDown`.
     pub fn start_refusing_sessions() -> Self {
         Self::serve(Answering::RefusingSessions)
+    }
+
+    /// Serves on a loopback port, answering every session start as the last value sent on the
+    /// returned sender says, at first accepting it.
+    pub fn start_controlling_session_starts() -> (Self, tokio::sync::watch::Sender<SessionStarts>) {
+        let (control, controlled) = tokio::sync::watch::channel(SessionStarts::Accept);
+        (Self::serve(Answering::Controlling(controlled)), control)
     }
 
     /// Serves on a loopback port, starting each session at once and holding its answer until
@@ -188,14 +215,6 @@ impl TestStorageServer {
         }
     }
 
-    /// Forgets every connection's sessions and numbers new ones from 1 again, as the fresh
-    /// session map of a reconnected connection does.
-    pub fn restart_sessions(&self) {
-        for map in self.sessions.lock().iter() {
-            *map.lock() = SessionMap::default();
-        }
-    }
-
     /// Sessions started so far, per connection in the order they were accepted.
     pub fn started_sessions_per_connection(&self) -> Vec<u32> {
         self.sessions
@@ -205,12 +224,42 @@ impl TestStorageServer {
             .collect()
     }
 
+    /// Session starts asked for so far, answered or not, per connection in the order they were
+    /// accepted.
+    pub fn requested_session_starts_per_connection(&self) -> Vec<u32> {
+        self.sessions
+            .lock()
+            .iter()
+            .map(|map| map.lock().requested)
+            .collect()
+    }
+
     /// Sessions started and not yet stopped, per connection in the order they were accepted.
     pub fn live_sessions_per_connection(&self) -> Vec<usize> {
         self.sessions
             .lock()
             .iter()
             .map(|map| map.lock().live.len())
+            .collect()
+    }
+
+    /// `get` requests received so far, served or not, per connection in the order they were
+    /// accepted.
+    pub fn received_gets_per_connection(&self) -> Vec<u64> {
+        self.sessions
+            .lock()
+            .iter()
+            .map(|map| map.lock().received)
+            .collect()
+    }
+
+    /// The partition of the session each `get` ran under, per connection in the order they were
+    /// accepted.
+    pub fn served_partitions_per_connection(&self) -> Vec<Vec<Partition>> {
+        self.sessions
+            .lock()
+            .iter()
+            .map(|map| map.lock().served.clone())
             .collect()
     }
 
@@ -239,7 +288,7 @@ impl TestStorageServer {
             )
             .await
             .expect("connect to the test server");
-            connected.push(Arc::new(client));
+            connected.push(client);
         }
         connected
     }
@@ -294,13 +343,13 @@ async fn serve_stream(
         }
         let response = match header.cmd {
             command if command == Command::Authorize as u8 && request.first() == Some(&0) => {
-                serve_session_start(&sessions, &answering).await
+                serve_session_start(&request, &sessions, &answering).await
             }
             command if command == Command::Authorize as u8 && request.first() == Some(&1) => {
                 sessions
                     .lock()
                     .live
-                    .retain(|&live| live != header.session_id);
+                    .retain(|&(live, _)| live != header.session_id);
                 Ok(Bytes::new())
             }
             command if command == Command::Get as u8 => {
@@ -323,20 +372,35 @@ async fn serve_stream(
     }
 }
 
-/// The id of a session started on the connection `sessions` belongs to, answered as `answering`
-/// says, or `SlowDown` where `answering` refuses sessions.
+/// The id of a session `request` starts, for the partition it names, on the connection `sessions`
+/// belongs to, answered as `answering` says, or `SlowDown` where `answering` refuses sessions.
 async fn serve_session_start(
+    request: &[u8],
     sessions: &parking_lot::Mutex<SessionMap>,
     answering: &Answering,
 ) -> Result<Bytes, u32> {
-    if matches!(answering, Answering::RefusingSessions) {
+    sessions.lock().requested += 1;
+    let refusing = match answering {
+        Answering::RefusingSessions => true,
+        Answering::Controlling(starts) => matches!(
+            starts
+                .clone()
+                .wait_for(|starts| *starts != SessionStarts::Hold)
+                .await
+                .map(|starts| *starts),
+            Ok(SessionStarts::Refuse)
+        ),
+        _ => false,
+    };
+    if refusing {
         return Err(QuicServiceError::SlowDown as u32);
     }
+    let partition: [u8; 16] = request[1..17].try_into().expect("a partition");
     let session_id = {
         let mut map = sessions.lock();
         let session_id = map.next;
         map.next += 1;
-        map.live.push(session_id);
+        map.live.push((session_id, Partition::from(partition)));
         session_id
     };
     if let Answering::HoldingSessionStarts(released) = answering {
@@ -346,7 +410,7 @@ async fn serve_session_start(
 }
 
 /// A `get` on `session_id`, served one at a time per connection and held as the server gathers,
-/// or `Failed` where the connection holds no such session.
+/// recording the session's partition, or `Failed` where the connection holds no such session.
 async fn serve_get(
     session_id: u32,
     gets: &AtomicU64,
@@ -354,8 +418,13 @@ async fn serve_get(
     sessions: &parking_lot::Mutex<SessionMap>,
     answering: &Answering,
 ) -> Result<Bytes, u32> {
-    if !sessions.lock().live.contains(&session_id) {
-        return Err(QuicServiceError::Failed as u32);
+    {
+        let mut map = sessions.lock();
+        map.received += 1;
+        let Some(&(_, partition)) = map.live.iter().find(|&&(live, _)| live == session_id) else {
+            return Err(QuicServiceError::Failed as u32);
+        };
+        map.served.push(partition);
     }
     {
         let _serial = serial.lock().await;

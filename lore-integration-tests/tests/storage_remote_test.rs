@@ -7780,4 +7780,184 @@ mod storage_remote_tests {
             })
             .await
     }
+
+    /// A `lore://` connection to `server` over `storage_connections` storage connections, for the
+    /// tests of sessions across connections lost to a close ([`Connection::close_transport`]).
+    /// They run over QUIC alone, as its server keeps sessions per connection, where gRPC keeps
+    /// them on the client.
+    ///
+    /// [`Connection::close_transport`]: lore_transport::Connection::close_transport
+    async fn connect_quic(
+        server: &TestServer,
+        storage_connections: usize,
+    ) -> Arc<lore_transport::Connection> {
+        lore_transport::connection::connect(
+            server.url.as_str(),
+            "reconnect-test",
+            lore_base::types::Partition::default(),
+            storage_connections,
+            "",
+            "",
+            lore_transport::auth::AuthMode::Auto,
+        )
+        .await
+        .expect("connect to the test server")
+    }
+
+    /// `count` payloads seeded on `server` for `partition`, unique to `test`, with their
+    /// addresses.
+    async fn seed_payloads(
+        server: &TestServer,
+        partition: lore_base::types::Partition,
+        test: &str,
+        count: usize,
+    ) -> Vec<(lore_base::types::Address, bytes::Bytes)> {
+        let mut seeded = Vec::with_capacity(count);
+        for index in 0..count {
+            let payload = bytes::Bytes::from(format!("{test} payload {index}"));
+            seeded.push((seed_server(server, partition, &payload).await, payload));
+        }
+        seeded
+    }
+
+    /// A pool's sessions spread over several storage connections serve once every connection is
+    /// lost, as often as they are: gets, the existing-fragment query a push makes, and a mutable
+    /// store all succeed through the session the pool started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_pool_serves_after_its_connections_are_lost() -> TestResult {
+        use lore_transport::quic::storage_service::QueryStatus;
+
+        let execution = setup_execution("storage-remote-lost-connections".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_quic_test_server().await;
+                let partition = lore_base::types::Partition::from([0xc1u8; 16]);
+                let seeded = seed_payloads(&server, partition, "lost-connections", 16).await;
+                let addresses: Vec<_> = seeded.iter().map(|(address, _)| *address).collect();
+                let connection = connect_quic(&server, 4).await;
+                let session = connection.session(partition, "lost-connections").await?;
+
+                for round in 0..3u8 {
+                    if round > 0 {
+                        connection.close_transport().await;
+                    }
+                    for (address, payload) in &seeded {
+                        let (_, fetched) = session.get(address).await?;
+                        assert_eq!(
+                            &fetched, payload,
+                            "round {round}: a get returns its payload"
+                        );
+                    }
+                    let found = session.query(&addresses).await?;
+                    assert!(
+                        found
+                            .iter()
+                            .all(|&status| status == QueryStatus::ExistFullMatch as u8),
+                        "round {round}: the query finds every fragment: {found:?}",
+                    );
+                    let key = Hash::from([0xc2 + round; 32]);
+                    let value = Hash::from([0xd2 + round; 32]);
+                    session.mutable_store(key, value, REMOTE_KEY_TYPE).await?;
+                    assert_eq!(
+                        server
+                            .backend_mutable
+                            .clone()
+                            .load(partition, key, REMOTE_KEY_TYPE)
+                            .await?,
+                        value,
+                        "round {round}: the server holds the stored key",
+                    );
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Sessions of two partitions and two correlation ids on one storage connection each serve
+    /// under their own partition once it is lost. The session used first after the loss is issued
+    /// the id the session used next held on the lost connection, and that session's command must
+    /// not run under it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_on_a_lost_connection_keep_their_partitions() -> TestResult {
+        let execution = setup_execution("storage-remote-lost-connection-partitions".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_quic_test_server().await;
+                let connection = connect_quic(&server, 1).await;
+                let first = lore_base::types::Partition::from([0xc3u8; 16]);
+                let second = lore_base::types::Partition::from([0xc4u8; 16]);
+                let mut sessions = Vec::new();
+                for (partition, correlation_id) in
+                    [(first, "first"), (second, "first"), (first, "second")]
+                {
+                    let pool = connection
+                        .unpinned_session_pool(partition, correlation_id)
+                        .await?;
+                    sessions.push((partition, lore_transport::StorageSession::pooled(pool)));
+                }
+
+                connection.close_transport().await;
+                for index in [1usize, 0, 2] {
+                    let (partition, session) = &sessions[index];
+                    let key = Hash::from([0xe0 + index as u8; 32]);
+                    let value = Hash::from([0xf0 + index as u8; 32]);
+                    session.mutable_store(key, value, REMOTE_KEY_TYPE).await?;
+                    let other = if *partition == first { second } else { first };
+                    assert_eq!(
+                        server
+                            .backend_mutable
+                            .clone()
+                            .load(*partition, key, REMOTE_KEY_TYPE)
+                            .await?,
+                        value,
+                        "session {index} stores under its own partition",
+                    );
+                    assert!(
+                        server
+                            .backend_mutable
+                            .clone()
+                            .load(other, key, REMOTE_KEY_TYPE)
+                            .await
+                            .is_err(),
+                        "session {index} stores nothing under another partition",
+                    );
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Gets racing the loss of every storage connection each return their payload, whether sent
+    /// before the loss or after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gets_racing_a_connection_loss_complete() -> TestResult {
+        use lore_base::lore_spawn;
+
+        let execution = setup_execution("storage-remote-lost-connections-in-flight".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_quic_test_server().await;
+                let partition = lore_base::types::Partition::from([0xc5u8; 16]);
+                let seeded = seed_payloads(&server, partition, "in-flight", 64).await;
+                let connection = connect_quic(&server, 4).await;
+                let session = connection.session(partition, "in-flight").await?;
+
+                let mut gets = tokio::task::JoinSet::new();
+                for (address, payload) in seeded {
+                    let session = session.clone();
+                    lore_spawn!(gets, async move {
+                        session
+                            .get(&address)
+                            .await
+                            .map(|(_, fetched)| fetched == payload)
+                    });
+                }
+                connection.close_transport().await;
+                while let Some(fetched) = gets.join_next().await {
+                    assert!(fetched??, "a get returns its payload");
+                }
+                Ok(())
+            })
+            .await
+    }
 }

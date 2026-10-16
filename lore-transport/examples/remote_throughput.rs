@@ -386,7 +386,7 @@ async fn connect_clients(
             .session_start(repository, "remote-throughput")
             .await
             .expect("session start");
-        clients.push((Arc::new(client), session_id));
+        clients.push((client, session_id));
     }
     Arc::new(clients)
 }

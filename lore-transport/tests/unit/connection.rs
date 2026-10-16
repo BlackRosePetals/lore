@@ -471,11 +471,10 @@ async fn an_unpinned_pool_stops_its_server_sessions_when_dropped() {
     .await;
 }
 
-/// A reconnect numbers the server's sessions from 1 again, so the ids a stale pool holds may name
-/// the sessions its replacement starts. Replacing it stops none of them, and the replacement serves
-/// on every connection while the stale pool is still held.
+/// The pool that replaces an invalidated one serves on every connection while the invalidated pool
+/// is still held.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stale_pool_replaced_after_a_reconnect_leaves_its_replacement_serving() {
+async fn an_invalidated_pools_replacement_serves_on_every_connection() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_address;
     use crate::quic::storage_service::test_server::test_partition;
@@ -488,7 +487,6 @@ async fn a_stale_pool_replaced_after_a_reconnect_leaves_its_replacement_serving(
         .expect("session over the detached storage");
     stale.get(&test_address(0)).await.expect("fetch");
 
-    server.restart_sessions();
     stale.invalidate().await;
     let fresh = connection
         .session(test_partition(), "correlation")

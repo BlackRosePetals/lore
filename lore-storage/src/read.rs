@@ -124,11 +124,10 @@ impl Drop for RemoteFetchGuard {
     }
 }
 
-/// Fetch a fragment from a remote session with retry on `SlowDown` and on
-/// transient `NotConnected` responses (e.g. the server's session-id map was
-/// reset by a QUIC reconnect; the storage layer mapping turns this into
-/// `StorageError::NotConnected`, which we recover from by invalidating the
-/// cached session and retrying with a fresh `session_start`).
+/// Fetch a fragment from a remote session with retry on `SlowDown` and on `NotConnected`, which
+/// the storage layer maps every failure of the session but a miss, `Disconnected` and `SlowDown`
+/// to ([`protocol_error_to_storage`](crate::error::protocol_error_to_storage)). A `NotConnected`
+/// invalidates the session before its retry, so a lazy one starts its server-side sessions again.
 ///
 /// `Disconnected` is deliberately not retried here: on both transports it means the
 /// transport already exhausted its own reconnect-and-reissue and gave up, so the remote
@@ -184,9 +183,7 @@ async fn remote_get_retry(
 /// Bound on retries for `StorageError::NotConnected` in `remote_get_retry`.
 /// Picked so a genuinely permanent server-side failure surfaces quickly
 /// rather than looping through the full `store_retry` backoff schedule (60
-/// attempts up to 10 s apart). Recovery from a QUIC reconnect typically
-/// succeeds on the first or second retry once the session has been
-/// re-established.
+/// attempts up to 10 s apart).
 const MAX_STALE_SESSION_RETRIES: u32 = 5;
 
 /// Outcome of probing the local store for a fragment, distinguishing a plain miss (nothing to

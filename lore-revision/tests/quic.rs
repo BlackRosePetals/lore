@@ -48,9 +48,9 @@ mod tests {
             let error_size = size_of::<ProtocolError>();
             let result_size = size_of::<Result<(Fragment, Bytes), ProtocolError>>();
 
-            // Never change this value - if the test fails, it means the code that caused the
+            // Never raise this value - if the test fails, it means the code that caused the
             // future size to increase must be fixed/refactored. This constant should remain.
-            const EXPECTED_SIZE: usize = 360;
+            const EXPECTED_SIZE: usize = 320;
             assert!(
                 quic_get_future_size <= EXPECTED_SIZE,
                 "If this test fails, the protocol get future size has increased and you need to look into why\nQUIC protocol get inner future \"{quic_get_future_type}\" currently {quic_get_future_size} bytes, should be {EXPECTED_SIZE} or less\nActual future type \"{actual_type}\" and size {actual_size}\nProtocolError size: {error_size}\nResult size: {result_size}"

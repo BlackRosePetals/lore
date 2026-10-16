@@ -2063,7 +2063,10 @@ Within a connection a client opens *sessions*. A session binds a repository (par
 correlation ID, and a user identity to a server-assigned `u32` session ID. Many concurrent
 sessions per connection are supported, allocated monotonically and not reused within a
 connection. The Authorize command creates and ends sessions; every subsequent storage
-command carries the session ID in its header.
+command carries the session ID in its header. A session lives as long as its connection:
+when the client reconnects, it starts each session again on the new connection before the
+next command under it, so a session ID is only ever sent on the connection that assigned
+it.
 
 The combination - several streams, pipelined commands per stream, many sessions per
 connection - lets a single connection saturate available bandwidth without head-of-line
