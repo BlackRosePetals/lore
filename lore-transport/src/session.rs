@@ -13,12 +13,11 @@ use crossbeam::epoch::Owned;
 use crossbeam::epoch::Shared;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use lore_base::lore_drain_tasks;
 use lore_base::lore_spawn_net;
+use lore_base::runtime::DetachingJoinSet;
 use lore_base::types::*;
-use parking_lot::Mutex;
+use lore_error_set::prelude::*;
 use tokio::sync::Mutex as TokioMutex;
-use tokio::task::JoinSet;
 
 use crate::connection::Connection;
 use crate::error::ProtocolError;
@@ -685,9 +684,11 @@ impl StorageConnector {
     ///
     /// On a miss, one server-side session is started per underlying connection, in
     /// parallel. The first writer wins the partition's entry, vacant, expired, stale or for
-    /// another correlation id alike. No session is stopped here: each stops its own when its
-    /// last reference drops, a losing racer's as its pool drops. A replaced entry's ids may
-    /// name sessions this one started, since a reconnect restarts the server's session ids.
+    /// another correlation id alike. Each started session is held as a [`StorageSession`], which
+    /// stops it when its last reference drops: a losing racer's as its pool drops, and a failed
+    /// or dropped start's as each start task ends, which it runs to even when this future is
+    /// dropped. A replaced entry's ids may name sessions this one started, since a reconnect
+    /// restarts the server's session ids.
     pub async fn session_pool(
         &self,
         partition: Partition,
@@ -705,25 +706,26 @@ impl StorageConnector {
         }
 
         // Slow path: start one session per connection in parallel. No lock held.
-        let started = Arc::new(Mutex::new(Vec::with_capacity(self.connections.len())));
-        let mut tasks = JoinSet::new();
+        let correlation: Arc<str> = Arc::from(correlation_id);
+        let mut tasks = DetachingJoinSet::default();
         for storage in self.connections.iter().cloned() {
-            let correlation_id = correlation_id.to_string();
-            let started = started.clone();
+            let correlation = correlation.clone();
+            let connection = connection.clone();
             lore_spawn_net!(tasks, async move {
-                let session_id = storage.session_start(partition, &correlation_id).await?;
-                started.lock().push((storage, session_id));
-                Ok::<_, ProtocolError>(())
+                let session_id = storage.session_start(partition, &correlation).await?;
+                Ok::<_, ProtocolError>(StorageSession::resolved(
+                    storage,
+                    connection,
+                    session_id,
+                    partition,
+                    correlation,
+                ))
             });
         }
-        lore_drain_tasks!(
-            tasks,
-            ProtocolError::internal("session_start task join failure")
-        )?;
-        let Ok(started) = Arc::try_unwrap(started) else {
-            unreachable!("session_start tasks dropped their Arc<Mutex<_>> clones");
-        };
-        let started: Vec<(Arc<dyn Storage>, u32)> = started.into_inner();
+        let mut sessions = Vec::with_capacity(tasks.len());
+        while let Some(started) = tasks.join_next().await {
+            sessions.push(Arc::new(started.internal("session_start task join")??));
+        }
 
         // session_start succeeded on every connection in parallel above; the partition is now
         // in `authorized_repos` of every server-side `SessionMap` for the pool. Even on the
@@ -733,20 +735,6 @@ impl StorageConnector {
         // to mark the partition as authorized for any future fast-path query.
         self.mark_partition_authorized(partition);
 
-        // Build the pool with strong refs to every session.
-        let correlation: Arc<str> = Arc::from(correlation_id);
-        let sessions: Vec<Arc<StorageSession>> = started
-            .into_iter()
-            .map(|(storage, session_id)| {
-                Arc::new(StorageSession::resolved(
-                    storage,
-                    connection.clone(),
-                    session_id,
-                    partition,
-                    correlation.clone(),
-                ))
-            })
-            .collect();
         let pool = Arc::new(SessionPool::new(correlation, sessions));
 
         #[allow(clippy::disallowed_methods)]

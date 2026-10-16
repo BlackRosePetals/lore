@@ -203,6 +203,36 @@ where
     }
 }
 
+/// A [`JoinSet`] that detaches its tasks when dropped rather than aborting them, for tasks that
+/// must not stop part way. A detached task runs to its end, and its output is dropped then.
+pub struct DetachingJoinSet<T: 'static>(JoinSet<T>);
+
+impl<T: 'static> Default for DetachingJoinSet<T> {
+    fn default() -> Self {
+        Self(JoinSet::new())
+    }
+}
+
+impl<T: 'static> std::ops::Deref for DetachingJoinSet<T> {
+    type Target = JoinSet<T>;
+
+    fn deref(&self) -> &JoinSet<T> {
+        &self.0
+    }
+}
+
+impl<T: 'static> std::ops::DerefMut for DetachingJoinSet<T> {
+    fn deref_mut(&mut self) -> &mut JoinSet<T> {
+        &mut self.0
+    }
+}
+
+impl<T: 'static> Drop for DetachingJoinSet<T> {
+    fn drop(&mut self) {
+        self.0.detach_all();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Spawn macros — propagate LORE_CONTEXT to spawned tasks
 // ---------------------------------------------------------------------------

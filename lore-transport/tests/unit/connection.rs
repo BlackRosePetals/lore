@@ -384,22 +384,6 @@ async fn a_session_spreads_requests_over_every_storage_connection() {
     assert_eq!(server.gets_per_connection(), vec![100, 100, 100, 100]);
 }
 
-/// Waits until `server` holds `live` sessions per connection, failing with `failure` after ten
-/// seconds.
-async fn until_live(
-    server: &crate::quic::storage_service::test_server::TestStorageServer,
-    live: &[usize],
-    failure: &str,
-) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while server.live_sessions_per_connection() != live {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect(failure);
-}
-
 /// Calls under one correlation id share the pool the connection pins for a partition, so its
 /// sessions start once however many calls take it. A call under another correlation id pins a
 /// pool of its own in its place, and the sessions of the one it replaces stop.
@@ -407,6 +391,7 @@ async fn until_live(
 async fn a_pinned_pool_serves_its_correlation_id_until_another_replaces_it() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_partition;
+    use crate::quic::storage_service::test_server::wait_until;
 
     let server = TestStorageServer::start();
     let connection = Connection::detached(server.connect(2).await);
@@ -424,9 +409,8 @@ async fn a_pinned_pool_serves_its_correlation_id_until_another_replaces_it() {
         .expect("a pool");
 
     assert_eq!(server.started_sessions_per_connection(), vec![2, 2]);
-    until_live(
-        &server,
-        &[1, 1],
+    wait_until(
+        || server.live_sessions_per_connection() == [1, 1],
         "the replaced pool's server sessions were left open",
     )
     .await;
@@ -438,6 +422,7 @@ async fn a_pinned_pool_serves_its_correlation_id_until_another_replaces_it() {
 async fn a_replaced_pool_leaves_another_partitions_pool_pinned() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_partition;
+    use crate::quic::storage_service::test_server::wait_until;
 
     let server = TestStorageServer::start();
     let connection = Connection::detached(server.connect(2).await);
@@ -455,9 +440,8 @@ async fn a_replaced_pool_leaves_another_partitions_pool_pinned() {
     }
 
     assert_eq!(server.started_sessions_per_connection(), vec![3, 3]);
-    until_live(
-        &server,
-        &[2, 2],
+    wait_until(
+        || server.live_sessions_per_connection() == [2, 2],
         "the replaced pool's server sessions were left open",
     )
     .await;
@@ -468,6 +452,7 @@ async fn a_replaced_pool_leaves_another_partitions_pool_pinned() {
 async fn an_unpinned_pool_stops_its_server_sessions_when_dropped() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_partition;
+    use crate::quic::storage_service::test_server::wait_until;
 
     let server = TestStorageServer::start();
     let connection = Connection::detached(server.connect(2).await);
@@ -479,9 +464,8 @@ async fn an_unpinned_pool_stops_its_server_sessions_when_dropped() {
 
     drop(pool);
 
-    until_live(
-        &server,
-        &[0, 0],
+    wait_until(
+        || server.live_sessions_per_connection() == [0, 0],
         "the unpinned pool's server sessions were left open",
     )
     .await;

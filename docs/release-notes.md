@@ -106,6 +106,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   connection to the remote. Each storage call used to leave one session open per storage connection on the connection
   every handle to the remote shares, so a process that made about 10,000 storage calls to one remote had every later
   call refused until it restarted, the server allowing that many sessions per connection
+- A storage session pool whose start fails on one of its connections, or is cancelled, stops every session it started,
+  those still starting included. They stayed open on the server for the life of their connection, so once
+  one connection reached the server's session limit, every retry moved the others towards it as well
 - Caches and prefetches check every payload they fetch on receipt, as reads do, unless the command trusts the remote,
   where they stored most payloads unchecked. A cache walk, which trusts the lists the local store holds, fails once it
   walks deeper than any fragment tree reaches

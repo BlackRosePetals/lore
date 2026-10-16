@@ -3,14 +3,14 @@
 //! A loopback QUIC server speaking just enough of lore-storage/0.4 for client tests: session
 //! start and stop, the client's user agent, and `get` of any address on a live session.
 //!
-//! Each connection serves one `get` at a time. A gathering server holds each until every
-//! connection has one in flight, so its `get`s finish only when they are spread over all of them.
+//! Each connection serves one `get` at a time. How the server answers is its [`Answering`].
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::Bytes;
 use lore_base::lore_spawn;
@@ -51,6 +51,17 @@ pub(crate) fn test_address(index: usize) -> Address {
     }
 }
 
+/// Waits until `condition` holds, failing with `failure` after ten seconds.
+pub(crate) async fn wait_until(condition: impl Fn() -> bool, failure: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect(failure);
+}
+
 pub(crate) struct TestStorageServer {
     pub url: String,
     gets: Arc<parking_lot::Mutex<Vec<Arc<AtomicU64>>>>,
@@ -74,6 +85,21 @@ impl Default for SessionMap {
     }
 }
 
+/// How a server answers its requests.
+#[derive(Clone)]
+enum Answering {
+    /// Every request at once.
+    AtOnce,
+    /// Every `get` once each of a number of connections has one in flight, so its `get`s finish
+    /// only when they are spread over all of them.
+    Gathering(Arc<tokio::sync::Barrier>),
+    /// Every session start with `SlowDown`, as a server does once a connection holds as many
+    /// sessions as it allows.
+    RefusingSessions,
+    /// Every session start once the receiver reads `true`, having started the session at once.
+    HoldingSessionStarts(tokio::sync::watch::Receiver<bool>),
+}
+
 impl Drop for TestStorageServer {
     fn drop(&mut self) {
         self.endpoint.close(0u32.into(), b"test over");
@@ -81,18 +107,35 @@ impl Drop for TestStorageServer {
 }
 
 impl TestStorageServer {
-    /// Serves on a loopback port, answering each `get` at once.
+    /// Serves on a loopback port, answering each request at once.
     pub fn start() -> Self {
-        Self::serve(None)
+        Self::serve(Answering::AtOnce)
     }
 
     /// Serves on a loopback port, holding each `get` until each of `connections` connections has
     /// one in flight.
     pub fn start_gathering(connections: usize) -> Self {
-        Self::serve(Some(Arc::new(tokio::sync::Barrier::new(connections))))
+        Self::serve(Answering::Gathering(Arc::new(tokio::sync::Barrier::new(
+            connections,
+        ))))
     }
 
-    fn serve(gathering: Option<Arc<tokio::sync::Barrier>>) -> Self {
+    /// Serves on a loopback port, answering every session start with `SlowDown`.
+    pub fn start_refusing_sessions() -> Self {
+        Self::serve(Answering::RefusingSessions)
+    }
+
+    /// Serves on a loopback port, starting each session at once and holding its answer until
+    /// `true` is sent on the returned sender.
+    pub fn start_holding_session_starts() -> (Self, tokio::sync::watch::Sender<bool>) {
+        let (release, released) = tokio::sync::watch::channel(false);
+        (
+            Self::serve(Answering::HoldingSessionStarts(released)),
+            release,
+        )
+    }
+
+    fn serve(answering: Answering) -> Self {
         let certificate = lore_transport::tls::generate_self_signed(vec!["127.0.0.1".to_string()])
             .expect("self-signed certificate");
         let chain = vec![
@@ -133,7 +176,7 @@ impl TestStorageServer {
                 accepted.lock().push(count.clone());
                 let map = Arc::new(parking_lot::Mutex::new(SessionMap::default()));
                 accepted_sessions.lock().push(map.clone());
-                lore_spawn!(serve_connection(connection, count, map, gathering.clone()));
+                lore_spawn!(serve_connection(connection, count, map, answering.clone()));
             }
         });
 
@@ -219,7 +262,7 @@ async fn serve_connection(
     connection: quinn::Connection,
     gets: Arc<AtomicU64>,
     sessions: Arc<parking_lot::Mutex<SessionMap>>,
-    gathering: Option<Arc<tokio::sync::Barrier>>,
+    answering: Answering,
 ) {
     let serial = Arc::new(tokio::sync::Mutex::new(()));
     while let Ok((send, recv)) = connection.accept_bi().await {
@@ -229,7 +272,7 @@ async fn serve_connection(
             gets.clone(),
             serial.clone(),
             sessions.clone(),
-            gathering.clone(),
+            answering.clone(),
         ));
     }
 }
@@ -240,7 +283,7 @@ async fn serve_stream(
     gets: Arc<AtomicU64>,
     serial: Arc<tokio::sync::Mutex<()>>,
     sessions: Arc<parking_lot::Mutex<SessionMap>>,
-    gathering: Option<Arc<tokio::sync::Barrier>>,
+    answering: Answering,
 ) {
     let mut header_bytes = [0u8; COMMAND_HEADER_SIZE_V4];
     while recv.read_exact(&mut header_bytes).await.is_ok() {
@@ -251,11 +294,7 @@ async fn serve_stream(
         }
         let response = match header.cmd {
             command if command == Command::Authorize as u8 && request.first() == Some(&0) => {
-                let mut map = sessions.lock();
-                let session_id = map.next;
-                map.next += 1;
-                map.live.push(session_id);
-                Ok(Bytes::copy_from_slice(&session_id.to_le_bytes()))
+                serve_session_start(&sessions, &answering).await
             }
             command if command == Command::Authorize as u8 && request.first() == Some(&1) => {
                 sessions
@@ -265,7 +304,7 @@ async fn serve_stream(
                 Ok(Bytes::new())
             }
             command if command == Command::Get as u8 => {
-                serve_get(header.session_id, &gets, &serial, &sessions, &gathering).await
+                serve_get(header.session_id, &gets, &serial, &sessions, &answering).await
             }
             _ => Ok(Bytes::new()),
         };
@@ -284,6 +323,28 @@ async fn serve_stream(
     }
 }
 
+/// The id of a session started on the connection `sessions` belongs to, answered as `answering`
+/// says, or `SlowDown` where `answering` refuses sessions.
+async fn serve_session_start(
+    sessions: &parking_lot::Mutex<SessionMap>,
+    answering: &Answering,
+) -> Result<Bytes, u32> {
+    if matches!(answering, Answering::RefusingSessions) {
+        return Err(QuicServiceError::SlowDown as u32);
+    }
+    let session_id = {
+        let mut map = sessions.lock();
+        let session_id = map.next;
+        map.next += 1;
+        map.live.push(session_id);
+        session_id
+    };
+    if let Answering::HoldingSessionStarts(released) = answering {
+        let _ = released.clone().wait_for(|released| *released).await;
+    }
+    Ok(Bytes::copy_from_slice(&session_id.to_le_bytes()))
+}
+
 /// A `get` on `session_id`, served one at a time per connection and held as the server gathers,
 /// or `Failed` where the connection holds no such session.
 async fn serve_get(
@@ -291,14 +352,14 @@ async fn serve_get(
     gets: &AtomicU64,
     serial: &tokio::sync::Mutex<()>,
     sessions: &parking_lot::Mutex<SessionMap>,
-    gathering: &Option<Arc<tokio::sync::Barrier>>,
+    answering: &Answering,
 ) -> Result<Bytes, u32> {
     if !sessions.lock().live.contains(&session_id) {
         return Err(QuicServiceError::Failed as u32);
     }
     {
         let _serial = serial.lock().await;
-        if let Some(gathering) = gathering {
+        if let Answering::Gathering(gathering) = answering {
             gathering.wait().await;
         }
     }

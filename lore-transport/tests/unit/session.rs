@@ -81,6 +81,7 @@ mod pooled {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_address as address;
     use crate::quic::storage_service::test_server::test_partition as partition;
+    use crate::quic::storage_service::test_server::wait_until;
 
     /// A pool of one resolved session per storage connection to `server`.
     async fn pool_over(server: &TestStorageServer, connections: usize) -> Arc<SessionPool> {
@@ -194,5 +195,130 @@ mod pooled {
         .expect("a connection served no request while the others waited for it");
 
         assert_eq!(server.gets_per_connection(), vec![16; CONNECTIONS]);
+    }
+
+    /// A pool that fails to start on one connection stops the sessions it started on the others.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pool_that_fails_to_start_stops_the_sessions_it_started() {
+        let serving = TestStorageServer::start();
+        let refusing = TestStorageServer::start_refusing_sessions();
+        let mut connections = serving.connect(2).await;
+        connections.extend(refusing.connect(1).await);
+        let connector = StorageConnector::new(connections);
+
+        let started = connector
+            .session_pool(partition(), "test", Connection::detached(Vec::new()))
+            .await;
+
+        assert!(started.is_err_and(|err| err.is_slow_down()));
+        assert_eq!(serving.started_sessions_per_connection(), vec![1, 1]);
+        wait_until(
+            || serving.live_sessions_per_connection() == [0, 0],
+            "the sessions started on the serving connections were left open",
+        )
+        .await;
+    }
+
+    /// A pool start dropped while its session starts are in flight stops the sessions they open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_pool_start_stops_the_sessions_in_flight() {
+        let (server, release) = TestStorageServer::start_holding_session_starts();
+        let connector = Arc::new(StorageConnector::new(server.connect(2).await));
+        let starting = lore_spawn_net!({
+            let connector = connector.clone();
+            async move {
+                connector
+                    .session_pool(partition(), "test", Connection::detached(Vec::new()))
+                    .await
+            }
+        });
+        wait_until(
+            || server.started_sessions_per_connection() == [1, 1],
+            "the session starts never reached the server",
+        )
+        .await;
+
+        starting.abort();
+        assert!(starting.await.is_err_and(|err| err.is_cancelled()));
+        release.send_replace(true);
+
+        wait_until(
+            || server.live_sessions_per_connection() == [0, 0],
+            "the sessions the dropped start opened were left open",
+        )
+        .await;
+    }
+
+    /// A pool start dropped while one of its session starts is held stops each session already
+    /// started without waiting for the held start to end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_pool_start_stops_each_session_as_its_start_ends() {
+        let serving = TestStorageServer::start();
+        let (holding, release) = TestStorageServer::start_holding_session_starts();
+        let mut connections = serving.connect(1).await;
+        connections.extend(holding.connect(1).await);
+        let connector = Arc::new(StorageConnector::new(connections));
+        let starting = lore_spawn_net!({
+            let connector = connector.clone();
+            async move {
+                connector
+                    .session_pool(partition(), "test", Connection::detached(Vec::new()))
+                    .await
+            }
+        });
+        wait_until(
+            || holding.started_sessions_per_connection() == [1],
+            "the held session start never reached the server",
+        )
+        .await;
+
+        starting.abort();
+        assert!(starting.await.is_err_and(|err| err.is_cancelled()));
+
+        wait_until(
+            || serving.live_sessions_per_connection() == [0],
+            "the started session was left open while another start was held",
+        )
+        .await;
+        release.send_replace(true);
+    }
+
+    /// Pool starts racing for one partition under one correlation id all take the winner's pool,
+    /// and the sessions the loser started stop. The second start begins once the first's starts
+    /// reach the server, so each held start is on a stream of its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn racing_pool_starts_share_the_winners_pool_and_stop_the_losers_sessions() {
+        let (server, release) = TestStorageServer::start_holding_session_starts();
+        let connector = Arc::new(StorageConnector::new(server.connect(2).await));
+        let start = || {
+            let connector = connector.clone();
+            lore_spawn_net!(async move {
+                connector
+                    .session_pool(partition(), "test", Connection::detached(Vec::new()))
+                    .await
+            })
+        };
+        let first = start();
+        wait_until(
+            || server.started_sessions_per_connection() == [1, 1],
+            "the first start never reached the server",
+        )
+        .await;
+        let second = start();
+        wait_until(
+            || server.started_sessions_per_connection() == [2, 2],
+            "the second start never reached the server",
+        )
+        .await;
+        release.send_replace(true);
+
+        let first = first.await.expect("joined").expect("a pool");
+        let second = second.await.expect("joined").expect("a pool");
+        assert!(Arc::ptr_eq(&first, &second));
+        wait_until(
+            || server.live_sessions_per_connection() == [1, 1],
+            "the losing start's sessions were left open",
+        )
+        .await;
     }
 }

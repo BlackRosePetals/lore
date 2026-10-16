@@ -16,6 +16,7 @@ mod topology_refresh;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::lore_spawn;
+use lore_base::runtime::DetachingJoinSet;
 use lore_error_set::prelude::*;
 use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
@@ -27,7 +28,6 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::StoreObliterateStats;
@@ -515,13 +515,13 @@ where
     T: 'static,
 {
     cancellation_token: CancellationToken,
-    queries: JoinSet<T>,
+    queries: DetachingJoinSet<T>,
 }
 
 impl<T> CompositeOperation<T> {
     fn new() -> Self {
         Self {
-            queries: JoinSet::new(),
+            queries: DetachingJoinSet::default(),
             cancellation_token: CancellationToken::new(),
         }
     }
@@ -533,10 +533,6 @@ where
 {
     fn drop(&mut self) {
         self.cancellation_token.cancel();
-        // not every target of a composite store operation is cancel
-        // safe, e.g. QUIC futures writing to a connection.
-        // Therefore, it is safest to detach all
-        self.queries.detach_all();
     }
 }
 
