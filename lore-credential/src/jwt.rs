@@ -10,6 +10,12 @@ use serde_with::serde_as;
 
 use crate::token_store::IdentityToken;
 
+/// The claim an issuer puts the user identity in when `sub` is not it.
+pub const IDENTITY_CLAIM: &str = "identity";
+/// The namespaced alias of [`IDENTITY_CLAIM`], for providers that require namespaced custom
+/// claims.
+pub const IDENTITY_CLAIM_NAMESPACED: &str = "https://lore.org/claims/identity";
+
 #[derive(Debug, Default, Clone)]
 pub struct UserInfo {
     pub id: String,
@@ -26,8 +32,20 @@ pub struct UserInfo {
 pub struct JWTUserInfo {
     #[serde(rename = "iss")]
     pub issuer: String,
+    /// The subject. The identity this token names may be another claim, see
+    /// [`JWTUserInfo::identity`].
     #[serde(rename = "sub")]
     pub user_id: String,
+    /// `None` when the claim is absent; `Some` holds whatever was carried, a JSON `null`
+    /// included, so presence decides (see [`JWTUserInfo::identity`]).
+    #[serde(default, rename = "identity", deserialize_with = "present")]
+    pub identity: Option<serde_json::Value>,
+    #[serde(
+        default,
+        rename = "https://lore.org/claims/identity",
+        deserialize_with = "present"
+    )]
+    pub identity_namespaced: Option<serde_json::Value>,
     pub name: Option<String>,
     pub preferred_username: Option<String>,
     pub is_service_account: Option<bool>,
@@ -44,7 +62,36 @@ pub struct JWTUserInfo {
     pub root_domains_namespaced: Option<Vec<String>>,
 }
 
+/// Keeps a present claim present: a JSON `null` decodes as `Some(Value::Null)`, where
+/// `Option<Value>` alone would read it as absent.
+fn present<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
 impl JWTUserInfo {
+    /// The identity this token names: the first of `identity`, its namespaced alias and `sub`
+    /// the token carries, and only that one. `None` when that claim is empty, `null` or not a
+    /// string, so the token names no one; the rule does not fall through to the next claim.
+    pub fn identity(&self) -> Option<&str> {
+        self.identity_source().1
+    }
+
+    /// The name of the claim that decides the identity, and its value when it is a non-empty
+    /// string.
+    pub fn identity_source(&self) -> (&'static str, Option<&str>) {
+        let (claim, value) = [
+            (IDENTITY_CLAIM, &self.identity),
+            (IDENTITY_CLAIM_NAMESPACED, &self.identity_namespaced),
+        ]
+        .into_iter()
+        .find_map(|(claim, value)| value.as_ref().map(|value| (claim, value.as_str())))
+        .unwrap_or(("sub", Some(self.user_id.as_str())));
+        (claim, value.filter(|value| !value.is_empty()))
+    }
+
     /// The root domains this token may be sent to, read from claims the issuer signed.
     ///
     /// The `root_domains` claim, or its namespaced alias, wins. Otherwise `aud` entries with a
@@ -135,12 +182,15 @@ pub fn insecure_decode_token(
     jsonwebtoken::decode::<JWTUserInfo>(token, &key, &validation)
 }
 
+/// The user a token names. `None` when the token is not a JWT with the standard claims, or
+/// names no identity (see [`JWTUserInfo::identity`]).
 pub fn user_info_from_token(token: String) -> Option<UserInfo> {
     let Ok(token_data) = insecure_decode_token(&token) else {
         return None;
     };
+    let id = token_data.claims.identity()?.to_string();
     Some(UserInfo {
-        id: token_data.claims.user_id.clone(),
+        id,
         name: token_data.claims.name.clone().unwrap_or_default(),
         token,
         preferred_username: token_data.claims.preferred_username.unwrap_or_default(),

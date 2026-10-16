@@ -79,8 +79,9 @@ message Oidc {
   // The issuer of the RFC 8693 token-exchange endpoint that mints
   // partition-scoped tokens.
   string token_exchange_issuer = 7;
-  // The claim clients record as the user identity.
-  string identity_claim = 8;
+  // Deprecated and left empty: the user identity is read from the token
+  // itself, its `identity` claim or else `sub`. Kept so older peers decode.
+  string identity_claim = 8 [deprecated = true];
 }
 
 // Composite environment record returned by EnvironmentGet.

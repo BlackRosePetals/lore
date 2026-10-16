@@ -5,6 +5,8 @@ pub mod token_store;
 pub mod util;
 
 // Re-export key types at the crate root for convenience
+pub use jwt::IDENTITY_CLAIM;
+pub use jwt::IDENTITY_CLAIM_NAMESPACED;
 pub use jwt::JWTUserInfo;
 pub use jwt::JwtUsageError;
 pub use jwt::UserInfo;

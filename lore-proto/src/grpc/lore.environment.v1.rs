@@ -90,7 +90,9 @@ pub struct Oidc {
     /// partition-scoped tokens.
     #[prost(string, tag = "7")]
     pub token_exchange_issuer: ::prost::alloc::string::String,
-    /// The claim clients record as the user identity.
+    /// Deprecated and left empty: the user identity is read from the token
+    /// itself, its `identity` claim or else `sub`. Kept so older peers decode.
+    #[deprecated]
     #[prost(string, tag = "8")]
     pub identity_claim: ::prost::alloc::string::String,
 }

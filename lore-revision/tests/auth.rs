@@ -47,6 +47,8 @@ mod tests {
             JWTUserInfo {
                 issuer: "my_test_issuer.example.com".to_string(),
                 user_id: "my_user_id".into(),
+                identity: None,
+                identity_namespaced: None,
                 name: Some("my_name".into()),
                 preferred_username: None,
                 is_service_account: None,

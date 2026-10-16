@@ -130,10 +130,16 @@ pub fn authentication_token(response: TokenResponse) -> Result<AuthenticationTok
             body_excerpt(&token_type)
         )));
     }
-    let Some(access) = lore_credential::user_info_from_token(access_token) else {
+    let Ok(decoded) = lore_credential::insecure_decode_token(&access_token) else {
         return Err(ProtocolError::internal(
             "OIDC access token is not a JWT carrying the standard claims",
         ));
+    };
+    let Some(access) = lore_credential::user_info_from_token(access_token) else {
+        let (claim, _) = decoded.claims.identity_source();
+        return Err(ProtocolError::internal(format!(
+            "OIDC access token names no one: its identity claim '{claim}' is empty, null or not a string"
+        )));
     };
     let identity = id_token.and_then(lore_credential::user_info_from_token);
     let user_name = [identity.as_ref(), Some(&access)]

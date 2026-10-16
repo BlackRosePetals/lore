@@ -44,9 +44,16 @@ class OidcUser:
     user_id: str
     display_name: str
     preferred_username: str
+    # The value minted into the `identity` claim, which names the user when
+    # `sub` does not: a durable id beside a `sub` that differs per client, as
+    # Entra's `oid` is. `None` mints no such claim.
+    identity: str | None = None
 
 
 USER = OidcUser("oidc-user-1", "OIDC User One", "oidcuser1")
+PAIRWISE_USER = OidcUser(
+    "pairwise-sub-1", "Pairwise User", "pairwiseuser", identity="stable-oid-1"
+)
 
 
 @dataclass
@@ -280,17 +287,18 @@ class MockOidcProvider:
         provider emits: no display name, so the name must come from the ID
         token."""
         now = int(time.time())
-        return self._sign(
-            {
-                "iss": self.issuer,
-                "sub": user.user_id,
-                "aud": self.audience,
-                "iat": now,
-                "exp": now + lifetime_seconds,
-                "client_id": self.client_id,
-                "scope": "openid offline_access",
-            }
-        )
+        claims = {
+            "iss": self.issuer,
+            "sub": user.user_id,
+            "aud": self.audience,
+            "iat": now,
+            "exp": now + lifetime_seconds,
+            "client_id": self.client_id,
+            "scope": "openid offline_access",
+        }
+        if user.identity is not None:
+            claims["identity"] = user.identity
+        return self._sign(claims)
 
     def mint_id_token(self, user: OidcUser) -> str:
         now = int(time.time())

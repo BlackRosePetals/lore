@@ -36,6 +36,5 @@ pub async fn advertised_oidc(
         resource_template,
         scope_template,
         token_exchange_issuer,
-        identity_claim: Some(auth.identity_claim.clone()),
     }))
 }

@@ -128,20 +128,6 @@ pub struct Oidc {
     pub scope_template: Option<String>,
     /// The issuer of the RFC 8693 token-exchange endpoint that mints partition-scoped tokens.
     pub token_exchange_issuer: Option<String>,
-    pub identity_claim: Option<String>,
-}
-
-impl Oidc {
-    pub const DEFAULT_IDENTITY_CLAIM: &'static str = "sub";
-
-    /// The claim recorded as the user identity: the advertised one, or `sub` when the server
-    /// names none.
-    pub fn identity_claim(&self) -> &str {
-        match self.identity_claim.as_deref() {
-            Some(claim) if !claim.is_empty() => claim,
-            _ => Self::DEFAULT_IDENTITY_CLAIM,
-        }
-    }
 }
 
 /// A compression mode as it arrives from a server, held as the number it was sent as: the codec

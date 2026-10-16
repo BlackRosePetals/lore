@@ -41,8 +41,11 @@ impl ResourcePermission {
 pub const DEFAULT_RESOURCE_ID_TEMPLATE: &str = "urc-{id}";
 /// The legacy wildcard, the `resource_wildcard` setting's default.
 pub const DEFAULT_RESOURCE_WILDCARD: &str = "urc-*";
-/// The `identity_claim` setting's default: the token's subject.
-pub const DEFAULT_IDENTITY_CLAIM: &str = "sub";
+/// The claim an issuer puts the user identity in when `sub` is not it.
+pub const IDENTITY_CLAIM: &str = "identity";
+/// The namespaced alias of [`IDENTITY_CLAIM`], for providers that require
+/// namespaced custom claims.
+pub const IDENTITY_CLAIM_NAMESPACED: &str = "https://lore.org/claims/identity";
 
 /// Renders repository ids into resource names and matches grant entries
 /// against them. The defaults reproduce the legacy `UrcAuthApi` shape for
@@ -148,16 +151,16 @@ pub struct AuthorizationToken {
     /// claims this struct does not name.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
-    /// The caller's identity, resolved from the claim that is configured
-    /// in `[server.auth].identity_claim`. Uses `sub` by default.
+    /// The caller's identity when the token carries it in the `identity`
+    /// claim or its namespaced alias; `None` when `sub` is the identity.
+    /// Resolved by the verifier, never decoded.
     #[serde(skip)]
     pub identity: Option<String>,
 }
 
 impl AuthorizationToken {
-    /// Token's unique identity: either the claim configured in
-    /// `[server.auth].identity_claim`, or the value of `sub`, if a custom
-    /// claim is not configured.
+    /// The identity the caller is recorded and compared as: the `identity`
+    /// claim where the token carries one, `sub` otherwise.
     pub fn identity(&self) -> &str {
         self.identity.as_deref().unwrap_or(&self.user_id)
     }
@@ -205,7 +208,7 @@ pub enum JwtVerifierError {
     KeyNotFound(#[from] JWKServiceError),
     #[error("JWT validation failed")]
     ValidationFailed(#[from] jsonwebtoken::errors::Error),
-    #[error("JWT carries no non-empty string at the identity claim `{claim}`")]
+    #[error("JWT carries an empty or non-string value at the identity claim `{claim}`")]
     IdentityClaimMissing { claim: String },
     #[error("JWT header `typ` is absent or not an accepted type")]
     TypNotAccepted,
@@ -221,9 +224,6 @@ pub struct JwtVerifier {
     /// Accepted `typ` header values.
     /// `None` skips the check (see [`AuthSettings::jwt_typ`](crate::settings::AuthSettings)).
     pub jwt_typ: Option<Vec<String>>,
-    /// Dotted path of the claim recorded and compared as the caller's
-    /// identity (see [`AuthSettings::identity_claim`](crate::settings::AuthSettings)).
-    pub identity_claim: String,
 }
 
 /// The comparison form of a `typ` header value. RFC 7515 §4.1.9 makes the
@@ -345,7 +345,7 @@ impl JwtVerifier {
 
         debug!("Decoded user info: {:?}", token_data.claims);
         let mut claims = token_data.claims;
-        claims.identity = self.resolve_identity(&claims)?;
+        claims.identity = resolve_identity(&claims)?;
         Ok(claims)
     }
 
@@ -365,26 +365,34 @@ impl JwtVerifier {
         warn!("Rejecting token: the `typ` header is absent or not an accepted type");
         Err(JwtVerifierError::TypNotAccepted)
     }
+}
 
-    /// `None` when the configured claim is `sub`, which `user_id` holds.
-    fn resolve_identity(
-        &self,
-        claims: &AuthorizationToken,
-    ) -> Result<Option<String>, JwtVerifierError> {
-        if self.identity_claim == DEFAULT_IDENTITY_CLAIM {
-            return Ok(None);
-        }
-        match claims.claim_at(&self.identity_claim) {
-            Some(serde_json::Value::String(identity)) if !identity.is_empty() => Ok(Some(identity)),
-            _ => {
-                warn!(
-                    claim = self.identity_claim,
-                    "Rejecting token: the identity claim is absent or not a string"
-                );
-                Err(JwtVerifierError::IdentityClaimMissing {
-                    claim: self.identity_claim.clone(),
-                })
-            }
-        }
+/// The identity `claims` name: the first of `identity`, its namespaced alias
+/// and `sub` the token carries, and only that one. `None` stands for `sub`,
+/// which `user_id` holds. An empty or non-string value at the claim that
+/// decides is an error; the rule does not fall through to the next claim.
+fn resolve_identity(claims: &AuthorizationToken) -> Result<Option<String>, JwtVerifierError> {
+    let refused = |claim: &str| {
+        warn!(
+            claim,
+            "Rejecting token: the identity claim is empty or not a string"
+        );
+        Err(JwtVerifierError::IdentityClaimMissing {
+            claim: claim.to_string(),
+        })
+    };
+    let Some((claim, value)) = [IDENTITY_CLAIM, IDENTITY_CLAIM_NAMESPACED]
+        .into_iter()
+        .find_map(|claim| claims.extra.get(claim).map(|value| (claim, value)))
+    else {
+        return if claims.user_id.is_empty() {
+            refused("sub")
+        } else {
+            Ok(None)
+        };
+    };
+    match value {
+        serde_json::Value::String(identity) if !identity.is_empty() => Ok(Some(identity.clone())),
+        _ => refused(claim),
     }
 }

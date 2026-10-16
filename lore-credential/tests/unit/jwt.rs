@@ -94,3 +94,61 @@ fn a_token_without_the_claims_falls_back_to_audience() {
     let claims = r#"{"iss":"i","sub":"s","exp":1,"aud":["URC",".epicgames.net"]}"#;
     assert_eq!(domains_of(claims), vec![".epicgames.net"]);
 }
+
+fn identity_of(claims: &str) -> Option<String> {
+    user_info_from_token(token_with_claims(claims)).map(|info| info.id)
+}
+
+/// The identity is the first of `identity`, its namespaced alias and `sub` the token carries.
+#[test]
+fn the_identity_claim_wins_over_the_alias_and_the_subject() {
+    let base = r#""iss":"i","sub":"pairwise-sub","exp":2000000000,"aud":["example.com"]"#;
+    assert_eq!(
+        identity_of(&format!(r#"{{{base}}}"#)).as_deref(),
+        Some("pairwise-sub")
+    );
+    assert_eq!(
+        identity_of(&format!(r#"{{{base},"identity":"stable-oid"}}"#)).as_deref(),
+        Some("stable-oid")
+    );
+    assert_eq!(
+        identity_of(&format!(
+            r#"{{{base},"https://lore.org/claims/identity":"alias-oid"}}"#
+        ))
+        .as_deref(),
+        Some("alias-oid")
+    );
+    assert_eq!(
+        identity_of(&format!(
+            r#"{{{base},"identity":"plain","https://lore.org/claims/identity":"alias"}}"#
+        ))
+        .as_deref(),
+        Some("plain")
+    );
+    assert_eq!(
+        identity_from_token(&token_with_claims(&format!(
+            r#"{{{base},"identity":"stable-oid"}}"#
+        ))),
+        "stable-oid"
+    );
+}
+
+/// An empty or non-string value at the deciding claim names no one; the rule does not fall
+/// through to a valid alias or `sub`.
+#[test]
+fn an_empty_or_non_string_identity_names_no_one() {
+    let base = r#""iss":"i","sub":"pairwise-sub","exp":2000000000,"aud":["example.com"]"#;
+    for claims in [
+        format!(r#"{{{base},"identity":""}}"#),
+        format!(r#"{{{base},"identity":"","https://lore.org/claims/identity":"alias"}}"#),
+        format!(r#"{{{base},"identity":7}}"#),
+        format!(r#"{{{base},"identity":null}}"#),
+        format!(r#"{{{base},"identity":null,"https://lore.org/claims/identity":"alias"}}"#),
+        format!(r#"{{{base},"https://lore.org/claims/identity":""}}"#),
+        format!(r#"{{{base},"https://lore.org/claims/identity":null}}"#),
+        r#"{"iss":"i","sub":"","exp":2000000000,"aud":["example.com"]}"#.to_string(),
+    ] {
+        assert_eq!(identity_of(&claims), None, "{claims}");
+        assert!(identity_from_token(&token_with_claims(&claims)).is_empty());
+    }
+}

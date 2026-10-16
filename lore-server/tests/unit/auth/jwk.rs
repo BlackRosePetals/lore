@@ -997,7 +997,6 @@ async fn keys_resolve_through_discovery_and_a_token_verifies() {
         jwt_issuer: Some(vec![provider.base.clone()]),
         jwt_audience: Some(vec!["Lore".to_string()]),
         jwt_typ: None,
-        identity_claim: lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
     };
     let token = {
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);

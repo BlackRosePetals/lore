@@ -63,13 +63,12 @@ fn delete_request(id: RepositoryId, token: AuthorizationToken) -> Request<Reposi
     request
 }
 
-/// The creator check compares the recorded creator against the token's
-/// `identity_claim` value, so a deployment recording
-/// `preferred_username` lets the same user, presenting the same claim,
-/// delete — while the subject the provider minted alongside is not what
-/// is compared.
+/// The creator check compares the recorded creator against the identity the
+/// verifier resolved, so an issuer minting `preferred_username` into the
+/// `identity` claim lets the same user delete, while the subject minted
+/// alongside is not what is compared.
 #[tokio::test]
-async fn the_creator_check_compares_the_identity_claim() {
+async fn the_creator_check_compares_the_resolved_identity() {
     let (immutable_store, mutable_store, execution) =
         test_store_create().await.expect("Failed to create stores");
 

@@ -536,7 +536,6 @@ mod behind_the_interceptor {
     use jsonwebtoken::encode;
     use lore_server::auth::jwk::JWKService;
     use lore_server::auth::jwk::JWKServiceError;
-    use lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM;
     use lore_server::auth::jwt::JwtVerifier;
     use lore_server::auth::jwt_interceptor::JWTInterceptor;
     use serde_json::json;
@@ -584,7 +583,6 @@ mod behind_the_interceptor {
             jwt_issuer: None,
             jwt_audience: Some(vec!["Lore".to_string()]),
             jwt_typ: None,
-            identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
         }));
         let inner = Inner::default();
         let mut stack = InterceptedService::new(

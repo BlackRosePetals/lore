@@ -376,9 +376,6 @@ pub struct AuthSettings {
     /// The resource name that matches every repository.
     #[serde(default = "AuthSettings::default_resource_wildcard")]
     pub resource_wildcard: String,
-    /// The claim recorded and compared as the caller's identity.
-    #[serde(default = "AuthSettings::default_identity_claim")]
-    pub identity_claim: String,
     /// What the repository listing answers for an authenticated caller with
     /// no explicit grant. Gates listing of the IDs only, never grants
     /// access to the contents. Consulted by the `baseline` catalog only.
@@ -430,10 +427,6 @@ impl AuthSettings {
 
     fn default_resource_wildcard() -> String {
         crate::auth::jwt::DEFAULT_RESOURCE_WILDCARD.to_string()
-    }
-
-    fn default_identity_claim() -> String {
-        "sub".to_string()
     }
 }
 

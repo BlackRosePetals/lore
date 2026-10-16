@@ -45,6 +45,13 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   `defragment::MAX_FRAGMENT_TREE_DEPTH` are public
 - Server: added opt-in HTTP health-only mode for deployments that do not serve repository HTTP routes.
 
+- The user identity is read from the token, by the same rule on the client and the server: the `identity` claim, or
+  its namespaced alias `https://lore.org/claims/identity`, where the issuer mints one, and `sub` otherwise. An issuer
+  whose `sub` is not a good identity maps the value it wants into `identity`, such as Entra's `oid` or a username. A
+  token whose deciding claim is empty or not a string is refused. The `[server.auth] identity_claim` setting and the
+  environment response's advertisement of it are gone, since the setting could not reach a token the client reads
+  without the server, such as one passed with `--identity-token` or used under `--offline`
+
 - `lore auth login` against a server that advertises an OIDC issuer logs in through the OAuth 2.0 device authorization
   grant (RFC 8628). The login asks the provider for the server's default scopes and `offline_access`, opens the
   verification URL in the browser, or prints it with `--no-browser`, shows the code the provider's page may ask the user

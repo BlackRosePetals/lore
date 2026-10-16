@@ -380,6 +380,40 @@ async fn the_display_name_falls_back_to_the_access_tokens_claims() {
     assert_eq!(nameless.user_name, "");
 }
 
+/// The identity is the access token's `identity` claim where it carries one, `sub` otherwise,
+/// and a token whose `identity` is empty is refused.
+#[tokio::test]
+async fn the_identity_claim_names_the_user() {
+    for (identity, expected) in [
+        (None, Some("pairwise-sub")),
+        (Some(serde_json::json!("stable-oid")), Some("stable-oid")),
+        (Some(serde_json::json!("")), None),
+        (Some(serde_json::Value::Null), None),
+        (Some(serde_json::json!(7)), None),
+    ] {
+        let carried = identity.clone();
+        let provider = provider_answering_polls(move |issuer, _| {
+            let mut claims = serde_json::json!({
+                "iss": issuer, "sub": "pairwise-sub",
+                "aud": ["lore.test.invalid"], "exp": 2_000_000_000,
+            });
+            if let Some(identity) = &carried {
+                claims["identity"] = identity.clone();
+            }
+            json(&serde_json::json!({ "access_token": jwt(&claims), "token_type": "Bearer" }))
+        })
+        .await;
+
+        match (poll(&provider).await, expected) {
+            (Ok(AuthSessionPoll::Complete(token)), Some(expected)) => {
+                assert_eq!(token.user_id, expected, "{identity:?}");
+            }
+            (Err(refused), None) => assert!(refused.is_internal(), "{refused}"),
+            (other, _) => panic!("{identity:?}: {other:?}"),
+        }
+    }
+}
+
 /// The client presents access tokens as `Bearer` and reads its identity from their claims
 /// (the LEP's P1), so any other token type, and an opaque token, are refused.
 #[tokio::test]

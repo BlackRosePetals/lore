@@ -16,7 +16,6 @@ use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwk::JWKService;
 use lore_server::auth::jwk::JWKServiceError;
 use lore_server::auth::jwt::AuthorizationToken;
-use lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM;
 use lore_server::auth::jwt::JwtVerifier;
 use lore_server::auth::jwt_interceptor::*;
 use lore_server::authnz::repository_authorizer::RawToken;
@@ -53,16 +52,11 @@ impl JWKService for CachedJWKService {
 }
 
 fn interceptor() -> JWTInterceptor {
-    interceptor_with_identity_claim(DEFAULT_IDENTITY_CLAIM)
-}
-
-fn interceptor_with_identity_claim(identity_claim: &str) -> JWTInterceptor {
     JWTInterceptor::new(Some(&JwtVerifier {
         jwk_service: Arc::new(CachedJWKService),
         jwt_issuer: None,
         jwt_audience: Some(vec!["Lore".to_string()]),
         jwt_typ: None,
-        identity_claim: identity_claim.to_string(),
     }))
 }
 
@@ -134,42 +128,47 @@ fn an_authenticated_token_with_no_partition_grant_passes_the_interceptor() {
 }
 
 /// The identity every handler records and compares comes out of the extensions the
-/// interceptor inserts, so this is where `identity_claim` takes effect end to end.
+/// interceptor inserts, so this is where the token's `identity` claim takes effect end to end.
 #[test]
-fn the_identity_claim_decides_what_handlers_read_as_the_user_id() {
-    let token = encode_token(&json!({
+fn the_tokens_identity_claim_decides_what_handlers_read_as_the_user_id() {
+    let exp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .checked_add(Duration::from_secs(60))
+        .unwrap()
+        .as_secs();
+    let claims = json!({
         "iss": "the issuer",
         "sub": "f7d3a1c2-0000-0000-0000-000000000000",
         "preferred_username": "alice",
         "aud": "Lore",
         "iat": 1,
-        "exp": SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .checked_add(Duration::from_secs(60))
-            .unwrap()
-            .as_secs(),
-    }));
+        "exp": exp,
+    });
 
     let request = interceptor()
-        .call(request_with(&token, None))
+        .call(request_with(&encode_token(&claims), None))
         .expect("verifies");
     assert_eq!(
         lore_server::grpc::get_user_id(request.extensions()),
         "f7d3a1c2-0000-0000-0000-000000000000"
     );
 
-    let request = interceptor_with_identity_claim("preferred_username")
-        .call(request_with(&token, None))
+    let mut with_identity = claims.clone();
+    with_identity["identity"] = json!("stable-oid");
+    let request = interceptor()
+        .call(request_with(&encode_token(&with_identity), None))
         .expect("verifies");
     assert_eq!(
         lore_server::grpc::get_user_id(request.extensions()),
-        "alice"
+        "stable-oid"
     );
 
-    let status = interceptor_with_identity_claim("oid")
-        .call(request_with(&token, None))
-        .expect_err("no `oid` claim to attribute the caller by");
+    let mut empty_identity = claims;
+    empty_identity["identity"] = json!("");
+    let status = interceptor()
+        .call(request_with(&encode_token(&empty_identity), None))
+        .expect_err("an empty identity attributes the caller to no one");
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
     assert_eq!(status.message(), "Not allowed");
 }

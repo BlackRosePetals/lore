@@ -224,7 +224,6 @@ mod token_verification {
     use lore_server::auth::jwk::JWKService;
     use lore_server::auth::jwk::JWKServiceError;
     use lore_server::auth::jwt::AuthorizationToken;
-    use lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM;
 
     use super::*;
 
@@ -264,7 +263,6 @@ mod token_verification {
             jwt_issuer: None,
             jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
             jwt_typ: None,
-            identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
         }
     }
 

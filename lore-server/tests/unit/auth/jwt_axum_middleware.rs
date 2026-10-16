@@ -21,7 +21,6 @@ use lore_revision::fragment;
 use lore_server::auth::jwk::JWKService;
 use lore_server::auth::jwk::JWKServiceError;
 use lore_server::auth::jwt::AuthorizationToken;
-use lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM;
 use lore_server::auth::jwt::JwtVerifier;
 use lore_server::auth::jwt::ResourcePermission;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
@@ -70,7 +69,6 @@ fn verifier() -> JwtVerifier {
         jwt_issuer: None,
         jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
         jwt_typ: None,
-        identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
     }
 }
 

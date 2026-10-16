@@ -44,7 +44,6 @@ fn auth_settings(issuer: &str, oidc_keys: Option<&str>) -> AuthSettings {
         r#"
             jwt_issuer = "{issuer}"
             jwt_audience = ["lore-service"]
-            identity_claim = "email"
             {oidc}
             "#
     );
@@ -91,7 +90,6 @@ async fn the_discovered_issuer_is_advertised_with_the_configured_fields() {
             resource_template: None,
             scope_template: Some("partition:{id}".to_string()),
             token_exchange_issuer: Some("https://sts.example.com".to_string()),
-            identity_claim: Some("email".to_string()),
         }
     );
 }

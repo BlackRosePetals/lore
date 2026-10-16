@@ -94,24 +94,3 @@ fn user_url_follows_the_auth_url_until_advertised() {
         "ucs-auth://directory.example.com"
     );
 }
-
-#[test]
-fn identity_claim_defaults_to_sub_until_advertised() {
-    assert_eq!(Oidc::default().identity_claim(), "sub");
-    assert_eq!(
-        Oidc {
-            identity_claim: Some(String::new()),
-            ..Default::default()
-        }
-        .identity_claim(),
-        "sub"
-    );
-    assert_eq!(
-        Oidc {
-            identity_claim: Some("email".into()),
-            ..Default::default()
-        }
-        .identity_claim(),
-        "email"
-    );
-}

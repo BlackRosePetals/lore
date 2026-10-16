@@ -20,7 +20,6 @@ use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwk::JWKService;
 use lore_server::auth::jwk::JWKServiceError;
 use lore_server::auth::jwt::AuthorizationToken;
-use lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM;
 use lore_server::auth::jwt::JwtVerifier;
 use lore_server::auth::jwt::ResourcePermission;
 use lore_server::grpc::handlers::obliterate::*;
@@ -69,7 +68,6 @@ fn make_verifier(jwk_service: MockTestJWKService) -> JwtVerifier {
         jwt_issuer: None,
         jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
         jwt_typ: None,
-        identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
     }
 }
 

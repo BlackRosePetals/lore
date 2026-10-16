@@ -123,7 +123,6 @@ fn auth_settings_authorization_fields_round_trip() {
             resource_id_claim = "rsname"
             resource_id_template = "repo:{id}"
             resource_wildcard = "urc-*"
-            identity_claim = "preferred_username"
             baseline_access = "reachable"
             repository_catalog = "auth_service"
             repository_catalog_url = "https://catalog.example.com"
@@ -136,7 +135,6 @@ fn auth_settings_authorization_fields_round_trip() {
     assert_eq!(auth.resource_id_claim, "rsname");
     assert_eq!(auth.resource_id_template, "repo:{id}");
     assert_eq!(auth.resource_wildcard, "urc-*");
-    assert_eq!(auth.identity_claim, "preferred_username");
     assert_eq!(auth.baseline_access, BaselineAccess::Reachable);
     assert_eq!(
         auth.repository_catalog,
@@ -149,8 +147,8 @@ fn auth_settings_authorization_fields_round_trip() {
 }
 
 /// A config setting none of the authorization fields gets the documented
-/// defaults: the `urc-` template and wildcard literals, `sub` as the
-/// identity claim, and no permission or resource claim selected.
+/// defaults: the `urc-` template and wildcard literals, and no permission or
+/// resource claim selected.
 #[test]
 fn auth_settings_authorization_fields_have_backward_compatible_defaults() {
     let auth: AuthSettings = toml::from_str(
@@ -167,7 +165,6 @@ fn auth_settings_authorization_fields_have_backward_compatible_defaults() {
     assert_eq!(auth.baseline_access, BaselineAccess::Denied);
     assert_eq!(auth.permission_claim, None);
     assert_eq!(auth.resource_claim, None);
-    assert_eq!(auth.identity_claim, "sub");
     assert_eq!(auth.repository_catalog, None);
     assert_eq!(auth.repository_catalog_url, None);
     assert_eq!(auth.jwt_typ, None);
