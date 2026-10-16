@@ -109,6 +109,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - A storage session pool whose start fails on one of its connections, or is cancelled, stops every session it started,
   those still starting included. They stayed open on the server for the life of their connection, so once
   one connection reached the server's session limit, every retry moved the others towards it as well
+- A storage handle, and a server's remote store, reconnect to the remote once the connection they hold has failed. Each
+  kept the failed connection, so once the transport had given up reconnecting, every remote call through it failed
+  until the handle was opened again or the server restarted. Calls waiting on a reconnect share it. A reconnect that
+  fails, or whose connection fails within its back-off, is not repeated until the back-off of 1 to 30 seconds has passed,
+  the calls in between failing at once. A refusal of the credentials is not held, so the next call connects again
 - Caches and prefetches check every payload they fetch on receipt, as reads do, unless the command trusts the remote,
   where they stored most payloads unchecked. A cache walk, which trusts the lists the local store holds, fails once it
   walks deeper than any fragment tree reaches

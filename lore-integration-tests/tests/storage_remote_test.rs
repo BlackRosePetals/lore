@@ -995,6 +995,79 @@ mod storage_remote_tests {
             .await
     }
 
+    /// A handle replaces a connection the transport has marked stale once its connect's back-off
+    /// has passed, as the QUIC client marks one once it gives up reconnecting, though its calls
+    /// carry one correlation id and the handle holds a pool on the stale connection for it. The
+    /// test marks it by hand.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handle_replaces_a_stale_connection() -> TestResult {
+        use std::sync::atomic::Ordering;
+
+        let execution = setup_execution("storage-remote-stale-connection".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = lore_base::types::Partition::from([0xd5u8; 16]);
+                    let payload = bytes::Bytes::from_static(b"served after a stale connection");
+                    let address = seed_server(&server, partition, &payload).await;
+                    let handle_id = open_remote_handle(&server).await;
+                    let endpoint =
+                        lore::storage::handle::lookup(lore::storage::handle::LoreStore {
+                            handle_id,
+                        })
+                        .and_then(|store| store.remote.clone())
+                        .expect("a handle with a remote");
+
+                    let get = async |id| {
+                        let globals = LoreGlobalArgs {
+                            correlation_id: "stale-connection".into(),
+                            ..Default::default()
+                        };
+                        run_get_batch_under(
+                            globals,
+                            handle_id,
+                            vec![get_item(id, partition, address)],
+                        )
+                        .await
+                    };
+                    let first = get(1).await;
+                    assert_eq!(first.codes.get(&1), Some(&0), "{transport:?}: first get");
+                    crate::common::net_common::wait_out_connect_back_off().await;
+                    crate::common::net_common::cached_connection(&server.url)
+                        .expect("the handle must have connected through the connection cache")
+                        .stale
+                        .store(true, Ordering::Relaxed);
+
+                    let second = get(2).await;
+                    assert_eq!(second.codes.get(&2), Some(&0), "{transport:?}: second get");
+                    let current = crate::common::net_common::cached_connection(&server.url).expect(
+                        "the handle must have replaced the stale connection through the cache",
+                    );
+                    let held = endpoint
+                        .connection(partition)
+                        .await
+                        .expect("the handle's connection");
+                    assert!(
+                        Arc::ptr_eq(&held, &current),
+                        "{transport:?}: the handle must hold the replacement",
+                    );
+                    assert!(
+                        !endpoint
+                            .pools
+                            .get(partition, "stale-connection")
+                            .expect("the handle holds the pool its gets took")
+                            .connection_is_stale(),
+                        "{transport:?}: the handle's pool must run on the replacement",
+                    );
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
     /// A storage handle holds the session pool its calls to a partition under one correlation id
     /// share, replaces it for a call under another, and drops it when it closes. A replacement
     /// leaves the pool held for another partition in place. Each get asks for an address of its

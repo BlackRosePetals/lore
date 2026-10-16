@@ -3,14 +3,12 @@
 //! `RemoteEndpoint` — connection-pool wrapper used by the storage API to drive remote-side
 //! ops without depending on `lore_revision::store::remote::RemoteImmutableStore`.
 //!
-//! Holds only what the storage API actually needs: the `(remote_url, identity)` pair plus
-//! per-partition `Connection` caches for the storage-session and admin paths. Construction
-//! does not open the wire — connections are established lazily by the first call that needs
-//! one. Each `lore_storage_open` with a `remote_config` builds its own `RemoteEndpoint` on
-//! `StoreInternal`, over connections from the process-wide connection cache that every handle
-//! shares.
+//! Holds only what the storage API actually needs: its connections to the remote and the
+//! session pools it holds, per partition. Construction does not open the wire — connections are
+//! established lazily by the first call that needs one. Each `lore_storage_open` with a
+//! `remote_config` builds its own `RemoteEndpoint` on `StoreInternal`, over connections from the
+//! process-wide connection cache that every handle shares.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use lore_revision::lore::RepositoryId;
@@ -20,22 +18,13 @@ use lore_transport::Connection;
 use lore_transport::PartitionSessions;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
-use tokio::sync::Mutex;
 
 /// Lazily-resolving handle to a peer storage service. One instance per open handle that has a
-/// remote configured. Internally caches one `Arc<Connection>` per partition for both the
-/// storage-session and admin paths so repeated ops against the same partition share the
-/// connection.
+/// remote configured. Internally caches one `Arc<Connection>` per partition, which every op on
+/// that partition shares.
 #[lore_macro::test_pub]
 pub(crate) struct RemoteEndpoint {
-    remote_url: String,
-    identity: Option<String>,
-    /// Cached connections used for `StorageSession` ops.
-    sessions: Mutex<HashMap<RepositoryId, Arc<Connection>>>,
-    /// Cached connections used for admin ops (`obliterate`, etc.). Kept separate from
-    /// `sessions` to mirror the existing transport-level split — admin connections may end up
-    /// pinned to a different physical socket than session connections.
-    admins: Mutex<HashMap<RepositoryId, Arc<Connection>>>,
+    connections: protocol::RemoteConnections,
     /// The session pool this handle holds for each partition, which its calls under one
     /// correlation id share until a call under another replaces it or the handle closes.
     pub pools: PartitionSessions,
@@ -45,56 +34,25 @@ impl RemoteEndpoint {
     #[lore_macro::test_pub]
     pub(crate) fn new(remote_url: impl Into<String>, identity: Option<&str>) -> Self {
         Self {
-            remote_url: remote_url.into(),
-            identity: identity.map(str::to_string),
-            sessions: Mutex::new(HashMap::new()),
-            admins: Mutex::new(HashMap::new()),
+            connections: protocol::RemoteConnections::new(remote_url, identity),
             pools: PartitionSessions::default(),
         }
     }
 
-    /// Get (or open) the connection used for storage-session ops on `partition`.
-    pub(crate) async fn session_connection(
+    /// The connection for ops on `partition`, as [`protocol::RemoteConnections::connection`]
+    /// hands it out.
+    #[lore_macro::test_pub]
+    pub(crate) fn connection(
         &self,
         partition: RepositoryId,
-    ) -> Result<Arc<Connection>, ProtocolError> {
-        let mut lock = self.sessions.lock().await;
-        if let Some(connection) = lock.get(&partition) {
-            return Ok(connection.clone());
-        }
-        let connection = protocol::connect(
-            self.remote_url.as_str(),
-            self.identity.as_deref().unwrap_or_default(),
-            partition,
-        )
-        .await?;
-        lock.insert(partition, connection.clone());
-        Ok(connection)
-    }
-
-    /// Get (or open) the connection used for admin ops on `partition`.
-    async fn admin_connection(
-        &self,
-        partition: RepositoryId,
-    ) -> Result<Arc<Connection>, ProtocolError> {
-        let mut lock = self.admins.lock().await;
-        if let Some(connection) = lock.get(&partition) {
-            return Ok(connection.clone());
-        }
-        let connection = protocol::connect(
-            self.remote_url.as_str(),
-            self.identity.as_deref().unwrap_or_default(),
-            partition,
-        )
-        .await?;
-        lock.insert(partition, connection.clone());
-        Ok(connection)
+    ) -> impl Future<Output = Result<Arc<Connection>, ProtocolError>> + '_ {
+        self.connections.connection(partition)
     }
 
     /// Resolve a `StorageSession` bound to `partition`, over the pool [`pools`](Self::pools)
-    /// holds for the partition under the call's correlation id, started on first use. The pool
-    /// is not pinned on the connection, so its server-side sessions end once the handle and every
-    /// call drop it.
+    /// holds for the partition under the call's correlation id, started on first use and again
+    /// once its connection is marked stale. The pool is not pinned on the connection, so its
+    /// server-side sessions end once the handle and every call drop it.
     pub(crate) async fn session(
         &self,
         partition: RepositoryId,
@@ -103,10 +61,14 @@ impl RemoteEndpoint {
             .globals()
             .correlation_id
             .to_string();
-        if let Some(pool) = self.pools.get(partition, &correlation_id) {
+        if let Some(pool) = self
+            .pools
+            .get(partition, &correlation_id)
+            .filter(|pool| !pool.connection_is_stale())
+        {
             return Ok(Arc::new(StorageSession::pooled(pool)));
         }
-        let connection = self.session_connection(partition).await?;
+        let connection = self.connection(partition).await?;
         let pool = connection
             .unpinned_session_pool(partition, &correlation_id)
             .await?;
@@ -122,7 +84,7 @@ impl RemoteEndpoint {
         &self,
         partition: RepositoryId,
     ) -> Result<(), ProtocolError> {
-        let connection = self.session_connection(partition).await?;
+        let connection = self.connection(partition).await?;
         let correlation_id = lore_revision::lore::execution_context()
             .globals()
             .correlation_id
@@ -138,7 +100,7 @@ impl RemoteEndpoint {
         &self,
         partition: RepositoryId,
     ) -> Result<Arc<dyn Admin>, ProtocolError> {
-        let connection = self.admin_connection(partition).await?;
+        let connection = self.connection(partition).await?;
         connection.admin(partition).await
     }
 }

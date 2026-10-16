@@ -548,6 +548,16 @@ impl SessionPool {
         *self.correlation_id == *correlation_id && !self.is_stale()
     }
 
+    /// Whether the connection this pool's first session runs on is marked stale, as the transport
+    /// marks one it has given up on. A connector starts every session of a pool on one connection.
+    pub fn connection_is_stale(&self) -> bool {
+        matches!(
+            self.sessions.first().map(|session| &session.inner),
+            Some(SessionInner::Resolved(resolved))
+                if resolved.connection.stale.load(Ordering::Relaxed)
+        )
+    }
+
     /// Returns the next session in the pool via round-robin.
     ///
     /// Every call advances the cursor, so only a caller that is going to use the

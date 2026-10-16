@@ -43,6 +43,8 @@ mod remote_store_tests {
     use rand::random;
 
     use crate::common::net_common::bind_matched_pair;
+    use crate::common::net_common::cached_connection;
+    use crate::common::net_common::wait_out_connect_back_off;
     use crate::setup_execution;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -179,6 +181,7 @@ mod remote_store_tests {
     }
 
     struct QuicTestServer {
+        url: String,
         immutable_store: Arc<RemoteImmutableStore>,
         _server: QuinnServer,
         _shutdown: tokio::sync::oneshot::Sender<()>,
@@ -221,6 +224,7 @@ mod remote_store_tests {
         let url = format!("lore://127.0.0.1:{}", addr.port());
         QuicTestServer {
             immutable_store: Arc::new(RemoteImmutableStore::new(&url, None)),
+            url,
             _server: server,
             _shutdown: shutdown_tx,
         }
@@ -267,6 +271,60 @@ mod remote_store_tests {
                     .and_then(StoreGetData::into_payload)
                     .expect("a read after a miss should still be answered");
                 assert_eq!(bytes.as_ref(), payload.as_ref());
+                Ok(())
+            })
+            .await
+    }
+
+    /// A remote store replaces a connection the transport has marked stale once its connect's
+    /// back-off has passed, as the QUIC client marks one once it gives up reconnecting, and the
+    /// replaced connection is freed though a session pool it pinned held it. The test marks it by
+    /// hand.
+    #[tokio::test]
+    async fn a_remote_store_replaces_and_frees_a_stale_connection() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_quic_server().await;
+                let store = server.immutable_store.clone();
+                let partition = lore_base::types::Partition::from(rand::random::<[u8; 16]>());
+                let payload = bytes::Bytes::from_static(b"served over the replacement");
+                let fragment = lore_base::types::Fragment {
+                    flags: 0,
+                    size_payload: payload.len() as u32,
+                    size_content: payload.len() as u64,
+                };
+                let address = lore_base::types::Address {
+                    hash: lore_storage::hash::hash_slice(payload.as_ref()),
+                    context: lore_base::types::Context::from(rand::random::<[u8; 16]>()),
+                };
+                store
+                    .clone()
+                    .put(partition, address, fragment, Some(payload.clone()), false)
+                    .await
+                    .expect("put should succeed");
+                wait_out_connect_back_off().await;
+                let stale = {
+                    let connection = cached_connection(&server.url)
+                        .expect("the store must have connected through the connection cache");
+                    connection
+                        .stale
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    Arc::downgrade(&connection)
+                };
+
+                let (_fragment, bytes) = store
+                    .clone()
+                    .get(partition, address)
+                    .await
+                    .and_then(StoreGetData::into_payload)
+                    .expect("a get after the connection went stale should be served");
+
+                assert_eq!(bytes.as_ref(), payload.as_ref());
+                assert!(
+                    stale.upgrade().is_none(),
+                    "the replaced connection must be freed"
+                );
                 Ok(())
             })
             .await

@@ -23,7 +23,7 @@ use futures::future::BoxFuture;
 use lore_base::error::Disconnected;
 use lore_base::error::NoRemote;
 use lore_revision::lore::RepositoryId;
-use lore_revision::repository::RemoteFuture;
+use lore_revision::protocol::RemoteFuture;
 use lore_revision::repository::RemoteState;
 use lore_revision::repository::RepositoryContext;
 use lore_transport::ProtocolError;

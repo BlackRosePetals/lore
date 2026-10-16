@@ -327,7 +327,7 @@ pub(crate) async fn synth_repository_context(
     repository: Partition,
 ) -> Arc<RepositoryContext> {
     let remote_result = match store.remote.as_ref() {
-        Some(endpoint) => endpoint.session_connection(repository).await,
+        Some(endpoint) => endpoint.connection(repository).await,
         None => Err(ProtocolError::from(NoRemote)),
     };
     Arc::new(

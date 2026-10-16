@@ -31,10 +31,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use futures::FutureExt;
-use futures::future::BoxFuture;
-use futures::future::Shared;
-use lore_base::lore_spawn;
 use lore_base::lore_spawn_guarded;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
@@ -43,7 +39,6 @@ use lore_transport::RepositoryData;
 use lore_transport::SessionPool;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use zerocopy::IntoBytes;
 
@@ -75,6 +70,7 @@ use crate::lore_debug;
 use crate::lore_warn;
 use crate::metadata::Metadata;
 use crate::protocol;
+use crate::protocol::RemoteFuture;
 use crate::revision;
 use crate::revision::sync;
 use crate::revision::sync::SyncOptions;
@@ -535,11 +531,6 @@ pub trait ServerContext {}
 struct InternalServerContext;
 impl ServerContext for InternalServerContext {}
 const INTERNAL_SERVER_CONTEXT: InternalServerContext = InternalServerContext;
-
-/// Shared, clone-able future that resolves the pending remote connection exactly once
-/// while fanning the result out to all awaiters.
-#[lore_macro::test_pub]
-type RemoteFuture = Shared<BoxFuture<'static, Result<Arc<Connection>, ProtocolError>>>;
 
 /// State machine for the remote connection. Lives behind `Arc<RwLock<_>>` so related
 /// contexts (e.g. filter views) can share the same underlying connection state while
@@ -1980,7 +1971,7 @@ fn connect(
     let identity = identity.as_deref().unwrap_or_default().to_string();
 
     let correlation_id = globals.correlation_id.to_string();
-    let handle: JoinHandle<Result<Arc<Connection>, ProtocolError>> = lore_spawn!(async move {
+    Ok(protocol::shared_connect(async move {
         let connection =
             protocol::connect(remote_url.as_str(), identity.as_str(), repository).await?;
         // Pre-warm the session pool so it's ready when the command runs
@@ -1988,16 +1979,7 @@ fn connect(
             let _ = connection.session_pool(repository, &correlation_id).await;
         }
         Ok(connection)
-    });
-
-    // Wrap the JoinHandle in a Shared future so many awaiters can poll one spawned task.
-    Ok(async move {
-        handle
-            .await
-            .unwrap_or_else(|_| Err(ProtocolError::internal("connect task failed")))
-    }
-    .boxed()
-    .shared())
+    }))
 }
 
 pub fn read_id_from_file(path: PathBuf) -> io::Result<RepositoryId> {

@@ -28,6 +28,28 @@ pub(crate) mod net_common {
         }
         panic!("no port free on both TCP and UDP after {PORT_PAIR_ATTEMPTS} attempts");
     }
+
+    /// Waits until a connect's first back-off, its jitter included, has passed.
+    pub(crate) async fn wait_out_connect_back_off() {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            lore_transport::connection::RECONNECT_START_DELAY + lore_base::retry::JITTER_CLAMP_MS,
+        ))
+        .await;
+    }
+
+    /// The connection to the remote at `url`, as the process-wide connection cache holds it.
+    /// `None` once no live connection to it is cached.
+    pub(crate) fn cached_connection(
+        url: &str,
+    ) -> Option<std::sync::Arc<lore_transport::Connection>> {
+        let (url, _protocol) = lore_transport::parse(url).expect("server url parses");
+        lore_transport::find_connection(
+            url.as_str(),
+            "",
+            false,
+            lore_revision::interface::LoreGlobalArgs::default().auth_mode,
+        )
+    }
 }
 
 #[cfg(all(test, feature = "integration_tests"))]

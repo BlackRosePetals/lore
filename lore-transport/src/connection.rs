@@ -310,7 +310,7 @@ pub fn parse(remote_url: &str) -> Result<(Url, Arc<dyn Protocol>), ProtocolError
 /// Only a refusal does. Everything else — a disconnect, backpressure, an internal fault — says the
 /// answer was not obtained rather than that it is no.
 fn refusal_is_final(err: &ProtocolError) -> bool {
-    err.is_not_authorized() || err.is_not_authenticated()
+    err.is_refusal()
 }
 
 /// `identity_token` and `access_token` are the credentials the caller supplied
@@ -861,6 +861,14 @@ impl ServiceReady {
         self.notify.notify_waiters();
     }
 
+    /// Whether the service failed to connect with a refusal of the connection's credentials.
+    fn refused(&self) -> bool {
+        self.result
+            .lock()
+            .as_ref()
+            .is_some_and(|result| result.as_ref().is_err_and(ProtocolError::is_refusal))
+    }
+
     async fn wait(&self) -> Result<(), ProtocolError> {
         loop {
             let notified = self.notify.notified();
@@ -985,6 +993,15 @@ impl Connection {
     /// storage themselves.
     #[cfg(feature = "test-util")]
     pub fn detached(storage: Vec<Arc<dyn Storage>>) -> Arc<Self> {
+        Self::detached_ready(storage, Ok(()))
+    }
+
+    /// A [`detached`](Self::detached) connection whose storage connect answered `ready`.
+    #[cfg(feature = "test-util")]
+    pub fn detached_ready(
+        storage: Vec<Arc<dyn Storage>>,
+        ready: Result<(), ProtocolError>,
+    ) -> Arc<Self> {
         let connection = Arc::new(Connection::unconnected(
             Url::parse("lore://detached.invalid").expect("valid URL"),
             AuthEndpoint::none(),
@@ -997,7 +1014,7 @@ impl Connection {
         if !storage.is_empty() {
             *connection.storage.write() = Some(Arc::new(StorageConnector::new(storage)));
         }
-        connection.storage_ready.complete(Ok(()));
+        connection.storage_ready.complete(ready);
         connection
     }
 
@@ -1085,6 +1102,11 @@ impl Connection {
             self.mark_failed();
         }
         result
+    }
+
+    /// Whether connecting this connection's storage was refused its credentials.
+    pub fn storage_refused(&self) -> bool {
+        self.storage_ready.refused()
     }
 
     pub async fn ensure_storage_connected(self: &Arc<Self>) -> Result<(), ProtocolError> {
@@ -1212,9 +1234,7 @@ impl Connection {
     /// `Connection::session` call rebuilds the pool even while another holder
     /// keeps the old one — re-running `session_start` against the current
     /// connection to obtain a fresh `session_id` the server actually knows
-    /// about. Called from `StorageSession::invalidate` when a server response
-    /// indicates the session-id is stale (e.g. after a QUIC reconnect that
-    /// rotated the server's `SessionMap`).
+    /// about.
     pub fn invalidate_all_sessions(&self) {
         self.session_cache.invalidate();
     }

@@ -13,6 +13,7 @@ const JITTER_CLAMP_MS: u64 = 100;
 pub const DEFAULT_JITTER: f32 = 0.5;
 
 /// Retry waiter with exponential back-off and jitter.
+#[derive(Clone)]
 pub struct Retry {
     current: u64,
     maximum: u64,
@@ -22,25 +23,26 @@ pub struct Retry {
 }
 
 impl Retry {
-    /// Sleep for the current interval, then double it up to the maximum. Returns `false` once
-    /// `limit` waits have been spent, so a caller can treat it as the loop condition and `false`
-    /// as "give up".
+    /// Sleep for the [`next_interval`](Self::next_interval). Returns `false` once `limit` waits
+    /// have been spent, so a caller can treat it as the loop condition and `false` as "give up".
     pub async fn wait(&mut self) -> bool {
-        if self.counter >= self.limit {
+        let Some(interval) = self.next_interval() else {
             return false;
+        };
+        tokio::time::sleep(interval).await;
+        true
+    }
+
+    /// The current interval with jitter, the current interval doubling up to the maximum. `None`
+    /// once `limit` intervals have been taken.
+    pub fn next_interval(&mut self) -> Option<Duration> {
+        if self.counter >= self.limit {
+            return None;
         }
-
-        tokio::time::sleep(Duration::from_millis(jittered(
-            self.current,
-            self.jitter,
-            rand::random::<f32>(),
-        )))
-        .await;
-
+        let interval = jittered(self.current, self.jitter, rand::random::<f32>());
         self.current = std::cmp::min(self.current * 2, self.maximum);
         self.counter += 1;
-
-        true
+        Some(Duration::from_millis(interval))
     }
 
     pub fn counter(&self) -> usize {
