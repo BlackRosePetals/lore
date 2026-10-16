@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Approved
 created: 2026-08-20
-updated: 2026-10-08
+updated: 2026-10-15
 discussion: https://crowd.urc.internal.epicgames.net/epic/Lore/change-request/412
 ---
 
@@ -467,7 +467,7 @@ The rest of this proposal calls the first four fields
 | `resource_template` | `[server.auth.oidc]` | How to name a partition as an [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) resource, for example `https://lore.example.com/partitions/{id}`. The standard form and the default. |
 | `scope_template` | `[server.auth.oidc]` | How to name a partition as a scope value instead, for example `partition:{id}`. For providers that reject `resource` or never see it on the exchange grant. |
 | `token_exchange_issuer` | `[server.auth.oidc]` | The [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) endpoint to exchange against, whether that is the provider itself or a separate token service. |
-| `identity_claim` | `[server.auth] identity_claim` | The claim clients record as the user identity, `sub` by default (D7). Advertised so every client records the same form. |
+| `identity_claim` | none | Reserved: a deprecated field the server leaves empty and the client ignores. The identity is read from the token itself, its `identity` claim or else `sub` (D7). |
 
 `Endpoint` gains `user_url`, from `[environment.endpoint]`: the user directory clients resolve
 names at, `auth_url` by default (D7). Independent of the auth path, so an OIDC deployment can
@@ -846,17 +846,23 @@ The directory operations outlive the auth service, so they get a gRPC API of the
 their messages copied field for field from `auth_api.proto`. The copy is wire-identical for
 simple migration.
 
-There is a third position for deployments that do not need the unmapping property: record a
-human-readable claim as the identity itself. Nothing in the protocol constrains what `created_by`
-holds, so a setting, `identity_claim`, names the claim used as the user identity, `sub` by
-default, `preferred_username` for a deployment that wants readable history with no directory at
-all. The server advertises the value in the environment response so every client records the
-same form (D2), and reads it from `[server.auth]` for its own creator and ownership comparisons
-(D8). The same setting serves providers whose `sub` is a poor durable identity, such as Entra ID,
-where `sub` is pairwise per client application and the stable identifier is `oid`. Choosing a
-human-readable claim is an explicit opt-in with two costs: names become permanent in history, and
-claims other than `sub` are not guaranteed unique or immutable, so a rename forks a user's
-identity and a reused username collides with its previous holder.
+**The user identity is read from the token.** Lore records a user as one string, in `created_by`
+and wherever else an identity is compared. Client and server take that string from the token's
+claims by the same rule: the first of these names the token carries decides.
+
+1. `identity`.
+2. `https://lore.org/claims/identity`, the namespaced alias for providers that require
+   namespaced custom claims.
+3. `sub`.
+
+A provider whose `sub` is a good unique identity doesn't need any extra configuration. A provider
+whose `sub` is not useful as a user ID can map any value it wants into `identity` claim. Entra ID,
+whose `sub` differs per client application, can map the stable `oid` as `identity` by configuring
+a claim mapping rule. Also a deployment that wants readable history without a user directory can
+map `preferred_username` into `identity`. A deployment where no single claim is unique can map a
+composition such as `tid:oid`.
+
+Only the first name present is read. If its value is empty or not a string, the token is invalid.
 
 #### The repository catalog
 
@@ -940,9 +946,8 @@ that. So when `jwt_issuer` holds an https URL the server fetches
 non-standard discovery.
 
 `[server.auth]` therefore gains `permission_claim`, `baseline_access`, `repository_catalog`,
-`repository_catalog_url`, `resource_claim`, `resource_id_claim`, `resource_id_template`,
-`resource_wildcard` and `identity_claim` (D7, `sub` by default, compared wherever the server
-checks a recorded identity). `permission_claim` is
+`repository_catalog_url`, `resource_claim`, `resource_id_claim`, `resource_id_template` and
+`resource_wildcard`.  `permission_claim` is
 exercised from phase 2 onwards, because it is what Tier 1 runs on. `baseline_access` steers only
 what the default `RepositoryCatalog` lists (D7), never an access decision. The other four only
 matter once a per-partition claim is in play, so phase 4 for a new deployment and immediately for
@@ -1362,9 +1367,10 @@ identifier. Today's tokens always carry a display name and username whether or n
 **The forgettable name mapping survives intact by default.** Revision history records a user
 identifier and not a name, so an operator can unmap that identifier from a person, on a departure
 or an erasure request, without rewriting history. Resolving names through a directory at read time
-is what makes that possible, and D7 keeps it that way. The identity-claim option in D7 trades the
-property away deliberately: a deployment that records `preferred_username` into history chooses
-readability over erasability, and the default stays `sub`. The `UserService` default answers
+is what makes that possible, and D7 keeps it that way. The `identity` claim in D7 trades the
+property away deliberately: an issuer that copies `preferred_username` into it puts names into
+history, choosing readability over erasability, and a token without the claim stays on `sub`. The
+`UserService` default answers
 from the caller's own token rather than accumulating a local cache of other people's names.
 
 **Tokens stay out of logs.** The existing discipline holds: `set_sensitive` on the gRPC
