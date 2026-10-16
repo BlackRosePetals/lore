@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 //! A loopback QUIC server speaking just enough of lore-storage/0.4 for client tests: session
 //! start and stop, the client's user agent, and `get` of any address on a live session, recording
-//! the partition of the session each `get` ran under. A test can fault the stream that answers a
-//! request ([`StreamFault`]).
+//! the authorization each session start presents and the partition of the session each `get` ran
+//! under. A test can fault the stream that answers a request ([`StreamFault`]).
 //!
 //! Each connection serves one `get` at a time. How the server answers is its [`Answering`].
 
@@ -68,6 +68,7 @@ pub(crate) struct TestStorageServer {
     pub url: String,
     gets: Arc<parking_lot::Mutex<Vec<Arc<AtomicU64>>>>,
     sessions: Arc<parking_lot::Mutex<Vec<Arc<parking_lot::Mutex<SessionMap>>>>>,
+    presented: Arc<parking_lot::Mutex<Vec<String>>>,
     fault: Arc<parking_lot::Mutex<Option<StreamFault>>>,
     endpoint: quinn::Endpoint,
 }
@@ -114,6 +115,8 @@ pub(crate) enum SessionStarts {
     Accept,
     /// With `SlowDown`.
     Refuse,
+    /// With `NotAuthorized`, as a server does once the authorization presented is revoked.
+    RefuseAuthorization,
     /// Answers none until the test says how to.
     Hold,
 }
@@ -133,6 +136,8 @@ enum Answering {
     Controlling(tokio::sync::watch::Receiver<SessionStarts>),
     /// Every session start once the receiver reads `true`, having started the session at once.
     HoldingSessionStarts(tokio::sync::watch::Receiver<bool>),
+    /// A session start presenting one of these authorizations with `NotAuthorized`.
+    RefusingAuthorizations(Arc<[String]>),
 }
 
 impl Drop for TestStorageServer {
@@ -158,6 +163,17 @@ impl TestStorageServer {
     /// Serves on a loopback port, answering every session start with `SlowDown`.
     pub fn start_refusing_sessions() -> Self {
         Self::serve(Answering::RefusingSessions)
+    }
+
+    /// Serves on a loopback port, refusing a session start that presents one of `authorizations`
+    /// with `NotAuthorized`, as a server does once the token is revoked.
+    pub fn start_refusing_authorizations(authorizations: &[&str]) -> Self {
+        Self::serve(Answering::RefusingAuthorizations(
+            authorizations
+                .iter()
+                .map(|token| token.to_string())
+                .collect(),
+        ))
     }
 
     /// Serves on a loopback port, answering every session start as the last value sent on the
@@ -206,10 +222,16 @@ impl TestStorageServer {
         let gets: Arc<parking_lot::Mutex<Vec<Arc<AtomicU64>>>> = Arc::default();
         let sessions: Arc<parking_lot::Mutex<Vec<Arc<parking_lot::Mutex<SessionMap>>>>> =
             Arc::default();
+        let presented: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
         let fault: Arc<parking_lot::Mutex<Option<StreamFault>>> = Arc::default();
 
         let accepting = endpoint.clone();
-        let (accepted, accepted_sessions, armed) = (gets.clone(), sessions.clone(), fault.clone());
+        let (accepted, accepted_sessions, logged, armed) = (
+            gets.clone(),
+            sessions.clone(),
+            presented.clone(),
+            fault.clone(),
+        );
         lore_spawn!(async move {
             while let Some(incoming) = accepting.accept().await {
                 let Ok(connection) = incoming.await else {
@@ -221,10 +243,14 @@ impl TestStorageServer {
                 accepted_sessions.lock().push(map.clone());
                 lore_spawn!(serve_connection(
                     connection,
-                    count,
-                    map,
-                    answering.clone(),
-                    armed.clone()
+                    Arc::new(Served {
+                        gets: count,
+                        serial: tokio::sync::Mutex::new(()),
+                        sessions: map,
+                        answering: answering.clone(),
+                        presented: logged.clone(),
+                        fault: armed.clone(),
+                    }),
                 ));
             }
         });
@@ -233,9 +259,15 @@ impl TestStorageServer {
             url: format!("lore://127.0.0.1:{port}"),
             gets,
             sessions,
+            presented,
             fault,
             endpoint,
         }
+    }
+
+    /// The authorizations session starts presented so far, in order.
+    pub fn presented_authorizations(&self) -> Vec<String> {
+        self.presented.lock().clone()
     }
 
     /// Applies `fault` to the stream that answers the next request, leaving its connection up.
@@ -339,36 +371,37 @@ impl TestStorageServer {
     }
 }
 
-async fn serve_connection(
-    connection: quinn::Connection,
+/// What the streams of one connection share: the `get`s it served, the lock that serves them one
+/// at a time, its sessions, how it answers, and the server's record of authorizations presented
+/// and its armed fault.
+struct Served {
     gets: Arc<AtomicU64>,
+    serial: tokio::sync::Mutex<()>,
     sessions: Arc<parking_lot::Mutex<SessionMap>>,
     answering: Answering,
+    presented: Arc<parking_lot::Mutex<Vec<String>>>,
     fault: Arc<parking_lot::Mutex<Option<StreamFault>>>,
-) {
-    let serial = Arc::new(tokio::sync::Mutex::new(()));
+}
+
+async fn serve_connection(connection: quinn::Connection, served: Arc<Served>) {
     while let Ok((send, recv)) = connection.accept_bi().await {
-        lore_spawn!(serve_stream(
-            send,
-            recv,
-            gets.clone(),
-            serial.clone(),
-            sessions.clone(),
-            answering.clone(),
-            fault.clone(),
-        ));
+        lore_spawn!(serve_stream(send, recv, served.clone()));
     }
 }
 
 async fn serve_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    gets: Arc<AtomicU64>,
-    serial: Arc<tokio::sync::Mutex<()>>,
-    sessions: Arc<parking_lot::Mutex<SessionMap>>,
-    answering: Answering,
-    fault: Arc<parking_lot::Mutex<Option<StreamFault>>>,
+    served: Arc<Served>,
 ) {
+    let Served {
+        gets,
+        serial,
+        sessions,
+        answering,
+        presented,
+        fault,
+    } = &*served;
     let mut header_bytes = [0u8; COMMAND_HEADER_SIZE_V4];
     while recv.read_exact(&mut header_bytes).await.is_ok() {
         let header = CommandHeader::from_bytes_v4(&header_bytes);
@@ -378,7 +411,7 @@ async fn serve_stream(
         }
         let response = match header.cmd {
             command if command == Command::Authorize as u8 && request.first() == Some(&0) => {
-                serve_session_start(&request, &sessions, &answering).await
+                serve_session_start(&request, sessions, presented, answering).await
             }
             command if command == Command::Authorize as u8 && request.first() == Some(&1) => {
                 sessions
@@ -388,7 +421,7 @@ async fn serve_stream(
                 Ok(Bytes::new())
             }
             command if command == Command::Get as u8 => {
-                serve_get(header.session_id, &gets, &serial, &sessions, &answering).await
+                serve_get(header.session_id, gets, serial, sessions, answering).await
             }
             _ => Ok(Bytes::new()),
         };
@@ -431,28 +464,51 @@ async fn hold_faulted(
     std::future::pending::<()>().await;
 }
 
+/// The authorization a session start presents, after its action, partition, correlation id and
+/// the authorization's length.
+fn presented_authorization(request: &[u8]) -> String {
+    let length_at = 18 + usize::from(request[17]);
+    let length = usize::from(u16::from_le_bytes([
+        request[length_at],
+        request[length_at + 1],
+    ]));
+    String::from_utf8_lossy(&request[length_at + 2..][..length]).into_owned()
+}
+
 /// The id of a session `request` starts, for the partition it names, on the connection `sessions`
-/// belongs to, answered as `answering` says, or `SlowDown` where `answering` refuses sessions.
+/// belongs to, answered as `answering` says: `SlowDown` where it refuses sessions, and
+/// `NotAuthorized` where it refuses the authorization presented. `presented` records every
+/// authorization a start presents.
 async fn serve_session_start(
     request: &[u8],
     sessions: &parking_lot::Mutex<SessionMap>,
+    presented: &parking_lot::Mutex<Vec<String>>,
     answering: &Answering,
 ) -> Result<Bytes, u32> {
+    let authorization = presented_authorization(request);
+    let refused = matches!(
+        answering,
+        Answering::RefusingAuthorizations(refused) if refused.contains(&authorization)
+    );
+    presented.lock().push(authorization);
     sessions.lock().requested += 1;
-    let refusing = match answering {
-        Answering::RefusingSessions => true,
-        Answering::Controlling(starts) => matches!(
-            starts
-                .clone()
-                .wait_for(|starts| *starts != SessionStarts::Hold)
-                .await
-                .map(|starts| *starts),
-            Ok(SessionStarts::Refuse)
-        ),
-        _ => false,
+    let refusal = match answering {
+        Answering::RefusingSessions => Some(QuicServiceError::SlowDown),
+        Answering::Controlling(starts) => match starts
+            .clone()
+            .wait_for(|starts| *starts != SessionStarts::Hold)
+            .await
+            .map(|starts| *starts)
+        {
+            Ok(SessionStarts::Refuse) => Some(QuicServiceError::SlowDown),
+            Ok(SessionStarts::RefuseAuthorization) => Some(QuicServiceError::NotAuthorized),
+            _ => None,
+        },
+        _ if refused => Some(QuicServiceError::NotAuthorized),
+        _ => None,
     };
-    if refusing {
-        return Err(QuicServiceError::SlowDown as u32);
+    if let Some(refusal) = refusal {
+        return Err(refusal as u32);
     }
     let partition: [u8; 16] = request[1..17].try_into().expect("a partition");
     let session_id = {

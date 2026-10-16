@@ -136,6 +136,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   cannot read or frame a request on it, or the client has stopped reading its answers, as it does after one it cannot
   parse. Such a request failed without reconnecting or waited forever for an answer, and so did every later request
   the stream took, until something else made the connection reconnect
+- A QUIC storage session start the server refuses as not authorized forgets the authorization it exchanged and
+  presented, and tries once more with the one an exchange then gives. The process served the refused authorization
+  from its cache, and from the token store, until it expired, so once the server stopped accepting it, by revocation or
+  a change of grants, every storage call for the repository failed meanwhile, in a long-lived process such as the Lore
+  service even after logging out and in again
 - Caches and prefetches check every payload they fetch on receipt, as reads do, unless the command trusts the remote,
   where they stored most payloads unchecked. A cache walk, which trusts the lists the local store holds, fails once it
   walks deeper than any fragment tree reaches

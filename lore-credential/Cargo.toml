@@ -24,6 +24,8 @@ toml = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+ctor = { workspace = true }
+lore-base = { workspace = true, features = ["test-util"] }
 lore-credential = { workspace = true, features = ["test-util"] }
 
 [features]

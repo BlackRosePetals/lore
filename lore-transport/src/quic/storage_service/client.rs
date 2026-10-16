@@ -374,56 +374,101 @@ impl StorageClient {
         Ok(storage)
     }
 
-    /// Issues `session` on the current connection: asks the server to start it, authorized for its
-    /// partition, and binds it to the id the server answers on the connection the request went to.
+    /// The authorization a session start for `partition` presents, read at each start because the
+    /// server checks storage authorization there: an access token the newest call supplied, as it
+    /// is, or the authorization the newest credentials exchange for, which the cache or the token
+    /// store may serve. Empty when there is none, as for a server without authentication or after
+    /// a failed exchange.
+    async fn authorization(&self, partition: Partition) -> Authorization {
+        if self.auth_endpoint.is_none() {
+            return Authorization::default();
+        }
+        let (identity_token, access_token) = self.credentials.tokens();
+        let (_, token, _) = crate::auth::exchange::auth_exchange(
+            &self.auth_endpoint,
+            &self.recipient_domain,
+            &self.identity,
+            partition,
+            &identity_token,
+            &access_token,
+        )
+        .await;
+        Authorization {
+            token,
+            exchanged_with: access_token.is_empty().then_some(identity_token),
+        }
+    }
+
+    /// Issues `session` on the current connection, authorized for its partition.
     async fn issue(&self, session: &Session) -> Result<(), ProtocolError> {
-        // Fetch auth token via token exchange (cached if already exchanged).
-        // The credentials are read here, not at construction: the server checks
-        // storage authorization at each session start, so a session opened later
-        // must present whatever the newest call supplied.
-        let token = if !self.auth_endpoint.is_none() {
-            let (identity_token, access_token) = self.credentials.tokens();
-            let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
-                &self.auth_endpoint,
-                &self.recipient_domain,
-                &self.identity,
-                session.partition,
-                &identity_token,
-                &access_token,
-            )
-            .await;
-            authorization_token
-        } else {
-            String::new()
-        };
-        let token_bytes = token.as_bytes();
+        let authorization = self.authorization(session.partition).await;
+        self.issue_presenting(session, authorization).await
+    }
 
-        // Build Authorize start payload:
-        // action(1=0) + partition_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)
-        let corr_bytes = session.correlation_id.as_bytes();
-        let mut payload =
-            BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len());
-        payload.put_u8(0);
-        payload.extend_from_slice(session.partition.as_bytes());
-        payload.put_u8(corr_bytes.len() as u8);
-        payload.extend_from_slice(corr_bytes);
-        payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
-        payload.extend_from_slice(token_bytes);
-        let payload = payload.freeze();
+    /// Issues `session` presenting `authorization`, and once more with a new authorization should
+    /// the server refuse an exchanged one. Its own future, so that what it holds is not held beside
+    /// the exchange that produced `authorization`.
+    async fn issue_presenting(
+        &self,
+        session: &Session,
+        authorization: Authorization,
+    ) -> Result<(), ProtocolError> {
+        let Authorization {
+            token,
+            exchanged_with,
+        } = authorization;
+        match (self.send_issue(session, &token).await, exchanged_with) {
+            (Err(refusal), Some(identity_token))
+                if refusal.is_not_authorized() && !token.is_empty() =>
+            {
+                Box::pin(self.issue_reauthorized(session, token, identity_token, refusal)).await
+            }
+            (issued, _) => issued,
+        }
+    }
 
+    /// Issues the session the server refused once more, with a new authorization in place of
+    /// `refused`, which was exchanged with `identity_token`. Cold: only after the server refused an
+    /// exchanged authorization.
+    ///
+    /// The cache would serve `refused` until it expires, so it is forgotten first, and the
+    /// exchange then serves an authorization another caller put in its place, or asks the auth
+    /// service for another. A refusal of the new authorization is final, and so is `refusal` when
+    /// the exchange yields none, or `refused` again.
+    async fn issue_reauthorized(
+        &self,
+        session: &Session,
+        refused: String,
+        identity_token: String,
+        refusal: ProtocolError,
+    ) -> Result<(), ProtocolError> {
+        let partition = session.partition;
+        lore_debug!("Session start for {partition} refused its authorization; exchanging another");
+        crate::auth::exchange::forget_refused_authorization(
+            &self.auth_endpoint,
+            &self.identity,
+            partition,
+            &self.recipient_domain,
+            &identity_token,
+            &refused,
+        )
+        .await;
+        let authorization = self.authorization(partition).await;
+        if authorization.token.is_empty() || authorization.token == refused {
+            return Err(refusal);
+        }
+        self.send_issue(session, &authorization.token).await
+    }
+
+    /// Asks the server to start `session` presenting `token`, and binds it to the id the server
+    /// answers on the connection the request went to.
+    async fn send_issue(&self, session: &Session, token: &str) -> Result<(), ProtocolError> {
+        let payload = session_start_payload(session.partition, &session.correlation_id, token);
         let response = send_normal_with_reconnect(self, Command::Authorize, session.id, || {
             [Bytes::default(), payload.clone()]
         })
         .await?;
-
-        if response.len() != 4 {
-            return Err(ProtocolError::internal(format!(
-                "session_start: expected 4-byte response, got {} bytes",
-                response.len()
-            )));
-        }
-
-        let id = u32::from_le_bytes(response[..4].try_into().unwrap());
+        let id = started_session_id(&response)?;
         let generation = session.issuing.load(Ordering::Relaxed);
         session
             .bound
@@ -521,6 +566,45 @@ impl Drop for Opening<'_> {
             self.sessions.remove(self.id);
         }
     }
+}
+
+/// The authorization a session start presents, with the identity token it was exchanged with,
+/// both from one reading of the credentials, so a refusal is judged by what produced the
+/// authorization and not by credentials a later call supplied meanwhile.
+#[derive(Default)]
+struct Authorization {
+    token: String,
+    /// The identity token `token` was exchanged with, empty where the token store supplied the
+    /// credentials. `None` where there is nothing to exchange again, whose refusal is final:
+    /// `token` is an access token the caller supplied, or the server has no authentication.
+    exchanged_with: Option<String>,
+}
+
+/// The payload of a session start for `partition` presenting `token`:
+/// `action(1=0) + partition_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)`.
+fn session_start_payload(partition: Partition, correlation_id: &str, token: &str) -> Bytes {
+    let token_bytes = token.as_bytes();
+    let corr_bytes = correlation_id.as_bytes();
+    let mut payload =
+        BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len());
+    payload.put_u8(0);
+    payload.extend_from_slice(partition.as_bytes());
+    payload.put_u8(corr_bytes.len() as u8);
+    payload.extend_from_slice(corr_bytes);
+    payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
+    payload.extend_from_slice(token_bytes);
+    payload.freeze()
+}
+
+/// The id of the session a session start's `response` names.
+fn started_session_id(response: &[u8]) -> Result<u32, ProtocolError> {
+    let Ok(session_id) = <[u8; 4]>::try_from(response) else {
+        return Err(ProtocolError::internal(format!(
+            "session_start: expected 4-byte response, got {} bytes",
+            response.len()
+        )));
+    };
+    Ok(u32::from_le_bytes(session_id))
 }
 
 impl ServiceClient for StorageClient {

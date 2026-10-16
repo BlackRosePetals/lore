@@ -1,8 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use lore_base::types::RepositoryId;
+use lore_credential::token_store;
 use lore_transport::auth::AuthEndpoint;
 use lore_transport::auth::exchange::*;
+
+use super::stub::AUTHN_ONE;
+use super::stub::AUTHN_TWO;
+use super::stub::AUTHZ_ONE;
+use super::stub::AUTHZ_TWO;
+use super::stub::StubAuthentication;
 
 /// A supplied access token is the authorization token, so the exchange is
 /// skipped entirely -- including the checks that would otherwise reject a
@@ -134,108 +141,7 @@ async fn an_expired_supplied_identity_token_is_still_used() {
 /// stub as the endpoint's implementation also keeps this off the network.
 #[tokio::test]
 async fn one_supplied_credential_is_never_served_anothers_authorization() {
-    use lore_transport::error::ProtocolError;
-    use lore_transport::traits::Authentication;
-    use lore_transport::types::AuthSession;
-    use lore_transport::types::AuthSessionPoll;
-    use lore_transport::types::AuthenticationToken;
-    use lore_transport::types::AuthorizationToken;
-
-    /// `sub` alice, `aud` example.com, expiring in 2033.
-    const AUTHN_ONE: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UifQ.signature";
-    /// The same user, a different credential -- note the `scope` claim.
-    const AUTHN_TWO: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UiLCJzY29wZSI6InJlYWQifQ.signature";
-    const AUTHZ_ONE: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UiLCJhdXRoeiI6Im9uZSJ9.signature";
-    const AUTHZ_TWO: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UiLCJhdXRoeiI6InR3byJ9.signature";
     const AUTH_URL: &str = "stub-auth://auth.credential-isolation.test.invalid";
-
-    /// Hands back an authorization naming which authentication token asked
-    /// for it, and counts the exchanges that actually happened.
-    struct StubAuthentication {
-        exchanges: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl Authentication for StubAuthentication {
-        async fn exchange_for_repository(
-            &self,
-            _auth_url: &str,
-            authn_token: &str,
-            _repository: RepositoryId,
-            _correlation_id: &str,
-        ) -> Result<AuthorizationToken, ProtocolError> {
-            self.exchanges
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            let token = if authn_token == AUTHN_ONE {
-                AUTHZ_ONE
-            } else {
-                AUTHZ_TWO
-            };
-            Ok(AuthorizationToken {
-                token: token.to_string(),
-                expires_ms: 0,
-                acceptable_root_domains: vec!["example.com".to_string()],
-            })
-        }
-
-        async fn start_auth_session(
-            &self,
-            _auth_url: &str,
-            _client_state: &str,
-            _correlation_id: &str,
-        ) -> Result<AuthSession, ProtocolError> {
-            Err(ProtocolError::internal(
-                "the stub only serves authorization exchanges",
-            ))
-        }
-
-        async fn poll_auth_session(
-            &self,
-            _auth_url: &str,
-            _client_state: &str,
-            _session_code: &str,
-            _correlation_id: &str,
-        ) -> Result<AuthSessionPoll, ProtocolError> {
-            Err(ProtocolError::internal(
-                "the stub only serves authorization exchanges",
-            ))
-        }
-
-        async fn exchange_external_token(
-            &self,
-            _auth_url: &str,
-            _token: &str,
-            _token_type: &str,
-            _correlation_id: &str,
-        ) -> Result<AuthenticationToken, ProtocolError> {
-            Err(ProtocolError::internal(
-                "the stub only serves authorization exchanges",
-            ))
-        }
-
-        async fn refresh_authentication(
-            &self,
-            _auth_url: &str,
-            _refresh_token: &str,
-            _correlation_id: &str,
-        ) -> Result<AuthenticationToken, ProtocolError> {
-            Err(ProtocolError::internal(
-                "the stub only serves authorization exchanges",
-            ))
-        }
-
-        async fn exchange_for_custom_resource(
-            &self,
-            _auth_url: &str,
-            _authn_token: &str,
-            _resource_id: &str,
-            _correlation_id: &str,
-        ) -> Result<AuthorizationToken, ProtocolError> {
-            Err(ProtocolError::internal(
-                "the stub only serves repository exchanges",
-            ))
-        }
-    }
 
     async fn authorize(
         endpoint: &AuthEndpoint,
@@ -254,8 +160,12 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
         .expect("the stub authorizes")
     }
 
-    let stub = std::sync::Arc::new(StubAuthentication {
-        exchanges: std::sync::atomic::AtomicUsize::new(0),
+    let stub = StubAuthentication::new(|authn_token, _| {
+        if authn_token == AUTHN_ONE {
+            AUTHZ_ONE
+        } else {
+            AUTHZ_TWO
+        }
     });
     let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
 
@@ -270,7 +180,7 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
         "the same credential reuses the authorization it earned"
     );
     assert_eq!(
-        stub.exchanges.load(std::sync::atomic::Ordering::Acquire),
+        stub.exchanges(),
         1,
         "a repeat of the same credential must come from the cache"
     );
@@ -281,10 +191,327 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
         "a different credential must earn its own authorization"
     );
     assert_eq!(
-        stub.exchanges.load(std::sync::atomic::Ordering::Acquire),
+        stub.exchanges(),
         2,
         "the second credential must not be served the first one's entry"
     );
+}
+
+/// An authorization the server refused is forgotten, so the next exchange asks for a new one, but
+/// only while the cache still holds it: a refusal that arrives after the cache holds a newer one
+/// leaves the newer one alone.
+#[tokio::test]
+async fn a_refusal_forgets_only_the_authorization_refused() {
+    let stub = StubAuthentication::new(|_, served| if served == 0 { AUTHZ_ONE } else { AUTHZ_TWO });
+    let endpoint = AuthEndpoint::new(
+        "stub-auth://auth.late-refusal.test.invalid".to_string(),
+        stub.clone(),
+    );
+    let repository: RepositoryId = "aabbccdd00112233aabbccdd00112233"
+        .parse()
+        .expect("a valid repository id");
+    let authorize = || {
+        exchange(
+            &endpoint,
+            "alice",
+            repository,
+            "example.com".to_string(),
+            AUTHN_ONE,
+            "",
+        )
+    };
+    let refuse = || {
+        forget_refused_authorization(
+            &endpoint,
+            "alice",
+            repository,
+            "example.com",
+            AUTHN_ONE,
+            AUTHZ_ONE,
+        )
+    };
+
+    assert_eq!(authorize().await.expect("authorized"), AUTHZ_ONE);
+    refuse().await;
+    assert_eq!(authorize().await.expect("authorized"), AUTHZ_TWO);
+    refuse().await;
+    assert_eq!(authorize().await.expect("authorized"), AUTHZ_TWO);
+    assert_eq!(stub.exchanges(), 2);
+}
+
+/// A refusal that arrives after the token store holds a newer authorization leaves the newer one
+/// in the store.
+#[tokio::test]
+async fn a_refusal_forgets_only_the_stored_authorization_refused() {
+    const AUTH_URL: &str = "stub-auth://auth.late-stored-refusal.test.invalid";
+    token_store::store_user_token(
+        AUTH_URL,
+        "alice",
+        AUTHN_ONE,
+        vec!["example.com".to_string()],
+    )
+    .await
+    .expect("store the authentication token");
+    let stub = StubAuthentication::new(|_, served| if served == 0 { AUTHZ_ONE } else { AUTHZ_TWO });
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+    let repository: RepositoryId = "aabbccdd00112233aabbccdd44556677"
+        .parse()
+        .expect("a valid repository id");
+    let authorize = || {
+        exchange(
+            &endpoint,
+            "alice",
+            repository,
+            "example.com".to_string(),
+            "",
+            "",
+        )
+    };
+    let refuse = || {
+        forget_refused_authorization(&endpoint, "alice", repository, "example.com", "", AUTHZ_ONE)
+    };
+
+    assert_eq!(authorize().await.expect("authorized"), AUTHZ_ONE);
+    refuse().await;
+    assert_eq!(authorize().await.expect("authorized"), AUTHZ_TWO);
+    refuse().await;
+
+    let stored = token_store::load_user_token_from_store(
+        &authorization_store_key(&endpoint, &repository.to_string()),
+        "alice",
+        token_store::vulnerable_all_tokens(),
+    )
+    .await;
+    assert_eq!(stored.ok().as_deref(), Some(AUTHZ_TWO));
+}
+
+mod refused {
+    use std::sync::Arc;
+    use std::sync::Weak;
+
+    use lore_base::lore_spawn_net;
+    use lore_credential::token_store;
+    use lore_transport::auth::AuthEndpoint;
+    use lore_transport::auth::exchange::exchange;
+    use lore_transport::connection::SuppliedCredentials;
+    use lore_transport::error::ProtocolError;
+    use lore_transport::quic::storage_service::client::StorageClient;
+    use lore_transport::traits::Storage;
+
+    use crate::auth::stub::*;
+    use crate::quic::storage_service::test_server::SessionStarts;
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_partition;
+    use crate::quic::storage_service::test_server::wait_until;
+
+    /// An auth service at `auth_url` that hands out the first authorization, then the second.
+    fn auth_service(auth_url: &str) -> (AuthEndpoint, Arc<StubAuthentication>) {
+        let stub =
+            StubAuthentication::new(|_, served| if served == 0 { AUTHZ_ONE } else { AUTHZ_TWO });
+        (AuthEndpoint::new(auth_url.to_string(), stub.clone()), stub)
+    }
+
+    /// A storage client for alice on `server`, through `endpoint`, with `credentials`.
+    async fn connect(
+        server: &TestStorageServer,
+        endpoint: &AuthEndpoint,
+        credentials: &Arc<SuppliedCredentials>,
+    ) -> Arc<StorageClient> {
+        StorageClient::connect(
+            Weak::new(),
+            &server.url,
+            "example.com".to_string(),
+            endpoint,
+            "alice",
+            test_partition(),
+            credentials,
+            None,
+        )
+        .await
+        .expect("connect to the test server")
+    }
+
+    /// A session start for alice through `endpoint` with `credentials`, on a server that refuses
+    /// `refused`. Returns the server and what the session start returned.
+    async fn session_start(
+        endpoint: &AuthEndpoint,
+        refused: &[&str],
+        credentials: SuppliedCredentials,
+    ) -> (TestStorageServer, Result<u32, ProtocolError>) {
+        let server = TestStorageServer::start_refusing_authorizations(refused);
+        let client = connect(&server, endpoint, &Arc::new(credentials)).await;
+        let started = client.session_start(test_partition(), "test").await;
+        (server, started)
+    }
+
+    /// A session start for alice through `endpoint` with `credentials`, which the server holds
+    /// until a later call has supplied `identity_token` in their place, then refuses as not
+    /// authorized, as it does every start after. Returns the server and what the session start
+    /// returned.
+    async fn session_start_across_a_rotation(
+        endpoint: &AuthEndpoint,
+        credentials: SuppliedCredentials,
+        identity_token: &str,
+    ) -> (TestStorageServer, Result<u32, ProtocolError>) {
+        let (server, starts) = TestStorageServer::start_controlling_session_starts();
+        starts
+            .send(SessionStarts::Hold)
+            .expect("the server holds starts");
+        let credentials = Arc::new(credentials);
+        let client = connect(&server, endpoint, &credentials).await;
+        let starting =
+            lore_spawn_net!(async move { client.session_start(test_partition(), "test").await });
+        wait_until(
+            || server.requested_session_starts_per_connection() == [1],
+            "the session start did not reach the server",
+        )
+        .await;
+        credentials.update(identity_token, "");
+        starts
+            .send(SessionStarts::RefuseAuthorization)
+            .expect("the server refuses the held start");
+        let started = starting.await.expect("session start task");
+        (server, started)
+    }
+
+    /// A storage session start the server refuses forgets the authorization it presented and starts
+    /// the session with a newly exchanged one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_authorization_is_exchanged_again() {
+        let (endpoint, stub) = auth_service("stub-auth://auth.refused-authorization.test.invalid");
+        let (server, started) = session_start(
+            &endpoint,
+            &[AUTHZ_ONE],
+            SuppliedCredentials::new(AUTHN_ONE, ""),
+        )
+        .await;
+
+        assert!(started.is_ok(), "the session must start: {started:?}");
+        assert_eq!(server.presented_authorizations(), [AUTHZ_ONE, AUTHZ_TWO]);
+        assert_eq!(stub.exchanges(), 2);
+    }
+
+    /// A refused authorization from the token store is not read back from it on the cache miss
+    /// its eviction leaves, so the session starts with a newly exchanged one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_stored_authorization_is_exchanged_again() {
+        const AUTH_URL: &str = "stub-auth://auth.refused-stored-authorization.test.invalid";
+        token_store::store_user_token(
+            AUTH_URL,
+            "alice",
+            AUTHN_ONE,
+            vec!["example.com".to_string()],
+        )
+        .await
+        .expect("store the authentication token");
+        let (endpoint, stub) = auth_service(AUTH_URL);
+
+        let (server, started) =
+            session_start(&endpoint, &[AUTHZ_ONE], SuppliedCredentials::default()).await;
+
+        assert!(started.is_ok(), "the session must start: {started:?}");
+        assert_eq!(server.presented_authorizations(), [AUTHZ_ONE, AUTHZ_TWO]);
+        assert_eq!(stub.exchanges(), 2);
+    }
+
+    /// A refusal of the newly exchanged authorization is final.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_new_authorization_is_final() {
+        let (endpoint, stub) = auth_service("stub-auth://auth.refused-twice.test.invalid");
+        let (server, started) = session_start(
+            &endpoint,
+            &[AUTHZ_ONE, AUTHZ_TWO],
+            SuppliedCredentials::new(AUTHN_ONE, ""),
+        )
+        .await;
+
+        assert!(started.is_err_and(|err| err.is_not_authorized()));
+        assert_eq!(server.presented_authorizations(), [AUTHZ_ONE, AUTHZ_TWO]);
+        assert_eq!(stub.exchanges(), 2);
+    }
+
+    /// A refusal is final where the exchange after it gives the authorization refused again, which
+    /// is not presented twice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_the_exchange_gives_again_is_final() {
+        let stub = StubAuthentication::new(|_, _| AUTHZ_ONE);
+        let endpoint = AuthEndpoint::new(
+            "stub-auth://auth.refused-unchanged.test.invalid".to_string(),
+            stub.clone(),
+        );
+        let (server, started) = session_start(
+            &endpoint,
+            &[AUTHZ_ONE],
+            SuppliedCredentials::new(AUTHN_ONE, ""),
+        )
+        .await;
+
+        assert!(started.is_err_and(|err| err.is_not_authorized()));
+        assert_eq!(server.presented_authorizations(), [AUTHZ_ONE]);
+        assert_eq!(stub.exchanges(), 2);
+    }
+
+    /// A refusal of an access token the caller supplied is final, and asks the auth service
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_supplied_access_token_is_final() {
+        let (endpoint, stub) = auth_service("stub-auth://auth.refused-access-token.test.invalid");
+        let (server, started) = session_start(
+            &endpoint,
+            &[AUTHZ_ONE],
+            SuppliedCredentials::new("", AUTHZ_ONE),
+        )
+        .await;
+
+        assert!(started.is_err_and(|err| err.is_not_authorized()));
+        assert_eq!(server.presented_authorizations(), [AUTHZ_ONE]);
+        assert_eq!(stub.exchanges(), 0);
+    }
+
+    /// A refusal of an access token the caller supplied is final, and asks the auth service
+    /// nothing, though a later call supplies an identity token while the server considers it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_supplied_access_token_is_final_after_a_rotation() {
+        let (endpoint, stub) = auth_service("stub-auth://auth.rotated-access-token.test.invalid");
+        let (server, started) = session_start_across_a_rotation(
+            &endpoint,
+            SuppliedCredentials::new("", AUTHZ_ONE),
+            AUTHN_ONE,
+        )
+        .await;
+
+        assert!(started.is_err_and(|err| err.is_not_authorized()));
+        assert_eq!(server.presented_authorizations(), [AUTHZ_ONE]);
+        assert_eq!(stub.exchanges(), 0);
+    }
+
+    /// A refusal is forgotten under the identity token that exchanged the authorization refused,
+    /// though a later call supplies another while the server considers it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_after_a_rotation_forgets_the_authorization_refused() {
+        let (endpoint, stub) = auth_service("stub-auth://auth.rotated-identity-token.test.invalid");
+        let (server, started) = session_start_across_a_rotation(
+            &endpoint,
+            SuppliedCredentials::new(AUTHN_ONE, ""),
+            AUTHN_TWO,
+        )
+        .await;
+
+        assert!(started.is_err_and(|err| err.is_not_authorized()));
+        assert_eq!(server.presented_authorizations(), [AUTHZ_ONE, AUTHZ_TWO]);
+        let authorized = exchange(
+            &endpoint,
+            "alice",
+            test_partition(),
+            "example.com".to_string(),
+            AUTHN_ONE,
+            "",
+        )
+        .await
+        .expect("authorized");
+        assert_eq!(authorized, AUTHZ_TWO);
+        assert_eq!(stub.exchanges(), 3);
+    }
 }
 
 /// An implementation that refuses the login token reports `NotAuthenticated`, and the

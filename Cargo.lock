@@ -2664,6 +2664,7 @@ name = "lore-credential"
 version = "0.10.2-nightly"
 dependencies = [
  "base64 0.22.1",
+ "ctor",
  "jsonwebtoken",
  "keyring",
  "lore-base",
@@ -3029,6 +3030,7 @@ dependencies = [
  "bitcode",
  "bytes",
  "crossbeam",
+ "ctor",
  "dashmap",
  "futures",
  "http 1.4.0",

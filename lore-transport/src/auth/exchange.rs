@@ -50,24 +50,84 @@ type Identity = String;
 type CacheResourceId = String;
 type RecipientDomain = String;
 type CredentialFingerprint = String;
-type AuthzCache = Mutex<
-    HashMap<
-        (
-            AuthEndpointUrl,
-            Identity,
-            CacheResourceId,
-            RecipientDomain,
-            CredentialFingerprint,
-            CredentialStore,
-        ),
-        String,
-    >,
->;
+type AuthzCacheKey = (
+    AuthEndpointUrl,
+    Identity,
+    CacheResourceId,
+    RecipientDomain,
+    CredentialFingerprint,
+    CredentialStore,
+);
+type AuthzCache = Mutex<HashMap<AuthzCacheKey, String>>;
 
 static AUTHZ_CACHE: std::sync::OnceLock<AuthzCache> = std::sync::OnceLock::new();
 
 fn cache() -> &'static AuthzCache {
     AUTHZ_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The key an authorization for `resource` is cached under: the endpoint, the identity, the
+/// resource, the recipient domain, the fingerprint of the identity token the caller supplied,
+/// empty for credentials from the token store, and the token store the call reads.
+fn authorization_cache_key(
+    auth_endpoint: &AuthEndpoint,
+    identity: &str,
+    resource: &str,
+    recipient_domain: &str,
+    identity_token: &str,
+) -> AuthzCacheKey {
+    (
+        auth_endpoint.url.clone(),
+        identity.to_string(),
+        resource.to_string(),
+        recipient_domain.to_string(),
+        lore_credential::token_fingerprint(identity_token),
+        credential_store(),
+    )
+}
+
+/// The key an authorization for `resource` is stored under in the token store.
+#[lore_macro::test_pub]
+fn authorization_store_key(auth_endpoint: &AuthEndpoint, resource: &str) -> String {
+    format!("{auth_endpoint}/{resource}")
+}
+
+/// Forgets `refused`, an authorization for `repository` that [`exchange`] handed out and the
+/// server has since refused, so the next exchange does not serve `refused` until it expires.
+///
+/// It is forgotten from the cache and, unless the caller supplied the identity token, from the
+/// token store, which the exchange reads on a cache miss. The cache stays locked until both are
+/// done, so no exchange reads `refused` back from the store meanwhile. An entry holding another
+/// token is left alone, as another caller has replaced it already. The store's entry is compared
+/// as [`token_store::remove_user_token_if`] compares it, so one another process has stored is
+/// left alone too.
+#[lore_macro::test_pub]
+pub(crate) async fn forget_refused_authorization(
+    auth_endpoint: &AuthEndpoint,
+    identity: &str,
+    repository: RepositoryId,
+    recipient_domain: &str,
+    identity_token: &str,
+    refused: &str,
+) {
+    let repository = repository.to_string();
+    let cache_key = authorization_cache_key(
+        auth_endpoint,
+        identity,
+        &repository,
+        recipient_domain,
+        identity_token,
+    );
+    let mut cache = cache().lock().await;
+    if cache.get(&cache_key).is_some_and(|token| token == refused) {
+        cache.remove(&cache_key);
+    }
+    if identity_token.is_empty() {
+        let token_store_key = authorization_store_key(auth_endpoint, &repository);
+        let _ = token_store::remove_user_token_if(&token_store_key, identity, refused)
+            .await
+            .inspect_err(|err| lore_warn!("Failed to remove a refused authorization: {err}"));
+    }
 }
 
 pub fn is_expired(expires: u64) -> bool {
@@ -131,15 +191,13 @@ pub async fn exchange(
     let repo_id_str = repository.to_string();
     // A supplied access token returned above, so the identity token is the only
     // credential that reaches the cache or the store from here.
-    let credential_fingerprint = lore_credential::token_fingerprint(identity_token);
-    let supplied_credentials = !credential_fingerprint.is_empty();
-    let cache_key = (
-        auth_url.clone(),
-        identity.to_string(),
-        repo_id_str.clone(),
-        recipient_domain.clone(),
-        credential_fingerprint,
-        credential_store(),
+    let supplied_credentials = !identity_token.is_empty();
+    let cache_key = authorization_cache_key(
+        auth_endpoint,
+        identity,
+        &repo_id_str,
+        &recipient_domain,
+        identity_token,
     );
     let mut cache = cache().lock().await;
 
@@ -150,8 +208,7 @@ pub async fn exchange(
 
     let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
 
-    // Token store key: "{auth_endpoint}/{repository_id}" (no urc- prefix)
-    let token_store_key = format!("{auth_endpoint}/{repo_id_str}");
+    let token_store_key = authorization_store_key(auth_endpoint, &repo_id_str);
 
     if !token.is_empty() {
         lore_trace!("Found cached authz token for {cache_key:?}");
@@ -309,15 +366,13 @@ pub async fn exchange_custom_resource(
     let auth_url = auth_endpoint.url.clone();
     // A supplied access token returned above, so the identity token is the only
     // credential that reaches the cache or the store from here.
-    let credential_fingerprint = lore_credential::token_fingerprint(identity_token);
-    let supplied_credentials = !credential_fingerprint.is_empty();
-    let cache_key = (
-        auth_url.clone(),
-        identity.to_string(),
-        resource_id.to_string(),
-        recipient_domain.clone(),
-        credential_fingerprint,
-        credential_store(),
+    let supplied_credentials = !identity_token.is_empty();
+    let cache_key = authorization_cache_key(
+        auth_endpoint,
+        identity,
+        resource_id,
+        &recipient_domain,
+        identity_token,
     );
     let mut cache = cache().lock().await;
 
@@ -328,9 +383,7 @@ pub async fn exchange_custom_resource(
 
     let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
 
-    // Token store key: "{auth_endpoint}/{resource_id}" -- same shape as the
-    // repository variant, with the resource ID taking the repository slot.
-    let token_store_key = format!("{auth_endpoint}/{resource_id}");
+    let token_store_key = authorization_store_key(auth_endpoint, resource_id);
 
     if !token.is_empty() {
         lore_trace!("Found cached authz token for {cache_key:?}");

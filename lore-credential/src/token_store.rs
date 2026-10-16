@@ -739,7 +739,39 @@ pub async fn remove_all_tokens_for_auth_url(auth_url: &str) -> Result<(), TokenS
     Ok(())
 }
 
-pub async fn remove_user_token(endpoint: &str, identity: &str) -> Result<(), TokenStoreError> {
+/// Remove every token `identity` holds for `endpoint`.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+pub fn remove_user_token<'a>(
+    endpoint: &'a str,
+    identity: &'a str,
+) -> impl Future<Output = Result<(), TokenStoreError>> + 'a {
+    remove_user_token_where(endpoint, identity, |_| true)
+}
+
+/// Remove `identity`'s token for `endpoint` if it is `token`, compared in the store as reloaded
+/// under its file lock, or as this process holds it where the file does not load, so a token
+/// another process has stored in its place is left alone.
+pub async fn remove_user_token_if(
+    endpoint: &str,
+    identity: &str,
+    token: &str,
+) -> Result<(), TokenStoreError> {
+    let key = get_token_encryption_key().await?;
+    remove_user_token_where(endpoint, identity, |sealed| {
+        open_token(&key, sealed).is_ok_and(|stored| stored == token)
+    })
+    .await
+}
+
+/// Remove each of `identity`'s tokens for `endpoint` whose sealed form `removes` returns true
+/// for, in the store as reloaded under its file lock, or as this process holds it where the file
+/// does not load.
+async fn remove_user_token_where(
+    endpoint: &str,
+    identity: &str,
+    mut removes: impl FnMut(&str) -> bool,
+) -> Result<(), TokenStoreError> {
     lore_trace!("Remove user {identity} token for auth_endpoint {endpoint}");
 
     let mut store = cached_token_map().await;
@@ -757,9 +789,9 @@ pub async fn remove_user_token(endpoint: &str, identity: &str) -> Result<(), Tok
         {
             let before_len = map.remotes[remote_index].token.len();
 
-            map.remotes[remote_index]
-                .token
-                .retain(|token_identity| token_identity.user_id != identity);
+            map.remotes[remote_index].token.retain(|token_identity| {
+                token_identity.user_id != identity || !removes(&token_identity.token)
+            });
 
             if map.remotes[remote_index].token.len() < before_len {
                 lore_trace!("Removed token for endpoint {endpoint} identity {identity}");
@@ -1287,6 +1319,11 @@ pub mod test_util {
 
     pub fn split_remote_resource(store_key: &str) -> (String, String) {
         super::split_remote_resource(store_key)
+    }
+
+    /// The file the token store this call reads is kept in.
+    pub fn store_file() -> Result<std::path::PathBuf, TokenStoreError> {
+        super::token_map_path(false)
     }
 
     pub fn is_entry_for_auth_url(remote: &str, auth_url: &str) -> bool {
