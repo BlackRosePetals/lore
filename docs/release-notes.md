@@ -239,6 +239,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Local stores: an index entry that a machine failure left pointing past the end of its packfile is detected when its
   bucket loads, and its payload is stored again when next fetched, rather than read back as other content or
   overwritten by later writes. A packfile whose sync fails takes no more writes
+- Local stores: a flush no longer returns before a bucket write that the delayed flush, another flush, eviction or
+  compaction had started has landed. A process stopped just after a flush could lose entries the flush reported written
 - `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of
   `Recursion task failed`
 - `lore clone` reports the error that stopped it, such as a file it failed to fetch or write, in place of

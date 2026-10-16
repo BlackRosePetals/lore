@@ -3954,11 +3954,17 @@ impl LocalImmutableStore {
             // flush, so it has nothing to serialize and owes no marker. A marker-less group
             // reloads at bucket_count = 256, correct for an empty group at any level, and its
             // first write fires the two-phase commit. Empty groups cost ~nothing per flush.
+            //
+            // Unless a bucket write holds the group's flush lock: it may have claimed a bucket's
+            // mark, before this scan, and not written the file yet. Every bucket write claims
+            // and writes under the lock, so a group whose lock is free once its marks read clean
+            // has every write claimed before then on disk, and one whose lock is held is waited
+            // for, so that this flush does not return before a write it covers has landed.
             let any_dirty = group
                 .dirty
                 .iter()
                 .any(|flag| flag.load(atomic::Ordering::Relaxed));
-            if !any_dirty && !group.fan_out_uncommitted() {
+            if !any_dirty && !group.fan_out_uncommitted() && group.flush_lock.try_lock().is_ok() {
                 continue;
             }
 

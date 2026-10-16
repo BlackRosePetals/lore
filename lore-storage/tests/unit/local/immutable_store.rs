@@ -320,6 +320,57 @@ async fn put_fragments(
     addresses
 }
 
+/// A flush returns only once a bucket write another flush claimed has landed. The claim clears
+/// the bucket's mark before the write, so the group reads clean to a flush starting meanwhile,
+/// which skipping it would let return with an entry acknowledged before it still unwritten: a
+/// process killed then loses the entry.
+#[tokio::test]
+async fn a_flush_waits_for_a_bucket_write_another_flush_claimed() {
+    let dir = lore_base::test_util::TempDir::new("is_flush_claimed_");
+    let store = LocalImmutableStore::new(
+        Some(dir.path().to_path_buf()),
+        ImmutableStoreSettings {
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        },
+    )
+    .await
+    .expect("store opens");
+    let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+    let partition = Partition::from([9u8; 16]);
+    let (first, _) = payload_off_bucket_zero(1);
+    put_payload(&store, partition, first.context, b"written before", false).await;
+    dyn_store.clone().flush(false).await.expect("flush");
+    let address = put_payload(
+        &store,
+        partition,
+        first.context,
+        b"claimed meanwhile",
+        false,
+    )
+    .await;
+
+    let pause = pause_at(PausePoint::Serializing);
+    let group_index = address.hash.data()[0] as usize;
+    let delayed = lore_base::lore_spawn!(ImmutableStoreGroup::flush_delayed(
+        Arc::downgrade(&store),
+        group_index,
+        0
+    ));
+    pause.reached.notified().await;
+    let flushing = dyn_store.clone();
+    let mut flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut flush)
+            .await
+            .is_err(),
+        "the flush returned while the claimed bucket write was still to land"
+    );
+    pause.resume.notify_one();
+    delayed.await.expect("delayed flush");
+    flush.await.expect("flush task").expect("flush");
+}
+
 /// Run the background timer's flush for every group, and nothing else.
 async fn run_delayed_flush(store: &Arc<LocalImmutableStore>) {
     let weak = Arc::downgrade(store);

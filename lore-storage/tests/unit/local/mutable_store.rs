@@ -187,6 +187,43 @@ async fn run_delayed_flush(store: &Arc<LocalMutableStore>) {
     }
 }
 
+/// A flush waits for a bucket write holding the group's flush lock, which may have claimed a
+/// bucket's mark and not written its file yet: the group reads clean, and skipping it would let
+/// the flush return with an entry acknowledged before it still unwritten.
+#[tokio::test]
+async fn a_flush_waits_for_a_bucket_write_holding_the_group() {
+    use lore_storage::mutable_store::MutableStore;
+    let dir = lore_base::test_util::TempDir::new("ms_flush_claimed_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            MutableStoreSettings {
+                flush_delay_seconds: 3600,
+                ..client_settings()
+            },
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store opens"),
+    );
+    let keys = store_keys(&store, Partition::default(), 1).await;
+    let group = &store.group[keys[0].data()[0] as usize];
+
+    // A write that took the lock and claimed the mark, and has not written the file.
+    let writing = group.flush_lock.clone().lock_owned().await;
+    assert!(group.dirty[0].swap(false, atomic::Ordering::Relaxed));
+    let flushing: Arc<dyn MutableStore> = store.clone();
+    let mut flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut flush)
+            .await
+            .is_err(),
+        "the flush returned while a claimed bucket write held the group"
+    );
+    drop(writing);
+    flush.await.expect("flush task").expect("flush");
+}
+
 /// Every `level` marker under a store's index directory.
 fn level_markers(index_root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();

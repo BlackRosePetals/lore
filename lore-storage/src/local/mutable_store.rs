@@ -1022,12 +1022,14 @@ impl LocalMutableStore {
         let authoritative = self.authoritative;
 
         for (group_index, group) in self.group.iter().enumerate() {
-            // Lock-free scan: skip entire group if nothing is dirty and no fan-out awaits its commit.
+            // Lock-free scan: skip entire group if nothing is dirty and no fan-out awaits its commit,
+            // unless a bucket write holds the group's flush lock: it may have claimed a bucket's
+            // mark and not written the file yet, and this flush must not return before it has.
             let any_dirty = group
                 .dirty
                 .iter()
                 .any(|flag| flag.load(atomic::Ordering::Relaxed));
-            if !any_dirty && !group.fan_out_uncommitted() {
+            if !any_dirty && !group.fan_out_uncommitted() && group.flush_lock.try_lock().is_ok() {
                 continue;
             }
 
