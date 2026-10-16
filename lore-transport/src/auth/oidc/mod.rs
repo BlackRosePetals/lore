@@ -4,6 +4,7 @@
 
 pub mod device;
 pub mod discovery;
+pub mod exchange;
 pub mod token;
 
 use std::future::Future;
@@ -207,8 +208,9 @@ pub fn issuer(endpoint: &str) -> &str {
 /// server names. Bound to that advertisement at selection, since the endpoint string alone
 /// names the issuer and not the client.
 ///
-/// The interactive login is the device authorization grant (RFC 8628). The other grants
-/// are not implemented yet, and fail with [`NotSupported`].
+/// The interactive login is the device authorization grant (RFC 8628), and authorization
+/// for a partition the token exchange (RFC 8693) when the server advertises a template. The
+/// other grants are not implemented yet, and fail with [`NotSupported`].
 pub struct OidcAuthentication {
     oidc: Oidc,
 }
@@ -228,12 +230,9 @@ impl OidcAuthentication {
         .into()
     }
 
-    /// The provider's endpoints, from its discovery document. The issuer is the one the
-    /// implementation was selected for; `auth_url` is the endpoint naming it.
-    async fn discover(
-        &self,
-        auth_url: &str,
-    ) -> Result<Arc<discovery::DiscoveryDocument>, ProtocolError> {
+    /// Refuses an `auth_url` naming an issuer other than the one the implementation was
+    /// selected for.
+    fn check_endpoint(&self, auth_url: &str) -> Result<(), ProtocolError> {
         let issuer = issuer(auth_url);
         if issuer != self.oidc.issuer {
             return Err(ProtocolError::internal(format!(
@@ -241,9 +240,31 @@ impl OidcAuthentication {
                 self.oidc.issuer
             )));
         }
-        discovery::discover(issuer)
+        Ok(())
+    }
+
+    /// The provider's endpoints, from its discovery document.
+    async fn discover(
+        &self,
+        auth_url: &str,
+    ) -> Result<Arc<discovery::DiscoveryDocument>, ProtocolError> {
+        self.check_endpoint(auth_url)?;
+        discovery::discover(&self.oidc.issuer)
             .await
             .map_err(ProtocolError::from)
+    }
+
+    async fn authorize(
+        &self,
+        auth_url: &str,
+        authn_token: &str,
+        target: Option<exchange::Target>,
+    ) -> Result<AuthorizationToken, ProtocolError> {
+        self.check_endpoint(auth_url)?;
+        match target {
+            Some(target) => exchange::exchange(&self.oidc, authn_token, target).await,
+            None => exchange::unexchanged(authn_token),
+        }
     }
 }
 
@@ -304,20 +325,24 @@ impl Authentication for OidcAuthentication {
     async fn exchange_for_repository(
         &self,
         auth_url: &str,
-        _authn_token: &str,
-        _repository: RepositoryId,
+        authn_token: &str,
+        repository: RepositoryId,
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
-        Err(Self::not_implemented("authorization", auth_url))
+        let target = exchange::partition_target(&self.oidc, repository)?;
+        self.authorize(auth_url, authn_token, target).await
     }
 
+    /// The resource is sent verbatim as `resource`, whichever template names a partition.
     async fn exchange_for_custom_resource(
         &self,
         auth_url: &str,
-        _authn_token: &str,
-        _resource_id: &str,
+        authn_token: &str,
+        resource_id: &str,
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
-        Err(Self::not_implemented("authorization", auth_url))
+        let target = exchange::is_exchanging(&self.oidc)
+            .then(|| exchange::Target::Resource(resource_id.to_owned()));
+        self.authorize(auth_url, authn_token, target).await
     }
 }

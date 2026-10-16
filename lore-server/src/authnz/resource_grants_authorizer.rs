@@ -141,6 +141,20 @@ impl RepositoryAuthorizer for ResourceGrantsAuthorizer {
         self.check(token, repository_id, action)
     }
 
+    /// Any verified token: the client looks a repository up before it can exchange for a
+    /// token naming it, and a record discloses no more than `RepositoryCreate` refusing a
+    /// taken name already does.
+    async fn check_repository_lookup(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        _repository_id: RepositoryId,
+    ) -> Result<(), Status> {
+        match token {
+            Some(_) => Ok(()),
+            None => Err(Status::unauthenticated("No token")),
+        }
+    }
+
     fn check_repository_access_sync(
         &self,
         token: Option<&VerifiedToken<'_>>,

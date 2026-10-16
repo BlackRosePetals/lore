@@ -214,7 +214,7 @@ pub async fn repository_query_name(
     })
 }
 
-/// The repository-query reachability check, on the configured authorizer.
+/// The repository-query lookup check, on the configured authorizer.
 ///
 /// Callers map a denial to `RepositoryNotFound` rather than
 /// `permission_denied`, deliberately: answering the two cases apart would
@@ -226,6 +226,6 @@ pub(crate) async fn check_repository_query_authorization(
     repository_id: RepositoryId,
 ) -> Result<(), Status> {
     authorizer
-        .check_repository_access(token, repository_id, None)
+        .check_repository_lookup(token, repository_id)
         .await
 }

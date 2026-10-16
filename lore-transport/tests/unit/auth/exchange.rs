@@ -286,3 +286,139 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
         "the second credential must not be served the first one's entry"
     );
 }
+
+/// An implementation that refuses the login token reports `NotAuthenticated`, and the
+/// exchange passes it on as such rather than as an internal failure, so the caller can
+/// tell that logging in again fixes it. The same holds for a refused partition and
+/// `NotAuthorized`.
+#[tokio::test]
+async fn a_refusal_of_the_login_token_stays_not_authenticated() {
+    use lore_base::error::NotAuthenticated;
+    use lore_base::error::NotAuthorized;
+    use lore_transport::error::ProtocolError;
+    use lore_transport::traits::Authentication;
+    use lore_transport::types::AuthSession;
+    use lore_transport::types::AuthSessionPoll;
+    use lore_transport::types::AuthenticationToken;
+    use lore_transport::types::AuthorizationToken;
+
+    /// `sub` alice, `aud` example.com, expiring in 2033.
+    const AUTHN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UifQ.signature";
+
+    /// Refuses every exchange with the error it holds.
+    struct Refusing(fn() -> ProtocolError);
+
+    fn unused() -> ProtocolError {
+        ProtocolError::internal("the stub only serves authorization exchanges")
+    }
+
+    #[async_trait::async_trait]
+    impl Authentication for Refusing {
+        async fn exchange_for_repository(
+            &self,
+            _auth_url: &str,
+            _authn_token: &str,
+            _repository: RepositoryId,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            Err((self.0)())
+        }
+
+        async fn exchange_for_custom_resource(
+            &self,
+            _auth_url: &str,
+            _authn_token: &str,
+            _resource_id: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            Err((self.0)())
+        }
+
+        async fn start_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthSession, ProtocolError> {
+            Err(unused())
+        }
+
+        async fn poll_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _session_code: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthSessionPoll, ProtocolError> {
+            Err(unused())
+        }
+
+        async fn exchange_external_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(unused())
+        }
+
+        async fn refresh_authentication(
+            &self,
+            _auth_url: &str,
+            _refresh_token: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(unused())
+        }
+    }
+
+    async fn assert_refused_as(
+        auth_url: &str,
+        refusal: fn() -> ProtocolError,
+        check: fn(&ExchangeError) -> bool,
+    ) {
+        let repository: RepositoryId = "ccddeeff00112233ccddeeff00112233"
+            .parse()
+            .expect("a valid repository id");
+        let endpoint =
+            AuthEndpoint::new(auth_url.to_string(), std::sync::Arc::new(Refusing(refusal)));
+
+        let refused = exchange(
+            &endpoint,
+            "alice",
+            repository,
+            "example.com".to_string(),
+            AUTHN,
+            "",
+        )
+        .await
+        .expect_err("the stub refuses the exchange");
+        assert!(check(&refused), "{auth_url}: {refused}");
+
+        let refused = exchange_custom_resource(
+            &endpoint,
+            "alice",
+            "urc-user-service",
+            "example.com".to_string(),
+            AUTHN,
+            "",
+        )
+        .await
+        .expect_err("the stub refuses the exchange");
+        assert!(check(&refused), "{auth_url}: {refused}");
+    }
+
+    assert_refused_as(
+        "stub-auth://auth.refused-login.test.invalid",
+        || NotAuthenticated.into(),
+        ExchangeError::is_not_authenticated,
+    )
+    .await;
+    assert_refused_as(
+        "stub-auth://auth.refused-partition.test.invalid",
+        || NotAuthorized.into(),
+        ExchangeError::is_not_authorized,
+    )
+    .await;
+}

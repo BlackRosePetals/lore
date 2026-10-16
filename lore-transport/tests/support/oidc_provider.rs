@@ -194,10 +194,20 @@ impl RecordingProvider {
 pub async fn spawn_recording_provider(
     respond: impl Fn(&str, &Received, usize) -> Response + Clone + Send + Sync + 'static,
 ) -> RecordingProvider {
+    spawn_recording_provider_named("127.0.0.1", respond).await
+}
+
+/// A [`RecordingProvider`] whose issuer names the loopback port it listens on as `host`,
+/// so two providers can sit on different hosts.
+pub async fn spawn_recording_provider_named(
+    host: &str,
+    respond: impl Fn(&str, &Received, usize) -> Response + Clone + Send + Sync + 'static,
+) -> RecordingProvider {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a loopback port");
-    let issuer = format!("http://{}", listener.local_addr().expect("local address"));
+    let port = listener.local_addr().expect("local address").port();
+    let issuer = format!("http://{host}:{port}");
     let received: Arc<Mutex<Vec<Received>>> = Arc::default();
 
     let handler = {

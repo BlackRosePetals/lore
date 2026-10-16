@@ -219,6 +219,8 @@ pub async fn exchange(
         .map_err(|err| {
             if err.is_not_authorized() {
                 ExchangeError::from(NotAuthorized)
+            } else if err.is_not_authenticated() {
+                ExchangeError::from(NotAuthenticated)
             } else {
                 ExchangeError::internal_with_context(err, "Failed to exchange token")
             }
@@ -394,6 +396,8 @@ pub async fn exchange_custom_resource(
         .map_err(|err| {
             if err.is_not_authorized() {
                 ExchangeError::from(NotAuthorized)
+            } else if err.is_not_authenticated() {
+                ExchangeError::from(NotAuthenticated)
             } else {
                 ExchangeError::internal_with_context(err, "Failed to exchange token")
             }

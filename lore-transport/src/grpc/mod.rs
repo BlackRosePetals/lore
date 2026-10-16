@@ -1579,6 +1579,37 @@ impl GRPCRepository {
 
         Ok(())
     }
+
+    /// A client for the calls about `repository` on the OIDC path: they carry the
+    /// partition's authorization token, as the partition services do, since a Tier 2
+    /// server authorizes them from its partition grant. `None` on the gRPC path, where the login token is
+    /// checked online and these calls keep it.
+    async fn partition_client(
+        &self,
+        repository: RepositoryId,
+    ) -> Option<repository_client::RepositoryService<AuthzInterceptor>> {
+        if !self
+            .auth_endpoint
+            .url
+            .starts_with(crate::auth::oidc::SCHEME_PREFIX)
+        {
+            return None;
+        }
+        let auth = self
+            .connection
+            .repository_authz(
+                &self.auth_endpoint,
+                self.identity.as_str(),
+                repository,
+                &self.credentials,
+            )
+            .await;
+        Some(repository_client::RepositoryService::for_partition(
+            self.connection.channel(),
+            repository,
+            auth,
+        ))
+    }
 }
 
 #[async_trait]
@@ -1619,7 +1650,12 @@ impl Repository for GRPCRepository {
     async fn delete(&self, id: RepositoryId) -> Result<(), ProtocolError> {
         with_reconnect(
             &self.connection,
-            || async { self.client.read().await.delete(id).await },
+            || async {
+                match self.partition_client(id).await {
+                    Some(client) => client.delete(id).await,
+                    None => self.client.read().await.delete(id).await,
+                }
+            },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await
@@ -1650,7 +1686,12 @@ impl Repository for GRPCRepository {
     async fn metadata_get(&self, id: RepositoryId) -> Result<Hash, ProtocolError> {
         with_reconnect(
             &self.connection,
-            || async { self.client.read().await.metadata_get(id).await },
+            || async {
+                match self.partition_client(id).await {
+                    Some(client) => client.metadata_get(id).await,
+                    None => self.client.read().await.metadata_get(id).await,
+                }
+            },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await
@@ -1665,11 +1706,16 @@ impl Repository for GRPCRepository {
         with_reconnect(
             &self.connection,
             || async {
-                self.client
-                    .read()
-                    .await
-                    .metadata_set(id, expected, new)
-                    .await
+                match self.partition_client(id).await {
+                    Some(client) => client.metadata_set(id, expected, new).await,
+                    None => {
+                        self.client
+                            .read()
+                            .await
+                            .metadata_set(id, expected, new)
+                            .await
+                    }
+                }
             },
             |reconnect_id| self.reconnect(reconnect_id),
         )

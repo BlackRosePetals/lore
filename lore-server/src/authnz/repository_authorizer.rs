@@ -109,6 +109,17 @@ pub trait RepositoryAuthorizer: Send + Sync {
         action: Option<&str>,
     ) -> Result<(), Status>;
 
+    /// Whether `token` may look `repository_id` up and read its record: the id, the name
+    /// and the metadata hash, not the metadata or the contents. Reachability by default.
+    async fn check_repository_lookup(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+    ) -> Result<(), Status> {
+        self.check_repository_access(token, repository_id, None)
+            .await
+    }
+
     /// The caller's enumerated access to `repository_id`, when this
     /// authorizer can enumerate it. `Ok(None)` means enumeration is
     /// not possible: an authorizer backed by a policy engine can answer

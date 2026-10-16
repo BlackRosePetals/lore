@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
-use lore_base::types::RepositoryId;
 use lore_transport::auth::AuthMode;
 use lore_transport::auth::AuthPath;
 use lore_transport::auth::authentication;
@@ -207,12 +206,12 @@ async fn the_oidc_endpoint_names_the_issuer_under_the_oidc_scheme() {
     assert!(!Arc::ptr_eq(&selected.endpoint.auth, &by_issuer));
     assert!(authentication::find(&selected.endpoint.url).is_err());
 
-    // The OIDC exchange grants are not implemented yet, and say so without
+    // The OIDC refresh grant is not implemented yet, and says so without
     // touching the network.
     let refused = selected
         .endpoint
         .auth
-        .exchange_for_repository(&selected.endpoint.url, "authn", RepositoryId::default(), "")
+        .refresh_authentication(&selected.endpoint.url, "refresh", "")
         .await
         .expect_err("not implemented yet");
     assert!(refused.is_not_supported(), "{refused}");

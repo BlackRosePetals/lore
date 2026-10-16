@@ -7,6 +7,12 @@ authorization endpoint (RFC 8628 §3.1), the token endpoint for the device
 code grant (§3.4) and the JWKS the lore server verifies tokens against. It
 mints RS256 access tokens, as `MockAuthServer` does for the gRPC path.
 
+The token endpoint also serves the token exchange grant (RFC 8693) that Tier 2
+authorizes partitions with. It reads the partition from the `resource` or
+`scope` the request carries, under the template the test sets, and answers
+with a token whose `resources` claim grants what `grants` holds for that
+partition, or with `invalid_target` for a partition `grants` does not name.
+
 The token endpoint answers from a script the test sets: a list of RFC 8628
 §3.5 error codes answered in order, then the token. An empty script hands out
 the token on the first poll.
@@ -24,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast
-from urllib.parse import parse_qs
+from urllib.parse import parse_qsl
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -32,6 +38,8 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 logger = logging.getLogger(__name__)
 
 DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
+ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 DEFAULT_TOKEN_LIFETIME_SECONDS = 3600
 
 
@@ -64,6 +72,8 @@ class Received:
     path: str
     headers: dict[str, str]
     form: dict[str, str] = field(default_factory=dict)
+    # Every form field in the order sent, a repeated one once per value.
+    fields: list[tuple[str, str]] = field(default_factory=list)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -83,8 +93,9 @@ class _Handler(BaseHTTPRequestHandler):
         provider = cast(_Server, self.server).provider
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length).decode("utf-8")
-        form = {name: values[-1] for name, values in parse_qs(body).items()}
-        self._record(form)
+        fields = parse_qsl(body)
+        form = dict(fields)
+        self._record(form, fields)
         if self.path == "/device":
             self._json(*provider.device_authorization(form))
         elif self.path == "/token":
@@ -92,12 +103,16 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._respond(404, b"not found")
 
-    def _record(self, form: dict[str, str]) -> None:
+    def _record(
+        self, form: dict[str, str], fields: list[tuple[str, str]] | None = None
+    ) -> None:
         provider = cast(_Server, self.server).provider
         headers = {name.lower(): value for name, value in self.headers.items()}
         with provider._lock:
             provider.requests.append(
-                Received(self.command, self.path.split("?")[0], headers, form)
+                Received(
+                    self.command, self.path.split("?")[0], headers, form, fields or []
+                )
             )
 
     def _json(self, status: int, payload: dict) -> None:
@@ -149,6 +164,13 @@ class MockOidcProvider:
         self._lock = threading.Lock()
         self._poll_script: list[str] = []
         self.requests: list[Received] = []
+        # The template the exchange reads the partition from, and the request
+        # parameter carrying it: "resource" or "scope".
+        self.exchange_template = ""
+        self.exchange_carrier = "resource"
+        # Partition id to the actions an exchange for it grants.
+        self.grants: dict[str, list[str]] = {}
+        self._minted: set[str] = set()
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
         self.port: int | None = None
@@ -174,6 +196,11 @@ class MockOidcProvider:
     def reset(self) -> None:
         with self._lock:
             self._poll_script.clear()
+            self.requests.clear()
+            self.grants.clear()
+
+    def reset_requests(self) -> None:
+        with self._lock:
             self.requests.clear()
 
     # ------------------------------------------------------------------
@@ -225,6 +252,8 @@ class MockOidcProvider:
         }
 
     def token(self, form: dict[str, str]) -> tuple[int, dict]:
+        if form.get("grant_type") == TOKEN_EXCHANGE_GRANT:
+            return self.token_exchange(form)
         if form.get("grant_type") != DEVICE_CODE_GRANT:
             return 400, {"error": "unsupported_grant_type"}
         if form.get("client_id") != self.client_id:
@@ -243,6 +272,30 @@ class MockOidcProvider:
             "expires_in": DEFAULT_TOKEN_LIFETIME_SECONDS,
             "scope": form.get("scope", "openid offline_access"),
             "id_token": self.mint_id_token(self.user),
+        }
+
+    def token_exchange(self, form: dict[str, str]) -> tuple[int, dict]:
+        """RFC 8693 §2.1: the subject token must be one this stub minted, and
+        the partition is read from the configured carrier."""
+        if form.get("client_id") != self.client_id:
+            return 400, {"error": "invalid_client"}
+        with self._lock:
+            minted = form.get("subject_token") in self._minted
+        if not minted or form.get("subject_token_type") != ACCESS_TOKEN_TYPE:
+            return 400, {"error": "invalid_grant"}
+        prefix, _, suffix = self.exchange_template.partition("{id}")
+        named = form.get(self.exchange_carrier, "")
+        partition = named.removeprefix(prefix).removesuffix(suffix)
+        if not named.startswith(prefix) or partition not in self.grants:
+            return 400, {"error": "invalid_target"}
+        resources = [
+            {"resource_id": f"urc-{partition}", "permission": self.grants[partition]}
+        ]
+        return 200, {
+            "access_token": self.mint_token(self.user, resources=resources),
+            "issued_token_type": ACCESS_TOKEN_TYPE,
+            "token_type": "Bearer",
+            "expires_in": DEFAULT_TOKEN_LIFETIME_SECONDS,
         }
 
     # ------------------------------------------------------------------
@@ -281,11 +334,15 @@ class MockOidcProvider:
         return f"{signing_input}.{_b64url(signature)}"
 
     def mint_token(
-        self, user: OidcUser, lifetime_seconds: int = DEFAULT_TOKEN_LIFETIME_SECONDS
+        self,
+        user: OidcUser,
+        lifetime_seconds: int = DEFAULT_TOKEN_LIFETIME_SECONDS,
+        resources: list[dict] | None = None,
     ) -> str:
         """An access token for `user`, carrying only the claims a stock
         provider emits: no display name, so the name must come from the ID
-        token."""
+        token. With `resources`, a partition-scoped token carrying that
+        claim, as an exchange mints."""
         now = int(time.time())
         claims = {
             "iss": self.issuer,
@@ -298,7 +355,12 @@ class MockOidcProvider:
         }
         if user.identity is not None:
             claims["identity"] = user.identity
-        return self._sign(claims)
+        if resources is not None:
+            claims["resources"] = resources
+        token = self._sign(claims)
+        with self._lock:
+            self._minted.add(token)
+        return token
 
     def mint_id_token(self, user: OidcUser) -> str:
         now = int(time.time())

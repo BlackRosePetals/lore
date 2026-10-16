@@ -269,6 +269,23 @@ def test_a_commit_after_login_records_the_tokens_identity(
 
 
 @pytest.mark.smoke
+def test_a_push_after_login_sends_the_login_token_unexchanged(oidc_env, make_repo):
+    """The server advertises no partition template, so the deployment is on
+    Tier 1: the login token authorizes the push itself, and the provider is
+    asked for no exchange."""
+    provider = oidc_env.provider
+    repo = make_repo()
+    repo.run(urc_args=["auth", "login", oidc_env.remote_url, "--no-browser"])
+    repo.repository_create()
+    seed_and_commit(repo)
+
+    repo.push()
+
+    grants = [r.form.get("grant_type") for r in provider.requests_to("/token")]
+    assert grants == [DEVICE_CODE_GRANT], grants
+
+
+@pytest.mark.smoke
 def test_a_supplied_token_and_an_offline_commit_record_the_identity(
     oidc_env, new_lore_repo, scratch_dir
 ):

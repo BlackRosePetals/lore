@@ -336,3 +336,32 @@ async fn no_token_denies_even_plain_access() {
         assert_eq!(err.code(), Code::Unauthenticated);
     }
 }
+
+/// A lookup needs a verified token and no grant: the client looks a repository up before
+/// it can exchange for a token naming it. Reaching the partition still needs the grant.
+#[tokio::test]
+async fn a_lookup_needs_a_verified_token_and_no_grant() {
+    let authorizer = default_authorizer();
+    let login = token_with_extra(json!({}));
+    let token = VerifiedToken {
+        raw: "raw",
+        claims: &login,
+    };
+
+    for id in [REPOSITORY_HEX, UNRELATED_HEX] {
+        authorizer
+            .check_repository_lookup(Some(&token), repository(id))
+            .await
+            .expect("any verified token may look a repository up");
+        let err = check(&authorizer, &login, repository(id), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    let err = authorizer
+        .check_repository_lookup(None, repository(REPOSITORY_HEX))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unauthenticated);
+}

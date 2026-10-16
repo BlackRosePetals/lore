@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 mod device;
 mod discovery;
+mod exchange;
 
 #[path = "../../support/oidc_provider.rs"]
 mod provider;

@@ -32,6 +32,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   store's error with its variant rather than as internal
 - C API: `lore_branch_merge_start_args_t` appends `link_paths` and `link_messages`, taking the struct from 80 to 112
   bytes. Rebuild against the new `lore.h`; a zero-initialized struct keeps today's behavior
+- The server refuses to start when `[server.auth] resource_id_template`, or `resource_template` or `scope_template` in
+  `[server.auth.oidc]`, has no `{id}`. Such a template names the same resource for every partition, so one grant
+  matched every partition. The error names the setting
 
 ### Features
 
@@ -58,9 +61,13 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   grant (RFC 8628). The login asks the provider for the server's default scopes and `offline_access`, opens the
   verification URL in the browser, or prints it with `--no-browser`, shows the code the provider's page may ask the user
   to confirm, polls the token endpoint at the cadence the provider sets, and stores the access token and the refresh
-  token it issues. An ID token the provider returns names the user for display and is neither stored nor sent. The
-  OIDC path serves login alone for now: the refresh, token exchange and client credentials grants are not implemented
-  yet
+  token it issues. An ID token the provider returns names the user for display and is neither stored nor sent. After
+  the login, partition operations send the access token itself. When the server advertises `resource_template` or
+  `scope_template`, they send a token the provider issues for that partition through the RFC 8693 token exchange,
+  which names the partition in that one parameter. A token exchange issuer on another host than the login issuer gets
+  the login token only if the token names that host: in its `root_domains` claim, or, without that claim, in its
+  `aud`. Repository metadata set and get and repository delete send the partition's token as well. The refresh and
+  client credentials grants are not implemented yet
 - `lore branch merge` and `lore branch merge start` accept `--link-message <PATH> <MESSAGE>`, as `lore commit` does,
   giving the linked repository at `PATH` its own message on the revision a merge auto-commits. A path that is not a
   link fails the merge before it starts
@@ -97,6 +104,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- On a server with `[server.auth] resource_claim` set, a repository lookup by name or id answers any verified caller
+  with the repository's id, name and metadata hash, so a client can learn the id it exchanges a token for. Without a
+  grant on the partition the lookup answered not found, so `lore repository clone`, `lore link add`, `lore layer add`,
+  `lore repository info` and `lore repository delete` failed. Reading the metadata or the contents still needs the
+  grant
 - `lore commit --link-message` accepts the link path in any spelling that names it, such as `./vendor/lib/`, as
   `lore branch merge` does. The path is checked in the library, so a C API commit naming a path that is not a link now
   fails as invalid arguments. A message for a link with nothing staged is ignored rather than refused
