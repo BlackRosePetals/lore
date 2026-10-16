@@ -70,7 +70,7 @@ async fn a_fresh_context_has_no_session_pool_to_reuse() {
     for state in [RemoteState::Offline, RemoteState::Failed(no_remote())] {
         let context = context_with_state(state).await;
         assert!(
-            context.cached_session_pool().is_none(),
+            context.cached_session_pool("correlation").is_none(),
             "a context that has resolved nothing reported a pool"
         );
     }
@@ -82,17 +82,19 @@ async fn a_fresh_context_has_no_session_pool_to_reuse() {
 async fn an_offline_context_resolves_no_session_pool() {
     let context = context_with_state(RemoteState::Offline).await;
     assert!(context.session_pool("correlation").await.is_err());
-    assert!(context.cached_session_pool().is_none());
+    assert!(context.cached_session_pool("correlation").is_none());
 }
 
-/// A pool for a context to hold, the strong reference left to the caller as the
-/// connection's session cache holds it. The session in it is never resolved:
-/// these tests ask which pool answered, not what it yields.
-fn held_pool() -> Arc<lore_transport::SessionPool> {
+/// A pool for a context to hold, started for `correlation_id`. The session in it is never
+/// resolved: these tests ask which pool answered, not what it yields.
+fn held_pool(correlation_id: &str) -> Arc<lore_transport::SessionPool> {
     let session = Arc::new(lore_transport::StorageSession::pending(|| async {
         Err(ProtocolError::internal("a pooled session no test resolves"))
     }));
-    Arc::new(lore_transport::SessionPool::new(vec![session]))
+    Arc::new(lore_transport::SessionPool::new(
+        Arc::from(correlation_id),
+        vec![session],
+    ))
 }
 
 /// A pool once resolved is handed back without consulting the remote. This
@@ -101,7 +103,7 @@ fn held_pool() -> Arc<lore_transport::SessionPool> {
 #[tokio::test]
 async fn a_resolved_pool_is_reused_without_touching_the_remote() {
     let context = context_with_state(RemoteState::Failed(disconnected())).await;
-    let pool = held_pool();
+    let pool = held_pool("correlation");
     context.set_session_pool(&pool);
 
     let reused = context
@@ -111,21 +113,35 @@ async fn a_resolved_pool_is_reused_without_touching_the_remote() {
     assert!(Arc::ptr_eq(&reused, &pool));
 }
 
-/// The pool is held weakly, so dropping the pin — which is what
-/// `StorageSession::invalidate` does to the connection's cache — sends the next
-/// caller back to the remote rather than handing out sessions the server has
-/// forgotten.
+/// A pool a session over it has invalidated is stale, so the next caller goes back to the
+/// remote rather than being handed sessions the server has forgotten.
 #[tokio::test]
-async fn a_pool_whose_pin_is_dropped_is_not_reused() {
+async fn a_stale_pool_is_not_reused() {
     let context = context_with_state(RemoteState::Failed(disconnected())).await;
-    let pool = held_pool();
+    let pool = held_pool("correlation");
     context.set_session_pool(&pool);
     assert!(context.session_pool("correlation").await.is_ok());
 
-    drop(pool);
+    lore_transport::StorageSession::pooled(pool)
+        .invalidate()
+        .await;
     assert!(
         context.session_pool("correlation").await.is_err(),
-        "an expired pool must send the caller back to the remote"
+        "a stale pool must send the caller back to the remote"
+    );
+}
+
+/// A pool started for one correlation id is not handed to a call under another, which goes back
+/// to the remote for its own.
+#[tokio::test]
+async fn a_pool_is_not_reused_under_another_correlation_id() {
+    let context = context_with_state(RemoteState::Failed(disconnected())).await;
+    context.set_session_pool(&held_pool("first"));
+
+    assert!(context.session_pool("first").await.is_ok());
+    assert!(
+        context.session_pool("second").await.is_err(),
+        "another correlation id must send the caller back to the remote"
     );
 }
 

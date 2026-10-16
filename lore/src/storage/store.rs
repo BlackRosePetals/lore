@@ -24,6 +24,7 @@ use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::options::ReadOptions;
 use lore_transport::StorageSession;
+use smallvec::SmallVec;
 use tokio::sync::Notify;
 
 use crate::interface::LoreGlobalArgs;
@@ -253,15 +254,16 @@ impl StoreInternal {
     }
 
     /// Close sequence: mark the store invalid so no new ops enter, then
-    /// block until every in-flight op has paired its decrement. Ops that
-    /// race in between increment-and-check self-abort because they see
-    /// `invalid=true` before proceeding.
+    /// block until every in-flight op has paired its decrement, then drop the
+    /// session pools the handle holds. Ops that race in between
+    /// increment-and-check self-abort because they see `invalid=true` before
+    /// proceeding.
     #[lore_macro::test_pub]
     pub(crate) async fn mark_invalid_and_await(&self) {
         self.invalid.store(true, Ordering::Release);
         loop {
             if self.in_flight.load(Ordering::Acquire) == 0 {
-                return;
+                break;
             }
             let mut notified = std::pin::pin!(self.drained.notified());
             // Register before the re-check — `notified()` alone is unregistered until
@@ -269,28 +271,32 @@ impl StoreInternal {
             // await.
             notified.as_mut().enable();
             if self.in_flight.load(Ordering::Acquire) == 0 {
-                return;
+                break;
             }
             notified.await;
+        }
+        if let Some(remote) = &self.remote {
+            remote.pools.clear();
         }
     }
 }
 
-/// Reuses one remote [`StorageSession`] across a batched call's items. Batched storage ops
-/// almost always target a single partition (a batch of keys/addresses in one repository), so a
-/// single `SessionReuse` threaded through the item loop resolves the session once for the whole
-/// call and reuses it for every following item with the same partition, resolving a fresh one
-/// only when the partition changes. It is scoped to one call so the lazily-resolved session binds
-/// to that call's correlation id, and it holds no heap state beyond the one remembered session.
+/// Reuses one remote [`StorageSession`] per partition across a batched call's items, so a
+/// `SessionReuse` threaded through the item loop resolves each partition's session once for the
+/// whole call. It is scoped to one call so the lazily-resolved sessions bind to that call's
+/// correlation id. Batched storage ops almost always target a single partition, whose session is
+/// held inline.
 #[derive(Default)]
+#[lore_macro::test_pub]
 pub(crate) struct SessionReuse {
-    last: Option<(Partition, Option<Arc<StorageSession>>)>,
+    sessions: SmallVec<[(Partition, Arc<StorageSession>); 1]>,
 }
 
 impl SessionReuse {
-    /// The remote session for `partition`, reusing the previously resolved one when `partition`
-    /// matches the last call. Returns `None` without resolving when `want_remote` is false (the
-    /// local path) or the handle has no remote endpoint.
+    /// The remote session for `partition`, reusing the one resolved for it earlier in the call.
+    /// Returns `None` without resolving when `want_remote` is false (the local path) or the
+    /// handle has no remote endpoint.
+    #[lore_macro::test_pub]
     pub(crate) fn session_for(
         &mut self,
         store: &StoreInternal,
@@ -300,14 +306,12 @@ impl SessionReuse {
         if !want_remote {
             return None;
         }
-        if let Some((last_partition, session)) = &self.last
-            && *last_partition == partition
-        {
-            return session.clone();
+        if let Some((_, session)) = self.sessions.iter().find(|(held, _)| *held == partition) {
+            return Some(session.clone());
         }
-        let session = store.remote_session_for(partition);
-        self.last = Some((partition, session.clone()));
-        session
+        let session = store.remote_session_for(partition)?;
+        self.sessions.push((partition, session.clone()));
+        Some(session)
     }
 }
 

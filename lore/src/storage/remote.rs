@@ -7,7 +7,8 @@
 //! per-partition `Connection` caches for the storage-session and admin paths. Construction
 //! does not open the wire — connections are established lazily by the first call that needs
 //! one. Each `lore_storage_open` with a `remote_config` builds its own `RemoteEndpoint` on
-//! `StoreInternal`; cross-handle connection reuse is intentionally out of scope here.
+//! `StoreInternal`, over connections from the process-wide connection cache that every handle
+//! shares.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::protocol;
 use lore_transport::Admin;
 use lore_transport::Connection;
+use lore_transport::PartitionSessions;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 use tokio::sync::Mutex;
@@ -34,15 +36,20 @@ pub(crate) struct RemoteEndpoint {
     /// `sessions` to mirror the existing transport-level split — admin connections may end up
     /// pinned to a different physical socket than session connections.
     admins: Mutex<HashMap<RepositoryId, Arc<Connection>>>,
+    /// The session pool this handle holds for each partition, which its calls under one
+    /// correlation id share until a call under another replaces it or the handle closes.
+    pub pools: PartitionSessions,
 }
 
 impl RemoteEndpoint {
+    #[lore_macro::test_pub]
     pub(crate) fn new(remote_url: impl Into<String>, identity: Option<&str>) -> Self {
         Self {
             remote_url: remote_url.into(),
             identity: identity.map(str::to_string),
             sessions: Mutex::new(HashMap::new()),
             admins: Mutex::new(HashMap::new()),
+            pools: PartitionSessions::default(),
         }
     }
 
@@ -84,18 +91,27 @@ impl RemoteEndpoint {
         Ok(connection)
     }
 
-    /// Resolve a `StorageSession` bound to `partition`. The session is created on first use;
-    /// the underlying connection is shared with subsequent calls for the same partition.
+    /// Resolve a `StorageSession` bound to `partition`, over the pool [`pools`](Self::pools)
+    /// holds for the partition under the call's correlation id, started on first use. The pool
+    /// is not pinned on the connection, so its server-side sessions end once the handle and every
+    /// call drop it.
     pub(crate) async fn session(
         &self,
         partition: RepositoryId,
     ) -> Result<Arc<StorageSession>, ProtocolError> {
-        let connection = self.session_connection(partition).await?;
         let correlation_id = lore_revision::lore::execution_context()
             .globals()
             .correlation_id
             .to_string();
-        connection.session(partition, &correlation_id).await
+        if let Some(pool) = self.pools.get(partition, &correlation_id) {
+            return Ok(Arc::new(StorageSession::pooled(pool)));
+        }
+        let connection = self.session_connection(partition).await?;
+        let pool = connection
+            .unpinned_session_pool(partition, &correlation_id)
+            .await?;
+        self.pools.hold(partition, pool.clone());
+        Ok(Arc::new(StorageSession::pooled(pool)))
     }
 
     /// Ensure `partition` is in the server's `authorized_repos` set on the underlying

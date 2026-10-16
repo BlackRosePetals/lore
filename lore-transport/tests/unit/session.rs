@@ -100,7 +100,7 @@ mod pooled {
                 ))
             })
             .collect();
-        Arc::new(SessionPool::new(sessions))
+        Arc::new(SessionPool::new(correlation, sessions))
     }
 
     /// A lazy session resolving to a session over `pool`, counting its resolutions in `calls`.

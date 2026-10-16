@@ -54,9 +54,9 @@ struct ResolvedFields {
 }
 
 /// Closure signature for a pending session's resolver. Returns an eager or a pooled
-/// `Arc<StorageSession>`, typically the pooled one `Connection::session` returns once the
-/// caller's pending connection resolves. Runs once per resolution, not once per session: a
-/// throttled or invalidated resolution is asked again.
+/// `Arc<StorageSession>`, typically a pooled one from the caller's connection once it
+/// resolves. Runs once per resolution, not once per session: a throttled or invalidated
+/// resolution is asked again.
 type PendingResolver =
     Arc<dyn Fn() -> BoxFuture<'static, Result<Arc<StorageSession>, ProtocolError>> + Send + Sync>;
 
@@ -111,9 +111,9 @@ impl StorageSession {
     /// throttled `session_start`. Typical use: defer the underlying remote
     /// connect and session creation until actually needed.
     ///
-    /// The resolver returns an eager or a pooled `Arc<StorageSession>`. Callers obtain a pooled
-    /// one by awaiting their pending connection and invoking `Connection::session`, which makes
-    /// the lazy session share the connection's session dedup cache.
+    /// The resolver returns an eager or a pooled `Arc<StorageSession>`, over a pool the
+    /// connection pins ([`Connection::session_pool`]) or one its caller holds
+    /// ([`Connection::unpinned_session_pool`]).
     pub fn pending<F, Fut>(resolver: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -506,6 +506,7 @@ impl Drop for StorageSession {
 /// on the next session, and [`pick`](Self::pick) hands out the next one for a
 /// single unit of work.
 pub struct SessionPool {
+    correlation_id: Arc<str>,
     sessions: Vec<Arc<StorageSession>>,
     /// Whether every session is resolved, so an operation reads its turn's fields without
     /// awaiting a resolution.
@@ -517,12 +518,13 @@ pub struct SessionPool {
 }
 
 impl SessionPool {
-    /// A pool over `sessions`, taken in turn.
+    /// A pool over `sessions`, started for `correlation_id` and taken in turn.
     ///
     /// The connector builds one session per underlying `Storage` connection, so taking them in
     /// turn spreads a command's operations over every connection the connect phase established.
-    pub fn new(sessions: Vec<Arc<StorageSession>>) -> Self {
+    pub fn new(correlation_id: Arc<str>, sessions: Vec<Arc<StorageSession>>) -> Self {
         Self {
+            correlation_id,
             resolved: sessions
                 .iter()
                 .all(|session| matches!(session.inner, SessionInner::Resolved(_))),
@@ -539,6 +541,12 @@ impl SessionPool {
 
     pub(crate) fn mark_stale(&self) {
         self.stale.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a call under `correlation_id` may take sessions from this pool: it was started
+    /// for that correlation id and is not stale.
+    pub fn serves(&self, correlation_id: &str) -> bool {
+        *self.correlation_id == *correlation_id && !self.is_stale()
     }
 
     /// Returns the next session in the pool via round-robin.
@@ -565,17 +573,54 @@ impl SessionPool {
     }
 }
 
+/// The session pool an owner holds for each partition it uses: the one started for the latest
+/// correlation id to reach that partition. A pool replaced or dropped here stops its sessions once
+/// no call still holds it.
+#[derive(Default)]
+pub struct PartitionSessions {
+    pools: dashmap::DashMap<Partition, Arc<SessionPool>>,
+}
+
+impl PartitionSessions {
+    /// The pool held for `partition`, if it [`serves`](SessionPool::serves) `correlation_id`.
+    pub fn get(&self, partition: Partition, correlation_id: &str) -> Option<Arc<SessionPool>> {
+        self.pools
+            .get(&partition)
+            .filter(|pool| pool.serves(correlation_id))
+            .map(|pool| pool.clone())
+    }
+
+    /// Holds `pool` for `partition` in place of the one held before.
+    pub fn hold(&self, partition: Partition, pool: Arc<SessionPool>) {
+        self.pools.insert(partition, pool);
+    }
+
+    /// Drops every pool held.
+    pub fn clear(&self) {
+        self.pools.clear();
+    }
+
+    /// Marks every pool held stale, so no resolution hands it out again while another holder
+    /// keeps it, and drops it.
+    pub(crate) fn invalidate(&self) {
+        for pool in self.pools.iter() {
+            pool.mark_stale();
+        }
+        self.pools.clear();
+    }
+}
+
 /// Owns a pool of Storage connections and manages session lifecycle with
 /// deduplication, round-robin connection assignment, and automatic cleanup.
 ///
-/// Each `(partition, correlation_id)` maps to a `SessionPool` containing one
+/// Each partition maps to the latest `SessionPool` started for it, containing one
 /// `StorageSession` per underlying `Storage` connection. Operations on a
 /// returned session round-robin across the pool so a single command spreads
 /// load over every connection set up in the connect phase.
 pub struct StorageConnector {
     connections: Vec<Arc<dyn Storage>>,
     counter: AtomicUsize,
-    pools: dashmap::DashMap<(Partition, String), Weak<SessionPool>>,
+    pools: dashmap::DashMap<Partition, Weak<SessionPool>>,
     /// Partitions for which `session_start` has already succeeded on every underlying
     /// `Storage`. Tracks the server-side `authorized_repos` state — once a partition is
     /// registered here, the server keeps it in `authorized_repos` for the connection's
@@ -630,31 +675,31 @@ impl StorageConnector {
         self.refused_partitions.remove(&partition);
     }
 
-    /// Get or create the `SessionPool` for the given partition and correlation ID.
-    /// The caller pins the pool to keep every session it owns alive across the
-    /// operations of one command. A stale pool is not handed out again.
+    /// Get or create the `SessionPool` for the given partition and correlation ID. The
+    /// connector holds each pool weakly, the latest per partition, so the pool lives as long as
+    /// a caller holds it. A stale pool is not handed out again.
     ///
     /// Nothing is taken from the pool here. Taking a session advances the pool's
     /// round-robin cursor, so a caller that only wanted the pool would leave every
     /// other caller striding over the connections instead of visiting each in turn.
     ///
     /// On a miss, one server-side session is started per underlying connection, in
-    /// parallel. The first writer wins the key, vacant, expired or stale entry alike. No
-    /// session is stopped here: each stops its own when its last reference drops, a losing
-    /// racer's as its pool drops. A replaced entry's ids may name sessions this one started,
-    /// since a reconnect restarts the server's session ids.
+    /// parallel. The first writer wins the partition's entry, vacant, expired, stale or for
+    /// another correlation id alike. No session is stopped here: each stops its own when its
+    /// last reference drops, a losing racer's as its pool drops. A replaced entry's ids may
+    /// name sessions this one started, since a reconnect restarts the server's session ids.
     pub async fn session_pool(
         &self,
         partition: Partition,
         correlation_id: &str,
         connection: Arc<Connection>,
     ) -> Result<Arc<SessionPool>, ProtocolError> {
-        let key = (partition, correlation_id.to_string());
-
         // Fast path: live pool exists.
-        if let Some(entry) = self.pools.get(&key)
-            && let Some(pool) = entry.upgrade()
-            && !pool.is_stale()
+        if let Some(pool) = self
+            .pools
+            .get(&partition)
+            .and_then(|entry| entry.upgrade())
+            .filter(|pool| pool.serves(correlation_id))
         {
             return Ok(pool);
         }
@@ -702,13 +747,17 @@ impl StorageConnector {
                 ))
             })
             .collect();
-        let pool = Arc::new(SessionPool::new(sessions));
+        let pool = Arc::new(SessionPool::new(correlation, sessions));
 
         #[allow(clippy::disallowed_methods)]
         // Synchronous entry check; no await while lock is held.
-        let winner = match self.pools.entry(key) {
+        let winner = match self.pools.entry(partition) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                if let Some(alive) = entry.get().upgrade().filter(|alive| !alive.is_stale()) {
+                if let Some(alive) = entry
+                    .get()
+                    .upgrade()
+                    .filter(|alive| alive.serves(correlation_id))
+                {
                     alive
                 } else {
                     entry.insert(Arc::downgrade(&pool));

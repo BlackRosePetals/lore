@@ -341,7 +341,8 @@ pub(crate) async fn synth_repository_context(
             filter: Arc::new(Filter::default()),
             filesystem_provider: None,
         })
-        .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
+        .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER))
+        .holding_its_sessions(),
     )
 }
 

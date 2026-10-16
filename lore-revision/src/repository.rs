@@ -633,19 +633,18 @@ pub struct RepositoryContext {
     write_token: Option<RepositoryWriteToken>,
     repo_lock: Option<Arc<RepositoryLock>>,
     /// The storage session pool this repository's reads and writes take sessions from,
-    /// resolved on first use.
-    ///
-    /// Weak on purpose. The strong reference lives in the connection's session
-    /// cache, and `StorageSession::invalidate` clears that cache when the server
-    /// reports a stale session id — after a reconnect that rotated its session
-    /// map, say. An invalidated pool then stops upgrading here, so the next caller
-    /// resolves a fresh one rather than handing out sessions the server has
-    /// forgotten.
-    session_pool: parking_lot::RwLock<Weak<SessionPool>>,
-    /// The lazy storage session this context's reads and writes carry, built on first
-    /// use. Held strongly: a pending session re-resolves after invalidation, so one
-    /// serves every operation against this context's partition for its lifetime.
-    lazy_session: parking_lot::RwLock<Option<Arc<lore_transport::StorageSession>>>,
+    /// resolved on first use, and resolved again for a call under another correlation id or
+    /// once the pool is stale, as after a reconnect rotated the server's session map.
+    session_pool: parking_lot::RwLock<Option<Arc<SessionPool>>>,
+    /// Whether this context is the only holder of its session pool, so the pool's sessions
+    /// stop with the context, as a revision tree handle's do. Otherwise the connection pins
+    /// the pool as well, for later calls under the same correlation id to take.
+    holds_its_sessions: bool,
+    /// The lazy storage session this context's reads and writes carry, with the correlation id
+    /// it was built for. Held strongly: a pending session re-resolves after invalidation, so one
+    /// serves every operation against this context's partition under that correlation id, until
+    /// an operation under another replaces it.
+    lazy_session: parking_lot::RwLock<Option<(Arc<str>, Arc<lore_transport::StorageSession>)>>,
 }
 
 impl std::fmt::Debug for RepositoryContext {
@@ -730,6 +729,7 @@ impl RepositoryContext {
             write_token: None,
             repo_lock: None,
             session_pool: Default::default(),
+            holds_its_sessions: false,
             lazy_session: Default::default(),
             file_system,
         }
@@ -760,6 +760,7 @@ impl RepositoryContext {
             write_token: self.write_token.as_ref().map(|token| token.share()),
             repo_lock: self.repo_lock.clone(),
             session_pool: Default::default(),
+            holds_its_sessions: self.holds_its_sessions,
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
@@ -1021,6 +1022,7 @@ impl RepositoryContext {
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
             session_pool: Default::default(),
+            holds_its_sessions: false,
             lazy_session: Default::default(),
         }
     }
@@ -1183,40 +1185,63 @@ impl RepositoryContext {
         result
     }
 
-    /// The storage session pool for this repository, resolved once and reused for
-    /// as long as it lives.
-    ///
-    /// `correlation_id` is only read when the pool has to be resolved. It belongs
-    /// to the command being executed and a context belongs to one command, so a
-    /// cached pool is always the one this context's correlation id asked for.
+    /// The storage session pool for this repository under `correlation_id`, resolved once and
+    /// reused for as long as it [`serves`](SessionPool::serves) that correlation id.
     #[lore_macro::test_pub]
     pub(crate) async fn session_pool(
         &self,
         correlation_id: &str,
     ) -> Result<Arc<SessionPool>, ProtocolError> {
-        if let Some(pool) = self.cached_session_pool() {
+        if let Some(pool) = self.cached_session_pool(correlation_id) {
             return Ok(pool);
         }
         let remote = self.remote().await?;
-        let pool = remote.session_pool(self.id, correlation_id).await?;
-        *self.session_pool.write() = Arc::downgrade(&pool);
+        let pool = if self.holds_its_sessions {
+            remote
+                .unpinned_session_pool(self.id, correlation_id)
+                .await?
+        } else {
+            remote.session_pool(self.id, correlation_id).await?
+        };
+        *self.session_pool.write() = Some(pool.clone());
         Ok(pool)
     }
 
-    /// The lazy storage session for this context, built once and shared. Partition-scoped,
-    /// so a derived context for a link or a layer resolves its own rather than borrowing one
-    /// started for another partition.
-    pub(crate) fn lazy_session(
-        &self,
-        build: impl FnOnce() -> Arc<lore_transport::StorageSession>,
-    ) -> Arc<lore_transport::StorageSession> {
-        if let Some(session) = self.lazy_session.read().as_ref() {
-            return session.clone();
-        }
-        self.lazy_session.write().get_or_insert_with(build).clone()
+    /// This context as the only holder of its session pools, so their sessions stop with it
+    /// rather than stay pinned on the connection.
+    pub fn holding_its_sessions(mut self) -> Self {
+        self.holds_its_sessions = true;
+        self
     }
 
-    /// The session pool if one is already resolved, live and not stale, without
+    /// The lazy storage session for this context under `correlation_id`, shared by every
+    /// operation under it. `build` makes one for the correlation id in place of a session held
+    /// for another, so operations of overlapping calls under distinct ids never share one.
+    /// Partition-scoped, so a derived context for a link or a layer resolves its own rather than
+    /// borrowing one started for another partition.
+    pub(crate) fn lazy_session(
+        &self,
+        correlation_id: &str,
+        build: impl FnOnce(Arc<str>) -> Arc<lore_transport::StorageSession>,
+    ) -> Arc<lore_transport::StorageSession> {
+        if let Some((held, session)) = self.lazy_session.read().as_ref()
+            && **held == *correlation_id
+        {
+            return session.clone();
+        }
+        let mut lazy = self.lazy_session.write();
+        if let Some((held, session)) = lazy.as_ref()
+            && **held == *correlation_id
+        {
+            return session.clone();
+        }
+        let correlation_id = Arc::<str>::from(correlation_id);
+        let session = build(correlation_id.clone());
+        *lazy = Some((correlation_id, session.clone()));
+        session
+    }
+
+    /// The session pool if one is already resolved and serves `correlation_id`, without
     /// touching the remote. `None` means "resolve it", not "there is none".
     ///
     /// Private so the pool is only ever reached through [`Self::session_pool`]. A
@@ -1224,19 +1249,18 @@ impl RepositoryContext {
     /// session cannot be invalidated and retried — see [`crate::immutable`]'s
     /// session resolution.
     #[lore_macro::test_pub]
-    fn cached_session_pool(&self) -> Option<Arc<SessionPool>> {
+    fn cached_session_pool(&self, correlation_id: &str) -> Option<Arc<SessionPool>> {
         self.session_pool
             .read()
-            .upgrade()
-            .filter(|pool| !pool.is_stale())
+            .as_ref()
+            .filter(|pool| pool.serves(correlation_id))
+            .cloned()
     }
 
     /// Hold `pool` as resolved, standing in for a resolution against a live remote.
-    /// The caller keeps the strong reference, as the connection's session cache
-    /// does.
     #[cfg(feature = "test-util")]
     pub fn set_session_pool(&self, pool: &Arc<SessionPool>) {
-        *self.session_pool.write() = Arc::downgrade(pool);
+        *self.session_pool.write() = Some(pool.clone());
     }
 
     /// Whether this context is known to hold no remote, answered without waiting

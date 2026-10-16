@@ -55,10 +55,11 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 ctor = { workspace = true }
+lore = { workspace = true, features = ["test-util"] }
 lore-base = { workspace = true, features = ["test-util"] }
 lore-server = { workspace = true }
 lore-storage = { workspace = true, features = ["test-util"] }
-lore-transport = { workspace = true }
+lore-transport = { workspace = true, features = ["test-util"] }
 rcgen = { workspace = true }
 
 [features]

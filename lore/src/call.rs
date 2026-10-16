@@ -106,7 +106,7 @@ where
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
                 let detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
-                (detail, Some(post_command_cleanup(repository).await))
+                (detail, Some(post_command_cleanup(repository)))
             };
 
             check_no_lingering_repository(weak_repository);
@@ -163,7 +163,7 @@ where
                 };
                 let detail =
                     LoreErrorDetail::from_result(command(repository.clone(), token, args).await);
-                (detail, Some(post_command_cleanup(repository).await))
+                (detail, Some(post_command_cleanup(repository)))
             };
 
             check_no_lingering_repository(weak_repository);
@@ -212,7 +212,7 @@ where
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
                 let detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
-                (detail, Some(post_command_cleanup(repository).await))
+                (detail, Some(post_command_cleanup(repository)))
             };
 
             check_no_lingering_repository(weak_repository);
@@ -269,19 +269,7 @@ async fn prepare_repository_call(
     Ok((repository_path, execution))
 }
 
-async fn post_command_cleanup(
-    repository: Arc<RepositoryContext>,
-) -> std::sync::Weak<RepositoryContext> {
-    // Snapshot the state so we don't force a pending connect to resolve
-    // just for teardown. session_stop fires when the last Arc ref drops;
-    // local-only commands never connect and have nothing to release.
-    if let lore_revision::repository::RemoteStatus::Connected(remote) =
-        repository.remote_status().await
-    {
-        let correlation_id = execution_context().globals().correlation_id.to_string();
-        remote.release_session(repository.id, &correlation_id);
-    }
-
+fn post_command_cleanup(repository: Arc<RepositoryContext>) -> std::sync::Weak<RepositoryContext> {
     let sync_data = execution_context().globals().sync_data();
     repository.try_spawn_post_command_flush(sync_data);
 

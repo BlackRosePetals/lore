@@ -159,7 +159,9 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
 ///
 /// The correlation id is read here rather than inside the resolver because the
 /// resolver runs wherever the read or write ends up, which is not necessarily
-/// under this command's execution context.
+/// under this command's execution context. The context holds one session per
+/// correlation id at a time, so a call never takes a session another call's id
+/// started.
 ///
 /// The context holds the session it is handed, so the resolver holds the context
 /// weakly: a strong reference there is a cycle neither end can free, and a context
@@ -170,12 +172,10 @@ pub(crate) fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc
     if repository.is_offline() {
         return None;
     }
-    Some(repository.lazy_session(|| {
+    let execution = crate::lore::execution_context();
+    let correlation_id = execution.globals().correlation_id.as_str();
+    Some(repository.lazy_session(correlation_id, |correlation_id| {
         let repository = Arc::downgrade(repository);
-        let correlation_id = crate::lore::execution_context()
-            .globals()
-            .correlation_id
-            .to_string();
         Arc::new(StorageSession::pending(move || {
             let repository = repository.clone();
             let correlation_id = correlation_id.clone();
@@ -195,9 +195,9 @@ pub(crate) fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc
 /// every storage connection.
 ///
 /// Going through [`RepositoryContext::session_pool`] rather than the connection is
-/// the point: the connection's own lookup owns a key and re-pins the pool, and
-/// every call in a command carries the same key, so all of them land on the one
-/// shard it hashes to.
+/// the point: the context holds the pool it resolved, so a command's operations take it
+/// without a lookup on the connection, and the context decides whether the connection pins
+/// it as well.
 #[lore_macro::test_pub]
 async fn pooled_session(
     repository: &Arc<RepositoryContext>,

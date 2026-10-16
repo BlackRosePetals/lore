@@ -85,6 +85,12 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- A storage handle keeps one server-side session per partition, which its calls share while they carry the same
+  correlation id. A call with another correlation id, given or generated, replaces it, and closing the handle stops it.
+  A revision tree handle keeps its sessions the same way, and repository commands keep theirs on the process's
+  connection to the remote. Each storage call used to leave one session open per storage connection on the connection
+  every handle to the remote shares, so a process that made about 10,000 storage calls to one remote had every later
+  call refused until it restarted, the server allowing that many sessions per connection
 - Caches and prefetches check every payload they fetch on receipt, as reads do, unless the command trusts the remote,
   where they stored most payloads unchecked. A cache walk, which trusts the lists the local store holds, fails once it
   walks deeper than any fragment tree reaches

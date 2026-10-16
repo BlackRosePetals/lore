@@ -995,6 +995,82 @@ mod storage_remote_tests {
             .await
     }
 
+    /// A storage handle holds the session pool its calls to a partition under one correlation id
+    /// share, replaces it for a call under another, and drops it when it closes. A replacement
+    /// leaves the pool held for another partition in place. Each get asks for an address of its
+    /// own, so each reaches the remote and takes a session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_storage_handle_keeps_its_session_pool_for_its_correlation_id() -> TestResult {
+        let execution = setup_execution("storage-remote-session-per-handle".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = lore_base::types::Partition::from([0xd4u8; 16]);
+                    let other = lore_base::types::Partition::from([0xd5u8; 16]);
+                    let handle_id = open_remote_handle(&server).await;
+                    let endpoint =
+                        lore::storage::handle::lookup(lore::storage::handle::LoreStore {
+                            handle_id,
+                        })
+                        .and_then(|store| store.remote.clone())
+                        .expect("a handle with a remote");
+                    let get_under = async |id: u64, partition, correlation_id: &str| {
+                        let payload = bytes::Bytes::from(format!("{transport:?} get {id}"));
+                        let address = seed_server(&server, partition, &payload).await;
+                        let globals = LoreGlobalArgs {
+                            correlation_id: correlation_id.into(),
+                            ..Default::default()
+                        };
+                        let results = run_get_batch_under(
+                            globals,
+                            handle_id,
+                            vec![get_item(id, partition, address)],
+                        )
+                        .await;
+                        assert_eq!(
+                            results.codes.get(&id),
+                            Some(&0),
+                            "{transport:?}: get {id} must succeed",
+                        );
+                        Arc::downgrade(
+                            &endpoint
+                                .pools
+                                .get(partition, correlation_id)
+                                .expect("the handle holds the pool its get took"),
+                        )
+                    };
+
+                    let first = get_under(1, partition, "first").await;
+                    let again = get_under(2, partition, "first").await;
+                    assert!(
+                        first.ptr_eq(&again),
+                        "{transport:?}: calls under one correlation id must share a pool",
+                    );
+                    let kept = get_under(3, other, "first").await;
+
+                    let second = get_under(4, partition, "second").await;
+                    assert!(!first.ptr_eq(&second));
+                    assert!(
+                        first.upgrade().is_none(),
+                        "{transport:?}: the replaced pool must be dropped",
+                    );
+                    assert!(
+                        kept.ptr_eq(&get_under(5, other, "first").await),
+                        "{transport:?}: a replacement must keep another partition's pool",
+                    );
+
+                    close_handle(handle_id).await;
+                    assert!(
+                        second.upgrade().is_none() && kept.upgrade().is_none(),
+                        "{transport:?}: closing the handle must drop its pools",
+                    );
+                }
+                Ok(())
+            })
+            .await
+    }
+
     /// What an item delivering into its own buffer reported: whether any `GET_DATA` arrived, the
     /// content size the header carried, and the code the item completed with.
     #[derive(Clone, Copy, Default)]
@@ -6930,6 +7006,15 @@ mod storage_remote_tests {
         handle_id: u64,
         items: Vec<lore::storage::get::LoreStorageGetItem>,
     ) -> GetBatchResults {
+        run_get_batch_under(LoreGlobalArgs::default(), handle_id, items).await
+    }
+
+    /// [`run_get_batch`] under `globals`.
+    async fn run_get_batch_under(
+        globals: LoreGlobalArgs,
+        handle_id: u64,
+        items: Vec<lore::storage::get::LoreStorageGetItem>,
+    ) -> GetBatchResults {
         let codes: Arc<Mutex<HashMap<u64, i32>>> = Arc::new(Mutex::new(HashMap::new()));
         let bytes: Arc<Mutex<HashMap<u64, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
         let headers: Arc<Mutex<HashMap<u64, u64>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -6972,7 +7057,7 @@ mod storage_remote_tests {
         }));
 
         lore::storage::get::get(
-            LoreGlobalArgs::default(),
+            globals,
             lore::storage::get::LoreStorageGetArgs {
                 handle: lore::storage::handle::LoreStore { handle_id },
                 items: lore_revision::interface::LoreArray::from_vec(items),

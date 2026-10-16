@@ -25,6 +25,7 @@ use crate::auth::exchange::auth_exchange;
 use crate::error::ProtocolError;
 use crate::grpc;
 use crate::quic;
+use crate::session::PartitionSessions;
 use crate::session::SessionPool;
 use crate::session::StorageConnector;
 use crate::session::StorageSession;
@@ -916,11 +917,9 @@ pub struct Connection {
     lock: dashmap::DashMap<RepositoryId, Arc<dyn Lock>>,
     /// Repository service -- not per-repository (uses default `RepositoryId`).
     repository: tokio::sync::Mutex<Option<Arc<dyn Repository>>>,
-    /// Pins `Arc<SessionPool>` to keep the `Weak` in `StorageConnector` upgradeable.
-    /// Pinning the pool keeps every session it owns alive across operations
-    /// within a command, avoiding session start/stop churn between calls.
-    /// Cleared by the caller (e.g. `repository_call`) when the API call completes.
-    session_cache: dashmap::DashMap<(Partition, String), Arc<SessionPool>>,
+    /// The session pool pinned for each partition, which calls under one correlation id share
+    /// for as long as the connection lives, and a call under another replaces.
+    session_cache: PartitionSessions,
     connector: tokio::sync::Mutex<Option<Connector>>,
     pub stale: std::sync::atomic::AtomicBool,
     /// Permits for the gets callers run over this connection to cache fragments ahead of a read,
@@ -975,7 +974,7 @@ impl Connection {
             admin: dashmap::DashMap::new(),
             lock: dashmap::DashMap::new(),
             repository: tokio::sync::Mutex::new(None),
-            session_cache: dashmap::DashMap::new(),
+            session_cache: PartitionSessions::default(),
             connector: tokio::sync::Mutex::new(None),
             stale: std::sync::atomic::AtomicBool::new(false),
             cache_gets: std::sync::OnceLock::new(),
@@ -1155,14 +1154,9 @@ impl Connection {
         Ok(connections[counter].clone())
     }
 
-    /// Creates or reuses a `SessionPool` for the given partition and correlation
-    /// ID, returning a session over it that runs each operation on the next
-    /// session of the pool, so a caller's operations spread over every storage
-    /// connection. The pool is pinned in the connection's session cache so the
-    /// `Weak` in `StorageConnector` stays upgradeable for subsequent calls within
-    /// the same command, keeping every session in the pool alive without
-    /// start/stop churn. Call `release_session()` when the API call completes to
-    /// release the pool.
+    /// A session over the pool [`session_pool`](Self::session_pool) pins for `partition`,
+    /// which runs each operation on the next session of the pool, so a caller's operations
+    /// spread over every storage connection.
     pub async fn session(
         self: &Arc<Self>,
         partition: Partition,
@@ -1173,56 +1167,45 @@ impl Connection {
         )))
     }
 
-    /// The pool of sessions for `(partition, correlation_id)`, pinned here so the
-    /// connector's `Weak` to it stays upgradeable.
+    /// The pool of sessions pinned here for `partition`, as long as it serves `correlation_id`.
+    /// Otherwise the pool the connector has for `(partition, correlation_id)`, or a new one, is
+    /// pinned in its place, and the one it replaces stops its sessions once no call holds it.
     ///
     /// A caller that needs one session per unit of work — a commit needs one per
     /// file — should hold the pool and [`pick`](SessionPool::pick) from it rather
-    /// than calling [`session`](Self::session) each time. Every call owns a key to
-    /// look the pool up by, twice over, so a caller in a loop allocates two strings
-    /// an iteration and every iteration hashes to the same shard of both maps.
+    /// than calling [`session`](Self::session) each time.
     pub async fn session_pool(
         self: &Arc<Self>,
         partition: Partition,
         correlation_id: &str,
     ) -> Result<Arc<SessionPool>, ProtocolError> {
         self.ensure_storage_connected().await?;
+        if let Some(pool) = self.session_cache.get(partition, correlation_id) {
+            return Ok(pool);
+        }
         let connector = self.storage_connector()?;
         let pool = connector
             .session_pool(partition, correlation_id, self.clone())
             .await?;
-        self.pin_session_pool(partition, correlation_id, &pool);
+        self.session_cache.hold(partition, pool.clone());
         Ok(pool)
     }
 
-    /// Pin `pool` for `(partition, correlation_id)`, unless that is where it is
-    /// pinned already, so a caller in a loop takes the shard's read lock rather
-    /// than its write lock.
+    /// The pool of sessions the connector has for `(partition, correlation_id)`, or a new one,
+    /// pinned nowhere: its server-side sessions stop once its last holder drops it.
     ///
-    /// The read guard is released before the insert: holding one across a write to
-    /// the same map deadlocks.
-    fn pin_session_pool(
-        &self,
+    /// Shares no helper with [`session_pool`](Self::session_pool): awaiting one from both would
+    /// hold its arguments twice in that future.
+    pub async fn unpinned_session_pool(
+        self: &Arc<Self>,
         partition: Partition,
         correlation_id: &str,
-        pool: &Arc<SessionPool>,
-    ) {
-        let key = (partition, correlation_id.to_string());
-        let pinned = self
-            .session_cache
-            .get(&key)
-            .is_some_and(|entry| Arc::ptr_eq(entry.value(), pool));
-        if !pinned {
-            self.session_cache.insert(key, pool.clone());
-        }
-    }
-
-    /// Unpin a cached session pool so its `Weak` in `StorageConnector` can
-    /// expire. The pool's `Drop` releases every `Arc<StorageSession>` it owns,
-    /// each of which sends `session_stop` to the server.
-    pub fn release_session(&self, partition: Partition, correlation_id: &str) {
-        self.session_cache
-            .remove(&(partition, correlation_id.to_string()));
+    ) -> Result<Arc<SessionPool>, ProtocolError> {
+        self.ensure_storage_connected().await?;
+        let connector = self.storage_connector()?;
+        connector
+            .session_pool(partition, correlation_id, self.clone())
+            .await
     }
 
     /// Mark every pinned `SessionPool` stale and drop it, so the next
@@ -1233,10 +1216,7 @@ impl Connection {
     /// indicates the session-id is stale (e.g. after a QUIC reconnect that
     /// rotated the server's `SessionMap`).
     pub fn invalidate_all_sessions(&self) {
-        for pool in self.session_cache.iter() {
-            pool.mark_stale();
-        }
-        self.session_cache.clear();
+        self.session_cache.invalidate();
     }
 
     /// Ensure the server's per-connection `authorized_repos` set contains `partition`,
@@ -1244,7 +1224,7 @@ impl Connection {
     /// `authorized_partitions` cache: if a previous `session_start` already registered
     /// `partition` on every underlying connection, no wire calls happen. Otherwise a
     /// fresh pool is started (which fans `session_start` across all connections in
-    /// parallel) and immediately released; the server keeps `authorized_repos` permanent
+    /// parallel) and dropped unpinned; the server keeps `authorized_repos` permanent
     /// for the connection's lifetime, so the registration outlives the sessions.
     pub async fn ensure_partition_authorized(
         self: &Arc<Self>,
@@ -1259,15 +1239,11 @@ impl Connection {
         if connector.is_partition_refused(partition) {
             return Err(ProtocolError::from(lore_base::error::NotAuthorized));
         }
-        // Drive the slow path through `session_pool()` so the `authorized_partitions`
-        // insert and the standard race-resolution / pool bookkeeping all run. We
-        // immediately drop the returned pool and release the cache entry — the call's
-        // only purpose was to register authz, not to keep a live session.
-        match self.session_pool(partition, correlation_id).await {
-            Ok(_pool) => {
-                self.release_session(partition, correlation_id);
-                Ok(())
-            }
+        match connector
+            .session_pool(partition, correlation_id, self.clone())
+            .await
+        {
+            Ok(_pool) => Ok(()),
             Err(err) => {
                 if refusal_is_final(&err) {
                     connector.mark_partition_refused(partition);

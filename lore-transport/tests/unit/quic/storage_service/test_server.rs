@@ -153,6 +153,24 @@ impl TestStorageServer {
         }
     }
 
+    /// Sessions started so far, per connection in the order they were accepted.
+    pub fn started_sessions_per_connection(&self) -> Vec<u32> {
+        self.sessions
+            .lock()
+            .iter()
+            .map(|map| map.lock().next - 1)
+            .collect()
+    }
+
+    /// Sessions started and not yet stopped, per connection in the order they were accepted.
+    pub fn live_sessions_per_connection(&self) -> Vec<usize> {
+        self.sessions
+            .lock()
+            .iter()
+            .map(|map| map.lock().live.len())
+            .collect()
+    }
+
     /// `get` requests served so far, per connection in the order they were accepted.
     pub fn gets_per_connection(&self) -> Vec<u64> {
         self.gets

@@ -151,3 +151,38 @@ fn read_options_carry_the_handles_trust_of_its_remote() {
         }
     }
 }
+
+/// A batch that interleaves partitions reuses each partition's session for the whole call rather
+/// than resolving a new one each time the partition changes.
+#[tokio::test]
+async fn a_batch_reuses_the_session_of_each_partition_it_returns_to() {
+    let bare = in_memory_for_tests("reuse").await;
+    let store = StoreInternal::new(
+        "reuse",
+        bare.immutable.clone(),
+        bare.mutable.clone(),
+        Some(Arc::new(lore::storage::remote::RemoteEndpoint::new(
+            "lore://127.0.0.1:1",
+            None,
+        ))),
+        BoundFlags::default(),
+        false,
+    );
+    let (first, second) = (
+        lore_base::types::Partition::from([0xa1u8; 16]),
+        lore_base::types::Partition::from([0xb2u8; 16]),
+    );
+
+    let mut reuse = SessionReuse::default();
+    let before = reuse
+        .session_for(&store, first, true)
+        .expect("a remote session");
+    reuse
+        .session_for(&store, second, true)
+        .expect("a remote session");
+    let after = reuse
+        .session_for(&store, first, true)
+        .expect("a remote session");
+
+    assert!(Arc::ptr_eq(&before, &after));
+}

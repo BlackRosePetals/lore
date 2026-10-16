@@ -70,15 +70,18 @@ fn absent_address() -> Address {
     }
 }
 
-/// A pool for the context to hold, with the strong reference left to the caller. Its one
-/// session is never resolved: the test asks which pool answered, not what it yields.
+/// A pool for the context to hold. Its one session is never resolved: the test asks which pool
+/// answered, not what it yields.
 fn held_pool() -> Arc<lore_transport::SessionPool> {
     let session = Arc::new(StorageSession::pending(|| async {
         Err(ProtocolError::internal(
             "a pooled session this test never resolves",
         ))
     }));
-    Arc::new(lore_transport::SessionPool::new(vec![session]))
+    Arc::new(lore_transport::SessionPool::new(
+        Arc::from("correlation"),
+        vec![session],
+    ))
 }
 
 /// A session that counts how often it is resolved, and fails: the test asks which session
@@ -104,10 +107,13 @@ async fn a_pooled_session_takes_turns_over_the_pool_the_context_holds() {
     let context = context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
     let first = Arc::new(AtomicUsize::new(0));
     let second = Arc::new(AtomicUsize::new(0));
-    let pool = Arc::new(lore_transport::SessionPool::new(vec![
-        counting_session(first.clone()),
-        counting_session(second.clone()),
-    ]));
+    let pool = Arc::new(lore_transport::SessionPool::new(
+        Arc::from("correlation"),
+        vec![
+            counting_session(first.clone()),
+            counting_session(second.clone()),
+        ],
+    ));
     context.set_session_pool(&pool);
 
     let session = pooled_session(&context, "correlation")
@@ -237,4 +243,81 @@ async fn reads_trust_the_remote_where_the_globals_do() {
     })
     .await;
     assert!(!untrusting.trust_remote && trusting.trust_remote);
+}
+
+/// Repository calls under one correlation id share the session pool the connection pins for
+/// their partition, though each call works through a context of its own, and a call under
+/// another correlation id takes a pool of its own.
+#[tokio::test]
+async fn repository_calls_under_one_correlation_id_share_a_session_pool() {
+    let source = context_with_state(RemoteState::Offline).await;
+    let connection = lore_transport::Connection::detached(vec![super::serving::serving_remote(
+        &source,
+        super::serving::Serving::default(),
+    )]);
+    let call = async |correlation_id: &str| {
+        let globals = LoreGlobalArgs {
+            correlation_id: correlation_id.into(),
+            ..Default::default()
+        };
+        under_globals(globals, || async {
+            let context = context_with_state(RemoteState::Connected(connection.clone())).await;
+            let session = resolve_session(&context).expect("a session over the remote");
+            let _ = session.get(&absent_address()).await;
+            let pool = context
+                .session_pool(correlation_id)
+                .await
+                .expect("the pool the read resolved");
+            Arc::downgrade(&pool)
+        })
+        .await
+    };
+
+    let first = call("same").await;
+    let second = call("same").await;
+    assert!(first.ptr_eq(&second));
+    assert!(first.upgrade().is_some(), "the connection pins the pool");
+
+    let other = call("other").await;
+    assert!(!first.ptr_eq(&other));
+    assert!(first.upgrade().is_none(), "the replaced pool is dropped");
+}
+
+/// Calls on one context, as a revision tree handle's are, share its session under one
+/// correlation id. Overlapping calls under distinct ids each take a session of their own, which
+/// resolves under that id wherever its operations run.
+#[tokio::test]
+async fn overlapping_calls_on_one_context_take_sessions_under_their_own_correlation_ids() {
+    let source = context_with_state(RemoteState::Offline).await;
+    let connection = lore_transport::Connection::detached(vec![super::serving::serving_remote(
+        &source,
+        super::serving::Serving::default(),
+    )]);
+    let context = context_with_state(RemoteState::Connected(connection)).await;
+    let session_under = async |correlation_id: &str| {
+        let globals = LoreGlobalArgs {
+            correlation_id: correlation_id.into(),
+            ..Default::default()
+        };
+        under_globals(globals, || async {
+            resolve_session(&context).expect("a session over the remote")
+        })
+        .await
+    };
+
+    let first = session_under("first").await;
+    assert!(Arc::ptr_eq(&first, &session_under("first").await));
+    let second = session_under("second").await;
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "a call must not take the session another call's correlation id started"
+    );
+
+    for (session, correlation_id) in [(&second, "second"), (&first, "first")] {
+        let _ = session.get(&absent_address()).await;
+        assert!(
+            context.cached_session_pool(correlation_id).is_some(),
+            "the session must resolve under {correlation_id}"
+        );
+    }
 }

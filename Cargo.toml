@@ -194,7 +194,7 @@ rustls = { version = "0.23.31", default-features = false, features = [
 ] }
 rustls-pki-types = "1.13.1"
 rustls-native-certs = "0.8.2"
-smallvec = "1.15.1"
+smallvec = { version = "1.15.1", features = ["union"] }
 serde = { version = "1.0.219", default-features = false, features = ["derive"] }
 serde_bytes = "0.11.17"
 serde_json = { version = "1.0.143", default-features = false }
