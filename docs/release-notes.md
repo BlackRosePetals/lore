@@ -131,6 +131,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   until the handle was opened again or the server restarted. Calls waiting on a reconnect share it. A reconnect that
   fails, or whose connection fails within its back-off, is not repeated until the back-off of 1 to 30 seconds has passed,
   the calls in between failing at once. A refusal of the credentials is not held, so the next call connects again
+- A QUIC storage or replication connection reconnects when a request goes out on one of its streams that has stopped
+  carrying requests while the connection stays up: the server has stopped reading the stream, as it does once it
+  cannot read or frame a request on it, or the client has stopped reading its answers, as it does after one it cannot
+  parse. Such a request failed without reconnecting or waited forever for an answer, and so did every later request
+  the stream took, until something else made the connection reconnect
 - Caches and prefetches check every payload they fetch on receipt, as reads do, unless the command trusts the remote,
   where they stored most payloads unchecked. A cache walk, which trusts the lists the local store holds, fails once it
   walks deeper than any fragment tree reaches

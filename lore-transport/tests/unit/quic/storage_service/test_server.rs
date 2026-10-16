@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 //! A loopback QUIC server speaking just enough of lore-storage/0.4 for client tests: session
 //! start and stop, the client's user agent, and `get` of any address on a live session, recording
-//! the partition of the session each `get` ran under.
+//! the partition of the session each `get` ran under. A test can fault the stream that answers a
+//! request ([`StreamFault`]).
 //!
 //! Each connection serves one `get` at a time. How the server answers is its [`Answering`].
 
@@ -67,7 +68,21 @@ pub(crate) struct TestStorageServer {
     pub url: String,
     gets: Arc<parking_lot::Mutex<Vec<Arc<AtomicU64>>>>,
     sessions: Arc<parking_lot::Mutex<Vec<Arc<parking_lot::Mutex<SessionMap>>>>>,
+    fault: Arc<parking_lot::Mutex<Option<StreamFault>>>,
     endpoint: quinn::Endpoint,
+}
+
+/// What the server does to the stream serving its next request once armed with
+/// [`TestStorageServer::arm_fault`], keeping the stream's connection up.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StreamFault {
+    /// Stops reading the stream ahead of its answer, so the client has seen the stop by the time
+    /// it reads the answer, and keeps its own side open: the client's writes to the stream fail
+    /// while its reader carries on.
+    StopReading,
+    /// Answers, then answers a command the client never sent, and keeps the stream open: the
+    /// client's reader stops while its writes to the stream still succeed.
+    StrayAnswer,
 }
 
 /// The sessions one connection has started and not stopped, numbered from 1 as a server's
@@ -191,9 +206,10 @@ impl TestStorageServer {
         let gets: Arc<parking_lot::Mutex<Vec<Arc<AtomicU64>>>> = Arc::default();
         let sessions: Arc<parking_lot::Mutex<Vec<Arc<parking_lot::Mutex<SessionMap>>>>> =
             Arc::default();
+        let fault: Arc<parking_lot::Mutex<Option<StreamFault>>> = Arc::default();
 
         let accepting = endpoint.clone();
-        let (accepted, accepted_sessions) = (gets.clone(), sessions.clone());
+        let (accepted, accepted_sessions, armed) = (gets.clone(), sessions.clone(), fault.clone());
         lore_spawn!(async move {
             while let Some(incoming) = accepting.accept().await {
                 let Ok(connection) = incoming.await else {
@@ -203,7 +219,13 @@ impl TestStorageServer {
                 accepted.lock().push(count.clone());
                 let map = Arc::new(parking_lot::Mutex::new(SessionMap::default()));
                 accepted_sessions.lock().push(map.clone());
-                lore_spawn!(serve_connection(connection, count, map, answering.clone()));
+                lore_spawn!(serve_connection(
+                    connection,
+                    count,
+                    map,
+                    answering.clone(),
+                    armed.clone()
+                ));
             }
         });
 
@@ -211,8 +233,14 @@ impl TestStorageServer {
             url: format!("lore://127.0.0.1:{port}"),
             gets,
             sessions,
+            fault,
             endpoint,
         }
+    }
+
+    /// Applies `fault` to the stream that answers the next request, leaving its connection up.
+    pub fn arm_fault(&self, fault: StreamFault) {
+        *self.fault.lock() = Some(fault);
     }
 
     /// Sessions started so far, per connection in the order they were accepted.
@@ -276,21 +304,25 @@ impl TestStorageServer {
     pub async fn connect(&self, count: usize) -> Vec<Arc<dyn Storage>> {
         let mut connected: Vec<Arc<dyn Storage>> = Vec::with_capacity(count);
         for _ in 0..count {
-            let client = StorageClient::connect(
-                Weak::new(),
-                &self.url,
-                "127.0.0.1".to_string(),
-                &AuthEndpoint::none(),
-                "",
-                test_partition(),
-                &Arc::new(SuppliedCredentials::default()),
-                None,
-            )
-            .await
-            .expect("connect to the test server");
-            connected.push(client);
+            connected.push(self.connect_client().await);
         }
         connected
+    }
+
+    /// Opens one storage connection.
+    pub async fn connect_client(&self) -> Arc<StorageClient> {
+        StorageClient::connect(
+            Weak::new(),
+            &self.url,
+            "127.0.0.1".to_string(),
+            &AuthEndpoint::none(),
+            "",
+            test_partition(),
+            &Arc::new(SuppliedCredentials::default()),
+            None,
+        )
+        .await
+        .expect("connect to the test server")
     }
 
     /// Opens `count` storage connections, each with a session started for [`test_partition`].
@@ -312,6 +344,7 @@ async fn serve_connection(
     gets: Arc<AtomicU64>,
     sessions: Arc<parking_lot::Mutex<SessionMap>>,
     answering: Answering,
+    fault: Arc<parking_lot::Mutex<Option<StreamFault>>>,
 ) {
     let serial = Arc::new(tokio::sync::Mutex::new(()));
     while let Ok((send, recv)) = connection.accept_bi().await {
@@ -322,6 +355,7 @@ async fn serve_connection(
             serial.clone(),
             sessions.clone(),
             answering.clone(),
+            fault.clone(),
         ));
     }
 }
@@ -333,6 +367,7 @@ async fn serve_stream(
     serial: Arc<tokio::sync::Mutex<()>>,
     sessions: Arc<parking_lot::Mutex<SessionMap>>,
     answering: Answering,
+    fault: Arc<parking_lot::Mutex<Option<StreamFault>>>,
 ) {
     let mut header_bytes = [0u8; COMMAND_HEADER_SIZE_V4];
     while recv.read_exact(&mut header_bytes).await.is_ok() {
@@ -366,10 +401,34 @@ async fn serve_stream(
             Bytes::copy_from_slice(&response_header[..length]),
             response.unwrap_or_default(),
         ];
+        let fault = fault.lock().take();
+        if matches!(fault, Some(StreamFault::StopReading)) {
+            let _ = recv.stop(0u32.into());
+        }
         if send.write_all_chunks(&mut chunks).await.is_err() {
             return;
         }
+        if let Some(fault) = fault {
+            return hold_faulted(fault, &header, send, recv).await;
+        }
     }
+}
+
+/// Completes `fault` on a stream that has answered `header`, then holds both its halves without
+/// end, so that neither closes.
+async fn hold_faulted(
+    fault: StreamFault,
+    header: &CommandHeader,
+    mut send: quinn::SendStream,
+    _recv: quinn::RecvStream,
+) {
+    if matches!(fault, StreamFault::StrayAnswer) {
+        let mut stray = header.response_success(0);
+        stray.command_id = u32::MAX;
+        let (stray, length) = stray.response_bytes();
+        let _ = send.write_all(&stray[..length]).await;
+    }
+    std::future::pending::<()>().await;
 }
 
 /// The id of a session `request` starts, for the partition it names, on the connection `sessions`

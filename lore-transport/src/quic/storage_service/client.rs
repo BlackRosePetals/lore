@@ -479,6 +479,20 @@ impl StorageClient {
         running.await
     }
 
+    /// The commands holding the last issue of the session `session_id` names: the handles to it
+    /// beside the session's own.
+    #[cfg(feature = "test-util")]
+    pub fn awaiting_issue(&self, session_id: u32) -> usize {
+        let Some(session) = self.sessions.get(session_id) else {
+            return 0;
+        };
+        let reissue = session.reissue.lock();
+        reissue
+            .as_ref()
+            .and_then(|(_, running)| running.strong_count())
+            .map_or(0, |handles| handles - 1)
+    }
+
     /// Issues `session` again on the current connection once no stop or other issue of it runs,
     /// unless a stop took it from the table or an issue bound it to the current connection first.
     async fn reissue(self: Arc<Self>, session: Arc<Session>) -> Result<(), ProtocolError> {

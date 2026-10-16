@@ -506,6 +506,19 @@ impl QuicConnection {
     pub fn stream_inflight(&self) -> [u64; STREAM_COUNT as usize] {
         std::array::from_fn(|stream| self.stream_inflight[stream].load(Ordering::Relaxed))
     }
+
+    /// How many of the connection's streams have a reader that has stopped, or 0 while the
+    /// connection is locked.
+    #[cfg(feature = "test-util")]
+    pub fn streams_ended(&self) -> usize {
+        self.connection.try_read().map_or(0, |connection| {
+            connection
+                .reader
+                .iter()
+                .filter(|reader| reader.task.is_finished())
+                .count()
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -1119,8 +1132,8 @@ where
             "QUIC lost connection {connection_id} to {remote_url} after {:.2}s: {:?} (last send: {:.2}s, last recv: {:.2}s)",
             elapsed as f64 / 1000.0,
             quinn.connection.close_reason(),
-            (elapsed - connection.last_send.load(Ordering::Relaxed)) as f64 / 1000.0,
-            (elapsed - connection.last_recv.load(Ordering::Relaxed)) as f64 / 1000.0
+            elapsed.saturating_sub(connection.last_send.load(Ordering::Relaxed)) as f64 / 1000.0,
+            elapsed.saturating_sub(connection.last_recv.load(Ordering::Relaxed)) as f64 / 1000.0
         );
 
         lore_debug!(
@@ -1459,6 +1472,9 @@ where
 /// out. Dropping the receiver unread is expected and handled; leaving the command unregistered is
 /// not, and would make the reader treat the response as unexpected and tear the stream down.
 ///
+/// A command on a stream whose reader has stopped, or that the peer has stopped reading, fails
+/// with `Terminated`, as one on a lost connection does, so `send_with_reconnect` reconnects.
+///
 /// A command whose session is bound to another connection than the one held is not written, and
 /// answers `StaleSession` ([`BoundSession`]).
 ///
@@ -1537,14 +1553,20 @@ pub fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
 
         {
             let mut stream = writer.lock_owned().await;
-            stream.write_all_chunks(chunks).await.map_err(|err| {
-                if let quinn::WriteError::ConnectionLost(_) = err {
-                    QuicClientError::Terminated
-                } else {
-                    lore_warn!("{}: {err}", QuicClientError::WriteChunks);
-                    QuicClientError::WriteChunks
-                }
-            })?;
+            stream
+                .write_all_chunks(chunks)
+                .await
+                .map_err(|err| match err {
+                    quinn::WriteError::ConnectionLost(_) => QuicClientError::Terminated,
+                    quinn::WriteError::Stopped(_) => {
+                        lore_warn!("QUIC write: {err}");
+                        QuicClientError::Terminated
+                    }
+                    err => {
+                        lore_warn!("{}: {err}", QuicClientError::WriteChunks);
+                        QuicClientError::WriteChunks
+                    }
+                })?;
         }
 
         if !AWAIT_RESPONSE {

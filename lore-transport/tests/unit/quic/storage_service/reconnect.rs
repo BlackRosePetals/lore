@@ -4,10 +4,9 @@
 //! the client started on one connection is issued again on the next before a command runs under
 //! it, and an id from the first never reaches the second.
 
-use std::time::Duration;
-
 use lore_base::lore_spawn_net;
 use lore_base::types::Partition;
+use lore_transport::traits::Storage;
 use tokio::task::JoinSet;
 
 use super::test_server::SessionStarts;
@@ -253,12 +252,12 @@ async fn a_refused_issue_reaches_the_command_and_a_later_one_issues_the_session(
 
 /// Commands that find their session stale while its issue waits on the server share that issue,
 /// and each receives the refusal it ends in, the server asked to start the session once. The
-/// commands have 10 ms to reach the issue before the server answers.
+/// server refuses once every command awaits the issue.
 #[tokio::test(flavor = "multi_thread")]
 async fn commands_waiting_for_a_refused_issue_each_receive_its_refusal() {
     const COMMANDS: usize = 32;
     let (server, starts) = TestStorageServer::start_controlling_session_starts();
-    let storage = server.connect(1).await.remove(0);
+    let storage = server.connect_client().await;
     let session = storage
         .session_start(test_partition(), "test")
         .await
@@ -276,11 +275,10 @@ async fn commands_waiting_for_a_refused_issue_each_receive_its_refusal() {
         });
     }
     wait_until(
-        || server.requested_session_starts_per_connection() == [1, 1],
-        "the session was not issued again",
+        || storage.awaiting_issue(session) == COMMANDS,
+        "the commands did not all await the session's issue",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
     starts
         .send(SessionStarts::Refuse)
         .expect("the server refuses the held start");

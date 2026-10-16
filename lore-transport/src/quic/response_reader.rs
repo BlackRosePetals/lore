@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -25,11 +26,21 @@ use super::command_header::COMMAND_HEADER_SIZE_V4;
 use crate::quic::chunking::ParallelChunking;
 
 type PendingResultSender = oneshot::Sender<Result<Bytes, QuicClientError>>;
-type PendingCommandMap = DashMap<u32, PendingResultSender>;
+
+/// The commands waiting for their answer on one stream, and whether its reader has stopped.
+///
+/// The map's shard locks order `closed`: the reader sets it before it locks every shard to see
+/// whether a command still waits, and [`ResponseReader::wait_for`] reads it after the lock that
+/// inserts its command, so either the reader finds the command or the command sees the flag.
+#[derive(Default)]
+struct PendingCommands {
+    commands: DashMap<u32, PendingResultSender>,
+    closed: AtomicBool,
+}
 
 pub struct ResponseReader {
     pub task: JoinHandle<Result<(), QuicClientError>>,
-    pending: Arc<PendingCommandMap>,
+    pending: Arc<PendingCommands>,
     counter: AtomicU32,
 }
 
@@ -41,7 +52,7 @@ impl ResponseReader {
         created: Instant,
         v4: bool,
     ) -> Self {
-        let pending = Arc::new(PendingCommandMap::new());
+        let pending = Arc::new(PendingCommands::default());
         let pending_clone = pending.clone();
         ResponseReader {
             task: lore_spawn_net!({
@@ -56,15 +67,17 @@ impl ResponseReader {
                         v4,
                     )
                     .await;
+                    pending.closed.store(true, Ordering::Relaxed);
                     {
                         let error_to_send = match result {
                             Err(QuicClientError::CrytpoError) => QuicClientError::CrytpoError,
                             _ => QuicClientError::Terminated,
                         };
-                        while !pending.is_empty() {
-                            let ids: Vec<u32> = pending.iter().map(|entry| *entry.key()).collect();
+                        while !pending.commands.is_empty() {
+                            let ids: Vec<u32> =
+                                pending.commands.iter().map(|entry| *entry.key()).collect();
                             for id in ids {
-                                if let Some((_, reader)) = pending.remove(&id) {
+                                if let Some((_, reader)) = pending.commands.remove(&id) {
                                     let _ = reader.send(Err(error_to_send.clone()));
                                 }
                             }
@@ -78,13 +91,19 @@ impl ResponseReader {
         }
     }
 
-    /// Assign a new stream specific command ID and put the completion channel in map
+    /// Assigns the command a new stream-specific id and puts its completion channel in the map.
+    ///
+    /// Fails with `Terminated` once the reader has stopped, since nothing would read the answer.
     pub fn wait_for(
         &self,
         tx: oneshot::Sender<Result<Bytes, QuicClientError>>,
     ) -> Result<u32, QuicClientError> {
         let command_id = self.counter.fetch_add(1, Ordering::Relaxed);
-        self.pending.insert(command_id, tx);
+        self.pending.commands.insert(command_id, tx);
+        if self.pending.closed.load(Ordering::Relaxed) {
+            self.pending.commands.remove(&command_id);
+            return Err(QuicClientError::Terminated);
+        }
         Ok(command_id)
     }
 }
@@ -92,7 +111,7 @@ impl ResponseReader {
 async fn read_response(
     mut stream: quinn::RecvStream,
     max_chunk_size: usize,
-    pending: Arc<PendingCommandMap>,
+    pending: Arc<PendingCommands>,
     last_recv: Arc<AtomicU64>,
     created: Instant,
     v4: bool,
@@ -148,7 +167,7 @@ async fn read_response(
                 return Err(QuicClientError::InvalidResponse(response.header));
             }
 
-            if let Some((_, reader)) = pending.remove(&response.header.command_id) {
+            if let Some((_, reader)) = pending.commands.remove(&response.header.command_id) {
                 // Send response header and reset so next read is next response
                 let result = if !response.header.error {
                     Ok(response.payload.unwrap_or_default())
