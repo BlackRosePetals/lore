@@ -1681,26 +1681,9 @@ async fn validate_link_messages(
         }
         .into());
     }
-    futures::future::try_join_all(options.link_messages.keys().map(|path| async move {
-        match link::resolve_link_at_path(state, repository.clone(), path).await {
-            Ok(_) => Ok(()),
-            Err(error)
-                if error.is_node_not_found()
-                    || error.is_invalid_path()
-                    || error.is_not_a_link() =>
-            {
-                Err(InvalidArguments {
-                    reason: format!(
-                        "Link message path '{path}' does not match any linked repository"
-                    ),
-                }
-                .into())
-            }
-            Err(error) => Err(error)
-                .forward_with::<MergeError, _>(|| format!("resolving link message path {path}")),
-        }
-    }))
-    .await?;
+    link::validate_link_message_paths(state, repository, options.link_messages.keys())
+        .await
+        .forward::<MergeError>("validating link message paths")?;
     Ok(())
 }
 

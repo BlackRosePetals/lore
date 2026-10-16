@@ -97,6 +97,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore commit --link-message` accepts the link path in any spelling that names it, such as `./vendor/lib/`, as
+  `lore branch merge` does. The path is checked in the library, so a C API commit naming a path that is not a link now
+  fails as invalid arguments. A message for a link with nothing staged is ignored rather than refused
 - A storage handle keeps one server-side session per partition, which its calls share while they carry the same
   correlation id. A call with another correlation id, given or generated, replaces it, and closing the handle stops it.
   A revision tree handle keeps its sessions the same way, and repository commands keep theirs on the process's

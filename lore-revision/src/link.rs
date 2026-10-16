@@ -1913,6 +1913,34 @@ pub async fn resolve_link_at_path(
     })
 }
 
+pub async fn validate_link_message_paths(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    paths: impl IntoIterator<Item = &String>,
+) -> Result<(), LinkError> {
+    futures::future::try_join_all(paths.into_iter().map(|path| async move {
+        match resolve_link_at_path(state, repository.clone(), path).await {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error.is_node_not_found()
+                    || error.is_invalid_path()
+                    || error.is_not_a_link() =>
+            {
+                Err(InvalidArguments {
+                    reason: format!(
+                        "Link message path '{path}' does not match any linked repository"
+                    ),
+                }
+                .into())
+            }
+            Err(error) => Err(error)
+                .forward_with::<LinkError, _>(|| format!("resolving link message path {path}")),
+        }
+    }))
+    .await?;
+    Ok(())
+}
+
 /// Updates a link pin when only the mount path is known.
 ///
 /// Finds the module node at the mount path, then delegates to

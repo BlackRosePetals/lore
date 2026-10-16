@@ -1015,38 +1015,6 @@ fn resolve_link_messages(
         }
     }
 
-    if !link_paths.is_empty() {
-        let discovered_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::default()));
-        let discovered_paths_clone = discovered_paths.clone();
-        let validation_callback: LoreEventCallback = Some(
-            (Box::new(move |event: &LoreEvent| {
-                if let LoreEvent::LinkStagedEntry(data) = event {
-                    discovered_paths_clone.lock().push(data.path.to_string());
-                }
-            }) as EventCallbackFn)
-                .with_defaults(),
-        );
-
-        run_listing(
-            globals,
-            lore::link::LoreLinkListStagedArgs {},
-            validation_callback,
-        )?;
-
-        let valid_paths = discovered_paths.lock().clone();
-        for path in link_paths.iter() {
-            if !valid_paths.iter().any(|p| p == path.as_str()) {
-                println!(
-                    "{}Error: --link-message path '{}' does not match any linked repository with staged changes{}",
-                    CommonStyles::FAILURE,
-                    path.as_str(),
-                    anstyle::Reset
-                );
-                return Err(1);
-            }
-        }
-    }
-
     Ok((link_paths, link_msgs))
 }
 

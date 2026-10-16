@@ -622,6 +622,20 @@ async fn commit_with_metadata_in_operation(
     let reporting = CommitReporting::from_globals();
     let _stats_report = reporting.report();
 
+    if !options.link_messages.is_empty() {
+        let (state_current, state_staged, _) =
+            State::deserialize_current_and_staged(repository.clone())
+                .await
+                .forward::<CommitError>("Failed to deserialize current and staged state")?;
+        link::validate_link_message_paths(
+            &state_staged.unwrap_or(state_current),
+            &repository,
+            options.link_messages.keys(),
+        )
+        .await
+        .forward::<CommitError>("validating link message paths")?;
+    }
+
     if let Some(ref link_path) = options.link {
         return commit_link_only(
             operation,

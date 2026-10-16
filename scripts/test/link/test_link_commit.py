@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
-from error_types import NotALinkError, NothingStagedError
+from error_types import ImproperArgumentsError, NotALinkError, NothingStagedError
 from link_helpers import make_parent_with_link, make_repo
 from lore_parsers import parse_commit_stats_json, parse_status_json
 from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
@@ -168,7 +168,8 @@ def test_link_commit_records_no_time_a_later_write_could_share(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_commit_per_link_message(new_lore_repo):
+@pytest.mark.parametrize("message_path", ["linked", "./linked/"])
+def test_link_commit_per_link_message(new_lore_repo, message_path):
     """Test that per-link commit messages are applied to linked repositories."""
     # Create link repository with initial content
     link_repo: Lore = new_lore_repo()
@@ -203,7 +204,7 @@ def test_link_commit_per_link_message(new_lore_repo):
     # Commit with per-link message
     urc.commit(
         "Main repo update",
-        link_messages={link_path: "Link-specific update message"},
+        link_messages={message_path: "Link-specific update message"},
         non_interactive=True,
     )
     urc.push()
@@ -276,15 +277,12 @@ def test_link_commit_invalid_link_message_errors(new_lore_repo):
     info_before = urc.revision_info(check=True, no_pager=True)
 
     # Try to commit with an invalid link-message path — should fail
-    output = urc.commit(
-        "Main message",
-        link_messages={"nonexistent/path": "Some message"},
-        non_interactive=True,
-        check=False,
-    )
-    assert "does not match any linked repository" in output, (
-        f"Expected a specific error for invalid --link-message path, got: {output}"
-    )
+    with pytest.raises(ImproperArgumentsError):
+        urc.commit(
+            "Main message",
+            link_messages={"nonexistent/path": "Some message"},
+            non_interactive=True,
+        )
 
     # Verify no new revision was created
     info_after = urc.revision_info(check=True, no_pager=True)
