@@ -10,7 +10,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use dashmap::DashMap;
 use lore_base::lore_debug;
-use lore_base::lore_spawn_net;
+use lore_base::lore_spawn_net_nocontext;
 use lore_base::lore_trace;
 use lore_base::lore_warn;
 use quinn::ConnectionError;
@@ -45,6 +45,8 @@ pub struct ResponseReader {
 }
 
 impl ResponseReader {
+    /// A reader of the answers on `stream`, run as a task without the context of the command that
+    /// opens the stream, as it serves every command the stream carries.
     pub fn new(
         stream: quinn::RecvStream,
         max_chunk_size: usize,
@@ -55,7 +57,7 @@ impl ResponseReader {
         let pending = Arc::new(PendingCommands::default());
         let pending_clone = pending.clone();
         ResponseReader {
-            task: lore_spawn_net!({
+            task: lore_spawn_net_nocontext!({
                 async move {
                     let pending = pending_clone;
                     let result = read_response(

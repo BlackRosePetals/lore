@@ -25,6 +25,7 @@ use lore_base::error::NotAuthorized;
 use lore_base::lore_debug;
 use lore_base::lore_error;
 use lore_base::lore_info;
+use lore_base::lore_spawn_net_nocontext;
 use lore_base::lore_trace;
 use lore_base::lore_warn;
 use lore_error_set::prelude::*;
@@ -73,6 +74,30 @@ pub struct EndpointConfig {
 }
 
 const IDLE_TIMEOUT_MS: u32 = 30000;
+/// How long the remainder of a dropped frame may take to write before its stream is reset: as long
+/// as the connection may go without hearing from its peer.
+const FINISH_FRAME_TIMEOUT: Duration = Duration::from_millis(IDLE_TIMEOUT_MS as u64);
+/// A test's [`FINISH_FRAME_TIMEOUT`] in milliseconds, or `0` for none.
+#[cfg(feature = "test-util")]
+static FINISH_FRAME_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Makes the remainder of every dropped frame wait at most `timeout` before its stream is reset,
+/// in place of [`FINISH_FRAME_TIMEOUT`], or the default again with `None`.
+#[cfg(feature = "test-util")]
+pub fn set_finish_frame_timeout(timeout: Option<Duration>) {
+    FINISH_FRAME_TIMEOUT_MS.store(
+        timeout.map_or(0, |timeout| timeout.as_millis() as u64),
+        Ordering::Relaxed,
+    );
+}
+
+fn finish_frame_timeout() -> Duration {
+    #[cfg(feature = "test-util")]
+    if let ms @ 1.. = FINISH_FRAME_TIMEOUT_MS.load(Ordering::Relaxed) {
+        return Duration::from_millis(ms);
+    }
+    FINISH_FRAME_TIMEOUT
+}
 const KEEP_ALIVE_MS: u64 = 500;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 const HAPPY_EYEBALLS_DELAY_MS: u64 = 250;
@@ -1461,6 +1486,131 @@ where
     )
 }
 
+/// A frame being written to a stream, with the stream's writer held while it is. A stream carries
+/// one frame after another, so a frame cut short would put the next frame's header inside its
+/// payload, and the server would read the two as one request. Dropped part way through its write,
+/// as when the command's future is dropped, it hands a copy of the rest of the frame and the writer
+/// to [`finish_frame`], spawned without the command's context as it serves every later command on
+/// the stream, and counts the finish as a request outstanding on the stream, which
+/// [`select_stream`] balances on, until the finish releases the writer; dropped before any of the
+/// frame was written, it sends nothing. The rest is copied as the finish outlives the command, and
+/// a chunk may be memory its caller lends only until the command is done.
+struct FrameWrite<'a> {
+    /// The stream's writer while the write is under way; `None` once it has returned.
+    stream: Option<tokio::sync::OwnedMutexGuard<quinn::SendStream>>,
+    chunks: &'a mut [Bytes],
+    /// The requests outstanding on each of the connection's streams.
+    stream_inflight: &'a Arc<[AtomicU64; STREAM_COUNT as usize]>,
+    /// The index of the frame's stream.
+    stream_index: u32,
+    /// The length of the frame's header, its first chunk, which keeps that length until the write
+    /// takes some of the frame.
+    header_size: u32,
+}
+
+impl<'a> FrameWrite<'a> {
+    /// The frame `chunks` hold, to be written to the stream at `stream_index` whose writer
+    /// `stream` holds.
+    fn new(
+        stream: tokio::sync::OwnedMutexGuard<quinn::SendStream>,
+        chunks: &'a mut [Bytes],
+        stream_inflight: &'a Arc<[AtomicU64; STREAM_COUNT as usize]>,
+        stream_index: u32,
+    ) -> Self {
+        Self {
+            stream: Some(stream),
+            header_size: chunks[0].len() as u32,
+            chunks,
+            stream_inflight,
+            stream_index,
+        }
+    }
+
+    /// Writes the frame, then releases the stream's writer. Each `write_chunks` is cancel safe and
+    /// empties or shortens in place the chunks it takes, so `chunks` hold what is left to write at
+    /// every await.
+    async fn write(&mut self) -> Result<(), quinn::WriteError> {
+        while let Some(stream) = self.stream.as_mut()
+            && self.chunks.iter().any(|chunk| !chunk.is_empty())
+        {
+            if let Err(err) = stream.write_chunks(self.chunks).await {
+                self.stream = None;
+                return Err(err);
+            }
+        }
+        self.stream = None;
+        Ok(())
+    }
+}
+
+impl Drop for FrameWrite<'_> {
+    fn drop(&mut self) {
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        if self.chunks[0].len() == self.header_size as usize {
+            return;
+        }
+        let mut rest = Vec::with_capacity(self.chunks.iter().map(Bytes::len).sum());
+        for chunk in self.chunks.iter() {
+            rest.extend_from_slice(chunk);
+        }
+        self.stream_inflight[self.stream_index as usize].fetch_add(1, Ordering::Relaxed);
+        lore_spawn_net_nocontext!(finish_frame(
+            stream,
+            Bytes::from(rest),
+            self.stream_inflight.clone(),
+            self.stream_index
+        ));
+    }
+}
+
+/// Writes `rest`, the remainder of a dropped frame, to the stream whose writer `stream` holds, and
+/// resets the stream when the write does not finish within [`FINISH_FRAME_TIMEOUT`]. The request
+/// [`FrameWrite`] counted for it on the stream at `stream_index` of `stream_inflight` is taken off
+/// once the writer is released.
+async fn finish_frame(
+    mut stream: tokio::sync::OwnedMutexGuard<quinn::SendStream>,
+    mut rest: Bytes,
+    stream_inflight: Arc<[AtomicU64; STREAM_COUNT as usize]>,
+    stream_index: u32,
+) {
+    if tokio::time::timeout(
+        finish_frame_timeout(),
+        stream.write_all_chunks(std::slice::from_mut(&mut rest)),
+    )
+    .await
+    .is_err()
+    {
+        lore_warn!(
+            "QUIC stream {} reset: the rest of a dropped frame was not written within {:?}",
+            stream.id(),
+            finish_frame_timeout()
+        );
+        let _ = stream.reset(VarInt::from_u32(0));
+    }
+    drop(stream);
+    stream_inflight[stream_index as usize].fetch_sub(1, Ordering::Relaxed);
+}
+
+/// A failed frame write as a client error. A stream reset or stopped by the server takes no further
+/// frame, so a write to one fails as a lost connection does.
+fn frame_write_error(err: quinn::WriteError) -> QuicClientError {
+    match err {
+        quinn::WriteError::ConnectionLost(_) | quinn::WriteError::ClosedStream => {
+            QuicClientError::Terminated
+        }
+        quinn::WriteError::Stopped(_) => {
+            lore_warn!("QUIC write: {err}");
+            QuicClientError::Terminated
+        }
+        err @ quinn::WriteError::ZeroRttRejected => {
+            lore_warn!("{}: {err}", QuicClientError::WriteChunks);
+            QuicClientError::WriteChunks
+        }
+    }
+}
+
 /// Send a command, waiting for its response only when `AWAIT_RESPONSE`.
 ///
 /// `AWAIT_RESPONSE` is a const parameter rather than a split into a write half and a wait half so
@@ -1472,8 +1622,9 @@ where
 /// out. Dropping the receiver unread is expected and handled; leaving the command unregistered is
 /// not, and would make the reader treat the response as unexpected and tear the stream down.
 ///
-/// A command on a stream whose reader has stopped, or that the peer has stopped reading, fails
-/// with `Terminated`, as one on a lost connection does, so `send_with_reconnect` reconnects.
+/// A command on a stream whose reader has stopped, that the peer has stopped reading, or that a
+/// dropped frame's finish reset, fails with `Terminated`, as one on a lost connection does, so
+/// `send_with_reconnect` reconnects.
 ///
 /// A command whose session is bound to another connection than the one held is not written, and
 /// answers `StaleSession` ([`BoundSession`]).
@@ -1503,7 +1654,7 @@ pub fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
             Ordering::Relaxed,
         );
 
-        let (command_id, writer, rx, _inflight) = {
+        let (command_id, writer, rx, stream_index, _inflight) = {
             let connection_lock = connection.connection.read().await;
             if connection_lock.reader.is_empty() {
                 lore_debug!("No quic stream available when sending command");
@@ -1528,7 +1679,7 @@ pub fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
             let (tx, rx) = oneshot::channel();
             let command_id = connection_lock.reader[stream_index].wait_for(tx)?;
             let writer = connection_lock.writer[stream_index].clone();
-            (command_id, writer, rx, inflight)
+            (command_id, writer, rx, stream_index as u32, inflight)
         };
 
         {
@@ -1552,21 +1703,10 @@ pub fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
         }
 
         {
-            let mut stream = writer.lock_owned().await;
-            stream
-                .write_all_chunks(chunks)
-                .await
-                .map_err(|err| match err {
-                    quinn::WriteError::ConnectionLost(_) => QuicClientError::Terminated,
-                    quinn::WriteError::Stopped(_) => {
-                        lore_warn!("QUIC write: {err}");
-                        QuicClientError::Terminated
-                    }
-                    err => {
-                        lore_warn!("{}: {err}", QuicClientError::WriteChunks);
-                        QuicClientError::WriteChunks
-                    }
-                })?;
+            let stream = writer.lock_owned().await;
+            let mut frame =
+                FrameWrite::new(stream, chunks, &connection.stream_inflight, stream_index);
+            frame.write().await.map_err(frame_write_error)?;
         }
 
         if !AWAIT_RESPONSE {

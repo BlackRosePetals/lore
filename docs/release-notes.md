@@ -136,6 +136,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   cannot read or frame a request on it, or the client has stopped reading its answers, as it does after one it cannot
   parse. Such a request failed without reconnecting or waited forever for an answer, and so did every later request
   the stream took, until something else made the connection reconnect
+- A QUIC storage request dropped while its frame is being written, as by a caller's timeout, has the rest of the frame
+  written in the background before the stream takes another request; one dropped before any of it was written sends
+  nothing. Requests go to other streams meanwhile, and a stream that does not take the rest within 30 seconds is reset,
+  the next request on it reconnecting. The next request on the stream went out in the middle of the dropped one, so the
+  server read its bytes as the dropped request's payload
 - A QUIC storage session start the server refuses as not authorized forgets the authorization it exchanged and
   presented, and tries once more with the one an exchange then gives. The process served the refused authorization
   from its cache, and from the token store, until it expired, so once the server stopped accepting it, by revocation or

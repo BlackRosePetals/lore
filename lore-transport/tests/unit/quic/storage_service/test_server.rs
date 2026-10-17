@@ -3,9 +3,11 @@
 //! A loopback QUIC server speaking just enough of lore-storage/0.4 for client tests: session
 //! start and stop, the client's user agent, and `get` of any address on a live session, recording
 //! the authorization each session start presents and the partition of the session each `get` ran
-//! under. A test can fault the stream that answers a request ([`StreamFault`]).
+//! under. Every other command is answered with an empty success. A test can fault the stream that
+//! answers a request ([`StreamFault`]).
 //!
-//! Each connection serves one `get` at a time. How the server answers is its [`Answering`].
+//! Each connection serves one `get` at a time. How the server answers is its [`Answering`]. Its
+//! reading of request payloads can be paused, so that a client's large write is held.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,6 +40,10 @@ use zerocopy::IntoBytes;
 /// Payload bytes the server returns for every `get`.
 pub(crate) const PAYLOAD_SIZE: usize = 1024;
 
+/// How far a client may write ahead of what the server has read on one stream: small, so that a
+/// large request whose payload the server is not reading holds the client's write.
+const STREAM_WINDOW: u32 = 16 * 1024;
+
 /// The partition test sessions are started for.
 pub(crate) fn test_partition() -> Partition {
     Partition::from([0x3cu8; 16])
@@ -69,6 +75,7 @@ pub(crate) struct TestStorageServer {
     gets: Arc<parking_lot::Mutex<Vec<Arc<AtomicU64>>>>,
     sessions: Arc<parking_lot::Mutex<Vec<Arc<parking_lot::Mutex<SessionMap>>>>>,
     presented: Arc<parking_lot::Mutex<Vec<String>>>,
+    reading: tokio::sync::watch::Sender<bool>,
     fault: Arc<parking_lot::Mutex<Option<StreamFault>>>,
     endpoint: quinn::Endpoint,
 }
@@ -214,7 +221,8 @@ impl TestStorageServer {
         ));
         Arc::get_mut(&mut server_config.transport)
             .expect("fresh transport config")
-            .max_concurrent_bidi_streams(lore_transport::quic::client::STREAM_COUNT.into());
+            .max_concurrent_bidi_streams(lore_transport::quic::client::STREAM_COUNT.into())
+            .stream_receive_window(STREAM_WINDOW.into());
 
         let address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let endpoint = quinn::Endpoint::server(server_config, address).expect("server endpoint");
@@ -223,13 +231,15 @@ impl TestStorageServer {
         let sessions: Arc<parking_lot::Mutex<Vec<Arc<parking_lot::Mutex<SessionMap>>>>> =
             Arc::default();
         let presented: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let reading = tokio::sync::watch::Sender::new(true);
         let fault: Arc<parking_lot::Mutex<Option<StreamFault>>> = Arc::default();
 
         let accepting = endpoint.clone();
-        let (accepted, accepted_sessions, logged, armed) = (
+        let (accepted, accepted_sessions, logged, read, armed) = (
             gets.clone(),
             sessions.clone(),
             presented.clone(),
+            reading.subscribe(),
             fault.clone(),
         );
         lore_spawn!(async move {
@@ -249,6 +259,7 @@ impl TestStorageServer {
                         sessions: map,
                         answering: answering.clone(),
                         presented: logged.clone(),
+                        reading: read.clone(),
                         fault: armed.clone(),
                     }),
                 ));
@@ -260,9 +271,26 @@ impl TestStorageServer {
             gets,
             sessions,
             presented,
+            reading,
             fault,
             endpoint,
         }
+    }
+
+    /// Leaves unread the payload of each request whose header arrives from now on, until
+    /// [`resume_reading`](Self::resume_reading).
+    pub fn pause_reading(&self) {
+        self.reading.send_replace(false);
+    }
+
+    /// Reads the payloads [`pause_reading`](Self::pause_reading) left unread, and those after.
+    pub fn resume_reading(&self) {
+        self.reading.send_replace(true);
+    }
+
+    /// Connections accepted so far.
+    pub fn accepted_connections(&self) -> usize {
+        self.gets.lock().len()
     }
 
     /// The authorizations session starts presented so far, in order.
@@ -372,14 +400,15 @@ impl TestStorageServer {
 }
 
 /// What the streams of one connection share: the `get`s it served, the lock that serves them one
-/// at a time, its sessions, how it answers, and the server's record of authorizations presented
-/// and its armed fault.
+/// at a time, its sessions, how it answers, and the server's record of authorizations presented,
+/// whether it reads payloads and its armed fault.
 struct Served {
     gets: Arc<AtomicU64>,
     serial: tokio::sync::Mutex<()>,
     sessions: Arc<parking_lot::Mutex<SessionMap>>,
     answering: Answering,
     presented: Arc<parking_lot::Mutex<Vec<String>>>,
+    reading: tokio::sync::watch::Receiver<bool>,
     fault: Arc<parking_lot::Mutex<Option<StreamFault>>>,
 }
 
@@ -400,13 +429,17 @@ async fn serve_stream(
         sessions,
         answering,
         presented,
+        reading,
         fault,
     } = &*served;
+    let mut reading = reading.clone();
     let mut header_bytes = [0u8; COMMAND_HEADER_SIZE_V4];
     while recv.read_exact(&mut header_bytes).await.is_ok() {
         let header = CommandHeader::from_bytes_v4(&header_bytes);
         let mut request = vec![0u8; header.size_or_status as usize];
-        if recv.read_exact(&mut request).await.is_err() {
+        if reading.wait_for(|reading| *reading).await.is_err()
+            || recv.read_exact(&mut request).await.is_err()
+        {
             return;
         }
         let response = match header.cmd {

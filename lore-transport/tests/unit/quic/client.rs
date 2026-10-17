@@ -332,3 +332,201 @@ fn raise_receive_buffer_keeps_a_larger_buffer() {
 
     assert_eq!(receive_buffer_size(&socket), before);
 }
+
+/// Held by the tests that drop a command part way through its frame, as one of them shortens the
+/// time every dropped frame's remainder has to be written.
+static FINISHING_FRAMES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A test server, and a client of it with a session started and the client's connection.
+async fn served_connection() -> (
+    crate::quic::storage_service::test_server::TestStorageServer,
+    Arc<lore_transport::quic::storage_service::client::StorageClient>,
+    Arc<QuicConnection>,
+) {
+    use lore_transport::traits::Storage;
+
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_partition;
+
+    let server = TestStorageServer::start();
+    let client = server.connect_client().await;
+    let quic = ServiceClient::quic(client.as_ref()).clone();
+    client
+        .session_start(test_partition(), "test")
+        .await
+        .expect("session start");
+    (server, client, quic)
+}
+
+/// Drops, under a context of its own, a command whose frame the stream does not take whole while
+/// the server reads nothing, once its write is held. Answers the index of the stream the frame is
+/// finished on, the dropped command's context, and its payload, which it lends as a caller of the C
+/// API does.
+async fn drop_a_held_command(
+    quic: &Arc<QuicConnection>,
+) -> (
+    usize,
+    std::sync::Weak<dyn std::any::Any + Send + Sync>,
+    std::sync::Weak<[u8]>,
+) {
+    use bytes::Bytes;
+    use lore_transport::quic::storage_service::Command;
+
+    let lent: Arc<[u8]> = Arc::from(vec![0xa5u8; 128 * 1024]);
+    let dropped_payload = Arc::downgrade(&lent);
+    let mut large = [Bytes::new(), Bytes::from_owner(lent)];
+    let context: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+    let dropped_context = Arc::downgrade(&context);
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(200),
+        lore_base::runtime::LORE_CONTEXT.scope(
+            context,
+            send_normal(
+                quic.clone(),
+                Command::Put as u8,
+                BoundSession::any(0),
+                true,
+                &mut large,
+            ),
+        ),
+    )
+    .await;
+    assert!(dropped.is_err(), "the write was not held: {dropped:?}");
+    let inflight = quic.stream_inflight();
+    assert_eq!(
+        inflight.iter().sum::<u64>(),
+        1,
+        "the finish is not the one request outstanding: {inflight:?}"
+    );
+    let finishing = inflight
+        .iter()
+        .position(|&count| count == 1)
+        .expect("the finish is counted on its stream");
+    (finishing, dropped_context, dropped_payload)
+}
+
+/// A command dropped part way through writing its frame has the frame finished in the background,
+/// so the command after it on the same stream reaches the server whole and is answered over the
+/// same connection. Neither the background write nor a stream's reader, which serve every later
+/// command, holds the dropped command's context, and the background write holds none of its
+/// payload, which a caller may lend only until the command is done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_dropped_mid_write_leaves_its_stream_framed() {
+    use bytes::Bytes;
+    use lore_transport::quic::storage_service::Command;
+
+    use crate::quic::storage_service::test_server::wait_until;
+
+    let _finishing = FINISHING_FRAMES.lock().await;
+    let (server, _client, quic) = served_connection().await;
+    server.pause_reading();
+    let (finishing, dropped_context, dropped_payload) = drop_a_held_command(&quic).await;
+    assert!(
+        dropped_context.upgrade().is_none(),
+        "a task the dropped command started holds its context"
+    );
+    wait_until(
+        || dropped_payload.upgrade().is_none(),
+        "the finish holds the dropped command's payload",
+    )
+    .await;
+    server.resume_reading();
+    wait_until(
+        || quic.stream_inflight()[finishing] == 0,
+        "the finish never released its stream",
+    )
+    .await;
+
+    server.pause_reading();
+    let after = {
+        let quic = quic.clone();
+        lore_base::lore_spawn!(async move {
+            let mut small = [Bytes::new(), Bytes::from_static(b"after")];
+            send_normal(
+                quic,
+                Command::Put as u8,
+                BoundSession::any(0),
+                true,
+                &mut small,
+            )
+            .await
+        })
+    };
+    wait_until(
+        || quic.stream_inflight()[finishing] == 1,
+        "the command after the dropped one went out on another stream",
+    )
+    .await;
+    server.resume_reading();
+    let answered = tokio::time::timeout(Duration::from_secs(10), after)
+        .await
+        .expect("the command after the dropped one was never answered")
+        .expect("the command's task");
+    assert!(answered.is_ok(), "{answered:?}");
+    assert_eq!(server.accepted_connections(), 1);
+}
+
+/// A command sent while a stream finishes a dropped frame goes out on another stream rather than
+/// waiting on the held writer. The server reads nothing meanwhile, so it is written only on a
+/// stream other than the dropped frame's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_finishing_a_dropped_frame_is_passed_over() {
+    use bytes::Bytes;
+    use lore_transport::quic::storage_service::Command;
+
+    use crate::quic::storage_service::test_server::wait_until;
+
+    let _finishing = FINISHING_FRAMES.lock().await;
+    let (server, _client, quic) = served_connection().await;
+    server.pause_reading();
+    let (finishing, ..) = drop_a_held_command(&quic).await;
+
+    let mut small = [Bytes::new(), Bytes::from_static(b"meanwhile")];
+    let written = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_without_response(quic.clone(), Command::Put as u8, 0, true, &mut small),
+    )
+    .await
+    .expect("the command waited on the stream finishing a dropped frame");
+    assert!(written.is_ok(), "{written:?}");
+
+    server.resume_reading();
+    wait_until(
+        || quic.stream_inflight()[finishing] == 0,
+        "the finish never released its stream",
+    )
+    .await;
+}
+
+/// A dropped frame whose remainder the server does not take in time has its stream reset. The
+/// command after it on that stream fails as a lost connection does, so it is sent again over a new
+/// connection and answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_after_a_reset_frame_is_answered_over_a_new_connection() {
+    use lore_transport::traits::Storage;
+
+    use crate::quic::storage_service::test_server::test_partition;
+    use crate::quic::storage_service::test_server::wait_until;
+
+    let _finishing = FINISHING_FRAMES.lock().await;
+    let (server, client, quic) = served_connection().await;
+    set_finish_frame_timeout(Some(Duration::from_millis(300)));
+    server.pause_reading();
+    let (finishing, ..) = drop_a_held_command(&quic).await;
+    wait_until(
+        || quic.stream_inflight()[finishing] == 0,
+        "the finish never reset its stream",
+    )
+    .await;
+    set_finish_frame_timeout(None);
+    server.resume_reading();
+
+    let answered = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.session_start(test_partition(), "test"),
+    )
+    .await
+    .expect("the command after the reset stream was never answered");
+    assert!(answered.is_ok(), "{answered:?}");
+    assert_eq!(server.accepted_connections(), 2);
+}
