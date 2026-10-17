@@ -676,6 +676,33 @@ mod migrate_groups {
         );
     }
 
+    /// A group directory that cannot be listed ends the pass as a failed group does, rather than
+    /// being taken for a group never written and stepped over.
+    #[tokio::test]
+    async fn an_unlistable_group_ends_the_pass_without_recording_progress() {
+        let (_dir, store) = open_store("om_groups_unlistable_").await;
+        let path = store.path.clone().expect("store has a path");
+        let group = 0x2a;
+        std::fs::create_dir_all(path.join("index")).expect("index directory");
+        std::fs::write(path.join("index").join(format!("{group:02x}")), b"")
+            .expect("a file in the group directory's place");
+        store
+            .update_store_info(|info| info.next_group_index_to_migrate_oodle = group)
+            .await
+            .expect("info records where to resume");
+
+        let completed = migrate_groups(store.clone(), &path, group)
+            .await
+            .expect("an unlistable group is not an error");
+
+        assert!(!completed);
+        assert_eq!(
+            store.info.read().await.next_group_index_to_migrate_oodle,
+            group,
+            "the unlistable group has to be retried, not skipped"
+        );
+    }
+
     /// A real store is a mix of kinds. Each has to be treated by its own rule, and the presence
     /// of one must not change what happens to another - in particular one unusable fragment
     /// must not stop the rest of the pass.

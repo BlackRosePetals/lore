@@ -265,6 +265,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   or files that a later commit's recovery takes in, which served other keys' bytes or brought back an obliterated entry.
   A commit that failed after its commit point is completed by the group's next flush. A failed level marker write no
   longer leaves its temporary file behind
+- Local stores: a group of the store index no longer reopens at the wrong bucket layout, where most of its entries could
+  not be found, when its directory cannot be listed at open, as when the process is out of file descriptors, when a new
+  store is stopped before its first index flush, or when writing a group's level marker fails
+- Local mutable stores: a store into a bucket whose delayed flush failed starts another. Until an explicit flush, the
+  bucket and every later change to it stayed in memory only
 - `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of
   `Recursion task failed`
 - `lore clone` reports the error that stopped it, such as a file it failed to fetch or write, in place of

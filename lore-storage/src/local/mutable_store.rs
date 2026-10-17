@@ -315,6 +315,12 @@ impl lore_io::StableBufList for MutableBucketWriteSegments {
 }
 
 impl MutableStoreBucket {
+    /// Whether a delayed flush of the bucket is started and not finished.
+    #[lore_macro::test_pub]
+    fn flush_pending(&self) -> bool {
+        self.flush.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
     #[lore_macro::test_pub]
     async fn deserialize_files(
         path: PathBuf,
@@ -946,30 +952,22 @@ impl LocalMutableStore {
         self.group[index].clone()
     }
 
+    /// Mark the bucket dirty and start its delayed flush unless one is pending: a delayed flush
+    /// that fails leaves the bucket dirty with none pending.
     fn mark_dirty(
         self: Arc<Self>,
         bucket: &mut MutableStoreBucket,
         group_index: usize,
         bucket_index: usize,
     ) {
-        let was_dirty =
-            self.group[group_index].dirty[bucket_index].swap(true, atomic::Ordering::Relaxed);
-        if !was_dirty {
-            if let Some(flush_task) = bucket.flush.as_ref()
-                && flush_task.is_finished()
-            {
-                let _ = bucket.flush.take();
-            }
-
-            if bucket.flush.is_none() && self.flush_delay_seconds > 0 {
-                let weak_self = Arc::downgrade(&self);
-                bucket.flush = Some(Self::flush_delayed(
-                    weak_self,
-                    group_index,
-                    bucket_index,
-                    self.flush_delay_seconds,
-                ));
-            }
+        self.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+        if self.flush_delay_seconds > 0 && !bucket.flush_pending() {
+            bucket.flush = Some(Self::flush_delayed(
+                Arc::downgrade(&self),
+                group_index,
+                bucket_index,
+                self.flush_delay_seconds,
+            ));
         }
     }
 
@@ -1004,6 +1002,22 @@ impl LocalMutableStore {
                     return;
                 }
 
+                if let Err(err) = crate::local::fan_out::commit_if_initial_level(
+                    &flush_guard,
+                    &group.committed_level,
+                    &group.bucket_count,
+                    path,
+                    group_index,
+                    false,
+                )
+                .await
+                {
+                    lore_base::lore_warn!(
+                        "Failed to write level marker for group {group_index}: {err}"
+                    );
+                    return;
+                }
+
                 let bucket = bucket.read_owned().await;
                 let _ = MutableStoreBucket::serialize(
                     bucket,
@@ -1012,16 +1026,6 @@ impl LocalMutableStore {
                     group_index,
                     bucket_index,
                     false, /* Don't wait and sync all data to storage media */
-                )
-                .await;
-
-                let _ = crate::local::fan_out::commit_if_initial_level(
-                    &flush_guard,
-                    &group.committed_level,
-                    &group.bucket_count,
-                    path,
-                    group_index,
-                    false,
                 )
                 .await;
             }

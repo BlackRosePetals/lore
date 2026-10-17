@@ -640,6 +640,53 @@ mod oodle_migration_seed {
     }
 }
 
+/// A store closed before its first index flush holds packfile directories and no bucket file. It
+/// reopens fan-out aware at the initial level, not at the flat layout of a store written before
+/// lazy fan-out.
+#[tokio::test]
+async fn a_store_closed_before_its_first_index_flush_reopens_fan_out_aware() {
+    let dir = lore_base::test_util::TempDir::new("is_unflushed_new_");
+    let settings = || ImmutableStoreSettings {
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    {
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+            .await
+            .expect("store opens");
+        put_fragments(&store, Partition::from([4u8; 16]), 8).await;
+    }
+    let groups = std::fs::read_dir(dir.path().join("immutable").join("index"))
+        .expect("the payloads made their packfile directories");
+    for group in groups {
+        let group = group.expect("a group directory").path();
+        assert!(
+            !lore_storage::local::fan_out::group_has_buckets(&group)
+                .await
+                .expect("the group directory lists"),
+            "{} holds a bucket file before the first index flush",
+            group.display()
+        );
+    }
+
+    let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+        .await
+        .expect("store reopens");
+    let initial = settings().initial_fan_out_level;
+    for (group_index, group) in store.group.iter().enumerate() {
+        assert_eq!(
+            group.serialize_version.load(atomic::Ordering::Relaxed),
+            ImmutableStoreVersion::LazyFanOut as u32,
+            "group {group_index:02x} reopened at the pre-fan-out version"
+        );
+        assert_eq!(
+            group.bucket_count.load(atomic::Ordering::Relaxed),
+            initial,
+            "group {group_index:02x} reopened at the wrong level"
+        );
+    }
+}
+
 /// A store written before lazy fan-out carries no level markers and a flat 256-bucket
 /// layout, which `read_group_level` reports as `PreFanOut`. Such a group already reads back
 /// at the level it was written at, so nothing may start writing markers into it: that would
@@ -4304,7 +4351,8 @@ mod obliteration {
     }
 
     /// An obliterate in a group with no level marker yet fails when the marker cannot be written,
-    /// as its tombstone would read back at another level, and leaves the payload whole.
+    /// as its tombstone would read back at another level: it writes no bucket file and leaves the
+    /// payload whole.
     #[tokio::test]
     async fn an_obliterate_that_cannot_commit_its_group_level_zeroes_nothing() {
         let dir = lore_base::test_util::TempDir::new("is_obliterate_marker_");
@@ -4326,6 +4374,15 @@ mod obliteration {
             .await;
 
         assert!(matches!(obliterating, Err(StoreError::Internal(_))));
+        let group_dir = marker
+            .parent()
+            .expect("the marker is in its group directory");
+        assert!(
+            !lore_storage::local::fan_out::group_has_buckets(group_dir)
+                .await
+                .expect("the group directory lists"),
+            "a bucket file was written without its group's level marker"
+        );
         let (_fragment, read_back) = dyn_store
             .get(partition, address)
             .await
@@ -5229,6 +5286,60 @@ async fn compaction_keeps_a_packfile_when_a_bucket_write_fails() {
     }
 
     let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(&store, partition, local).await;
+}
+
+/// A compaction in a group with no level marker yet, whose marker cannot be written, writes no
+/// bucket file, neither in the eviction nor in the rewrite, returns the error and keeps the
+/// packfile, so that every local payload reads back once the store reopens.
+#[tokio::test]
+async fn compaction_keeps_a_packfile_when_its_group_level_marker_cannot_be_written() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_marker_fails_");
+    let settings = || ImmutableStoreSettings {
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    let partition = Partition::from([0x49u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    let marker = format_bucket_path(&dir.join("immutable"), group_index, 0)
+        .with_file_name(lore_storage::local::fan_out::MARKER_FILENAME);
+    let mut local = vec![];
+    {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+            .await
+            .unwrap();
+        for (index, payload) in payloads.iter().enumerate() {
+            let address =
+                put_payload(&store, partition, Context::default(), payload, index < 2).await;
+            if index >= 2 {
+                local.push((address, payload.clone()));
+            }
+        }
+        std::fs::create_dir_all(marker.join("blocker")).unwrap();
+
+        let failed = try_compact_group_toward(&store, group_index, 1, true).await;
+        assert!(failed.is_err(), "the failed marker write is returned");
+
+        assert_eq!(
+            store.group[group_index].packstore.sizes().await.unwrap()[0],
+            4 * 4096,
+            "the packfile is not truncated"
+        );
+        assert!(
+            !lore_storage::local::fan_out::group_has_buckets(marker.parent().unwrap())
+                .await
+                .unwrap(),
+            "a bucket file was written without its group's level marker"
+        );
+        std::fs::remove_dir_all(&marker).unwrap();
+        store.clone().flush(true).await.unwrap();
+    }
+
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
         .await
         .unwrap();
     assert_payloads_read_back(&store, partition, local).await;

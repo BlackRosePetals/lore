@@ -1387,13 +1387,29 @@ impl ImmutableStoreGroup {
                 // Guard this bucket write against a concurrent two-phase commit's
                 // rename. Taken before the bucket guard to keep the lock order
                 // flush_lock -> bucket RwLock -> serialize_lock uniform with `flush_all`.
-                let _flush_guard = group.flush_lock.clone().lock_owned().await;
+                let flush_guard = group.flush_lock.clone().lock_owned().await;
 
                 // Re-check under the lock: a flush that ran while we waited may already
                 // have written this bucket. The dirty read above happened before the
                 // lock, so it is stale.
                 if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
                     continue;
+                }
+
+                if let Err(err) = crate::local::fan_out::commit_if_initial_level(
+                    &flush_guard,
+                    &group.committed_level,
+                    &group.bucket_count,
+                    path,
+                    group_index,
+                    false,
+                )
+                .await
+                {
+                    lore_base::lore_warn!(
+                        "Failed to write level marker for group {group_index}: {err}"
+                    );
+                    return;
                 }
 
                 let bucket = bucket.read_owned().await;
@@ -1407,17 +1423,6 @@ impl ImmutableStoreGroup {
                 )
                 .await;
             }
-
-            let flush_guard = group.flush_lock.clone().lock_owned().await;
-            let _ = crate::local::fan_out::commit_if_initial_level(
-                &flush_guard,
-                &group.committed_level,
-                &group.bucket_count,
-                path,
-                group_index,
-                false,
-            )
-            .await;
         }
     }
 }
@@ -1512,9 +1517,6 @@ impl LocalImmutableStore {
 
         // Groups are surveyed before their levels are decided: the decision needs the store's
         // serialize version, which is only known once every marker has been read.
-        let index_existed_on_disk = immutable_path
-            .as_ref()
-            .is_some_and(|p| p.join("index").exists());
         // Every group is read at once. Each group is one recovery check and one marker read, and
         // awaiting them in turn puts a whole store open behind `GROUP_COUNT` round trips to the
         // I/O engine — a cost every process that opens a store pays before it does any work. The
@@ -1577,12 +1579,17 @@ impl LocalImmutableStore {
         let any_marker_seen = group_levels
             .iter()
             .any(|level| matches!(level, GroupLevel::Marked(_)));
+        // Group directories also hold packfiles, so a store stopped before its first index flush
+        // has them without a bucket file, and is new.
+        let index_written = group_levels
+            .iter()
+            .any(|level| !matches!(level, GroupLevel::Unwritten));
 
         // Determine serialize_version per Decision 8. Fresh stores, stores with markers, and
         // existing stores with bucket files at any older version (v1-v3) all go to LazyFanOut.
         // Existing stores at the current pre-fan-out version (v4 LastAccessInEntry) with no
         // markers stay at v4 for backward compatibility (old binaries can still read them).
-        let any_older_bucket_seen = if index_existed_on_disk
+        let any_older_bucket_seen = if index_written
             && !any_marker_seen
             && let Some(path) = immutable_path.as_deref()
         {
@@ -1592,12 +1599,11 @@ impl LocalImmutableStore {
         } else {
             false
         };
-        let serialize_version: u32 =
-            if !index_existed_on_disk || any_marker_seen || any_older_bucket_seen {
-                ImmutableStoreVersion::LazyFanOut as u32
-            } else {
-                ImmutableStoreVersion::LastAccessInEntry as u32
-            };
+        let serialize_version: u32 = if !index_written || any_marker_seen || any_older_bucket_seen {
+            ImmutableStoreVersion::LazyFanOut as u32
+        } else {
+            ImmutableStoreVersion::LastAccessInEntry as u32
+        };
 
         let unwritten_level = crate::local::fan_out::unwritten_group_level(
             serialize_version == ImmutableStoreVersion::LazyFanOut as u32,
@@ -2724,6 +2730,16 @@ impl LocalImmutableStore {
                 .await
                 .forward::<StoreError>("committing the group of an obliterated entry");
         }
+        crate::local::fan_out::commit_if_initial_level(
+            &flush_guard,
+            &group.committed_level,
+            &group.bucket_count,
+            path.as_ref(),
+            group_index,
+            true,
+        )
+        .await
+        .internal("committing the level of the group of an obliterated entry")?;
         let bucket = group.bucket(bucket_index).clone().read_owned().await;
         ImmutableStoreBucket::serialize(
             bucket,
@@ -2735,16 +2751,6 @@ impl LocalImmutableStore {
         )
         .await
         .forward::<StoreError>("writing the bucket of an obliterated entry")?;
-        crate::local::fan_out::commit_if_initial_level(
-            &flush_guard,
-            &group.committed_level,
-            &group.bucket_count,
-            path.as_ref(),
-            group_index,
-            true,
-        )
-        .await
-        .internal("committing the level of the group of an obliterated entry")?;
         Ok(())
     }
 
@@ -2925,7 +2931,22 @@ impl LocalImmutableStore {
                 lore_base::lore_spawn!(serialize_tasks, async move {
                     let group = store.group[group_index].clone();
                     let bucket = group.bucket(bucket_index).clone();
-                    let _flush_guard = group.flush_lock.clone().lock_owned().await;
+                    let flush_guard = group.flush_lock.clone().lock_owned().await;
+                    if let Err(err) = crate::local::fan_out::commit_if_initial_level(
+                        &flush_guard,
+                        &group.committed_level,
+                        &group.bucket_count,
+                        path.as_ref(),
+                        group_index,
+                        sync_data,
+                    )
+                    .await
+                    {
+                        lore_base::lore_warn!(
+                            "Failed to write level marker for group {group_index}: {err}"
+                        );
+                        return;
+                    }
                     let bucket = bucket.read_owned().await;
                     let _ = ImmutableStoreBucket::serialize(
                         bucket,
@@ -2942,19 +2963,6 @@ impl LocalImmutableStore {
 
         // Await all serialization
         while serialize_tasks.join_next().await.is_some() {}
-
-        if let Some(path) = path.as_ref() {
-            let flush_guard = group.flush_lock.clone().lock_owned().await;
-            let _ = crate::local::fan_out::commit_if_initial_level(
-                &flush_guard,
-                &group.committed_level,
-                &group.bucket_count,
-                path.as_ref(),
-                group_index,
-                sync_data,
-            )
-            .await;
-        }
 
         if total_evicted_count > 0 {
             lore_base::lore_debug!(
@@ -3875,12 +3883,22 @@ impl LocalImmutableStore {
             referenced |= bucket_referenced;
 
             let bucket = group.bucket(bucket_index).clone();
-            let _flush_guard = group.flush_lock.clone().lock_owned().await;
+            let flush_guard = group.flush_lock.clone().lock_owned().await;
             if group.bucket_count.load(atomic::Ordering::Relaxed) != bucket_count {
                 return Ok(Rewrite::Interrupted);
             }
-            let bucket = bucket.read_owned().await;
             group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+            crate::local::fan_out::commit_if_initial_level(
+                &flush_guard,
+                &group.committed_level,
+                &group.bucket_count,
+                path.as_ref(),
+                group_index,
+                true,
+            )
+            .await
+            .internal_with(|| format!("writing the level marker of group {group_index}"))?;
+            let bucket = bucket.read_owned().await;
             ImmutableStoreBucket::serialize(
                 bucket,
                 group.clone(),
@@ -3906,15 +3924,6 @@ impl LocalImmutableStore {
         }
 
         let flush_guard = group.flush_lock.clone().lock_owned().await;
-        let _ = crate::local::fan_out::commit_if_initial_level(
-            &flush_guard,
-            &group.committed_level,
-            &group.bucket_count,
-            path.as_ref(),
-            group_index,
-            true,
-        )
-        .await;
         let fanned_out = group.bucket_count.load(atomic::Ordering::Relaxed) != bucket_count;
         drop(flush_guard);
 

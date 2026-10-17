@@ -336,7 +336,16 @@ pub async fn migrate_groups(
         // The walk covers a range of indices, but a group is materialized by the hash byte that
         // selects it, so on a store holding few fragments most of that range was never written.
         // Migrating one regardless would create its directory and level marker to hold nothing.
-        if crate::local::fan_out::group_has_buckets(&group_path).await {
+        let has_buckets = match crate::local::fan_out::group_has_buckets(&group_path).await {
+            Ok(has_buckets) => has_buckets,
+            Err(err) => {
+                lore_error!(
+                    "Oodle local migration: failed to list group {group_to_migrate}: {err:?}"
+                );
+                return Ok(false);
+            }
+        };
+        if has_buckets {
             lore_info!("Oodle local migration: migrating group {group_to_migrate}");
 
             // there could unknown errors with old Immutable stores. If we have problem

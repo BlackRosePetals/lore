@@ -182,6 +182,33 @@ async fn commit_if_initial_level_records_the_level_below_the_maximum() {
     }
 }
 
+/// A group's first bucket file creates its directory, so a marker written ahead of it may have to.
+#[tokio::test]
+async fn commit_if_initial_level_creates_the_group_directory() {
+    let dir = lore_base::test_util::TempDir::new("fan_out_commit_");
+    let committed = AtomicUsize::new(0);
+    let bucket_count = AtomicUsize::new(LEVEL_LADDER[0]);
+
+    commit_if_initial_level(
+        &held_flush_guard().await,
+        &committed,
+        &bucket_count,
+        dir.path(),
+        0x2a,
+        false,
+    )
+    .await
+    .expect("commit the level");
+
+    let mut group_path = dir.path().join("index");
+    push_group_dir(&mut group_path, 0x2a);
+    assert_eq!(
+        read_level_marker(&group_path).await.unwrap(),
+        Some(LEVEL_LADDER[0])
+    );
+    assert_eq!(committed.load(Ordering::Relaxed), LEVEL_LADDER[0]);
+}
+
 #[tokio::test]
 async fn commit_if_initial_level_leaves_a_committed_group_alone() {
     let (dir, group_path) = temp_store_with_group(0x2a);
@@ -224,6 +251,7 @@ async fn commit_if_initial_level_leaves_a_group_at_the_maximum_alone() {
     assert_eq!(committed.load(Ordering::Relaxed), 0);
 }
 
+/// A caller writes no bucket file without the marker, so a marker it cannot write is an error.
 #[tokio::test]
 async fn commit_if_initial_level_returns_a_marker_it_cannot_write() {
     let (dir, group_path) = temp_store_with_group(0x2a);
@@ -453,13 +481,13 @@ async fn recovery_keeps_the_pending_level_when_a_rename_fails() {
 #[tokio::test]
 async fn group_has_buckets_missing_directory_is_false() {
     let dir = temp_group_dir();
-    assert!(!group_has_buckets(&dir.path().join("absent")).await);
+    assert!(!group_has_buckets(&dir.path().join("absent")).await.unwrap());
 }
 
 #[tokio::test]
 async fn group_has_buckets_empty_directory_is_false() {
     let dir = temp_group_dir();
-    assert!(!group_has_buckets(dir.path()).await);
+    assert!(!group_has_buckets(dir.path()).await.unwrap());
 }
 
 #[tokio::test]
@@ -467,7 +495,7 @@ async fn group_has_buckets_level_files_alone_are_false() {
     let dir = temp_group_dir();
     write_level_marker(dir.path(), 32, false).await.unwrap();
     write_level_pending(dir.path(), 64, false).await.unwrap();
-    assert!(!group_has_buckets(dir.path()).await);
+    assert!(!group_has_buckets(dir.path()).await.unwrap());
 }
 
 #[tokio::test]
@@ -476,7 +504,7 @@ async fn group_has_buckets_uncommitted_new_twins_alone_are_false() {
     for bb in 0..4 {
         std::fs::write(bucket_new_path(dir.path(), bb), [bb as u8; 8]).unwrap();
     }
-    assert!(!group_has_buckets(dir.path()).await);
+    assert!(!group_has_buckets(dir.path()).await.unwrap());
 }
 
 /// A temporary file a bucket write left behind, stopped before its rename, records no committed
@@ -487,7 +515,16 @@ async fn group_has_buckets_temporary_files_alone_are_false() {
     let mut temporary = bucket_path(dir.path(), 0x37).into_os_string();
     temporary.push(".tmp");
     std::fs::write(temporary, b"partial").unwrap();
-    assert!(!group_has_buckets(dir.path()).await);
+    assert!(!group_has_buckets(dir.path()).await.unwrap());
+}
+
+/// A group path that cannot be listed, here a file, is an error, not a group without bucket files.
+#[tokio::test]
+async fn group_has_buckets_unlistable_directory_is_an_error() {
+    let dir = temp_group_dir();
+    let unlistable = dir.path().join("group");
+    std::fs::write(&unlistable, b"").unwrap();
+    assert!(group_has_buckets(&unlistable).await.is_err());
 }
 
 #[tokio::test]
@@ -495,7 +532,7 @@ async fn group_has_buckets_committed_bucket_is_true() {
     let dir = temp_group_dir();
     std::fs::write(bucket_path(dir.path(), 0x37), b"bucket").unwrap();
     std::fs::write(bucket_new_path(dir.path(), 0x38), b"twin").unwrap();
-    assert!(group_has_buckets(dir.path()).await);
+    assert!(group_has_buckets(dir.path()).await.unwrap());
 }
 
 #[test]

@@ -345,31 +345,35 @@ pub fn unwritten_group_level(fan_out_aware: bool, initial_fan_out_level: usize) 
 ///
 /// # Returns
 /// * `Ok(GroupLevel)` classifying the group.
-/// * `Err(io::Error)` for the failures [`read_level_marker`] reports.
+/// * `Err(io::Error)` for the failures [`read_level_marker`] and [`group_has_buckets`] report.
 pub async fn read_group_level(group_path: &Path) -> std::io::Result<GroupLevel> {
     match read_level_marker(group_path).await? {
         Some(level) => Ok(GroupLevel::Marked(level)),
-        None if group_has_buckets(group_path).await => Ok(GroupLevel::PreFanOut),
+        None if group_has_buckets(group_path).await? => Ok(GroupLevel::PreFanOut),
         None => Ok(GroupLevel::Unwritten),
     }
 }
 
 /// Record the level a group's bucket files are laid out at, when the group has no marker yet.
-/// `store_path` is the store root; the group directory is `<store_path>/index/<gg>`.
+/// `store_path` is the store root; the group directory is `<store_path>/index/<gg>`, created when
+/// missing.
 /// `_flush_guard` is the group's held flush lock, which orders the `Relaxed` `committed_level`
 /// store against `flush_all`'s reads of it; it is taken to make the caller prove it holds one.
 ///
 /// A bucket file is only interpretable at the level it was written at, and [`read_group_level`]
 /// reads a marker-less group holding bucket files as [`GroupLevel::PreFanOut`]. Anything a lower
 /// level wrote then sits in a file no lookup opens again. Every path that writes a bucket file
-/// outside the two-phase commit therefore owes the group a marker.
+/// outside the two-phase commit therefore records the marker first, and writes no bucket file
+/// when it cannot: a bucket file written ahead of its marker is left without one by a kill in
+/// between or a marker write that fails.
 ///
 /// A group that already has a marker is left alone, as committing a level is the two-phase
 /// commit's business. So is a group at [`FAN_OUT_LEVEL_MAX`], which already reads back at that
 /// level — keeping this inert for pre-fan-out and server stores, whose groups are all there.
 ///
-/// A marker that cannot be written is logged and its error returned, and `committed_level` is
-/// left at 0.
+/// # Returns
+/// * `Ok(())` when the group's level is recorded, now or before, or needs no marker.
+/// * `Err(io::Error)` when writing the marker failed, leaving `committed_level` at 0.
 pub async fn commit_if_initial_level(
     _flush_guard: &OwnedMutexGuard<()>,
     committed_level: &AtomicUsize,
@@ -389,12 +393,11 @@ pub async fn commit_if_initial_level(
     marker_path.push(store_path);
     marker_path.push("index");
     push_group_dir(&mut marker_path, group_index);
+    lore_io::IoDriver::global()
+        .create_dir_all(&marker_path)
+        .await?;
     marker_path.push(MARKER_FILENAME);
-    write_level_header_file(&marker_path, active_buckets, sync_data)
-        .await
-        .inspect_err(|err| {
-            lore_base::lore_warn!("Failed to write level marker for group {group_index}: {err}");
-        })?;
+    write_level_header_file(&marker_path, active_buckets, sync_data).await?;
     committed_level.store(active_buckets, Ordering::Relaxed);
     Ok(())
 }
@@ -412,26 +415,30 @@ pub(crate) fn is_bucket_file_name(name: &str) -> bool {
 /// that never reached its commit point and record no committed layout. Temporary files
 /// are ignored too: they belong to a write that never reached its rename.
 ///
+/// A directory that cannot be listed is an error, not a group without bucket files: a written
+/// group taken for an unwritten one is laid out at the initial level, where lookups miss them.
+///
 /// # Returns
-/// * `true` when the directory holds a file named `index_<bb>`.
-/// * `false` when it holds none, or cannot be read at all.
+/// * `Ok(true)` when the directory holds a file named `index_<bb>`.
+/// * `Ok(false)` when it holds none, or does not exist.
+/// * `Err(io::Error)` when it cannot be listed.
 #[lore_macro::test_pub]
-pub(crate) async fn group_has_buckets(group_path: &Path) -> bool {
-    let Ok(mut entries) = lore_io::IoDriver::global().read_dir(group_path).await else {
-        return false;
+pub(crate) async fn group_has_buckets(group_path: &Path) -> std::io::Result<bool> {
+    let mut entries = match lore_io::IoDriver::global().read_dir(group_path).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
     };
     while let Some(entry) = entries.next().await {
-        let Ok(entry) = entry else {
-            continue;
-        };
+        let entry = entry?;
         let Some(name) = entry.file_name.to_str() else {
             continue;
         };
         if is_bucket_file_name(name) {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Format the path for the in-progress (`.new`) twin of a bucket index file used during

@@ -224,6 +224,76 @@ async fn a_flush_waits_for_a_bucket_write_holding_the_group() {
     flush.await.expect("flush task").expect("flush");
 }
 
+/// A delayed flush that cannot write its group's level marker finishes and leaves the bucket
+/// dirty. The next store into the bucket starts another, which writes it once the marker can be
+/// written.
+#[tokio::test]
+async fn a_store_after_a_failed_delayed_flush_starts_another() {
+    use lore_storage::mutable_store::MutableStore;
+    let dir = lore_base::test_util::TempDir::new("ms_delayed_retry_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            MutableStoreSettings {
+                flush_delay_seconds: 1,
+                ..client_settings()
+            },
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store opens"),
+    );
+    let dyn_store: Arc<dyn MutableStore> = store.clone();
+    let store_key = |byte: u8| {
+        let dyn_store = dyn_store.clone();
+        async move {
+            let mut key = Hash::default();
+            key.data_mut()[0] = 7;
+            key.data_mut()[1] = byte;
+            dyn_store
+                .store(
+                    Partition::default(),
+                    key,
+                    Hash::from_u64(u64::from(byte) + 1),
+                    KeyType::BranchMetadata,
+                )
+                .await
+                .expect("store succeeds");
+        }
+    };
+    let group_path = dir.path().join("mutable").join("index").join("07");
+    let marker = group_path.join(lore_storage::local::fan_out::MARKER_FILENAME);
+    let bucket_file = lore_storage::local::fan_out::bucket_path(&group_path, 0);
+    let bucket = store.group[7].bucket(0).clone();
+    std::fs::create_dir_all(marker.join("blocker")).expect("block the level marker");
+
+    store_key(0).await;
+    wait_for_delayed_flush(&bucket).await;
+    assert!(store.group[7].dirty[0].load(atomic::Ordering::Relaxed));
+    assert!(!bucket_file.exists());
+
+    std::fs::remove_dir_all(&marker).expect("unblock the level marker");
+    store_key(1).await;
+    assert!(
+        bucket.read().await.flush_pending(),
+        "the store into a bucket a failed delayed flush left dirty started no delayed flush"
+    );
+    wait_for_delayed_flush(&bucket).await;
+    assert!(!store.group[7].dirty[0].load(atomic::Ordering::Relaxed));
+    assert!(bucket_file.exists() && marker.exists());
+}
+
+/// Wait until no delayed flush of `bucket` is pending, for at most 10 s.
+async fn wait_for_delayed_flush(bucket: &tokio::sync::RwLock<MutableStoreBucket>) {
+    for _ in 0..1000 {
+        if !bucket.read().await.flush_pending() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the delayed flush did not finish");
+}
+
 /// A fan-out commit that fails after writing its `level.pending` is one the next open's recovery
 /// completes, renaming its `.new` files over whatever is there. Until a flush rolls it forward, no
 /// bucket file is written outside it: here a group's first commit fails at one rename, and a newer
