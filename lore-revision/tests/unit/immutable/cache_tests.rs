@@ -268,11 +268,15 @@ async fn caching_a_local_list_that_does_not_expand_fetches_and_overwrites_it() {
         ..list.fragment
     };
     let cached = context_with_state(RemoteState::Offline).await;
-    cached
-        .immutable_store()
-        .put(cached.id, root, undecodable, list.payload, false)
-        .await
-        .expect("the list is stored in a form that does not expand");
+    lore_storage::test_util::accepting_unvalidated_puts(cached.immutable_store().put(
+        cached.id,
+        root,
+        undecodable,
+        list.payload,
+        false,
+    ))
+    .await
+    .expect("the list is stored in a form that does not expand");
     let (session, remote) = serving_session(&written, Serving::default()).await;
 
     let fetched =
@@ -485,17 +489,15 @@ async fn a_cache_trusting_the_remote_stores_no_payload_whose_sizes_disagree() {
         size_payload: content.len() as u32,
         size_content: content.len() as u64 + 1,
     };
-    source
-        .immutable_store()
-        .put(
-            source.id,
-            address,
-            claims_more,
-            Some(Bytes::from_static(content)),
-            false,
-        )
-        .await
-        .expect("the remote's copy is stored");
+    lore_storage::test_util::accepting_unvalidated_puts(source.immutable_store().put(
+        source.id,
+        address,
+        claims_more,
+        Some(Bytes::from_static(content)),
+        false,
+    ))
+    .await
+    .expect("the remote's copy is stored");
     let cached = context_with_state(RemoteState::Offline).await;
     let (session, _) = serving_session(&source, Serving::default()).await;
 

@@ -98,6 +98,7 @@ use crate::store_types::StoreObliterateStats;
 #[error_set]
 pub enum LocalImmutableStoreError {
     NotSupported,
+    PayloadNotFound,
 }
 
 const VALIDATE_COMPACTION: bool = false;
@@ -137,6 +138,19 @@ pub struct ImmutableData {
 }
 
 impl ImmutableData {
+    /// The stored flags of an entry holding the payload at `pack_file`, 0 for none, stored with
+    /// `flags`: durable as they say, and local exactly when the entry holds its payload, whatever
+    /// they say.
+    #[inline]
+    fn stored_flags(flags: u32, pack_file: u32) -> u32 {
+        let local = if pack_file != 0 {
+            FragmentFlags::PayloadStoredLocal.bits()
+        } else {
+            0
+        };
+        (flags & FragmentFlags::PayloadStored & !FragmentFlags::PayloadStoredLocal.bits()) | local
+    }
+
     /// Assign the relevant data to make this instance of a fragment point to the same
     /// deduplicated payload as another fragment. Synchronizes `PayloadStoredLocal` with the
     /// resulting `pack_file` so the flag and the pointer it describes always agree.
@@ -149,12 +163,7 @@ impl ImmutableData {
         self.pack_offset = deduplicated.pack_offset;
         self.size_payload = deduplicated.size_payload;
         self.flags = (deduplicated.flags & !FragmentFlags::PayloadStored)
-            | (self.flags & FragmentFlags::PayloadStored);
-        if self.pack_file != 0 {
-            self.flags |= FragmentFlags::PayloadStoredLocal.bits();
-        } else {
-            self.flags &= !FragmentFlags::PayloadStoredLocal.bits();
-        }
+            | Self::stored_flags(self.flags, self.pack_file);
     }
 
     /// Apply data from a copy operation's source onto `self`. Delegates payload adoption to
@@ -2228,7 +2237,8 @@ impl LocalImmutableStore {
     /// Insert or update the entry for `address` under its bucket's write lock. An entry needing a
     /// payload, which the best match for its hash does not hold or `force` replaces, takes the one
     /// `payload` was written to, and is reported as [`StoreOutcome::NeedsPayload`] while it is
-    /// unwritten. A written payload the entry does not take stays unreferenced.
+    /// unwritten. A written payload the entry does not take stays unreferenced. A store without a
+    /// payload over the tombstone of its association is refused with `PayloadNotFound`.
     async fn store_entry(
         &self,
         partition: &Partition,
@@ -2268,6 +2278,14 @@ impl LocalImmutableStore {
         if matched_hash {
             let entry_index = bucket.sorted_index[match_slot] as usize;
             let data = bucket.entry[entry_index].data;
+            if match_made == StoreMatch::MatchFull
+                && !has_payload
+                && data.flags & FragmentFlags::PayloadObliterated != 0
+            {
+                return Err(LocalImmutableStoreError::from(PayloadNotFound::from(
+                    address.hash,
+                )));
+            }
             if data.size_content != fragment.size_content {
                 if (data.flags & FragmentFlags::PayloadObliterated) == 0 {
                     // Same hash, different content - we have a collision
@@ -2294,28 +2312,24 @@ impl LocalImmutableStore {
                 );
                 let keeps_payload = (!force && data.pack_file != 0) || !has_payload;
                 if keeps_payload {
-                    if fragment_flags != data.flags {
-                        // Update stored upstream/local flags
-                        if (fragment_flags & FragmentFlags::PayloadStored)
-                            != (current_flags & FragmentFlags::PayloadStored)
+                    let stored = ImmutableData::stored_flags(fragment_flags, data.pack_file);
+                    if stored != (current_flags & FragmentFlags::PayloadStored) {
+                        let previous_flags = current_flags;
                         {
-                            let previous_flags = current_flags;
-                            {
-                                let entry = &mut bucket.entry[entry_index];
-                                entry.data.flags &= !FragmentFlags::PayloadStored;
-                                entry.data.flags |= fragment_flags & FragmentFlags::PayloadStored;
-                                current_flags = entry.data.flags;
-                            }
-
-                            group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-
-                            lore_base::lore_trace!(
-                                "Immutable store updated flags for {} from {} to {}",
-                                address,
-                                previous_flags,
-                                current_flags
-                            );
+                            let entry = &mut bucket.entry[entry_index];
+                            entry.data.flags &= !FragmentFlags::PayloadStored;
+                            entry.data.flags |= stored;
+                            current_flags = entry.data.flags;
                         }
+
+                        group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+
+                        lore_base::lore_trace!(
+                            "Immutable store updated flags for {} from {} to {}",
+                            address,
+                            previous_flags,
+                            current_flags
+                        );
                     }
                     return Ok(StoreOutcome::Kept {
                         changed_flags: (current_flags != data.flags).then_some(current_flags),
@@ -2355,7 +2369,8 @@ impl LocalImmutableStore {
         let last_access = Self::last_access();
 
         let data = ImmutableData {
-            flags: fragment_flags,
+            flags: (fragment_flags & !FragmentFlags::PayloadStored)
+                | ImmutableData::stored_flags(fragment_flags, pack_file),
             size_payload,
             size_content: fragment.size_content,
             pack_file,
@@ -4156,8 +4171,11 @@ impl LocalImmutableStore {
             for bucket in group.bucket.iter().filter_map(|cell| cell.get()) {
                 let mut bucket = bucket.write().await;
                 for entry in bucket.entry.iter_mut() {
-                    entry.data.flags |=
-                        FragmentFlags::PayloadStoredDurable | FragmentFlags::PayloadStoredLocal;
+                    entry.data.flags = (entry.data.flags & !FragmentFlags::PayloadStored)
+                        | ImmutableData::stored_flags(
+                            entry.data.flags | FragmentFlags::PayloadStoredDurable.bits(),
+                            entry.data.pack_file,
+                        );
                 }
             }
         }
@@ -4303,17 +4321,14 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             return Ok(StoreGetData::default());
         }
 
-        let mut local_flags = 0;
-        if find.data.pack_file != 0 {
-            local_flags |= FragmentFlags::PayloadStoredLocal.bits();
-        }
+        let mut stored_flags = ImmutableData::stored_flags(find.data.flags, find.data.pack_file);
         if self.settings.implicit_durable_stored {
-            local_flags |= FragmentFlags::PayloadStoredDurable.bits();
+            stored_flags |= FragmentFlags::PayloadStoredDurable.bits();
         }
 
         Ok(StoreGetData::metadata(
             Fragment {
-                flags: (find.data.flags & !FragmentFlags::PayloadStoredLocal.bits()) | local_flags,
+                flags: (find.data.flags & !FragmentFlags::PayloadStored) | stored_flags,
                 size_payload: find.data.size_payload,
                 size_content: find.data.size_content,
             },
@@ -4354,7 +4369,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             return Err(StoreError::from(AddressNotFound::from(address)));
         }
 
-        let mut local_flags = 0;
+        let mut local_flags = FragmentFlags::PayloadStoredLocal.bits();
         if self.settings.implicit_durable_stored {
             local_flags |= FragmentFlags::PayloadStoredDurable.bits();
         }
@@ -4414,7 +4429,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             return Err(StoreError::from(AddressNotFound::from(address)));
         }
 
-        let mut local_flags = 0;
+        let mut local_flags = FragmentFlags::PayloadStoredLocal.bits();
         if self.settings.implicit_durable_stored {
             local_flags |= FragmentFlags::PayloadStoredDurable.bits();
         }
@@ -4460,6 +4475,8 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         Ok((fragment, PayloadRead::IntoBuffer))
     }
 
+    /// A put without its payload over the tombstone of its association is refused with
+    /// `PayloadNotFound`, and one with its payload replaces the tombstone.
     async fn put(
         self: Arc<Self>,
         partition: Partition,
@@ -4470,16 +4487,13 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
     ) -> Result<(), StoreError> {
         sanitise_fragment_behavior_flags(&mut fragment);
 
-        if let Some(payload) = payload.as_ref() {
-            crate::validate_fragment_payload(&fragment, payload.len())?;
-        } else if fragment.size_payload as usize > crate::FRAGMENT_SIZE_THRESHOLD {
-            return Err(StoreError::from(crate::errors::Oversized {
-                context: format!(
-                    "fragment size_payload {} exceeds FRAGMENT_SIZE_THRESHOLD {} on put",
-                    fragment.size_payload,
-                    crate::FRAGMENT_SIZE_THRESHOLD
-                ),
-            }));
+        let payload_len = payload.as_ref().map(Bytes::len);
+        if !crate::immutable_store::put_is_valid(&fragment, payload_len) {
+            #[cfg(feature = "test-util")]
+            let enforced = !crate::test_util::unvalidated_puts_accepted();
+            #[cfg(not(feature = "test-util"))]
+            let enforced = true;
+            crate::immutable_store::refuse_put(&fragment, payload_len, enforced)?;
         }
 
         #[cfg(feature = "failure_generator")]
@@ -4536,6 +4550,12 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 )
             })?;
 
+        if find.matching == StoreMatch::MatchFull
+            && payload.is_none()
+            && find.data.flags & FragmentFlags::PayloadObliterated != 0
+        {
+            return Err(StoreError::from(PayloadNotFound::from(address.hash)));
+        }
         if find.matching != StoreMatch::MatchNone
             && fragment.size_content != find.data.size_content
             && (!force || payload.is_none())

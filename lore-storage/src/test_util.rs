@@ -34,6 +34,10 @@ thread_local! {
     static PACKFILE_SIZE_LIMIT: Cell<u64> = const { Cell::new(0) };
 }
 
+tokio::task_local! {
+    static UNVALIDATED_PUTS: ();
+}
+
 /// A point where [`pause_at`] holds a store, a read or a compaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PausePoint {
@@ -157,6 +161,18 @@ pub(crate) async fn park_packfile_write<B: Clone + Send + 'static>(buffer: &B) {
     *in_flight.buffer.lock() = Some(Box::new(buffer.clone()));
     in_flight.issued.notify_one();
     std::future::pending::<()>().await;
+}
+
+/// Runs `puts`, letting the puts it makes store fragments that pass only the size checks, for
+/// tests of the paths that read such data. The allowance is the future's, whichever thread polls
+/// it, and ends with it.
+pub async fn accepting_unvalidated_puts<F: Future>(puts: F) -> F::Output {
+    UNVALIDATED_PUTS.scope((), puts).await
+}
+
+/// Whether the running task is inside [`accepting_unvalidated_puts`].
+pub(crate) fn unvalidated_puts_accepted() -> bool {
+    UNVALIDATED_PUTS.try_with(|()| ()).is_ok()
 }
 
 /// Runs `hook` once, in the next payload gate hold taken on this thread, after the hold reads the

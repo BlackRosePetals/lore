@@ -72,6 +72,54 @@ fn validate_payload_rejects_oversize_before_mismatch() {
 mod validate_metadata {
     use super::*;
 
+    /// The inlined check passes exactly the fragments every check passes, over every combination
+    /// of the ten low flag bits and sizes around each bound, and each other bit alone.
+    #[test]
+    fn the_quick_check_agrees_with_every_check() {
+        let threshold = lore_storage::FRAGMENT_SIZE_THRESHOLD as u64;
+        let reference = size_of::<FragmentReference>() as u64;
+        let payloads = [
+            0,
+            1,
+            reference,
+            100,
+            threshold - 1,
+            threshold,
+            threshold + 1,
+        ];
+        let contents = [0, 1, 99, 100, 101, threshold, threshold + 1, 2 * threshold];
+        let flags = (0u32..1 << 10).chain((10..32).map(|bit| 1u32 << bit));
+        for flags in flags {
+            for &size_payload in &payloads {
+                for &size_content in &contents {
+                    let fragment = Fragment {
+                        flags,
+                        size_payload: size_payload as u32,
+                        size_content,
+                    };
+                    assert_eq!(
+                        fragment_metadata_is_valid(&fragment),
+                        refuse_fragment_metadata(&fragment).is_ok(),
+                        "{fragment:?}"
+                    );
+                    let lengths = [
+                        None,
+                        Some(size_payload as usize),
+                        Some(size_payload as usize + 1),
+                        Some((size_payload as usize).saturating_sub(1)),
+                    ];
+                    for payload_len in lengths {
+                        assert_eq!(
+                            put_is_valid(&fragment, payload_len),
+                            refuse_put(&fragment, payload_len, true).is_ok(),
+                            "{fragment:?} with a payload of {payload_len:?} bytes"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn accepts_uncompressed_unfragmented() {
         assert!(validate_fragment_metadata(&make_fragment(128)).is_ok());

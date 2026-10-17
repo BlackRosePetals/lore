@@ -125,6 +125,8 @@ mod tests {
                     .expect("Failed to create store");
 
                 let repository = random::<RepositoryId>();
+                // Every entry holds a payload the store has, and the store says so.
+                let local = FragmentFlags::PayloadStoredLocal.bits();
 
                 // Stress test, put 10000 items in the same bucket
                 for i in 0..10000 {
@@ -179,7 +181,7 @@ mod tests {
                         "Store unique did not return same fragment details"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Store unique did not return same fragment details"
                     );
 
@@ -212,7 +214,7 @@ mod tests {
                         "Store repeated did not return same fragment details"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Store repeated did not return same fragment details"
                     );
 
@@ -265,7 +267,7 @@ mod tests {
                         "Partial deduplicate did not return identical fragment details as expected"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Partial deduplicate did not return identical fragment details as expected"
                     );
 
@@ -310,7 +312,7 @@ mod tests {
                         "Repository deduplication did not return identical fragment details as expected"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Repository deduplication did not return identical fragment details as expected"
                     );
 
@@ -350,7 +352,7 @@ mod tests {
                         "Repository deduplication with new fragment representation did not return previous fragment details as expected"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Repository deduplication with new fragment representation did not return previous fragment details as expected"
                     );
 

@@ -1658,8 +1658,8 @@ async fn evicted_payload_restored_after_crash(dir: PathBuf) -> Outcome {
 }
 
 /// A put must refuse a fragment whose flags or sizes no store should keep, or keep it sanitized:
-/// flags the store manages, bits no flag names, two compressors, a payload claimed local without
-/// one, sizes that contradict each other.
+/// flags the store manages, two compressors, a payload claimed local without one, sizes that
+/// contradict each other.
 async fn put_refuses_invalid_fragments(dir: PathBuf) -> Outcome {
     let config = config(1000);
     let store = open(&dir, &config).await;
@@ -1759,8 +1759,8 @@ async fn flags_agree_with_payload_after_deduplication(dir: PathBuf) -> Outcome {
     }
 }
 
-/// A store without a payload of an obliterated address succeeds and records nothing: the address
-/// stays obliterated, to reads and to metadata alike.
+/// A store without a payload of an obliterated address is refused with `PayloadNotFound` and
+/// records nothing: the address stays obliterated, to reads and to metadata alike.
 async fn metadata_put_on_an_obliterated_address(dir: PathBuf) -> Outcome {
     let config = config(1000);
     let key = keys(&config, 0..255, 64..4096, 1, &mut HashSet::new())[0];
@@ -1785,10 +1785,11 @@ async fn metadata_put_on_an_obliterated_address(dir: PathBuf) -> Outcome {
         .map(|metadata| metadata.match_made);
     let detail = format!(
         "the put returned {:?}, the address reads as {read_back:?} and is described at {:?}",
-        stored.map_err(|err| err.to_string()),
+        stored.as_ref().map_err(ToString::to_string),
         described.as_ref().map_err(ToString::to_string)
     );
-    if matches!(read_back, Read::Served(_))
+    if !matches!(stored, Err(StoreError::PayloadNotFound(_)))
+        || matches!(read_back, Read::Served(_))
         || matches!(described, Ok(lore_storage::StoreMatch::MatchFull))
     {
         return Outcome::Fail(detail);

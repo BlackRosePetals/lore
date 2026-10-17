@@ -1493,21 +1493,19 @@ mod defragment_integration {
             hash: hash::hash_slice(stub.as_ref()),
             context,
         };
-        store
-            .clone()
-            .put(
-                partition,
-                sub_empty,
-                Fragment {
-                    flags: FragmentFlags::PayloadFragmented.bits(),
-                    size_payload: stub.len() as u32,
-                    size_content: 100,
-                },
-                Some(stub),
-                false,
-            )
-            .await
-            .expect("put empty sublist");
+        lore_storage::test_util::accepting_unvalidated_puts(store.clone().put(
+            partition,
+            sub_empty,
+            Fragment {
+                flags: FragmentFlags::PayloadFragmented.bits(),
+                size_payload: stub.len() as u32,
+                size_content: 100,
+            },
+            Some(stub),
+            false,
+        ))
+        .await
+        .expect("put empty sublist");
         let sub_b = put_list(&store, partition, context, &refs_at(&[(leaf_b, 100)]), 100).await;
         let root = put_list(
             &store,
@@ -1555,7 +1553,14 @@ mod defragment_integration {
         // The root's own entries are strictly increasing, so the only fault in this tree is
         // the one under test. A root placing both sublists at the same offset would be
         // rejected for that instead, before either is ever loaded.
-        let sub_zero = put_list(&store, partition, context, &refs_at(&[(leaf_b, 0)]), 0).await;
+        let sub_zero = lore_storage::test_util::accepting_unvalidated_puts(put_list(
+            &store,
+            partition,
+            context,
+            &refs_at(&[(leaf_b, 0)]),
+            0,
+        ))
+        .await;
         let sub_a = put_list(&store, partition, context, &refs_at(&[(leaf_a, 100)]), 100).await;
         let root = put_list(
             &store,
@@ -1735,21 +1740,19 @@ mod defragment_integration {
             hash: hash::hash_slice(stub.as_ref()),
             context,
         };
-        store
-            .clone()
-            .put(
-                partition,
-                root,
-                Fragment {
-                    flags: FragmentFlags::PayloadFragmented.bits(),
-                    size_payload: stub.len() as u32,
-                    size_content: 100,
-                },
-                Some(stub),
-                false,
-            )
-            .await
-            .expect("put empty root list");
+        lore_storage::test_util::accepting_unvalidated_puts(store.clone().put(
+            partition,
+            root,
+            Fragment {
+                flags: FragmentFlags::PayloadFragmented.bits(),
+                size_payload: stub.len() as u32,
+                size_content: 100,
+            },
+            Some(stub),
+            false,
+        ))
+        .await
+        .expect("put empty root list");
 
         let out_path = dir.join("empty-root.bin");
         let err = lore_storage::read::read_into_file(
@@ -1978,7 +1981,12 @@ mod defragment_integration {
             let (address, fragment, payload) =
                 put_stored_leaf(&store, partition, context, part, mode).await;
             entries.push((address, (index * 4096) as u64));
-            leaves.push((fragment, payload));
+            // Read back local, as the store holds the payload.
+            let held = Fragment {
+                flags: fragment.flags | FragmentFlags::PayloadStoredLocal.bits(),
+                ..fragment
+            };
+            leaves.push((held, payload));
         }
         assert_ne!(leaves[0].0.flags & FragmentFlags::PayloadCompressed, 0);
         assert_ne!(leaves[1].0.flags & FragmentFlags::PayloadCompressed, 0);

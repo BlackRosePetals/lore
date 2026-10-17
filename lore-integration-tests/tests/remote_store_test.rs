@@ -650,11 +650,14 @@ mod remote_store_tests {
                     flags: plain.flags | unassigned.bits(),
                     ..plain
                 };
-                server
-                    .backend
-                    .clone()
-                    .put(repository, address, undecodable, Some(payload), false)
-                    .await?;
+                lore_storage::test_util::accepting_unvalidated_puts(server.backend.clone().put(
+                    repository,
+                    address,
+                    undecodable,
+                    Some(payload),
+                    false,
+                ))
+                .await?;
 
                 let got = server
                     .immutable_store

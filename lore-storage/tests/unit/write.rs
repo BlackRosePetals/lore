@@ -680,17 +680,15 @@ async fn a_write_does_not_reuse_a_stored_payload_whose_sizes_disagree() {
         size_payload: 1,
         ..fragment
     };
-    store
-        .clone()
-        .put(
-            partition,
-            address,
-            claims_more,
-            Some(buffer.slice(..1)),
-            false,
-        )
-        .await
-        .expect("store a payload claiming more content than it holds");
+    lore_storage::test_util::accepting_unvalidated_puts(store.clone().put(
+        partition,
+        address,
+        claims_more,
+        Some(buffer.slice(..1)),
+        false,
+    ))
+    .await
+    .expect("store a payload claiming more content than it holds");
     let session = Arc::new(StorageSession::pending(|| async {
         Err(lore_transport::ProtocolError::internal(
             "the stand-in remote takes no upload",

@@ -170,16 +170,126 @@ const FRAGMENT_FLAGS_DEFINED_COMPRESSORS: u32 = FragmentFlags::PayloadCompressed
 ///
 /// All three Put protocols (QUIC, gRPC storage v1, legacy gRPC storage) call
 /// this at ingress so malformed metadata fails fast with a specific error
-/// rather than propagating into the store layer.
+/// rather than propagating into the store layer. A valid fragment passes in a
+/// few inlined instructions; the error is built in a cold function.
+#[inline]
 pub fn validate_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError> {
-    validate_fragment_size(fragment)?;
+    if fragment_metadata_is_valid(fragment) {
+        return Ok(());
+    }
+    refuse_fragment_metadata(fragment)
+}
 
+/// Whether a put of `fragment`, with a payload of `payload_len` bytes when there is one, is one a
+/// store keeps: [`fragment_is_consistent`] passes the fragment, a fragment list's payload size is
+/// a whole number of references, and the payload is the size it says. One expression, so that a
+/// local store's put, which nearly always passes, spends a few instructions on it and calls
+/// nothing.
+#[lore_macro::test_pub]
+#[inline]
+pub(crate) fn put_is_valid(fragment: &Fragment, payload_len: Option<usize>) -> bool {
+    fragment_is_consistent(fragment)
+        && (fragment.flags & FragmentFlags::PayloadFragmented.bits() == 0
+            || (fragment.size_payload as usize).is_multiple_of(size_of::<FragmentReference>()))
+        && payload_len.is_none_or(|len| len == fragment.size_payload as usize)
+}
+
+/// Why a put [`put_is_valid`] refuses is refused. Unless `enforced`, only the size checks of
+/// [`validate_fragment_payload`], or of [`validate_fragment_size`] without a payload, are made.
+#[lore_macro::test_pub]
+#[cold]
+#[inline(never)]
+pub(crate) fn refuse_put(
+    fragment: &Fragment,
+    payload_len: Option<usize>,
+    enforced: bool,
+) -> Result<(), StoreError> {
+    if !enforced {
+        return match payload_len {
+            Some(len) => validate_fragment_payload(fragment, len),
+            None => validate_fragment_size(fragment),
+        };
+    }
+    refuse_inconsistency(fragment)?;
+    if fragment.flags & FragmentFlags::PayloadFragmented.bits() != 0
+        && !(fragment.size_payload as usize).is_multiple_of(size_of::<FragmentReference>())
+    {
+        return Err(StoreError::internal(format!(
+            "fragment list of {} bytes is not a whole number of references",
+            fragment.size_payload
+        )));
+    }
+    if let Some(len) = payload_len {
+        validate_fragment_payload(fragment, len)?;
+    }
+    Ok(())
+}
+
+/// The checks of [`validate_fragment_metadata`] as one expression, without saying which fails.
+#[lore_macro::test_pub]
+#[inline]
+fn fragment_metadata_is_valid(fragment: &Fragment) -> bool {
+    fragment.flags & !FragmentFlags::all().bits() == 0
+        && fragment.flags
+            & FragmentFlags::PayloadCompressed.bits()
+            & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS
+            == 0
+        && fragment_is_consistent(fragment)
+}
+
+/// Whether nothing `fragment` says contradicts what this build knows, as one expression: no
+/// server-managed flag, at most one compression bit, not compressed and fragmented at once, and
+/// sizes within their bounds and agreeing with each other. A flag bit this build gives no meaning
+/// is not checked.
+#[lore_macro::test_pub]
+#[inline]
+fn fragment_is_consistent(fragment: &Fragment) -> bool {
+    let flags = fragment.flags;
+    let compressed = flags & FragmentFlags::PayloadCompressed.bits();
+    let fragmented = flags & FragmentFlags::PayloadFragmented.bits() != 0;
+    let size_payload = u64::from(fragment.size_payload);
+    let threshold = crate::FRAGMENT_SIZE_THRESHOLD as u64;
+    flags & FRAGMENT_FLAGS_SERVER_MANAGED_INGRESS_REJECTED == 0
+        && compressed & compressed.wrapping_sub(1) == 0
+        && (compressed == 0 || !fragmented)
+        && size_payload != 0
+        && size_payload <= threshold
+        && size_payload <= fragment.size_content
+        && (fragmented || fragment.size_content <= threshold)
+        && (compressed != 0 || fragmented || size_payload == fragment.size_content)
+}
+
+/// Which check of [`validate_fragment_metadata`] `fragment` fails, for one
+/// [`fragment_metadata_is_valid`] refuses.
+#[lore_macro::test_pub]
+#[cold]
+#[inline(never)]
+fn refuse_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError> {
     if fragment.flags & !FragmentFlags::all().bits() != 0 {
         return Err(StoreError::internal(format!(
             "fragment flags contain unknown bits: {:#x}",
             fragment.flags & !FragmentFlags::all().bits()
         )));
     }
+
+    let reserved = fragment.flags
+        & FragmentFlags::PayloadCompressed.bits()
+        & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS;
+    if reserved != 0 {
+        return Err(StoreError::internal(format!(
+            "fragment has reserved compression bit set: {reserved:#x}"
+        )));
+    }
+
+    refuse_inconsistency(fragment)
+}
+
+/// Which check of [`fragment_is_consistent`] `fragment` fails, for one it refuses.
+#[lore_macro::test_pub]
+#[cold]
+#[inline(never)]
+fn refuse_inconsistency(fragment: &Fragment) -> Result<(), StoreError> {
+    validate_fragment_size(fragment)?;
 
     if fragment.flags & FRAGMENT_FLAGS_SERVER_MANAGED_INGRESS_REJECTED != 0 {
         return Err(StoreError::internal(format!(
@@ -192,12 +302,6 @@ pub fn validate_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError>
     if compressed_bits.count_ones() > 1 {
         return Err(StoreError::internal(format!(
             "fragment has multiple compression flags set: {compressed_bits:#x}"
-        )));
-    }
-    if compressed_bits & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS != 0 {
-        return Err(StoreError::internal(format!(
-            "fragment has reserved compression bit set: {:#x}",
-            compressed_bits & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS
         )));
     }
 

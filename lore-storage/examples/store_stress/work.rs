@@ -548,7 +548,7 @@ pub fn invalid_fragment(
     let len = payload.len();
     let mut fragment = config.fragment(key, variant);
     let base = fragment.flags;
-    let name = match rng.below(10) {
+    let name = match rng.below(9) {
         0 => {
             fragment.flags = F::PayloadStoredLocal.bits();
             return ("stored-local-without-payload", fragment, None);
@@ -562,27 +562,23 @@ pub fn invalid_fragment(
             "obliterating-flag-from-caller"
         }
         3 => {
-            fragment.flags = base | 1 << 30;
-            "unknown-flag-bit"
-        }
-        4 => {
             fragment.flags =
                 base | F::PayloadCompressedLZ4.bits() | F::PayloadCompressedZstd.bits();
             "two-compressors"
         }
-        5 => {
+        4 => {
             fragment.flags = base | F::PayloadCompressedLZ4.bits() | F::PayloadFragmented.bits();
             "compressed-and-fragmented"
         }
-        6 => {
+        5 => {
             fragment.size_content = len as u64 - 1;
             "size-payload-over-size-content"
         }
-        7 => {
+        6 => {
             fragment.size_content = len as u64 + 100;
             "plain-payload-shorter-than-content"
         }
-        8 => {
+        7 => {
             fragment.flags = base | F::PayloadFragmented.bits();
             "fragment-list-of-arbitrary-bytes"
         }

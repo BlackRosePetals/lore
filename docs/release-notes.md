@@ -36,6 +36,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   `[server.auth.oidc]`, has no `{id}`. Such a template names the same resource for every partition, so one grant
   matched every partition. The error names the setting
 - `lore-storage`: `local::fan_out::commit_if_initial_level` returns the `std::io::Result` of its level marker write
+- `lore-storage`: a local immutable store's `put` refuses a fragment whose flags or sizes contradict each other or its
+  payload, such as store-managed obliteration flags, two compressors, or a fragment list that is not a whole number of
+  references, and stores a flag bit it does not know. A put without its payload to an obliterated association is refused
+  as `PayloadNotFound`; one with its payload replaces the obliteration
 
 ### Features
 
@@ -254,6 +258,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   content under another association, or re-encoding it in the Oodle migration, no longer brings an obliterated entry
   back with a size of 0, and obliterating a fragment list the store holds without its payload fails instead of leaving
   its fragments readable
+- Local immutable stores: `PayloadStoredLocal` says whether the store holds an entry's payload, whatever flags it was
+  put with, so a fragment the local store serves carries it, in `get` and in the C API's
+  `LORE_EVENT_STORAGE_GET_FRAGMENT`
 - `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of
   `Recursion task failed`
 - `lore clone` reports the error that stopped it, such as a file it failed to fetch or write, in place of

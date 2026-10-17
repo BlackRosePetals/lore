@@ -3460,7 +3460,10 @@ mod copy_source {
 
         let (payload, leaf_hash, root_hash, references) = (0u32..)
             .find_map(|salt| {
-                let payload = format!("leaf payload {salt}").into_bytes();
+                // Longer than its list's one reference, which a list describes no more bytes
+                // than.
+                let payload =
+                    format!("leaf payload {salt}, the content of a one-leaf list").into_bytes();
                 let leaf_hash = lore_storage::hash::hash_slice(&payload);
                 let references = vec![FragmentReference {
                     hash: leaf_hash,
@@ -3858,6 +3861,68 @@ mod obliteration {
         }
     }
 
+    /// A put without its payload over a tombstone is refused, whatever flags it carries, and
+    /// leaves the tombstone as it was, so that the payload is zeroed once the last live
+    /// association of its hash is obliterated. A put with its payload replaces the tombstone.
+    #[tokio::test]
+    async fn only_a_put_with_its_payload_replaces_a_tombstone() {
+        let store = create(
+            None::<&Path>,
+            ImmutableStoreCreateOptions::none(),
+            false,
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create store");
+        let payload = b"content one association of which is put again once obliterated".repeat(4);
+        let tombstoned = Partition::from([0x7bu8; 16]);
+        let live = Partition::from([0x7cu8; 16]);
+        let address = put(&store, tombstoned, &payload).await;
+        put(&store, live, &payload).await;
+        obliterate(&store, tombstoned, address).await;
+
+        for flags in [0, FragmentFlags::PayloadStoredDurable.bits()] {
+            let refused = store
+                .clone()
+                .put(
+                    tombstoned,
+                    address,
+                    Fragment {
+                        flags,
+                        ..fragment(&payload)
+                    },
+                    None,
+                    false,
+                )
+                .await;
+            assert!(
+                matches!(refused, Err(StoreError::PayloadNotFound(_))),
+                "{flags:#x}: {refused:?}"
+            );
+        }
+        let stats = Arc::new(lore_storage::store_types::StoreObliterateStats::default());
+        store
+            .clone()
+            .obliterate(live, address, stats.clone())
+            .await
+            .expect("obliterate");
+        assert_eq!(stats.num_payloads.load(atomic::Ordering::Relaxed), 1);
+
+        put(&store, tombstoned, &payload).await;
+        let (fragment, read_back) = store
+            .clone()
+            .get(tombstoned, address)
+            .await
+            .and_then(lore_storage::StoreGetData::into_payload)
+            .expect("the put with its payload replaces the tombstone");
+        assert_eq!(fragment.flags & FragmentFlags::PayloadObliterated.bits(), 0);
+        assert_eq!(read_back.as_ref(), payload.as_slice());
+        assert!(matches!(
+            store.clone().get(live, address).await,
+            Err(StoreError::AddressNotFound(_))
+        ));
+    }
+
     /// Copy the tree at `source` to `destination`: a copy of a store directory with no write in
     /// flight is what a process killed then leaves on disk.
     fn copy_tree(source: &Path, destination: &Path) {
@@ -4224,6 +4289,414 @@ mod obliteration {
                 result.match_made,
                 StoreMatch::MatchNone,
                 "the retry obliterates them all"
+            );
+        }
+    }
+}
+
+/// `put` refuses a fragment no store should keep, and records whether an entry holds its payload
+/// from where the payload is, not from the flags it is given.
+mod put_validation {
+    use lore_storage::immutable_store::ImmutableStore;
+    use lore_storage::local::fan_out::BucketGroup;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_fragments_are_refused_and_not_stored() {
+        use FragmentFlags as F;
+        let store = create(
+            None::<&Path>,
+            ImmutableStoreCreateOptions::none(),
+            false,
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create store");
+        let payload = Bytes::from(b"a payload to describe wrongly".repeat(4));
+        let len = payload.len();
+        let plain = Fragment {
+            flags: 0,
+            size_payload: len as u32,
+            size_content: len as u64,
+        };
+        let internal: fn(&StoreError) -> bool = StoreError::is_internal;
+        let oversized: fn(&StoreError) -> bool = StoreError::is_oversized;
+        let cases = [
+            (
+                "obliterated flag",
+                Fragment {
+                    flags: F::PayloadObliterated.bits(),
+                    ..plain
+                },
+                true,
+                internal,
+            ),
+            (
+                "obliterating flag",
+                Fragment {
+                    flags: F::PayloadObliterating.bits(),
+                    ..plain
+                },
+                true,
+                internal,
+            ),
+            (
+                "two compressors",
+                Fragment {
+                    flags: (F::PayloadCompressedLZ4 | F::PayloadCompressedZstd).bits(),
+                    size_content: len as u64 * 2,
+                    ..plain
+                },
+                true,
+                internal,
+            ),
+            (
+                "compressed and fragmented",
+                Fragment {
+                    flags: (F::PayloadCompressedLZ4 | F::PayloadFragmented).bits(),
+                    size_content: len as u64 * 2,
+                    ..plain
+                },
+                true,
+                internal,
+            ),
+            (
+                "payload over its content",
+                Fragment {
+                    size_content: len as u64 - 1,
+                    ..plain
+                },
+                true,
+                internal,
+            ),
+            (
+                "plain payload under its content",
+                Fragment {
+                    size_content: len as u64 + 1,
+                    ..plain
+                },
+                true,
+                internal,
+            ),
+            (
+                "fragment list of a part of a reference",
+                Fragment {
+                    flags: F::PayloadFragmented.bits(),
+                    size_content: len as u64 * 10,
+                    ..plain
+                },
+                true,
+                internal,
+            ),
+            (
+                "fragment list of a part of a reference without its payload",
+                Fragment {
+                    flags: F::PayloadFragmented.bits(),
+                    size_content: len as u64 * 10,
+                    ..plain
+                },
+                false,
+                internal,
+            ),
+            (
+                "oversized content without a payload",
+                Fragment {
+                    size_content: lore_storage::FRAGMENT_SIZE_THRESHOLD as u64 * 4,
+                    ..plain
+                },
+                false,
+                oversized,
+            ),
+            (
+                "local without a payload, sizes disagreeing",
+                Fragment {
+                    flags: F::PayloadStoredLocal.bits(),
+                    size_content: len as u64 + 7,
+                    ..plain
+                },
+                false,
+                internal,
+            ),
+        ];
+        let partition = Partition::from([0x31u8; 16]);
+        for (index, (name, fragment, with_payload, refused_as)) in cases.into_iter().enumerate() {
+            let address = Address {
+                hash: Hash::from([index as u8 + 1; 32]),
+                context: Context::default(),
+            };
+            let stored = store
+                .clone()
+                .put(
+                    partition,
+                    address,
+                    fragment,
+                    with_payload.then(|| payload.clone()),
+                    false,
+                )
+                .await;
+            assert!(stored.as_ref().is_err_and(refused_as), "{name}: {stored:?}");
+            let mut result = [StoreMatchResult::default()];
+            store
+                .clone()
+                .query(partition, &[address], &mut result)
+                .await
+                .expect("query");
+            assert_eq!(result[0].match_made, StoreMatch::MatchNone, "{name} stored");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_local_flag_says_whether_the_entry_holds_its_payload() {
+        use FragmentFlags as F;
+        let store = LocalImmutableStore::new(None, ImmutableStoreSettings::default())
+            .await
+            .expect("store opens");
+        let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+        let payload = b"a payload stored once and described twice".repeat(3);
+        let fragment = |flags: FragmentFlags| Fragment {
+            flags: flags.bits(),
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        let address = Address {
+            hash: hash::hash_slice(&payload),
+            context: Context::default(),
+        };
+        let (stored, described) = (Partition::from([0x41u8; 16]), Partition::from([0x42u8; 16]));
+        dyn_store
+            .clone()
+            .put(
+                stored,
+                address,
+                fragment(F::empty()),
+                Some(Bytes::copy_from_slice(&payload)),
+                false,
+            )
+            .await
+            .expect("put with the payload");
+        dyn_store
+            .clone()
+            .put(described, address, fragment(F::empty()), None, false)
+            .await
+            .expect("put of the representation alone");
+        for partition in [stored, described] {
+            let found = store.find(partition, address).await.expect("find");
+            assert_ne!(found.data.pack_file, 0, "the entry holds the payload");
+            assert_ne!(
+                found.data.flags & F::PayloadStoredLocal,
+                0,
+                "an entry holding its payload is local, whatever it was stored with"
+            );
+        }
+        dyn_store
+            .clone()
+            .put(
+                stored,
+                address,
+                fragment(F::PayloadStoredDurable),
+                None,
+                false,
+            )
+            .await
+            .expect("put of the representation marked durable");
+        let found = store.find(stored, address).await.expect("find");
+        assert_eq!(
+            found.data.flags & F::PayloadStored,
+            (F::PayloadStoredLocal | F::PayloadStoredDurable).bits(),
+            "an entry marked durable and holding its payload stays local"
+        );
+
+        let other = Address {
+            hash: Hash::from([0x43u8; 32]),
+            context: Context::default(),
+        };
+        dyn_store
+            .clone()
+            .put(
+                stored,
+                other,
+                fragment(F::PayloadStoredLocal | F::PayloadStoredDurable),
+                None,
+                false,
+            )
+            .await
+            .expect("put of a representation claimed local");
+        let found = store.find(stored, other).await.expect("find");
+        assert_eq!(found.data.pack_file, 0);
+        assert_eq!(
+            found.data.flags & F::PayloadStored,
+            F::PayloadStoredDurable.bits(),
+            "an entry without its payload is not local, whatever it was stored with"
+        );
+    }
+
+    /// An entry an earlier build stored holding its payload without `PayloadStoredLocal` reads back
+    /// local through `get` and `get_into` once the store is reopened.
+    #[tokio::test]
+    async fn an_entry_stored_without_the_local_flag_reads_back_local_after_a_reopen() {
+        use FragmentFlags as F;
+        let dir = lore_base::test_util::TempDir::new("is_local_flag_reopen_");
+        let payload = b"a payload an earlier build stored without the local flag".repeat(3);
+        let partition = Partition::from([0x44u8; 16]);
+        let address = Address {
+            hash: hash::hash_slice(&payload),
+            context: Context::default(),
+        };
+        {
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+            let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+            dyn_store
+                .clone()
+                .put(
+                    partition,
+                    address,
+                    Fragment {
+                        flags: 0,
+                        size_payload: payload.len() as u32,
+                        size_content: payload.len() as u64,
+                    },
+                    Some(Bytes::copy_from_slice(&payload)),
+                    false,
+                )
+                .await
+                .expect("put");
+            let group = &store.group[address.hash.data()[0] as usize];
+            let (bucket_index, mut bucket) = group.bucket_for_write(&address.hash).await;
+            for entry in bucket.entry.iter_mut() {
+                entry.data.flags &= !F::PayloadStoredLocal.bits();
+            }
+            group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+            drop(bucket);
+            dyn_store.flush(true).await.expect("flush");
+        }
+
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+            .await
+            .expect("store reopens");
+        let found = store.find(partition, address).await.expect("find");
+        assert_eq!(found.data.flags & F::PayloadStoredLocal, 0);
+        let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+        let got = dyn_store
+            .clone()
+            .get(partition, address)
+            .await
+            .expect("get");
+        assert_ne!(got.fragment.flags & F::PayloadStoredLocal, 0);
+        let mut buffer = vec![0u8; payload.len()];
+        // SAFETY: `buffer` outlives the read and nothing else touches it until the read returns.
+        let mut dst = unsafe { lore_storage::CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+        let (fragment, _read) = dyn_store
+            .get_into(partition, address, &mut dst)
+            .await
+            .expect("get_into");
+        assert_ne!(fragment.flags & F::PayloadStoredLocal, 0);
+    }
+
+    /// `put` stores the fragment shapes the workspace writes: a fragment list without its payload,
+    /// a compressed payload marked durable, the cache priority and revision state bits, and the
+    /// do-not-replicate behavior flag, which the store takes off before it validates. It also
+    /// stores a fragment carrying a flag bit or a compressor bit this build does not know.
+    #[tokio::test]
+    async fn valid_fragments_are_stored() {
+        use FragmentFlags as F;
+        let store = create(
+            None::<&Path>,
+            ImmutableStoreCreateOptions::none(),
+            false,
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create store");
+        let payload = Bytes::from(b"a payload described rightly".repeat(4));
+        let len = payload.len();
+        let plain = Fragment {
+            flags: 0,
+            size_payload: len as u32,
+            size_content: len as u64,
+        };
+        let cases = [
+            (
+                "fragment list without its payload",
+                Fragment {
+                    flags: F::PayloadFragmented.bits(),
+                    size_payload: 2 * size_of::<FragmentReference>() as u32,
+                    size_content: 1 << 20,
+                },
+                false,
+            ),
+            (
+                "compressed and durable",
+                Fragment {
+                    flags: (F::PayloadCompressedZstd | F::PayloadStoredDurable).bits(),
+                    size_content: len as u64 * 3,
+                    ..plain
+                },
+                true,
+            ),
+            (
+                "cache priority and revision state",
+                Fragment {
+                    flags: (F::PayloadLocalCachePriority | F::PayloadRevisionState).bits(),
+                    ..plain
+                },
+                true,
+            ),
+            (
+                "do not replicate",
+                Fragment {
+                    flags: F::PayloadDoNotReplicate.bits(),
+                    ..plain
+                },
+                true,
+            ),
+            (
+                "a flag bit this build does not know",
+                Fragment {
+                    flags: 1 << 30,
+                    ..plain
+                },
+                true,
+            ),
+            (
+                "a compressor bit this build does not know",
+                Fragment {
+                    flags: 1 << 4,
+                    size_content: len as u64 * 3,
+                    ..plain
+                },
+                true,
+            ),
+        ];
+        let partition = Partition::from([0x51u8; 16]);
+        for (index, (name, fragment, with_payload)) in cases.into_iter().enumerate() {
+            let address = Address {
+                hash: Hash::from([index as u8 + 0x60; 32]),
+                context: Context::default(),
+            };
+            store
+                .clone()
+                .put(
+                    partition,
+                    address,
+                    fragment,
+                    with_payload.then(|| payload.clone()),
+                    false,
+                )
+                .await
+                .unwrap_or_else(|err| panic!("{name} refused: {err:?}"));
+            let mut result = [StoreMatchResult::default()];
+            store
+                .clone()
+                .query(partition, &[address], &mut result)
+                .await
+                .expect("query");
+            assert_eq!(
+                result[0].match_made,
+                StoreMatch::MatchFull,
+                "{name} not stored"
             );
         }
     }
@@ -5077,7 +5550,7 @@ async fn obliterate_holds_the_payload_gate_while_it_loads_the_fragment_list() {
         .await
         .unwrap();
     let partition = Partition::from([0x38u8; 16]);
-    let leaf_payload = b"the one leaf of the list";
+    let leaf_payload = b"the one leaf of the list, longer than the list's one reference";
     let leaf = put_payload(&store, partition, Context::default(), leaf_payload, false).await;
     let references = [FragmentReference {
         hash: leaf.hash,

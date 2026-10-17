@@ -4195,7 +4195,10 @@ mod tests {
                         .await
                         .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("get should work");
-                    assert_eq!(got_fragment, fragment);
+                    // The store that served it holds the payload, and says so.
+                    let mut held = fragment;
+                    held.flags |= lore_base::types::FragmentFlags::PayloadStoredLocal.bits();
+                    assert_eq!(got_fragment, held);
                     assert_eq!(got_payload, payload);
                 })
                 .await;
@@ -4254,7 +4257,10 @@ mod tests {
                         .await
                         .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("get should succeed via durable despite empty replica");
-                    assert_eq!(got_fragment, fragment);
+                    // The store that served it holds the payload, and says so.
+                    let mut held = fragment;
+                    held.flags |= lore_base::types::FragmentFlags::PayloadStoredLocal.bits();
+                    assert_eq!(got_fragment, held);
                     assert_eq!(got_payload, payload);
                 })
                 .await;

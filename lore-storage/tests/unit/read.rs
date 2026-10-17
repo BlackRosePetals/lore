@@ -3693,17 +3693,15 @@ async fn a_local_payload_that_does_not_load_is_fetched_again_and_overwritten() {
         let partition = Partition::from([seed; 16]);
         let (address, content, session) = serve_compressed(Context::from([seed; 16]), 4096);
         let (_, served) = lore_storage::test_util::remote_payload(address).expect("the payload");
-        store
-            .clone()
-            .put(
-                partition,
-                address,
-                broken,
-                Some(Bytes::from(vec![0xff; 64])),
-                false,
-            )
-            .await
-            .expect("put the broken copy");
+        lore_storage::test_util::accepting_unvalidated_puts(store.clone().put(
+            partition,
+            address,
+            broken,
+            Some(Bytes::from(vec![0xff; 64])),
+            false,
+        ))
+        .await
+        .expect("put the broken copy");
         let expected = if options.decompress {
             Bytes::from(content)
         } else {
@@ -3751,17 +3749,15 @@ async fn a_local_root_that_does_not_load_is_resolved_again_and_overwritten() {
             fragment,
             payload.clone(),
         );
-        store
-            .clone()
-            .put(
-                partition,
-                address,
-                broken,
-                Some(Bytes::from(vec![0xff; 64])),
-                false,
-            )
-            .await
-            .expect("put the broken copy");
+        lore_storage::test_util::accepting_unvalidated_puts(store.clone().put(
+            partition,
+            address,
+            broken,
+            Some(Bytes::from(vec![0xff; 64])),
+            false,
+        ))
+        .await
+        .expect("put the broken copy");
         mutable
             .clone()
             .store(partition, key, address.hash, KeyType::Resolve)
@@ -3847,17 +3843,15 @@ async fn a_read_into_caller_memory_fetches_and_overwrites_a_local_payload_that_d
         let (_dir, store) = make_test_store().await;
         let partition = Partition::from([seed; 16]);
         let (address, content, session) = serve_compressed(Context::from([seed; 16]), 4096);
-        store
-            .clone()
-            .put(
-                partition,
-                address,
-                broken,
-                Some(Bytes::from(vec![0xff; 64])),
-                false,
-            )
-            .await
-            .expect("put the broken copy");
+        lore_storage::test_util::accepting_unvalidated_puts(store.clone().put(
+            partition,
+            address,
+            broken,
+            Some(Bytes::from(vec![0xff; 64])),
+            false,
+        ))
+        .await
+        .expect("put the broken copy");
         let at = (partition, address, content.len());
         let options = ReadOptions::default().trusting_remote();
 
