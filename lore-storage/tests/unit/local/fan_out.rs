@@ -291,6 +291,20 @@ async fn read_level_marker_unsupported_version_errors() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
 
+/// A marker write that fails leaves no temporary file behind, which on a full disk would hold
+/// space the store needs back.
+#[tokio::test]
+async fn a_failed_marker_write_leaves_no_temporary_file() {
+    let dir = temp_group_dir();
+    let marker = dir.path().join(MARKER_FILENAME);
+    std::fs::create_dir(&marker).unwrap();
+    std::fs::write(marker.join("blocker"), b"x").unwrap();
+    assert!(write_level_marker(dir.path(), 32, false).await.is_err());
+    let mut temporary = marker.into_os_string();
+    temporary.push(".tmp");
+    assert!(!PathBuf::from(temporary).exists());
+}
+
 #[tokio::test]
 async fn write_level_marker_overwrites_existing() {
     let dir = temp_group_dir();
@@ -609,16 +623,12 @@ async fn recover_level_transition_is_idempotent() {
 }
 
 #[test]
-fn a_group_dir_name_parses_only_in_the_form_group_dirs_are_given() {
-    assert_eq!(parse_group_dir_name("00"), Some(0));
-    assert_eq!(parse_group_dir_name("7f"), Some(0x7f));
-    assert_eq!(parse_group_dir_name("ff"), Some(0xff));
+fn a_hex_byte_parses_only_in_the_form_it_is_written() {
+    assert_eq!(parse_hex_byte("00"), Some(0));
+    assert_eq!(parse_hex_byte("7f"), Some(0x7f));
+    assert_eq!(parse_hex_byte("ff"), Some(0xff));
     for name in ["", "0", "000", "FF", "0g", "-1", "pack"] {
-        assert_eq!(
-            parse_group_dir_name(name),
-            None,
-            "{name:?} is not a group dir"
-        );
+        assert_eq!(parse_hex_byte(name), None, "{name:?} is not a hex byte");
     }
 }
 

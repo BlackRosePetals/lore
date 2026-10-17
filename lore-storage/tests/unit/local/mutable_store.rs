@@ -224,6 +224,166 @@ async fn a_flush_waits_for_a_bucket_write_holding_the_group() {
     flush.await.expect("flush task").expect("flush");
 }
 
+/// A fan-out commit that fails after writing its `level.pending` is one the next open's recovery
+/// completes, renaming its `.new` files over whatever is there. Until a flush rolls it forward, no
+/// bucket file is written outside it: here a group's first commit fails at one rename, and a newer
+/// value in that bucket, written and flushed since, must survive the recovery rather than be
+/// renamed over by the commit's older file.
+#[tokio::test]
+async fn a_commit_failing_after_its_pending_marker_is_rolled_forward_before_any_write() {
+    use lore_storage::mutable_store::MutableStore;
+    let dir = lore_base::test_util::TempDir::new("ms_commit_tail_");
+    let settings = || MutableStoreSettings {
+        fan_out_threshold: 2,
+        ..client_settings()
+    };
+    let key = |byte: u8| {
+        let mut key = Hash::default();
+        key.data_mut()[0] = 7;
+        key.data_mut()[1] = byte;
+        key
+    };
+    let group_path = dir.path().join("mutable").join("index").join("07");
+    let level = lore_storage::local::fan_out::level_for(1, 6, 2);
+    let bucket = lore_storage::local::fan_out::bucket_index_for(&key(0), level);
+    let blocked = lore_storage::local::fan_out::bucket_path(&group_path, bucket);
+    {
+        let store = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.path()),
+                settings(),
+                make_in_memory_immutable().await,
+            )
+            .await
+            .expect("store opens"),
+        );
+        let dyn_store: Arc<dyn MutableStore> = store.clone();
+        for byte in 0..6u8 {
+            dyn_store
+                .clone()
+                .store(
+                    Partition::default(),
+                    key(byte),
+                    Hash::from_u64(u64::from(byte) + 1),
+                    KeyType::BranchMetadata,
+                )
+                .await
+                .expect("store succeeds");
+        }
+        std::fs::create_dir_all(&blocked).expect("block the bucket's rename");
+        std::fs::write(blocked.join("blocker"), b"x").expect("block the bucket's rename");
+        assert!(
+            dyn_store.clone().flush(false).await.is_err(),
+            "the commit's rename fails"
+        );
+        std::fs::remove_dir_all(&blocked).expect("unblock the bucket");
+
+        dyn_store
+            .clone()
+            .store(
+                Partition::default(),
+                key(0),
+                Hash::from_u64(100),
+                KeyType::BranchMetadata,
+            )
+            .await
+            .expect("store the newer value");
+        LocalMutableStore::flush_delayed(Arc::downgrade(&store), 7, bucket, 0)
+            .await
+            .expect("delayed flush joins");
+        dyn_store.clone().flush(false).await.expect("flush");
+    }
+
+    let reopened: Arc<dyn MutableStore> = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store reopens"),
+    );
+    assert_eq!(
+        reopened
+            .load(Partition::default(), key(0), KeyType::BranchMetadata)
+            .await
+            .expect("load"),
+        Hash::from_u64(100),
+        "recovery renamed the failed commit's older file over the value flushed since"
+    );
+}
+
+/// A fan-out commit removes the `.new` files it did not write before it writes `level.pending`,
+/// so that recovery, which renames every `.new` file it finds, cannot give a bucket the commit
+/// left empty an older commit's file.
+#[tokio::test]
+async fn a_fan_out_commit_removes_new_files_it_did_not_write() {
+    use lore_storage::mutable_store::MutableStore;
+    let dir = lore_base::test_util::TempDir::new("ms_stale_new_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            MutableStoreSettings {
+                fan_out_threshold: 4,
+                ..client_settings()
+            },
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store opens"),
+    );
+    let dyn_store: Arc<dyn MutableStore> = store.clone();
+    let key = |bucket_byte: u8| {
+        let mut key = Hash::default();
+        key.data_mut()[0] = 7;
+        key.data_mut()[1] = bucket_byte;
+        key
+    };
+    let store_key = |byte: u8| {
+        let dyn_store = dyn_store.clone();
+        async move {
+            dyn_store
+                .store(
+                    Partition::default(),
+                    key(byte),
+                    Hash::from_u64(u64::from(byte) + 1),
+                    KeyType::BranchMetadata,
+                )
+                .await
+                .expect("store succeeds");
+        }
+    };
+    for byte in [0, 1] {
+        store_key(byte).await;
+    }
+    dyn_store
+        .clone()
+        .flush(false)
+        .await
+        .expect("flush at level 1");
+    let group_path = dir.path().join("mutable").join("index").join("07");
+    let stale_path = lore_storage::local::fan_out::bucket_new_path(&group_path, 5);
+    std::fs::copy(group_path.join("index_00"), &stale_path).expect("an interrupted commit's file");
+
+    for byte in [2, 3, 4] {
+        store_key(byte).await;
+    }
+    dyn_store
+        .clone()
+        .flush(false)
+        .await
+        .expect("flush fanning out");
+    assert_eq!(
+        store.group[7].bucket_count.load(atomic::Ordering::Relaxed),
+        32,
+        "the group fanned out"
+    );
+    assert!(
+        !stale_path.exists(),
+        "the commit left a .new file it did not write for recovery to rename"
+    );
+}
+
 /// Every `level` marker under a store's index directory.
 fn level_markers(index_root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();

@@ -131,6 +131,7 @@ async fn migrate_initial_to_typed(
             committed_level: std::sync::atomic::AtomicUsize::new(
                 lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
+            pending_level: std::sync::atomic::AtomicUsize::new(0),
             flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }));
     }
@@ -178,6 +179,7 @@ async fn migrate_initial_to_typed(
             committed_level: std::sync::atomic::AtomicUsize::new(
                 lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
+            pending_level: std::sync::atomic::AtomicUsize::new(0),
             flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }));
     }

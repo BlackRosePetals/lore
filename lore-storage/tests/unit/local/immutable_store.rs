@@ -371,6 +371,73 @@ async fn a_flush_waits_for_a_bucket_write_another_flush_claimed() {
     flush.await.expect("flush task").expect("flush");
 }
 
+/// A fan-out commit removes the `.new` files it did not write before it writes `level.pending`.
+/// A commit stopped before its commit point leaves its `.new` files behind, and recovery renames
+/// every `.new` file it finds, so a bucket the next commit left empty would take the older file,
+/// whose entries point where compaction may since have truncated and rewritten the packfile.
+#[tokio::test]
+async fn a_fan_out_commit_removes_new_files_it_did_not_write() {
+    let dir = lore_base::test_util::TempDir::new("is_stale_new_");
+    let store = LocalImmutableStore::new(
+        Some(dir.path().to_path_buf()),
+        ImmutableStoreSettings {
+            fan_out_threshold: 4,
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        },
+    )
+    .await
+    .expect("store opens");
+    let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+    let partition = Partition::from([3u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(5);
+    for payload in &payloads[..2] {
+        put_payload(&store, partition, Context::default(), payload, false).await;
+    }
+    dyn_store
+        .clone()
+        .flush(false)
+        .await
+        .expect("flush at level 1");
+
+    let group_path = dir
+        .path()
+        .join("immutable")
+        .join("index")
+        .join(format!("{group_index:02x}"));
+    let used: Vec<usize> = payloads
+        .iter()
+        .map(|payload| {
+            lore_storage::local::fan_out::bucket_index_for(&hash::hash_slice(payload), 32)
+        })
+        .collect();
+    let stale = (1..32)
+        .find(|bucket| !used.contains(bucket))
+        .expect("a bucket the fan-out leaves empty");
+    let stale_path = lore_storage::local::fan_out::bucket_new_path(&group_path, stale);
+    std::fs::copy(group_path.join("index_00"), &stale_path).expect("an interrupted commit's file");
+
+    for payload in &payloads[2..] {
+        put_payload(&store, partition, Context::default(), payload, false).await;
+    }
+    dyn_store
+        .clone()
+        .flush(false)
+        .await
+        .expect("flush fanning out");
+    assert_eq!(
+        store.group[group_index]
+            .bucket_count
+            .load(atomic::Ordering::Relaxed),
+        32,
+        "the group fanned out"
+    );
+    assert!(
+        !stale_path.exists(),
+        "the commit left a .new file it did not write for recovery to rename"
+    );
+}
+
 /// Run the background timer's flush for every group, and nothing else.
 async fn run_delayed_flush(store: &Arc<LocalImmutableStore>) {
     let weak = Arc::downgrade(store);
@@ -4159,6 +4226,72 @@ mod obliteration {
             reopened_dyn.get(partition, addresses[0]).await,
             Err(StoreError::AddressNotFound(_))
         ));
+        assert_payloads_read_back(
+            &reopened,
+            partition,
+            addresses[1..]
+                .iter()
+                .copied()
+                .zip(payloads[1..].iter().cloned()),
+        )
+        .await;
+    }
+
+    /// A fan-out commit that fails after writing its `level.pending` is one the next open's
+    /// recovery completes, renaming its `.new` files over whatever is there. Until a flush rolls it
+    /// forward, nothing writes a bucket file outside it: here a group's first commit fails at one
+    /// rename, and an obliterate's tombstone in that bucket must survive the recovery rather than
+    /// be renamed over, bringing the zeroed payload back as live.
+    #[tokio::test]
+    async fn a_commit_failing_after_its_pending_marker_is_rolled_forward_before_any_write() {
+        let dir = lore_base::test_util::TempDir::new("is_commit_tail_fails_");
+        let settings = || ImmutableStoreSettings {
+            fan_out_threshold: 2,
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        };
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+            .await
+            .expect("store opens");
+        let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+        let partition = Partition::from([0x7au8; 16]);
+        let (group_index, payloads) = payloads_in_one_group(6);
+        let mut addresses = vec![];
+        for payload in &payloads {
+            addresses.push(put(&dyn_store, partition, payload).await);
+        }
+        let level = lore_storage::local::fan_out::level_for(1, payloads.len(), 2);
+        let bucket = lore_storage::local::fan_out::bucket_index_for(&addresses[0].hash, level);
+        let blocked = format_bucket_path(&dir.join("immutable"), group_index, bucket);
+        std::fs::create_dir_all(&blocked).expect("block the bucket's rename");
+        std::fs::write(blocked.join("blocker"), b"x").expect("block the bucket's rename");
+        assert!(
+            dyn_store.clone().flush(false).await.is_err(),
+            "the commit's rename fails"
+        );
+        assert!(
+            blocked
+                .with_file_name(lore_storage::local::fan_out::LEVEL_PENDING_FILENAME)
+                .exists(),
+            "the commit wrote level.pending before the rename failed"
+        );
+        std::fs::remove_dir_all(&blocked).expect("unblock the bucket");
+
+        obliterate(&dyn_store, partition, addresses[0]).await;
+
+        let killed = lore_base::test_util::TempDir::new("is_commit_tail_fails_killed_");
+        copy_tree(dir.path(), killed.path());
+        let reopened = LocalImmutableStore::new(Some(killed.to_path_buf()), settings())
+            .await
+            .expect("store reopens");
+        let reopened_dyn: Arc<dyn ImmutableStore> = reopened.clone();
+        match reopened_dyn.get(partition, addresses[0]).await {
+            Err(StoreError::AddressNotFound(_)) => {}
+            other => panic!(
+                "the obliterated address came back from recovery: {:?}",
+                other.map(|data| data.payload.map(|payload| payload.len()))
+            ),
+        }
         assert_payloads_read_back(
             &reopened,
             partition,

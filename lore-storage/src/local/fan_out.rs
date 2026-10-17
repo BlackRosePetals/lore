@@ -265,7 +265,7 @@ pub async fn existing_group_dirs(index_path: &Path, group_count: usize) -> Optio
     };
     while let Some(entry) = entries.next().await {
         let entry = entry.ok()?;
-        let Some(group_index) = entry.file_name.to_str().and_then(parse_group_dir_name) else {
+        let Some(group_index) = entry.file_name.to_str().and_then(parse_hex_byte) else {
             continue;
         };
         // A name that could be a group but whose metadata did not resolve may be a group that
@@ -281,10 +281,10 @@ pub async fn existing_group_dirs(index_path: &Path, group_count: usize) -> Optio
     Some(existing)
 }
 
-/// The group a directory name stands for, when it is exactly the name [`push_group_dir`] gives
-/// one: two lowercase hex digits.
+/// The value `name` stands for, when it is exactly two lowercase hex digits as [`write_hex_byte`]
+/// writes them: a group directory name, or the `<bb>` of a bucket file name.
 #[lore_macro::test_pub]
-fn parse_group_dir_name(name: &str) -> Option<usize> {
+fn parse_hex_byte(name: &str) -> Option<usize> {
     let &[high, low] = name.as_bytes() else {
         return None;
     };
@@ -470,6 +470,50 @@ pub async fn write_level_pending(
     write_level_header_file(&group_path.join(LEVEL_PENDING_FILENAME), level, sync_data).await
 }
 
+/// Remove each `.new` twin in `group_path` of a bucket not in `written`. A fan-out commit stopped
+/// before it wrote `level.pending` leaves its `.new` files, and recovery renames the `.new` file of
+/// every bucket below the level it commits, so a commit removes those it did not write before it
+/// writes `level.pending`: a bucket it left empty would otherwise take an older commit's file, and
+/// with it entries the group has since changed or removed.
+///
+/// It runs on every two-phase commit, a group's first included, a cold path, so callers box it:
+/// inline, its listing would grow the future of every group flush.
+pub async fn remove_stale_new_files(group_path: &Path, written: &[usize]) -> std::io::Result<()> {
+    let mut kept = [false; FAN_OUT_LEVEL_MAX];
+    for &bucket_index in written {
+        if let Some(slot) = kept.get_mut(bucket_index) {
+            *slot = true;
+        }
+    }
+    let mut entries = lore_io::IoDriver::global().read_dir(group_path).await?;
+    while let Some(entry) = entries.next().await {
+        let entry = entry?;
+        let Some(bucket_index) = entry.file_name.to_str().and_then(new_file_bucket) else {
+            continue;
+        };
+        if kept[bucket_index] {
+            continue;
+        }
+        match lore_io::IoDriver::global()
+            .remove_file(group_path.join(&entry.file_name))
+            .await
+        {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// The bucket whose `.new` twin `name` names, when it names one.
+fn new_file_bucket(name: &str) -> Option<usize> {
+    let bucket = name
+        .strip_prefix(BUCKET_FILENAME_PREFIX)?
+        .strip_suffix(BUCKET_NEW_SUFFIX)?;
+    parse_hex_byte(bucket)
+}
+
 /// Delete the `level.pending` sentinel. Returns `Ok(())` whether or not it existed.
 pub async fn delete_level_pending(group_path: &Path) -> std::io::Result<()> {
     match lore_io::IoDriver::global()
@@ -538,7 +582,8 @@ impl lore_io::StableBufList for LevelHeaderSegment {
 
 /// Write a level-header file (marker or pending) to a temporary file renamed over `path`, so that
 /// a process stopped during the write leaves the file it last wrote, or none. With `sync_data`,
-/// the file is synced before the rename and its directory after.
+/// the file is synced before the rename and its directory after. A write that fails removes its
+/// temporary file, which on a full disk holds space the store needs.
 async fn write_level_header_file(
     path: &Path,
     level: usize,
@@ -552,9 +597,10 @@ async fn write_level_header_file(
     };
     let mut segment = Box::new([0u8; size_of::<LevelMarkerHeader>()]);
     segment.copy_from_slice(header.as_bytes());
-    lore_io::IoDriver::global()
+    let temporary = temporary_path(path);
+    let written = lore_io::IoDriver::global()
         .write_file_segments_atomic(
-            temporary_path(path),
+            &temporary,
             path,
             &lore_io::OpenOptions::new()
                 .write(true)
@@ -563,7 +609,11 @@ async fn write_level_header_file(
             LevelHeaderSegment(segment),
             sync_data,
         )
-        .await
+        .await;
+    if written.is_err() {
+        let _ = lore_io::IoDriver::global().remove_file(&temporary).await;
+    }
+    written
 }
 
 /// The file a write of `path` goes to before it is renamed over `path`: `path` with `.tmp`
@@ -636,4 +686,27 @@ pub async fn recover_level_transition(
     write_level_marker(group_path, target, sync_data).await?;
     delete_level_pending(group_path).await?;
     Ok(Some(target))
+}
+
+/// Complete the fan-out commit to `pending_level` that failed after writing its `level.pending`,
+/// as the next open's recovery would, see [`recover_level_transition`], and record that level as
+/// committed. Does nothing when `pending_level` is `0`. `store_path` is the store root; the group
+/// directory is `<store_path>/index/<gg>`. Run under the group's flush lock.
+pub(crate) async fn roll_pending_commit_forward(
+    committed_level: &AtomicUsize,
+    pending_level: &AtomicUsize,
+    store_path: &Path,
+    group_index: usize,
+    sync_data: bool,
+) -> std::io::Result<()> {
+    let pending = pending_level.load(Ordering::Relaxed);
+    if pending == 0 {
+        return Ok(());
+    }
+    let mut group_path = store_path.join("index");
+    push_group_dir(&mut group_path, group_index);
+    recover_level_transition(&group_path, sync_data).await?;
+    committed_level.store(pending, Ordering::Relaxed);
+    pending_level.store(0, Ordering::Relaxed);
+    Ok(())
 }

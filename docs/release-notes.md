@@ -261,6 +261,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Local immutable stores: `PayloadStoredLocal` says whether the store holds an entry's payload, whatever flags it was
   put with, so a fragment the local store serves carries it, in `get` and in the C API's
   `LORE_EVENT_STORAGE_GET_FRAGMENT`
+- Local stores: a fan-out commit that fails or is stopped part way no longer leaves index entries in the wrong buckets,
+  or files that a later commit's recovery takes in, which served other keys' bytes or brought back an obliterated entry.
+  A commit that failed after its commit point is completed by the group's next flush. A failed level marker write no
+  longer leaves its temporary file behind
 - `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of
   `Recursion task failed`
 - `lore clone` reports the error that stopped it, such as a file it failed to fetch or write, in place of

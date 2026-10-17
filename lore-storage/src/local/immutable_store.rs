@@ -368,6 +368,10 @@ pub struct ImmutableStoreGroup {
     /// two-phase commit (`level.pending` deleted), so a mismatch with `bucket_count` indicates a
     /// pending level transition that needs the two-phase commit on the next flush.
     pub committed_level: std::sync::atomic::AtomicUsize,
+    /// The level a fan-out commit named in the `level.pending` it wrote before a later step of it
+    /// failed, or `0`. Recovery takes that commit as made, and the bucket files on disk are partly
+    /// at its layout, so no bucket is written until the next flush rolls it forward.
+    pub pending_level: std::sync::atomic::AtomicUsize,
     /// Forces the bucket-file writes for this group to be serial.
     ///
     /// `flush_all` holds it for a whole group flush so that the fan-out check, the
@@ -1353,13 +1357,15 @@ impl ImmutableStoreGroup {
         Ok(cleared > 0)
     }
 
-    /// Whether the group fanned out to a layout that no commit recorded on disk, as after a
-    /// fan-out commit that failed. Its bucket files are in the committed layout, and writing a
-    /// bucket as it is in memory would mix the two. Read under the flush lock, which every change
-    /// to either count holds.
+    /// Whether the group's buckets can only be written by a flush of the whole group. It fanned
+    /// out to a layout no commit recorded on disk, and writing a bucket as it is in memory would
+    /// mix two layouts, or a commit failed after writing its `level.pending`, and completing it
+    /// renames the commit's `.new` files over any bucket file written meanwhile. Read under the
+    /// flush lock, which every change to the levels holds.
     fn fan_out_uncommitted(&self) -> bool {
         let committed = self.committed_level.load(atomic::Ordering::Relaxed);
-        committed != 0 && committed != self.bucket_count.load(atomic::Ordering::Relaxed)
+        self.pending_level.load(atomic::Ordering::Relaxed) != 0
+            || (committed != 0 && committed != self.bucket_count.load(atomic::Ordering::Relaxed))
     }
 
     #[lore_macro::test_pub]
@@ -1625,6 +1631,7 @@ impl LocalImmutableStore {
                 serialize_version: std::sync::atomic::AtomicU32::new(serialize_version),
                 fan_out_threshold: store.settings.fan_out_threshold,
                 committed_level: std::sync::atomic::AtomicUsize::new(committed),
+                pending_level: std::sync::atomic::AtomicUsize::new(0),
                 flush_lock: Arc::new(Mutex::new(())),
                 packstore: crate::PackStore::new(
                     packpath,
@@ -5534,6 +5541,21 @@ pub(crate) async fn flush_locked_group(
 ) -> Result<(), LocalImmutableStoreError> {
     let mut first_err: Option<LocalImmutableStoreError> = None;
 
+    crate::local::fan_out::roll_pending_commit_forward(
+        &group.committed_level,
+        &group.pending_level,
+        &path,
+        group_index,
+        sync_data,
+    )
+    .await
+    .map_err(|e| {
+        LocalImmutableStoreError::internal_with_context(
+            e,
+            "Failed to roll a failed fan-out commit forward",
+        )
+    })?;
+
     // Re-check under the lock: another flusher may have drained this group
     // while we waited. The scan that got us here is lock-free and stale by
     // now, so skip the redundant fan-out check, path selection and - in the
@@ -5655,20 +5677,37 @@ pub(crate) async fn flush_locked_group(
         } else {
             // Full two-phase commit: pending → renames → marker → delete pending.
             if first_err.is_none()
-                && let Err(err) = crate::local::fan_out::write_level_pending(
+                && let Err(err) = Box::pin(crate::local::fan_out::remove_stale_new_files(
+                    &group_path,
+                    &wrote_new,
+                ))
+                .await
+                .map_err(|e| {
+                    LocalImmutableStoreError::internal_with_context(
+                        e,
+                        "Failed to remove stale .new bucket files",
+                    )
+                })
+            {
+                first_err = Some(err);
+            }
+            let mut pending_written = false;
+            if first_err.is_none() {
+                match crate::local::fan_out::write_level_pending(
                     &group_path,
                     active_buckets,
                     sync_data,
                 )
                 .await
-                .map_err(|e| {
-                    LocalImmutableStoreError::internal_with_context(
-                        e,
-                        "Failed to write level.pending",
-                    )
-                })
-            {
-                first_err = Some(err);
+                {
+                    Ok(()) => pending_written = true,
+                    Err(e) => {
+                        first_err = Some(LocalImmutableStoreError::internal_with_context(
+                            e,
+                            "Failed to write level.pending",
+                        ));
+                    }
+                }
             }
 
             if first_err.is_none() {
@@ -5724,6 +5763,11 @@ pub(crate) async fn flush_locked_group(
                     .committed_level
                     .store(active_buckets, atomic::Ordering::Relaxed);
             } else {
+                if pending_written {
+                    group
+                        .pending_level
+                        .store(active_buckets, atomic::Ordering::Relaxed);
+                }
                 crate::local::fan_out::mark_uncommitted_dirty(&group.dirty, &wrote_new);
             }
         }

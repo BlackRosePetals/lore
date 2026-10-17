@@ -197,7 +197,8 @@ mod pooled {
         assert_eq!(server.gets_per_connection(), vec![16; CONNECTIONS]);
     }
 
-    /// A pool that fails to start on one connection stops the sessions it started on the others.
+    /// A pool that fails to start on one connection stops the sessions it started on the others,
+    /// those whose start was still in flight when it failed included.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pool_that_fails_to_start_stops_the_sessions_it_started() {
         let serving = TestStorageServer::start();
@@ -211,7 +212,11 @@ mod pooled {
             .await;
 
         assert!(started.is_err_and(|err| err.is_slow_down()));
-        assert_eq!(serving.started_sessions_per_connection(), vec![1, 1]);
+        wait_until(
+            || serving.started_sessions_per_connection() == [1, 1],
+            "a session start the failed pool left running never reached the server",
+        )
+        .await;
         wait_until(
             || serving.live_sessions_per_connection() == [0, 0],
             "the sessions started on the serving connections were left open",
