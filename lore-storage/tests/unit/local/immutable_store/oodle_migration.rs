@@ -9,19 +9,16 @@ use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::FragmentFlags;
-use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_storage::CompressionMode;
 use lore_storage::LocalImmutableStore;
 use lore_storage::LocalImmutableStoreError;
 use lore_storage::hash;
 use lore_storage::immutable_store::ImmutableStore;
-use lore_storage::local::immutable_store::ImmutableStoreBucket;
-use lore_storage::local::immutable_store::ImmutableStoreGroup;
+use lore_storage::local::fan_out::BucketGroup;
 use lore_storage::local::immutable_store::ImmutableStoreSettings;
 use lore_storage::local::immutable_store::oodle_migration::*;
 use lore_storage::store_types::StoreMatchResult;
-use tokio::sync::OwnedRwLockWriteGuard;
 
 fn partition() -> Partition {
     Partition::from([7u8; 16])
@@ -62,22 +59,6 @@ async fn reopen(path: &std::path::Path) -> Arc<LocalImmutableStore> {
         .expect("store opens")
 }
 
-/// The bucket `hash` belongs to, locked for writing. Mirrors how the store itself resolves a
-/// bucket, re-reading the level in case a fan-out moved it while the lock was being taken.
-async fn lock_bucket_for_hash(
-    group: &Arc<ImmutableStoreGroup>,
-    hash: &Hash,
-) -> (usize, OwnedRwLockWriteGuard<ImmutableStoreBucket>) {
-    loop {
-        let level = group.bucket_count.load(Ordering::Relaxed);
-        let index = lore_storage::local::fan_out::bucket_index_for(hash, level);
-        let lock = group.bucket(index).clone().write_owned().await;
-        if group.bucket_count.load(Ordering::Relaxed) == level {
-            break (index, lock);
-        }
-    }
-}
-
 fn oodle_encode(payload: &Bytes) -> (Fragment, Bytes) {
     let raw = Fragment {
         flags: 0,
@@ -109,7 +90,7 @@ async fn put_as_oodle(store: &Arc<LocalImmutableStore>, address: Address, payloa
         .await
         .expect("the Oodle payload writes to the packstore");
 
-    let (_, mut bucket) = lock_bucket_for_hash(group, &address.hash).await;
+    let (_, mut bucket) = group.bucket_for_write(&address.hash).await;
     for entry in bucket.entry.iter_mut() {
         if entry.address.hash != address.hash {
             continue;
@@ -201,7 +182,7 @@ async fn migrate_bucket_holding(
     let group_index = group_of(&address);
     let group = store.group[group_index].clone();
     let path = store.path.clone().expect("store has a path");
-    let (bucket_index, guard) = lock_bucket_for_hash(&group, &address.hash).await;
+    let (bucket_index, guard) = group.bucket_for_write(&address.hash).await;
 
     migrate_bucket(
         bucket_index,
@@ -218,7 +199,7 @@ async fn migrate_bucket_holding(
 /// lost from under it.
 async fn lose_the_packfile(store: &Arc<LocalImmutableStore>, address: &Address) {
     let group = &store.group[group_of(address)];
-    let (_, mut bucket) = lock_bucket_for_hash(group, &address.hash).await;
+    let (_, mut bucket) = group.bucket_for_write(&address.hash).await;
     bucket
         .entry
         .iter_mut()
@@ -236,7 +217,7 @@ fn group_of(address: &Address) -> usize {
 /// was still a codec.
 async fn flag_as_oodle(store: &Arc<LocalImmutableStore>, address: Address) {
     let group = &store.group[group_of(&address)];
-    let (_, mut bucket) = lock_bucket_for_hash(group, &address.hash).await;
+    let (_, mut bucket) = group.bucket_for_write(&address.hash).await;
     bucket
         .entry
         .iter_mut()
@@ -258,7 +239,7 @@ async fn point_at_foreign_content(
         .store(encoded.clone())
         .await
         .expect("the impostor payload writes");
-    let (_, mut bucket) = lock_bucket_for_hash(group, &address.hash).await;
+    let (_, mut bucket) = group.bucket_for_write(&address.hash).await;
     let entry = bucket
         .entry
         .iter_mut()
@@ -345,7 +326,7 @@ mod migrate_bucket {
         assert_eq!(content(&store, address).await, payload);
 
         let group = &store.group[group_of(&address)];
-        let (bucket_index, _bucket) = lock_bucket_for_hash(group, &address.hash).await;
+        let (bucket_index, _bucket) = group.bucket_for_write(&address.hash).await;
         assert!(!group.dirty[bucket_index].load(Ordering::Relaxed));
     }
 
@@ -414,7 +395,7 @@ mod migrate_bucket {
         // describes what an entry holds, not the bytes it shares - so this reads the bucket.
         let entries = {
             let group = &store.group[group_of(&addresses[0])];
-            let (_, guard) = lock_bucket_for_hash(group, &addresses[0].hash).await;
+            let (_, guard) = group.bucket_for_write(&addresses[0].hash).await;
             guard.entry.to_vec()
         };
         let location_of = |address: &Address| {
@@ -477,6 +458,42 @@ mod migrate_bucket {
             0
         );
         assert_eq!(content(&store, addresses[1]).await, payload);
+    }
+
+    /// A tombstone in a run stays one: the payload the run is re-encoded to does not bring the
+    /// obliterated association back.
+    #[tokio::test]
+    async fn a_tombstone_in_a_run_stays_obliterated() {
+        let (_dir, store) = open_store("om_dedup_tombstone_").await;
+        let payload = compressible(8, 4096);
+        let addresses: Vec<Address> = (0..2).map(|c| address_of(&payload, c)).collect();
+        for address in &addresses {
+            put(&store, *address, &payload, true).await;
+        }
+        put_as_oodle(&store, addresses[0], &payload).await;
+        let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+        dyn_store
+            .clone()
+            .obliterate(
+                partition(),
+                addresses[1],
+                Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate");
+
+        let counts = migrate_bucket_holding(&store, addresses[0])
+            .await
+            .expect("migration succeeds");
+
+        assert_eq!(counts.migrated, 1);
+        assert!(matches!(
+            dyn_store.get(partition(), addresses[1]).await,
+            Err(lore_storage::immutable_store::StoreError::AddressNotFound(
+                _
+            ))
+        ));
+        assert_eq!(content(&store, addresses[0]).await, payload);
     }
 
     /// Stored bytes that decode to content the address does not describe cannot be served or
@@ -769,7 +786,7 @@ mod migrate_groups {
 
         let entries = {
             let group = &store.group[group_of(&shared_addresses[0])];
-            let (_, guard) = lock_bucket_for_hash(group, &shared_addresses[0].hash).await;
+            let (_, guard) = group.bucket_for_write(&shared_addresses[0].hash).await;
             guard.entry.to_vec()
         };
         let locations: Vec<(u32, u32)> = shared_addresses

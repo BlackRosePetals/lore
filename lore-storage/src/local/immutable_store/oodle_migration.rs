@@ -61,7 +61,8 @@ fn warn_entry(message: &str, entry: &ImmutableStoreEntry) {
 /// Re-encode local-only Oodle payloads reachable from one bucket, rewriting its entries in place.
 ///
 /// Iteration follows `sorted_index`, so entries sharing a hash are visited consecutively and the
-/// payload they share is decoded and re-encoded once for the whole run.
+/// payload they share is decoded and re-encoded once for the whole run. A tombstone in the run is
+/// left as it is.
 ///
 /// Marks the bucket dirty if anything changed; persisting it is the caller's job.
 #[lore_macro::test_pub]
@@ -222,12 +223,13 @@ async fn migrate_bucket(
             if bucket.entry[sibling_index].address.hash != entry.address.hash {
                 break;
             }
-            bucket.entry[sibling_index]
-                .data
-                .assign_deduplicated_payload(migrated_data);
             next_entry += 1;
             num_entries += 1;
-            counts.migrated += 1;
+            let sibling = &mut bucket.entry[sibling_index].data;
+            if sibling.flags & FragmentFlags::PayloadObliterated == 0 {
+                sibling.assign_deduplicated_payload(migrated_data);
+                counts.migrated += 1;
+            }
         }
     }
 

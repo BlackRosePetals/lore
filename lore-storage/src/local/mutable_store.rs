@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -34,6 +35,7 @@ use crate::Partition;
 use crate::errors::AddressNotFound;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
+use crate::local::fan_out::BucketGroup;
 use crate::local::fan_out::GroupLevel;
 use crate::local::immutable_store::SerializeFailureGuard;
 use crate::local::immutable_store::format_bucket_path;
@@ -193,6 +195,18 @@ impl MutableStoreGroup {
     fn fan_out_uncommitted(&self) -> bool {
         let committed = self.committed_level.load(atomic::Ordering::Relaxed);
         committed != 0 && committed != self.bucket_count.load(atomic::Ordering::Relaxed)
+    }
+}
+
+impl BucketGroup for MutableStoreGroup {
+    type Bucket = MutableStoreBucket;
+
+    fn bucket_count(&self) -> &AtomicUsize {
+        &self.bucket_count
+    }
+
+    fn bucket(&self, index: usize) -> &Arc<RwLock<MutableStoreBucket>> {
+        MutableStoreGroup::bucket(self, index)
     }
 }
 
@@ -994,7 +1008,7 @@ impl LocalMutableStore {
                 )
                 .await;
 
-                crate::local::fan_out::commit_if_initial_level(
+                let _ = crate::local::fan_out::commit_if_initial_level(
                     &flush_guard,
                     &group.committed_level,
                     &group.bucket_count,
@@ -1303,15 +1317,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         let group_index = key.group_index();
         let group = &self.group[group_index];
 
-        let (bucket_index, mut bucket) = loop {
-            let n = group.bucket_count.load(atomic::Ordering::Relaxed);
-            let idx = crate::local::fan_out::bucket_index_for(&key.hash(), n);
-            let lock = group.bucket(idx).write().await;
-            if group.bucket_count.load(atomic::Ordering::Relaxed) == n {
-                break (idx, lock);
-            }
-            drop(lock);
-        };
+        let (bucket_index, mut bucket) = group.bucket_for_write(&key.0).await;
 
         if !bucket.deserialized && self.path.is_some() {
             Box::pin(bucket.deserialize(
@@ -1440,15 +1446,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         let group_index = key.group_index();
         let group = &self.group[group_index];
 
-        let (bucket_index, mut bucket) = loop {
-            let n = group.bucket_count.load(atomic::Ordering::Relaxed);
-            let idx = crate::local::fan_out::bucket_index_for(&key.hash(), n);
-            let lock = group.bucket(idx).write().await;
-            if group.bucket_count.load(atomic::Ordering::Relaxed) == n {
-                break (idx, lock);
-            }
-            drop(lock);
-        };
+        let (bucket_index, mut bucket) = group.bucket_for_write(&key.0).await;
 
         if !bucket.deserialized && self.path.is_some() {
             Box::pin(bucket.deserialize(

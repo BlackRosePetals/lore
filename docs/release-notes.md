@@ -35,6 +35,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - The server refuses to start when `[server.auth] resource_id_template`, or `resource_template` or `scope_template` in
   `[server.auth.oidc]`, has no `{id}`. Such a template names the same resource for every partition, so one grant
   matched every partition. The error names the setting
+- `lore-storage`: `local::fan_out::commit_if_initial_level` returns the `std::io::Result` of its level marker write
 
 ### Features
 
@@ -246,6 +247,13 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   overwritten by later writes. A packfile whose sync fails takes no more writes
 - Local stores: a flush no longer returns before a bucket write that the delayed flush, another flush, eviction or
   compaction had started has landed. A process stopped just after a flush could lose entries the flush reported written
+- Local immutable stores: an obliterate writes its tombstone to disk before zeroing the payload, and waits for reads
+  that found the payload and for compaction. A process stopped in between reopened with the entry serving zeros, and a
+  read could return the payload partly zeroed. An obliterate whose tombstone cannot be written fails and leaves the
+  entry as it was, and one that zeroes a payload writes and syncs the index bucket of its entry. Storing the same
+  content under another association, or re-encoding it in the Oodle migration, no longer brings an obliterated entry
+  back with a size of 0, and obliterating a fragment list the store holds without its payload fails instead of leaving
+  its fragments readable
 - `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of
   `Recursion task failed`
 - `lore clone` reports the error that stopped it, such as a file it failed to fetch or write, in place of

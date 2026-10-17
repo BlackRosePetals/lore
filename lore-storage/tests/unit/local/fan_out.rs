@@ -174,7 +174,8 @@ async fn commit_if_initial_level_records_the_level_below_the_maximum() {
             0x2a,
             false,
         )
-        .await;
+        .await
+        .expect("commit the level");
 
         assert_eq!(read_level_marker(&group_path).await.unwrap(), Some(level));
         assert_eq!(committed.load(Ordering::Relaxed), level);
@@ -195,7 +196,8 @@ async fn commit_if_initial_level_leaves_a_committed_group_alone() {
         0x2a,
         false,
     )
-    .await;
+    .await
+    .expect("commit the level");
 
     assert_eq!(read_level_marker(&group_path).await.unwrap(), None);
     assert_eq!(committed.load(Ordering::Relaxed), 32);
@@ -215,9 +217,32 @@ async fn commit_if_initial_level_leaves_a_group_at_the_maximum_alone() {
         0x2a,
         false,
     )
-    .await;
+    .await
+    .expect("commit the level");
 
     assert_eq!(read_level_marker(&group_path).await.unwrap(), None);
+    assert_eq!(committed.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn commit_if_initial_level_returns_a_marker_it_cannot_write() {
+    let (dir, group_path) = temp_store_with_group(0x2a);
+    std::fs::create_dir_all(group_path.join(MARKER_FILENAME).join("blocker"))
+        .expect("block the marker");
+    let committed = AtomicUsize::new(0);
+    let bucket_count = AtomicUsize::new(1);
+
+    let committing = commit_if_initial_level(
+        &held_flush_guard().await,
+        &committed,
+        &bucket_count,
+        dir.path(),
+        0x2a,
+        false,
+    )
+    .await;
+
+    assert!(committing.is_err());
     assert_eq!(committed.load(Ordering::Relaxed), 0);
 }
 

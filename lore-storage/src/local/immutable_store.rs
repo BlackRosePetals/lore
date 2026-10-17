@@ -53,6 +53,7 @@ use opentelemetry::metrics::Histogram;
 use smallvec::SmallVec;
 use tokio::sync::Mutex;
 use tokio::sync::OwnedRwLockReadGuard;
+use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -81,6 +82,7 @@ use crate::hash;
 use crate::immutable_store::CopyBehavior;
 use crate::immutable_store::StoreError;
 use crate::immutable_store::sanitise_fragment_behavior_flags;
+use crate::local::fan_out::BucketGroup;
 use crate::local::fan_out::GroupLevel;
 use crate::local::immutable_store::info::ImmutableStoreInfo;
 use crate::local::immutable_store::info::get_or_init_disk_info;
@@ -310,6 +312,19 @@ enum StorePayload {
     Written(crate::PackStoreRef),
 }
 
+/// What [`LocalImmutableStore::tombstone`] did with an entry.
+enum Tombstone {
+    /// Nothing: it was obliterated already.
+    Already,
+    /// Tombstoned it. Another entry of its hash is not a tombstone, or it held no payload.
+    Kept,
+    /// Tombstoned it, and every other entry of its hash is a tombstone: the payload it held, as
+    /// this describes, is to be zeroed.
+    Zero(ImmutableData),
+    /// Nothing yet: its payload is to be zeroed, which happens only while compaction is held off.
+    ZeroOnceCompactionStops,
+}
+
 impl ImmutableStoreBucket {
     fn clone_for_compaction(&self) -> (Vec<ImmutableStoreEntry>, Vec<u32>) {
         (self.entry.to_vec(), self.sorted_index.to_vec())
@@ -386,6 +401,18 @@ impl ImmutableStoreGroup {
     #[inline]
     pub fn try_bucket(&self, idx: usize) -> Option<&Arc<RwLock<ImmutableStoreBucket>>> {
         self.bucket[idx].get()
+    }
+}
+
+impl BucketGroup for ImmutableStoreGroup {
+    type Bucket = ImmutableStoreBucket;
+
+    fn bucket_count(&self) -> &AtomicUsize {
+        &self.bucket_count
+    }
+
+    fn bucket(&self, index: usize) -> &Arc<RwLock<ImmutableStoreBucket>> {
+        ImmutableStoreGroup::bucket(self, index)
     }
 }
 
@@ -1367,7 +1394,7 @@ impl ImmutableStoreGroup {
             }
 
             let flush_guard = group.flush_lock.clone().lock_owned().await;
-            crate::local::fan_out::commit_if_initial_level(
+            let _ = crate::local::fan_out::commit_if_initial_level(
                 &flush_guard,
                 &group.committed_level,
                 &group.bucket_count,
@@ -2213,15 +2240,7 @@ impl LocalImmutableStore {
         let has_payload = !matches!(payload, StorePayload::Absent);
         let group_index = address.hash.data()[0] as usize;
         let group = &self.group[group_index];
-        let (bucket_index, mut bucket) = loop {
-            let n = group.bucket_count.load(atomic::Ordering::Relaxed);
-            let idx = crate::local::fan_out::bucket_index_for(&address.hash, n);
-            let lock = group.bucket(idx).clone().write_owned().await;
-            if group.bucket_count.load(atomic::Ordering::Relaxed) == n {
-                break (idx, lock);
-            }
-            drop(lock);
-        };
+        let (bucket_index, mut bucket) = group.bucket_for_write(&address.hash).await;
 
         if !bucket.deserialized && self.path.is_some() {
             Box::pin(bucket.deserialize(
@@ -2363,7 +2382,9 @@ impl LocalImmutableStore {
         }
 
         // Ensure all other instances of this hash has the same payload associated - if storing
-        // a payload for an already existing hash that had no payload we should upgrade those
+        // a payload for an already existing hash that had no payload we should upgrade those.
+        // A tombstone is left as it is, so that storing the content under another association
+        // does not bring the obliterated one back.
         if data.pack_file != 0 {
             let last_slot = bucket.sorted_index.len() - 1;
 
@@ -2373,8 +2394,9 @@ impl LocalImmutableStore {
                     return false;
                 }
                 let entry = &mut bucket.entry[entry_index];
-                if entry.data.pack_file != data.pack_file
-                    || entry.data.pack_offset != data.pack_offset
+                if entry.data.flags & FragmentFlags::PayloadObliterated == 0
+                    && (entry.data.pack_file != data.pack_file
+                        || entry.data.pack_offset != data.pack_offset)
                 {
                     entry.data.assign_deduplicated_payload(data);
                 }
@@ -2506,6 +2528,15 @@ impl LocalImmutableStore {
     /// Tombstone one address and release the payload it holds, if nothing else
     /// refers to that payload.
     ///
+    /// A payload is zeroed only once nothing can read it through the index. Its tombstone is
+    /// written to the bucket file durably first, so that a process killed meanwhile does not
+    /// reopen with the live entry pointing at zeros, and the group's payload gate is drained, so
+    /// that a read that located the payload before the tombstone has loaded it whole. No
+    /// compaction runs from the lookup to the zeroing: compaction moves payloads and truncates
+    /// packfiles, and the range zeroed must still hold this payload rather than one written
+    /// since. A tombstone that cannot be written is undone and the obliterate fails, so that a
+    /// retry zeroes the payload.
+    ///
     /// Whatever the address itself references is the caller's to have dealt with
     /// first; see [`ImmutableStore::obliterate`].
     async fn obliterate_one(
@@ -2516,15 +2547,67 @@ impl LocalImmutableStore {
     ) -> Result<(), StoreError> {
         let group_index = address.hash.data()[0] as usize;
         let group = &self.group[group_index];
-        let (bucket_index, mut bucket) = loop {
-            let n = group.bucket_count.load(atomic::Ordering::Relaxed);
-            let idx = crate::local::fan_out::bucket_index_for(&address.hash, n);
-            let lock = group.bucket(idx).clone().write_owned().await;
-            if group.bucket_count.load(atomic::Ordering::Relaxed) == n {
-                break (idx, lock);
+        let mut compaction_stopped = None;
+        let original = loop {
+            match self
+                .tombstone(partition, address, compaction_stopped.is_some())
+                .await?
+            {
+                Tombstone::Already => return Ok(()),
+                Tombstone::Kept => {
+                    stats.num_fragments.fetch_add(1, atomic::Ordering::Relaxed);
+                    self.flush_later(group_index, FragmentFlags::PayloadObliterated.bits())
+                        .await;
+                    return Ok(());
+                }
+                Tombstone::Zero(original) => break original,
+                Tombstone::ZeroOnceCompactionStops => {
+                    compaction_stopped = Some(
+                        self.compaction
+                            .acquire()
+                            .await
+                            .internal("holding compaction off")?,
+                    );
+                }
             }
-            drop(lock);
         };
+        lore_base::lore_debug!(
+            "Fragment payload has no other references, obliterating from packstore"
+        );
+        if let Some(path) = self.path.clone()
+            && let Err(err) =
+                Box::pin(self.write_bucket_of(group_index, &address.hash, &path)).await
+        {
+            Box::pin(self.untombstone(partition, address, original)).await;
+            return Err(err);
+        }
+        group.payload_gate.drain().await;
+        group
+            .packstore
+            .obliterate(
+                original.pack_file,
+                original.pack_offset,
+                original.size_payload,
+            )
+            .await
+            .forward::<StoreError>("Failed to obliterate payload from pack store.")?;
+        drop(compaction_stopped);
+        stats.num_payloads.fetch_add(1, atomic::Ordering::Relaxed);
+        stats.num_fragments.fetch_add(1, atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Tombstone the entry of `address`, unless it is one already, see [`Tombstone`]. An entry
+    /// whose payload is to be zeroed is tombstoned only with `compaction_stopped`.
+    async fn tombstone(
+        &self,
+        partition: Partition,
+        address: Address,
+        compaction_stopped: bool,
+    ) -> Result<Tombstone, StoreError> {
+        let group_index = address.hash.data()[0] as usize;
+        let group = &self.group[group_index];
+        let (bucket_index, mut bucket) = group.bucket_for_write(&address.hash).await;
 
         if !bucket.deserialized && self.path.is_some() {
             Box::pin(bucket.deserialize(
@@ -2569,28 +2652,14 @@ impl LocalImmutableStore {
             == FragmentFlags::PayloadObliterated
         {
             lore_base::lore_warn!("Address {address} already obliterated");
-            return Ok(());
+            return Ok(Tombstone::Already);
         }
 
-        if is_last_fragment && entry.data.pack_file != 0 {
-            lore_base::lore_debug!(
-                "Fragment payload has no other references, obliterating from packstore"
-            );
-
-            stats.num_payloads.fetch_add(1, atomic::Ordering::Relaxed);
-
-            group
-                .packstore
-                .obliterate(
-                    entry.data.pack_file,
-                    entry.data.pack_offset,
-                    entry.data.size_payload,
-                )
-                .await
-                .forward::<StoreError>("Failed to obliterate payload from pack store.")?;
+        let original = entry.data;
+        let zero = is_last_fragment && original.pack_file != 0;
+        if zero && !compaction_stopped {
+            return Ok(Tombstone::ZeroOnceCompactionStops);
         }
-
-        stats.num_fragments.fetch_add(1, atomic::Ordering::Relaxed);
 
         bucket.entry[index].data = ImmutableData {
             flags: FragmentFlags::PayloadObliterated.bits(),
@@ -2600,13 +2669,79 @@ impl LocalImmutableStore {
             pack_offset: 0,
             last_access: 0,
         };
-
         group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-        drop(bucket);
-        self.flush_later(group_index, FragmentFlags::PayloadObliterated.bits())
-            .await;
 
+        Ok(if zero {
+            Tombstone::Zero(original)
+        } else {
+            Tombstone::Kept
+        })
+    }
+
+    /// Write the bucket holding `hash` in group `group_index` durably, whatever its mark says, as
+    /// the tombstone in it has to be on disk before the payload it held is zeroed. In a group whose
+    /// fan-out is not committed, a bucket is only written with the commit, so the group is flushed.
+    /// A group below [`crate::local::fan_out::FAN_OUT_LEVEL_MAX`] with no level marker yet is given
+    /// one, and the write fails if it cannot be, see
+    /// [`crate::local::fan_out::commit_if_initial_level`].
+    async fn write_bucket_of(
+        &self,
+        group_index: usize,
+        hash: &Hash,
+        path: &Arc<PathBuf>,
+    ) -> Result<(), StoreError> {
+        let group = self.group[group_index].clone();
+        let flush_guard = group.flush_lock.clone().lock_owned().await;
+        let bucket_index = crate::local::fan_out::bucket_index_for(
+            hash,
+            group.bucket_count.load(atomic::Ordering::Relaxed),
+        );
+        group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+        if group.fan_out_uncommitted() {
+            return Box::pin(flush_locked_group(group, group_index, path.clone(), true))
+                .await
+                .forward::<StoreError>("committing the group of an obliterated entry");
+        }
+        let bucket = group.bucket(bucket_index).clone().read_owned().await;
+        ImmutableStoreBucket::serialize(
+            bucket,
+            group.clone(),
+            path.as_ref(),
+            group_index,
+            bucket_index,
+            true,
+        )
+        .await
+        .forward::<StoreError>("writing the bucket of an obliterated entry")?;
+        crate::local::fan_out::commit_if_initial_level(
+            &flush_guard,
+            &group.committed_level,
+            &group.bucket_count,
+            path.as_ref(),
+            group_index,
+            true,
+        )
+        .await
+        .internal("committing the level of the group of an obliterated entry")?;
         Ok(())
+    }
+
+    /// Give the tombstone of `address` back the entry `original` it replaced, as an obliterate
+    /// that could not write the tombstone leaves the address as it found it.
+    async fn untombstone(&self, partition: Partition, address: Address, original: ImmutableData) {
+        let group_index = address.hash.data()[0] as usize;
+        let group = &self.group[group_index];
+        let (bucket_index, mut bucket) = group.bucket_for_write(&address.hash).await;
+        let (slot, _, matched) = Self::lookup(&bucket, partition, address, StoreMatch::MatchFull);
+        if matched != StoreMatch::MatchFull {
+            return;
+        }
+        let index = bucket.sorted_index[slot] as usize;
+        let data = &mut bucket.entry[index].data;
+        if data.flags == FragmentFlags::PayloadObliterated.bits() && data.pack_file == 0 {
+            *data = original;
+            group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+        }
     }
 
     /// Starts the group's delayed flush unless one is pending, after an index change that leaves
@@ -2788,7 +2923,7 @@ impl LocalImmutableStore {
 
         if let Some(path) = path.as_ref() {
             let flush_guard = group.flush_lock.clone().lock_owned().await;
-            crate::local::fan_out::commit_if_initial_level(
+            let _ = crate::local::fan_out::commit_if_initial_level(
                 &flush_guard,
                 &group.committed_level,
                 &group.bucket_count,
@@ -3749,7 +3884,7 @@ impl LocalImmutableStore {
         }
 
         let flush_guard = group.flush_lock.clone().lock_owned().await;
-        crate::local::fan_out::commit_if_initial_level(
+        let _ = crate::local::fan_out::commit_if_initial_level(
             &flush_guard,
             &group.committed_level,
             &group.bucket_count,
@@ -4032,15 +4167,7 @@ impl LocalImmutableStore {
     pub async fn mark_as_not_durably_stored(&self, partition: Partition, address: Address) {
         let group_index = address.hash.data()[0] as usize;
         let group = &self.group[group_index];
-        let (bucket_index, mut bucket) = loop {
-            let n = group.bucket_count.load(atomic::Ordering::Relaxed);
-            let idx = crate::local::fan_out::bucket_index_for(&address.hash, n);
-            let lock = group.bucket(idx).clone().write_owned().await;
-            if group.bucket_count.load(atomic::Ordering::Relaxed) == n {
-                break (idx, lock);
-            }
-            drop(lock);
-        };
+        let (bucket_index, mut bucket) = group.bucket_for_write(&address.hash).await;
         if !bucket.deserialized && self.path.is_some() {
             let _ = bucket
                 .deserialize(
@@ -4474,6 +4601,9 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         Ok(())
     }
 
+    /// A fragment list held without its payload fails with `PayloadNotFound` and obliterates
+    /// nothing: the fragments it names are out of reach without it, and obliterating the list
+    /// alone would leave them readable with no list for a retry to follow.
     async fn obliterate(
         self: Arc<Self>,
         partition: Partition,
@@ -4515,19 +4645,24 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                     lore_base::lore_debug!("Payload fragmented, obliterating subfragments");
                     #[cfg(feature = "test-util")]
                     crate::test_util::pause_point(crate::test_util::PausePoint::Located).await;
-                    Some(Self::load(&group.packstore, data).await)
+                    if data.pack_file == 0 {
+                        return Err(StoreError::from(crate::errors::PayloadNotFound::from(
+                            address.hash,
+                        )));
+                    }
+                    Some(
+                        Self::load(&group.packstore, data)
+                            .await
+                            .forward_with::<StoreError, _>(|| {
+                                format!("loading the fragment list of {address}")
+                            })?,
+                    )
                 } else {
                     None
                 };
                 drop(gate);
 
-                if let Some(references) = references
-                    && let Ok(payload) = references.inspect_err(|e| {
-                        lore_base::lore_warn!(
-                            "Failed to load fragment while obliterating address {address}: {e:?}"
-                        );
-                    })
-                {
+                if let Some(payload) = references {
                     let payload = payload.to_aligned::<FragmentReference>();
                     for reference in payload.as_type_slice::<FragmentReference>().iter() {
                         self.clone()
@@ -4875,15 +5010,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
 
         let group_index = source_address.hash.data()[0] as usize;
         let group = &self.group[group_index];
-        let (bucket_index, mut bucket) = loop {
-            let n = group.bucket_count.load(atomic::Ordering::Relaxed);
-            let idx = crate::local::fan_out::bucket_index_for(&source_address.hash, n);
-            let lock = group.bucket(idx).clone().write_owned().await;
-            if group.bucket_count.load(atomic::Ordering::Relaxed) == n {
-                break (idx, lock);
-            }
-            drop(lock);
-        };
+        let (bucket_index, mut bucket) = group.bucket_for_write(&source_address.hash).await;
 
         if !bucket.deserialized && self.path.is_some() {
             bucket
@@ -5642,8 +5769,7 @@ async fn maybe_fan_out_immutable_group(
         return Ok(());
     }
 
-    let mut guards: Vec<tokio::sync::OwnedRwLockWriteGuard<ImmutableStoreBucket>> =
-        Vec::with_capacity(target);
+    let mut guards: Vec<OwnedRwLockWriteGuard<ImmutableStoreBucket>> = Vec::with_capacity(target);
     for i in 0..target {
         guards.push(group.bucket(i).clone().write_owned().await);
     }

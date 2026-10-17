@@ -5,11 +5,14 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use tokio::sync::OwnedMutexGuard;
+use tokio::sync::OwnedRwLockWriteGuard;
+use tokio::sync::RwLock;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::Immutable;
@@ -94,6 +97,46 @@ pub fn bucket_index_for(key: &Hash, bucket_count: usize) -> usize {
     }
     let shift = (256usize / bucket_count).trailing_zeros();
     (key.data()[1] as usize) >> shift
+}
+
+/// A group of buckets that [`bucket_index_for`] spreads hashes over.
+#[lore_macro::test_pub]
+pub(crate) trait BucketGroup {
+    type Bucket: Send + Sync;
+
+    /// The number of buckets the group's hashes are spread over.
+    fn bucket_count(&self) -> &AtomicUsize;
+
+    /// The bucket at `index`, created on first use.
+    fn bucket(&self, index: usize) -> &Arc<RwLock<Self::Bucket>>;
+
+    /// The index of the bucket `hash` belongs to, and that bucket locked for writing. The bucket
+    /// count is read again once the lock is held, as a fan-out while it waits can move `hash` to
+    /// another bucket. The index is computed again rather than held across the wait.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    fn bucket_for_write<'a>(
+        &'a self,
+        hash: &'a Hash,
+    ) -> impl Future<Output = (usize, OwnedRwLockWriteGuard<Self::Bucket>)> + Send + 'a
+    where
+        Self: Sync,
+    {
+        async move {
+            loop {
+                let count = self.bucket_count().load(Ordering::Relaxed);
+                let bucket = self
+                    .bucket(bucket_index_for(hash, count))
+                    .clone()
+                    .write_owned()
+                    .await;
+                if self.bucket_count().load(Ordering::Relaxed) == count {
+                    return (bucket_index_for(hash, count), bucket);
+                }
+            }
+        }
+    }
 }
 
 /// Compute the target level for a group whose largest bucket has overshot the threshold.
@@ -324,6 +367,9 @@ pub async fn read_group_level(group_path: &Path) -> std::io::Result<GroupLevel> 
 /// A group that already has a marker is left alone, as committing a level is the two-phase
 /// commit's business. So is a group at [`FAN_OUT_LEVEL_MAX`], which already reads back at that
 /// level — keeping this inert for pre-fan-out and server stores, whose groups are all there.
+///
+/// A marker that cannot be written is logged and its error returned, and `committed_level` is
+/// left at 0.
 pub async fn commit_if_initial_level(
     _flush_guard: &OwnedMutexGuard<()>,
     committed_level: &AtomicUsize,
@@ -331,25 +377,26 @@ pub async fn commit_if_initial_level(
     store_path: &Path,
     group_index: usize,
     sync_data: bool,
-) {
+) -> std::io::Result<()> {
     if committed_level.load(Ordering::Relaxed) != 0 {
-        return;
+        return Ok(());
     }
     let active_buckets = bucket_count.load(Ordering::Relaxed);
     if active_buckets == FAN_OUT_LEVEL_MAX {
-        return;
+        return Ok(());
     }
     let mut marker_path = PathBuf::with_capacity(store_path.as_os_str().len() + MARKER_PATH_LEN);
     marker_path.push(store_path);
     marker_path.push("index");
     push_group_dir(&mut marker_path, group_index);
     marker_path.push(MARKER_FILENAME);
-    match write_level_header_file(&marker_path, active_buckets, sync_data).await {
-        Ok(()) => committed_level.store(active_buckets, Ordering::Relaxed),
-        Err(err) => {
+    write_level_header_file(&marker_path, active_buckets, sync_data)
+        .await
+        .inspect_err(|err| {
             lore_base::lore_warn!("Failed to write level marker for group {group_index}: {err}");
-        }
-    }
+        })?;
+    committed_level.store(active_buckets, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Whether `name` names a committed bucket file, `index_<bb>`, rather than a `.new` twin or a

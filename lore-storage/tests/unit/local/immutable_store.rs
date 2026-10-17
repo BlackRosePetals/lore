@@ -3767,6 +3767,468 @@ mod copy_source {
     }
 }
 
+/// An obliterated association stays obliterated whatever is stored under the others.
+mod obliteration {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    use super::*;
+
+    fn fragment(payload: &[u8]) -> Fragment {
+        Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        }
+    }
+
+    async fn put(store: &Arc<dyn ImmutableStore>, partition: Partition, payload: &[u8]) -> Address {
+        let address = Address {
+            hash: lore_storage::hash::hash_slice(payload),
+            context: Context::default(),
+        };
+        store
+            .clone()
+            .put(
+                partition,
+                address,
+                fragment(payload),
+                Some(Bytes::copy_from_slice(payload)),
+                false,
+            )
+            .await
+            .expect("put");
+        address
+    }
+
+    async fn obliterate(store: &Arc<dyn ImmutableStore>, partition: Partition, address: Address) {
+        store
+            .clone()
+            .obliterate(
+                partition,
+                address,
+                Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate");
+    }
+
+    /// Storing content under a new association points every entry of its hash at the payload,
+    /// except a tombstone: the obliterated association reads as not found, and the content can
+    /// still be stored under further associations, rather than colliding with the tombstone's
+    /// empty sizes. With every association obliterated the payload is zeroed, and the next store
+    /// writes a new one.
+    #[tokio::test]
+    async fn a_store_under_another_partition_leaves_a_tombstone_obliterated() {
+        for zeroed in [false, true] {
+            let store = create(
+                None::<&Path>,
+                ImmutableStoreCreateOptions::none(),
+                false,
+                ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("create store");
+            let payload = b"content one association of which is obliterated".repeat(8);
+            let obliterated = Partition::from([0x71u8; 16]);
+            let kept = Partition::from([0x72u8; 16]);
+            let address = put(&store, obliterated, &payload).await;
+            put(&store, kept, &payload).await;
+            obliterate(&store, obliterated, address).await;
+            if zeroed {
+                obliterate(&store, kept, address).await;
+            }
+
+            put(&store, Partition::from([0x73u8; 16]), &payload).await;
+
+            assert!(
+                matches!(
+                    store.clone().get(obliterated, address).await,
+                    Err(StoreError::AddressNotFound(_))
+                ),
+                "the obliterated association reads again, payload zeroed {zeroed}"
+            );
+            let mut result = [StoreMatchResult::default()];
+            store
+                .clone()
+                .query(obliterated, &[address], &mut result)
+                .await
+                .expect("query");
+            assert_eq!(result[0].match_made, StoreMatch::MatchNone);
+            put(&store, Partition::from([0x74u8; 16]), &payload).await;
+        }
+    }
+
+    /// Copy the tree at `source` to `destination`: a copy of a store directory with no write in
+    /// flight is what a process killed then leaves on disk.
+    fn copy_tree(source: &Path, destination: &Path) {
+        std::fs::create_dir_all(destination).expect("create the copy");
+        for entry in std::fs::read_dir(source).expect("list the store") {
+            let entry = entry.expect("entry");
+            let target = destination.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copy a file");
+            }
+        }
+    }
+
+    async fn store_over(dir: &Path) -> (Arc<LocalImmutableStore>, Arc<dyn ImmutableStore>) {
+        let store = LocalImmutableStore::new(
+            Some(dir.to_path_buf()),
+            ImmutableStoreSettings {
+                flush_delay_seconds: 3600,
+                ..client_settings()
+            },
+        )
+        .await
+        .expect("store opens");
+        let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+        (store, dyn_store)
+    }
+
+    /// An obliterate writes the tombstone to disk before it zeroes the payload: a process killed
+    /// while the tombstone is written reopens with the payload whole, and one killed once the
+    /// obliterate returns reopens with the address obliterated, rather than serving zeros.
+    #[tokio::test]
+    async fn the_tombstone_is_on_disk_before_the_payload_is_zeroed() {
+        let dir = lore_base::test_util::TempDir::new("is_obliterate_order_");
+        let (_store, dyn_store) = store_over(dir.path()).await;
+        let payload = b"content to be obliterated".repeat(16);
+        let partition = Partition::from([0x75u8; 16]);
+        let address = put(&dyn_store, partition, &payload).await;
+        dyn_store.clone().flush(false).await.expect("flush");
+
+        let pause = pause_at(PausePoint::Serializing);
+        let obliterating = dyn_store.clone();
+        let obliterate_task = lore_base::lore_spawn!(async move {
+            obliterate(&obliterating, partition, address).await;
+        });
+        pause.reached.notified().await;
+        let writing = lore_base::test_util::TempDir::new("is_obliterate_order_writing_");
+        copy_tree(dir.path(), writing.path());
+        pause.resume.notify_one();
+        obliterate_task.await.expect("obliterate task");
+        let (_reopened, reopened) = store_over(writing.path()).await;
+        let (_fragment, read_back) = reopened
+            .get(partition, address)
+            .await
+            .and_then(lore_storage::StoreGetData::into_payload)
+            .expect("the payload reads back while its tombstone is written");
+        assert_eq!(read_back.as_ref(), payload.as_slice());
+
+        let killed = lore_base::test_util::TempDir::new("is_obliterate_order_killed_");
+        copy_tree(dir.path(), killed.path());
+        let (_reopened, reopened) = store_over(killed.path()).await;
+        match reopened.get(partition, address).await {
+            Err(StoreError::AddressNotFound(_)) => {}
+            Ok(data) => panic!(
+                "the live entry survived the obliterate on disk, serving {} zero bytes",
+                data.payload.map_or(0, |payload| payload
+                    .iter()
+                    .filter(|byte| **byte == 0)
+                    .count())
+            ),
+            Err(err) => panic!("the obliterated address reads as {err}"),
+        }
+    }
+
+    /// A read that located a payload before an obliterate tombstoned its entry loads it whole: the
+    /// obliterate zeroes the payload only once the reads holding the group's payload gate are done.
+    #[tokio::test]
+    async fn a_read_that_located_the_payload_loads_it_before_it_is_zeroed() {
+        let dir = lore_base::test_util::TempDir::new("is_obliterate_read_");
+        let (store, dyn_store) = store_over(dir.path()).await;
+        let payload = b"content a read is loading".repeat(16);
+        let partition = Partition::from([0x76u8; 16]);
+        let address = put(&dyn_store, partition, &payload).await;
+
+        let pause = pause_at(PausePoint::Located);
+        let reading = dyn_store.clone();
+        let read = lore_base::lore_spawn!(async move { reading.get(partition, address).await });
+        pause.reached.notified().await;
+        let obliterating = dyn_store.clone();
+        let obliterate_task = lore_base::lore_spawn!(async move {
+            obliterating
+                .obliterate(
+                    partition,
+                    address,
+                    Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+                )
+                .await
+        });
+        let gate = &store.group[address.hash.data()[0] as usize].payload_gate;
+        wait_until(|| gate.is_draining(), &obliterate_task).await;
+        assert!(
+            !obliterate_task.is_finished(),
+            "the obliterate zeroed the payload while a read had located it"
+        );
+        pause.resume.notify_one();
+        let (_fragment, read_back) = read
+            .await
+            .expect("read task")
+            .and_then(lore_storage::StoreGetData::into_payload)
+            .expect("the read that located the payload loads it");
+        assert_eq!(read_back.as_ref(), payload.as_slice());
+        obliterate_task
+            .await
+            .expect("obliterate task")
+            .expect("obliterate");
+        assert!(matches!(
+            dyn_store.clone().get(partition, address).await,
+            Err(StoreError::AddressNotFound(_))
+        ));
+    }
+
+    /// An obliterate zeroes a payload only while no compaction runs, as compaction moves payloads
+    /// and truncates packfiles, and the range zeroed has to hold this payload still.
+    #[tokio::test]
+    async fn an_obliterate_zeroes_only_while_no_compaction_runs() {
+        let dir = lore_base::test_util::TempDir::new("is_obliterate_compaction_");
+        let (store, dyn_store) = store_over(dir.path()).await;
+        let (group_index, payloads) = payloads_in_one_group(8);
+        let partition = Partition::from([0x77u8; 16]);
+        let mut addresses = vec![];
+        for payload in &payloads {
+            addresses.push(put(&dyn_store, partition, payload).await);
+        }
+        for address in &addresses[4..] {
+            obliterate(&dyn_store, partition, *address).await;
+        }
+        dyn_store
+            .clone()
+            .load_index()
+            .await
+            .expect("load the index");
+
+        assert_eq!(addresses[0].hash.data()[0] as usize, group_index);
+        let pause = pause_at(PausePoint::Stopped);
+        let compacting = dyn_store.clone();
+        let compaction = lore_base::lore_spawn!(async move {
+            let mut at = None;
+            while let Ok(Some(next)) = compacting.clone().compact(1, at, false, None).await {
+                at = Some(next);
+            }
+        });
+        pause.reached.notified().await;
+        let obliterating = dyn_store.clone();
+        let target = addresses[0];
+        let mut obliterate_task = lore_base::lore_spawn!(async move {
+            obliterating
+                .obliterate(
+                    partition,
+                    target,
+                    Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut obliterate_task)
+                .await
+                .is_err(),
+            "the obliterate zeroed a payload while compaction was rewriting its packfile"
+        );
+        pause.resume.notify_one();
+        compaction.await.expect("compaction task");
+        obliterate_task
+            .await
+            .expect("obliterate task")
+            .expect("obliterate");
+        assert_payloads_read_back(
+            &store,
+            partition,
+            addresses[1..4]
+                .iter()
+                .zip(&payloads[1..4])
+                .map(|(address, payload)| (*address, payload.clone())),
+        )
+        .await;
+    }
+
+    /// An obliterate in a group whose fan-out a failed flush left uncommitted commits it, as the
+    /// tombstone can only reach disk with the commit, rather than failing until a later flush does.
+    #[tokio::test]
+    async fn an_obliterate_commits_a_fan_out_left_uncommitted() {
+        let dir = lore_base::test_util::TempDir::new("is_obliterate_uncommitted_");
+        let settings = || ImmutableStoreSettings {
+            fan_out_threshold: 2,
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        };
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+            .await
+            .expect("store opens");
+        let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+        let partition = Partition::from([0x79u8; 16]);
+        let (group_index, payloads) = payloads_in_one_group(4);
+        let mut addresses = vec![];
+        for payload in &payloads[..2] {
+            addresses.push(put(&dyn_store, partition, payload).await);
+        }
+        dyn_store.clone().flush(false).await.expect("flush");
+        for payload in &payloads[2..] {
+            addresses.push(put(&dyn_store, partition, payload).await);
+        }
+        let pending = format_bucket_path(&dir.join("immutable"), group_index, 0)
+            .with_file_name(lore_storage::local::fan_out::LEVEL_PENDING_FILENAME);
+        std::fs::create_dir_all(&pending).expect("block level.pending");
+        std::fs::write(pending.join("blocker"), b"x").expect("block level.pending");
+        assert!(dyn_store.clone().flush(false).await.is_err());
+        std::fs::remove_dir_all(&pending).expect("unblock level.pending");
+        let group = &store.group[group_index];
+        assert_ne!(
+            group.bucket_count.load(atomic::Ordering::Relaxed),
+            group.committed_level.load(atomic::Ordering::Relaxed),
+            "the group fanned out without committing"
+        );
+
+        obliterate(&dyn_store, partition, addresses[0]).await;
+
+        let killed = lore_base::test_util::TempDir::new("is_obliterate_uncommitted_killed_");
+        copy_tree(dir.path(), killed.path());
+        let reopened = LocalImmutableStore::new(Some(killed.to_path_buf()), settings())
+            .await
+            .expect("store reopens");
+        let reopened_dyn: Arc<dyn ImmutableStore> = reopened.clone();
+        assert!(matches!(
+            reopened_dyn.get(partition, addresses[0]).await,
+            Err(StoreError::AddressNotFound(_))
+        ));
+        assert_payloads_read_back(
+            &reopened,
+            partition,
+            addresses[1..]
+                .iter()
+                .copied()
+                .zip(payloads[1..].iter().cloned()),
+        )
+        .await;
+    }
+
+    /// An obliterate in a group with no level marker yet fails when the marker cannot be written,
+    /// as its tombstone would read back at another level, and leaves the payload whole.
+    #[tokio::test]
+    async fn an_obliterate_that_cannot_commit_its_group_level_zeroes_nothing() {
+        let dir = lore_base::test_util::TempDir::new("is_obliterate_marker_");
+        let (_store, dyn_store) = store_over(dir.path()).await;
+        let payload = b"content in a group with no level marker".repeat(16);
+        let partition = Partition::from([0x7au8; 16]);
+        let address = put(&dyn_store, partition, &payload).await;
+        let marker = format_bucket_path(&dir.join("immutable"), address.hash.data()[0] as usize, 0)
+            .with_file_name(lore_storage::local::fan_out::MARKER_FILENAME);
+        std::fs::create_dir_all(marker.join("blocker")).expect("block the level marker");
+
+        let obliterating = dyn_store
+            .clone()
+            .obliterate(
+                partition,
+                address,
+                Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+            )
+            .await;
+
+        assert!(matches!(obliterating, Err(StoreError::Internal(_))));
+        let (_fragment, read_back) = dyn_store
+            .get(partition, address)
+            .await
+            .and_then(lore_storage::StoreGetData::into_payload)
+            .expect("the address reads back");
+        assert_eq!(read_back.as_ref(), payload.as_slice());
+    }
+
+    /// A fragment list held without its payload names fragments the store cannot reach: the
+    /// obliterate fails and obliterates nothing, the list included, so that once the list is stored
+    /// a retry obliterates it with its fragments.
+    #[tokio::test]
+    async fn a_fragment_list_without_its_payload_is_not_obliterated_alone() {
+        let store = create(
+            None::<&Path>,
+            ImmutableStoreCreateOptions::none(),
+            false,
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create store");
+        let partition = Partition::from([0x78u8; 16]);
+        let mut addresses = vec![];
+        let mut references = vec![];
+        let mut content = 0u64;
+        for leaf in [
+            b"the first leaf of a list held without its payload".as_slice(),
+            b"the second leaf of that list, long enough for the list to describe".as_slice(),
+        ] {
+            let address = put(&store, partition, leaf).await;
+            references.push(FragmentReference {
+                hash: address.hash,
+                offset_content: content,
+            });
+            content += leaf.len() as u64;
+            addresses.push(address);
+        }
+        let list = Bytes::copy_from_slice(references.as_bytes());
+        let root = Address {
+            hash: hash::hash_slice(&list),
+            context: Context::default(),
+        };
+        let list_fragment = Fragment {
+            flags: FragmentFlags::PayloadFragmented.bits(),
+            size_payload: list.len() as u32,
+            size_content: content,
+        };
+        store
+            .clone()
+            .put(partition, root, list_fragment, None, false)
+            .await
+            .expect("put of the list's representation");
+        addresses.push(root);
+
+        let refused = store
+            .clone()
+            .obliterate(
+                partition,
+                root,
+                Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::PayloadNotFound(_))),
+            "an obliterate that cannot reach the fragments a list names: {refused:?}"
+        );
+        let mut results = [StoreMatchResult::default(); 3];
+        store
+            .clone()
+            .query(partition, &addresses, &mut results)
+            .await
+            .expect("query");
+        for result in results {
+            assert_eq!(
+                result.match_made,
+                StoreMatch::MatchFull,
+                "a refused obliterate changes nothing"
+            );
+        }
+
+        store
+            .clone()
+            .put(partition, root, list_fragment, Some(list), false)
+            .await
+            .expect("put of the list");
+        obliterate(&store, partition, root).await;
+        store
+            .clone()
+            .query(partition, &addresses, &mut results)
+            .await
+            .expect("query");
+        for result in results {
+            assert_eq!(
+                result.match_made,
+                StoreMatch::MatchNone,
+                "the retry obliterates them all"
+            );
+        }
+    }
+}
+
 /// Set the last access of each entry of the group for which `stamp` names one.
 async fn stamp_entries(
     store: &LocalImmutableStore,
