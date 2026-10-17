@@ -22,6 +22,7 @@ use lore_storage::options::WriteOptions;
 
 use super::serving::Serving;
 use super::serving::remote_copy;
+use super::serving::serving_remote;
 use super::serving::serving_session;
 use super::session_tests::context_with_state;
 use super::session_tests::under_execution_context;
@@ -389,6 +390,34 @@ async fn caching_an_entry_without_its_payload_fetches_it() {
 
     assert_eq!(fetched, 1);
     assert_eq!(remote.asked(), BTreeSet::from([address]));
+    assert!(
+        is_stored_local(context.clone(), address).await,
+        "the payload is stored"
+    );
+}
+
+/// A cache goes through the repository's lazy session, so a session the remote no longer knows is
+/// started again once the fetch invalidates it, and the fetch succeeds.
+#[tokio::test]
+async fn a_cache_starts_again_a_session_the_remote_forgot() {
+    let (source, address, _) =
+        remote_copy(b"content a remote serves once it forgot a session", 0x5e, 0).await;
+    let remote = serving_remote(
+        &source,
+        Serving {
+            forgets_first_session: true,
+            ..Serving::default()
+        },
+    );
+    let connection = lore_transport::Connection::detached(vec![remote.clone()]);
+    let context = context_with_state(RemoteState::Connected(connection)).await;
+
+    let cached = under_execution_context(|| cache_counted(context.clone(), vec![address], false))
+        .await
+        .expect("the remote is connected");
+
+    assert!(cached.failure.is_none(), "{:?}", cached.failure);
+    assert_eq!((cached.fragments, remote.starts()), (1, 2));
     assert!(
         is_stored_local(context.clone(), address).await,
         "the payload is stored"

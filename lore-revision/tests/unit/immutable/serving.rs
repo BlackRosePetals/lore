@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -28,8 +29,9 @@ use super::session_tests::under_execution_context;
 /// How a [`ServingStorage`] departs from serving what it holds: the address it answers with its
 /// payload altered, until a heal where it `heals`, and after that heal too where it `heal_fails`,
 /// though it reports the heal made; the address whose first get it answers `SlowDown`; whether it
-/// answers every get `NotSupported`, as a remote that does not support the request; the gate it
-/// holds each get at until as many as the gate takes are in; and the content whose first get it
+/// answers every get `NotSupported`, as a remote that does not support the request; whether it
+/// fails every get on the first session it started, as a server that lost its sessions; the gate
+/// it holds each get at until as many as the gate takes are in; and the content whose first get it
 /// holds for a notification.
 #[derive(Default)]
 pub(super) struct Serving {
@@ -38,16 +40,19 @@ pub(super) struct Serving {
     pub(super) heal_fails: bool,
     pub(super) slow_down: Option<Address>,
     pub(super) unsupported: bool,
+    pub(super) forgets_first_session: bool,
     pub(super) gate: Option<Arc<tokio::sync::Barrier>>,
     pub(super) hold: Option<(Hash, Arc<tokio::sync::Notify>)>,
 }
 
 /// A remote serving what `source` stores as `serving` says, recording each address asked of it, the
-/// verifies asked of it and the most gets it held at once.
+/// sessions started on it, numbered from 1, the verifies asked of it and the most gets it held at
+/// once.
 pub(super) struct ServingStorage {
     source: Arc<RepositoryContext>,
     serving: Serving,
     asked: std::sync::Mutex<Vec<Address>>,
+    starts: AtomicU32,
     verifies: AtomicUsize,
     healed: AtomicBool,
     slowed: AtomicBool,
@@ -62,7 +67,7 @@ impl lore_transport::Storage for ServingStorage {
         _partition: Partition,
         _correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
-        Ok(1)
+        Ok(self.starts.fetch_add(1, Ordering::SeqCst) + 1)
     }
 
     async fn session_stop(&self, _session_id: u32) -> Result<(), ProtocolError> {
@@ -71,9 +76,14 @@ impl lore_transport::Storage for ServingStorage {
 
     async fn get(
         &self,
-        _session_id: u32,
+        session_id: u32,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
+        if self.serving.forgets_first_session && session_id == 1 {
+            return Err(ProtocolError::internal(
+                "the serving remote no longer knows session 1",
+            ));
+        }
         let first = {
             let mut asked = self.asked.lock().expect("asked");
             asked.push(*address);
@@ -190,6 +200,11 @@ impl ServingStorage {
         self.asked.lock().expect("asked").len()
     }
 
+    /// How many sessions were started on the remote.
+    pub(super) fn starts(&self) -> u32 {
+        self.starts.load(Ordering::SeqCst)
+    }
+
     /// How many verifies the remote was asked.
     pub(super) fn verifies(&self) -> usize {
         self.verifies.load(Ordering::SeqCst)
@@ -215,6 +230,7 @@ pub(super) fn serving_remote(
         source: source.clone(),
         serving,
         asked: std::sync::Mutex::default(),
+        starts: AtomicU32::new(0),
         verifies: AtomicUsize::new(0),
         healed: AtomicBool::new(false),
         slowed: AtomicBool::new(false),

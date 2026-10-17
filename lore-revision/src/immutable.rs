@@ -707,7 +707,7 @@ fn cache_gets_from(value: Option<String>) -> usize {
 
 /// The connection's cache get permits, which every [`cache_through`] fetch takes; `None` with no
 /// cap.
-type CacheGets = Option<Arc<tokio::sync::Semaphore>>;
+pub(crate) type CacheGets = Option<Arc<tokio::sync::Semaphore>>;
 
 /// What one [`cache_through`] fetch came to.
 #[lore_macro::test_pub]
@@ -906,6 +906,8 @@ pub struct Cached {
     pub bytes: u64,
     /// Fragments found local after waiting for a cache get permit, and so not fetched.
     pub already_local: usize,
+    /// Fragments looked up locally, at every level the walk reached.
+    pub queried: usize,
     /// The first failure to query, fetch, check or store a fragment.
     pub failure: Option<Box<ImmutableError>>,
 }
@@ -919,36 +921,47 @@ impl Cached {
 }
 
 /// [`cache`], answering everything it fetched ([`Cached`]) rather than its first failure; only a
-/// failure to connect is an error.
+/// failure to connect to the remote is an error, and a session that cannot be started fails each
+/// fetch.
 pub async fn cache_counted(
     repository: Arc<RepositoryContext>,
     address: Vec<Address>,
     cache_fragmented: bool,
 ) -> Result<Cached, ImmutableError> {
-    let remote_result: Result<_, ImmutableError> = repository
-        .remote()
-        .await
-        .forward("connecting to remote for cache");
-    let remote = remote_result?;
-    let correlation_id = crate::lore::execution_context()
-        .globals()
-        .correlation_id
-        .to_string();
-    let storage_result: Result<_, ImmutableError> = remote
-        .session(repository.id, &correlation_id)
-        .await
-        .forward("connecting to remote storage for cache");
-    let remote_storage = storage_result?;
-    let permits = remote.cache_get_permits(cache_gets());
-
-    Ok(cache_through(
+    let (remote_storage, permits) = cache_session(&repository).await?;
+    let start = Instant::now();
+    let cached = cache_through(
         repository,
         remote_storage,
         permits,
         address,
         cache_fragmented,
     )
-    .await)
+    .await;
+    lore_debug!(
+        "Fetched {} / {} immutable fragments in {:.3}s",
+        cached.fragments,
+        cached.queried,
+        start.elapsed().as_secs_f64()
+    );
+    Ok(cached)
+}
+
+/// The session `repository`'s cache fetches go through, its lazy one ([`resolve_session`]), which
+/// starts its server-side sessions again once a fetch invalidates them, and the connection's cache
+/// get permits they take ([`cache_through`]).
+pub(crate) async fn cache_session(
+    repository: &Arc<RepositoryContext>,
+) -> Result<(Arc<StorageSession>, CacheGets), ImmutableError> {
+    let remote_result: Result<_, ImmutableError> = repository
+        .remote()
+        .await
+        .forward("connecting to remote for cache");
+    let remote = remote_result?;
+    let Some(session) = resolve_session(repository) else {
+        return Err(ImmutableError::from(NoRemote));
+    };
+    Ok((session, remote.cache_get_permits(cache_gets())))
 }
 
 /// [`cache_counted`] once connected, fetching through `remote_storage`, each get holding one of
@@ -965,7 +978,7 @@ pub async fn cache_counted(
 ///
 /// [`MAX_FRAGMENT_TREE_DEPTH`]: lore_storage::defragment::MAX_FRAGMENT_TREE_DEPTH
 #[lore_macro::test_pub]
-async fn cache_through(
+pub(crate) async fn cache_through(
     repository: Arc<RepositoryContext>,
     remote_storage: Arc<StorageSession>,
     permits: CacheGets,
@@ -984,7 +997,6 @@ async fn cache_through(
         let _ = query_address.split_to(size_of::<Address>());
     }
 
-    let start = Instant::now();
     let mut total_fetches = 0;
     let mut total_already_local = 0;
     let mut total_bytes = 0;
@@ -1226,16 +1238,11 @@ async fn cache_through(
         }
     }
 
-    let fetched = total_fetches - total_already_local;
-    lore_debug!(
-        "Fetched {fetched} / {total_query_count} immutable fragments in {:.3}s",
-        start.elapsed().as_secs_f64()
-    );
-
     Cached {
-        fragments: fetched,
+        fragments: total_fetches - total_already_local,
         bytes: total_bytes,
         already_local: total_already_local,
+        queried: total_query_count,
         failure,
     }
 }

@@ -1977,6 +1977,265 @@ mod storage_remote_tests {
             .await
     }
 
+    /// A revision a block warm-up test fetches ([`spanning_revision`]).
+    struct SpanningRevision {
+        revision: lore_base::types::Hash,
+        state: Arc<lore_revision::state::State>,
+        /// The node blocks its address list holds, by index.
+        nodes: Vec<(usize, lore_base::types::Address)>,
+        /// The file-metadata blocks its address list holds, by index.
+        file_metadata: Vec<(usize, lore_base::types::Address)>,
+    }
+
+    /// A revision of 1,200 root files on `test`'s server, spanning several node blocks with file
+    /// metadata in two of them, as the client deserializes it. `seed` sets its names and file
+    /// metadata apart from every other test's, so no read flight joins blocks of another test.
+    async fn spanning_revision(
+        test: &CacheTest,
+        seed: u8,
+    ) -> Result<SpanningRevision, Box<dyn Error>> {
+        use lore_base::types::Address;
+        use lore_base::types::Hash;
+        use lore_base::types::TypedBytes;
+        use lore_revision::node::Node;
+        use lore_revision::node::NodeFileMetadata;
+        use lore_revision::node::NodeFileMetadataBlock;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::node::node_to_file_metadata;
+        use lore_revision::repository::RepositoryWriteToken;
+        use lore_revision::state::State;
+        use lore_storage::hash::hash_string;
+
+        let write_token = RepositoryWriteToken::acquire(std::path::Path::new(&format!(
+            "block-warm-up-test-{seed}"
+        )))
+        .await;
+        let state = State::new();
+        for index in 0..1200 {
+            let name = format!("file{seed}-{index}");
+            let node = Node {
+                name_hash: hash_string(&name),
+                ..Default::default()
+            };
+            let node = state
+                .node_add(test.server_repository.clone(), ROOT_NODE, node, &name)
+                .await?;
+            if [0, 1100].contains(&index) {
+                let metadata_node = node_to_file_metadata(node);
+                let block_index = NodeFileMetadataBlock::index(metadata_node);
+                let block = state
+                    .block_file_metadata(test.server_repository.clone(), block_index)
+                    .await?;
+                {
+                    let mut writer = block.write();
+                    let slot = writer.node(NodeFileMetadata::index(metadata_node));
+                    slot.revision[0] = Hash::from_u64((u64::from(seed) << 32) | (index + 1));
+                    writer.mark_dirty();
+                }
+                state.block_file_metadata_modified(block, block_index);
+            }
+        }
+        state.mark_dirty();
+        let revision = state
+            .serialize(test.server_repository.clone(), &write_token)
+            .await?;
+
+        let client = test.client_repository.clone();
+        let client_state = State::deserialize(client.clone(), revision).await?;
+        let (nodes, file_metadata) = client_state.block_address_lists(client).await?;
+        let present = |hashes: &[Hash]| {
+            hashes
+                .iter()
+                .enumerate()
+                .filter(|(_, hash)| !hash.is_zero())
+                .map(|(index, hash)| (index, Address::zero_context_hash(*hash)))
+                .collect::<Vec<_>>()
+        };
+        let nodes = present(nodes.as_type_slice::<Hash>());
+        let file_metadata = present(file_metadata.as_type_slice::<Hash>());
+        assert!(nodes.len() > 1, "the tree spans several node blocks");
+        assert!(!file_metadata.is_empty(), "the tree holds file metadata");
+        Ok(SpanningRevision {
+            revision,
+            state: client_state,
+            nodes,
+            file_metadata,
+        })
+    }
+
+    /// A block warm-up fetches every node block of a state with its name table and its
+    /// file-metadata block, so once the state's own records are cached as well the whole tree reads
+    /// without a remote. A warm-up told to stop fetches nothing, and one given block indices
+    /// fetches only the blocks the lists hold among them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_block_warm_up_makes_the_tree_available_offline() -> TestResult {
+        use lore_revision::immutable::is_stored_local;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::repository::prefetch::warm_blocks;
+        use lore_revision::state::State;
+
+        let execution = setup_execution("storage-remote-block-warm-up".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let test =
+                        CacheTest::start(transport, RepositoryId::from([0xd5u8; 16])).await?;
+                    let SpanningRevision {
+                        revision,
+                        state: client_state,
+                        nodes,
+                        file_metadata,
+                    } = spanning_revision(&test, 1).await?;
+                    let client = test.client_repository.clone();
+
+                    let stopped = warm_blocks(
+                        client.clone(),
+                        client_state.clone(),
+                        None,
+                        Arc::new(|| true),
+                    )
+                    .await?;
+                    assert_eq!(stopped.blocks, 0, "a stopped warm-up starts no block");
+                    let offline = test.offline();
+                    assert!(!is_stored_local(offline.clone(), nodes[0].1).await);
+
+                    let chosen = warm_blocks(
+                        client.clone(),
+                        client_state.clone(),
+                        Some(&[usize::MAX, nodes[1].0]),
+                        Arc::new(|| false),
+                    )
+                    .await?;
+                    assert_eq!(
+                        (chosen.blocks, chosen.failures),
+                        (1, 0),
+                        "an index past the lists is skipped"
+                    );
+                    assert!(is_stored_local(offline.clone(), nodes[1].1).await);
+                    assert!(!is_stored_local(offline.clone(), nodes[0].1).await);
+
+                    let warmed = warm_blocks(
+                        client.clone(),
+                        client_state.clone(),
+                        None,
+                        Arc::new(|| false),
+                    )
+                    .await?;
+                    assert_eq!(
+                        (warmed.blocks, warmed.name_tables, warmed.file_metadata),
+                        (
+                            nodes.len() as u64,
+                            nodes.len() as u64,
+                            file_metadata.len() as u64
+                        )
+                    );
+                    assert!(warmed.block_bytes > 0 && warmed.name_table_bytes > 0);
+                    assert_eq!(warmed.failures, 0);
+
+                    client_state.cache_fragments(client, false).await?;
+                    let offline_state = State::deserialize(offline.clone(), revision).await?;
+                    for (index, _) in &nodes {
+                        offline_state
+                            .block_with_nametable(offline.clone(), *index)
+                            .await?;
+                    }
+                    for (index, _) in &file_metadata {
+                        offline_state
+                            .block_file_metadata(offline.clone(), *index)
+                            .await?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// A block warm-up counts each fetch the remote cannot serve and goes on: a node block the
+    /// remote lacks leaves its name table unfetched, a file-metadata block it lacks is counted
+    /// alone, and every other block and name table is stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_block_warm_up_counts_what_the_remote_lacks_and_goes_on() -> TestResult {
+        use lore_revision::immutable::is_stored_local;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::repository::prefetch::warm_blocks;
+        use lore_storage::StoreObliterateStats;
+
+        let execution = setup_execution("storage-remote-block-warm-up-lacking".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let test =
+                        CacheTest::start(transport, RepositoryId::from([0xd3u8; 16])).await?;
+                    let spanning = spanning_revision(&test, 2).await?;
+                    let &(lacking_node, node_address) = spanning
+                        .nodes
+                        .iter()
+                        .find(|(index, _)| {
+                            spanning
+                                .file_metadata
+                                .iter()
+                                .all(|(metadata, _)| metadata != index)
+                        })
+                        .expect("a node block without file metadata");
+                    let &(lacking_metadata, metadata_address) = spanning
+                        .file_metadata
+                        .iter()
+                        .find(|(index, _)| *index != lacking_node)
+                        .expect("the file metadata of another node block");
+                    for address in [node_address, metadata_address] {
+                        test.server
+                            .backend_immutable
+                            .clone()
+                            .obliterate(
+                                test.repository_id,
+                                address,
+                                Arc::new(StoreObliterateStats::default()),
+                            )
+                            .await?;
+                    }
+
+                    let warmed = warm_blocks(
+                        test.client_repository.clone(),
+                        spanning.state.clone(),
+                        None,
+                        Arc::new(|| false),
+                    )
+                    .await?;
+                    assert_eq!(
+                        (
+                            warmed.blocks,
+                            warmed.name_tables,
+                            warmed.file_metadata,
+                            warmed.failures
+                        ),
+                        (
+                            spanning.nodes.len() as u64,
+                            spanning.nodes.len() as u64 - 1,
+                            spanning.file_metadata.len() as u64,
+                            2
+                        )
+                    );
+                    let offline = test.offline();
+                    for &(index, address) in &spanning.nodes {
+                        assert_eq!(
+                            is_stored_local(offline.clone(), address).await,
+                            index != lacking_node,
+                            "node block {index}"
+                        );
+                    }
+                    for &(index, address) in &spanning.file_metadata {
+                        assert_eq!(
+                            is_stored_local(offline.clone(), address).await,
+                            index != lacking_metadata,
+                            "file-metadata block {index}"
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await
+    }
+
     /// The diagnostic immutable query checks the payload the remote serves as the command's trust of
     /// its remote asks: a list that does not hash to its address is reported as served and not
     /// walked, and a command trusting the remote walks it.

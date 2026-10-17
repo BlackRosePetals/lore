@@ -141,7 +141,7 @@ pub(crate) fn run_handler<A: InvokableLoreArgs>(
 - Reserve the slot, then build the item in the permit's `send` call. The future of `send(item)` holds the item while it waits.
 
 ```rust
-let Ok(permit) = dispatcher.file_tx.reserve().await else {
+let Ok(permit) = clone.file_tx.reserve().await else {
     return Err(CloneError::internal("Recursion task failed"));
 };
 permit.send(CloneWorkItem {

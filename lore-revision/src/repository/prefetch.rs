@@ -1,0 +1,452 @@
+// SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-License-Identifier: MIT
+//! Warming a revision's tree into the local store, walked from the root or loaded block by block,
+//! and the access recordings that name what to warm.
+
+use std::mem::offset_of;
+use std::num::NonZeroU32;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use lore_base::lore_spawn;
+use lore_base::types::Address;
+use lore_base::types::Hash;
+use lore_base::types::TypedBytes;
+use lore_error_set::prelude::*;
+use lore_storage::ReadOptions;
+use lore_transport::StorageSession;
+use tokio::task::JoinSet;
+use zerocopy::FromBytes;
+
+use crate::immutable;
+use crate::immutable::CacheGets;
+use crate::lore_debug;
+use crate::lore_warn;
+use crate::node::NodeBlockData;
+use crate::node::NodeBlockFormat;
+use crate::repository::RepositoryContext;
+use crate::state::State;
+use crate::state::StateError;
+use crate::util::path::RelativePath;
+
+/// The environment variable that selects [`TreePrefetch`] for a [`plan`] given none.
+const TREE_PREFETCH_ENV: &str = "LORE_TREE_PREFETCH_DEPTH";
+
+/// How much of a revision's tree a warm-up loads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TreePrefetch {
+    /// Nothing.
+    Off,
+    /// The view-filtered tree down to this many levels below the root: every block a listing of a
+    /// directory above that depth reads.
+    Levels(NonZeroU32),
+    /// The whole view-filtered tree, walked.
+    View,
+    /// Every node block, with its name table and file-metadata block, taken from the block address
+    /// lists: no walk and no view. The default, as no block waits for the one before it on a
+    /// sibling chain, as a walk's blocks do.
+    #[default]
+    Blocks,
+}
+
+impl TreePrefetch {
+    /// `value` as `LORE_TREE_PREFETCH_DEPTH` spells it: a level count (`0` for none), `all` for
+    /// [`Self::View`] or `blocks` for [`Self::Blocks`]. `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("all") {
+            return Some(TreePrefetch::View);
+        }
+        if value.eq_ignore_ascii_case("blocks") {
+            return Some(TreePrefetch::Blocks);
+        }
+        Some(NonZeroU32::new(value.parse().ok()?).map_or(TreePrefetch::Off, TreePrefetch::Levels))
+    }
+}
+
+/// One path of an access recording.
+#[derive(Clone)]
+pub struct RecordedPath {
+    pub path: RelativePath,
+    /// Recorded with a trailing `/`: its listing is warmed rather than its content.
+    pub directory: bool,
+}
+
+/// The paths of an access recording in first-access order, each once, and the node block indices
+/// any line names after a tab, separated by spaces, in first-need order, each once. A line holds
+/// its path up to the tab or the line end, spelled as it is; the root is `/` and a directory ends
+/// with `/`. Paths are compared as parsed, so `a//b` repeats `a/b`. A line that is not UTF-8 is
+/// skipped whole; a path not within the tree or naming the root as a file, and an index that does
+/// not parse, are skipped alone.
+#[lore_macro::test_pub]
+fn parse_recording(recording: &[u8]) -> (Vec<RecordedPath>, Vec<usize>) {
+    let mut paths = Vec::new();
+    let mut blocks = Vec::new();
+    for line in recording.split(|&byte| byte == b'\n') {
+        let Ok(line) = std::str::from_utf8(line.strip_suffix(b"\r").unwrap_or(line)) else {
+            continue;
+        };
+        let (path, hints) = line.split_once('\t').unwrap_or((line, ""));
+        blocks.extend(
+            hints
+                .split(' ')
+                .filter_map(|hint| hint.parse::<usize>().ok()),
+        );
+        let directory = path.ends_with('/');
+        if let Ok(path) = RelativePath::new_from_initial_path(path)
+            && (directory || !path.is_empty())
+        {
+            paths.push(RecordedPath { path, directory });
+        }
+    }
+    let first = {
+        let keys: Vec<(&str, bool)> = paths
+            .iter()
+            .map(|recorded| (recorded.path.as_str(), recorded.directory))
+            .collect();
+        first_occurrences(&keys)
+    };
+    let mut first = first.into_iter();
+    paths.retain(|_| first.next().unwrap_or(false));
+    let mut first = first_occurrences(&blocks).into_iter();
+    blocks.retain(|_| first.next().unwrap_or(false));
+    (paths, blocks)
+}
+
+/// Whether each item is the first of its value, found by sorting rather than hashing.
+fn first_occurrences<T: Ord>(items: &[T]) -> Vec<bool> {
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_unstable_by(|&a, &b| items[a].cmp(&items[b]).then(a.cmp(&b)));
+    let mut first = vec![true; items.len()];
+    for pair in order.windows(2) {
+        if items[pair[0]] == items[pair[1]] {
+            first[pair[1]] = false;
+        }
+    }
+    first
+}
+
+/// An access recording, as read from its file.
+pub struct Recording {
+    /// The file it was read from.
+    pub source: PathBuf,
+    pub paths: Vec<RecordedPath>,
+    /// Node block indices the recording names, in first-need order.
+    pub blocks: Vec<usize>,
+}
+
+/// What a warm-up loads: the tree, and a recording's paths and blocks.
+pub struct PrefetchPlan {
+    pub tree: TreePrefetch,
+    pub recording: Option<Recording>,
+}
+
+impl PrefetchPlan {
+    /// Whether the plan has no tree warm-up and no recording.
+    pub fn is_empty(&self) -> bool {
+        self.tree == TreePrefetch::Off && self.recording.is_none()
+    }
+}
+
+/// The plan of `tree`, else the environment's setting, and the recording at `recording`, read now
+/// so that a file that cannot be read is reported to the command.
+pub async fn plan(tree: Option<TreePrefetch>, recording: Option<&str>) -> PrefetchPlan {
+    let recording = match recording {
+        Some(source) => read_recording(source).await,
+        None => None,
+    };
+    PrefetchPlan {
+        tree: tree.unwrap_or_else(tree_prefetch_from_env),
+        recording,
+    }
+}
+
+/// The setting [`TREE_PREFETCH_ENV`] names in this process's environment; the default
+/// ([`TreePrefetch::Blocks`]) where it is unset or names none.
+fn tree_prefetch_from_env() -> TreePrefetch {
+    let Ok(value) = std::env::var(TREE_PREFETCH_ENV) else {
+        return TreePrefetch::default();
+    };
+    TreePrefetch::parse(&value).unwrap_or_else(|| {
+        lore_warn!(
+            "{TREE_PREFETCH_ENV}={value} is not a level count, `all` or `blocks`; the tree \
+             prefetch uses its default"
+        );
+        TreePrefetch::default()
+    })
+}
+
+/// Largest prefetch file [`plan`] reads. A recording holds a line per first access, so a build that
+/// opens a few hundred thousand files records tens of MiB, past `lore_io::WHOLE_FILE_LIMIT`.
+#[lore_macro::test_pub]
+const PREFETCH_FILE_LIMIT: usize = 128 << 20;
+
+/// The recording at `source`, taken in one positional read of the whole file, as the parse needs
+/// every byte at once; `None`, logged, where the file cannot be read or exceeds
+/// [`PREFETCH_FILE_LIMIT`].
+async fn read_recording(source: &str) -> Option<Recording> {
+    let read = async {
+        let file = lore_io::IoDriver::global()
+            .open(source, &lore_io::OpenOptions::new().read(true))
+            .await?;
+        let len = file.metadata().await?.len();
+        match usize::try_from(len) {
+            Ok(len) if len <= PREFETCH_FILE_LIMIT => file.read_exact_at(len, 0).await,
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{len} bytes exceeds the {PREFETCH_FILE_LIMIT} byte prefetch file limit"),
+            )),
+        }
+    };
+    let bytes = match read.await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            lore_warn!(
+                "Prefetch file {source} was not read, nothing is prefetched from it: {error}"
+            );
+            return None;
+        }
+    };
+    let (paths, blocks) = parse_recording(&bytes);
+    Some(Recording {
+        source: PathBuf::from(source),
+        paths,
+        blocks,
+    })
+}
+
+/// Answers whether a warm-up is to start no more work.
+pub type StopWhen = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Node blocks a block warm-up has in flight, each fetched with its name table after it and its
+/// file-metadata block beside it.
+const BLOCKS_IN_FLIGHT: usize = 512;
+
+/// What a block warm-up asked for of each kind, the content bytes of the node blocks it read, the
+/// payload bytes it fetched of the other kinds, and its fetches that failed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WarmedBlocks {
+    pub blocks: u64,
+    pub block_bytes: u64,
+    pub name_tables: u64,
+    pub name_table_bytes: u64,
+    pub file_metadata: u64,
+    pub file_metadata_bytes: u64,
+    pub failures: u64,
+}
+
+impl std::ops::AddAssign for WarmedBlocks {
+    fn add_assign(&mut self, other: Self) {
+        self.blocks += other.blocks;
+        self.block_bytes += other.block_bytes;
+        self.name_tables += other.name_tables;
+        self.name_table_bytes += other.name_table_bytes;
+        self.file_metadata += other.file_metadata;
+        self.file_metadata_bytes += other.file_metadata_bytes;
+        self.failures += other.failures;
+    }
+}
+
+/// Fetches node blocks of `state`'s tree into the local store with their name tables and
+/// file-metadata blocks, taking the addresses from the block address lists: nothing is walked and
+/// no view applies. `blocks` names the block indices in the order to fetch them, skipping any the
+/// lists do not hold; `None` fetches every block. Every block fetch goes through one session,
+/// [`BLOCKS_IN_FLIGHT`] blocks at a time ([`warm_block`]), at normal priority, and is checked on
+/// receipt as a read's is; one that fails is counted, and the warm-up goes on. It reads nothing
+/// where `stop` answers true at the start, starts no block once it does, and logs what it warmed
+/// in one line.
+pub async fn warm_blocks(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    blocks: Option<&[usize]>,
+    stop: StopWhen,
+) -> Result<WarmedBlocks, StateError> {
+    if stop() {
+        return Ok(WarmedBlocks::default());
+    }
+    let start = Instant::now();
+    let (nodes, file_metadata) = state.block_address_lists(repository.clone()).await?;
+    let (session, permits) = immutable::cache_session(&repository)
+        .await
+        .forward::<StateError>("Connecting for a block warm-up")?;
+    let nodes = nodes.as_type_slice::<Hash>();
+    let file_metadata = file_metadata.as_type_slice::<Hash>();
+    let fetch = WarmFetch {
+        options: immutable::read_options_from_repository(&repository).with_cache(),
+        repository,
+        session,
+        permits,
+    };
+    let warmed = match blocks {
+        Some(blocks) => {
+            warm_block_indices(&fetch, nodes, file_metadata, blocks.iter().copied(), &stop).await
+        }
+        None => warm_block_indices(&fetch, nodes, file_metadata, 0..nodes.len(), &stop).await,
+    }?;
+    lore_debug!(
+        "Warmed {} node blocks, {} name tables and {} file-metadata blocks, {} failed, in {:.3}s",
+        warmed.blocks,
+        warmed.name_tables,
+        warmed.file_metadata,
+        warmed.failures,
+        start.elapsed().as_secs_f64()
+    );
+    Ok(warmed)
+}
+
+/// What every block fetch of a block warm-up goes through: one session, the connection's cache get
+/// permits, and the options a node block is read with.
+#[derive(Clone)]
+struct WarmFetch {
+    repository: Arc<RepositoryContext>,
+    session: Arc<StorageSession>,
+    permits: CacheGets,
+    options: ReadOptions,
+}
+
+impl WarmFetch {
+    /// Fetches the fragment at `address` the local store lacks, as [`immutable::cache`] does.
+    fn cache(
+        &self,
+        address: Address,
+        cache_fragmented: bool,
+    ) -> impl Future<Output = immutable::Cached> {
+        immutable::cache_through(
+            self.repository.clone(),
+            self.session.clone(),
+            self.permits.clone(),
+            vec![address],
+            cache_fragmented,
+        )
+    }
+}
+
+async fn warm_block_indices(
+    fetch: &WarmFetch,
+    nodes: &[Hash],
+    file_metadata: &[Hash],
+    indices: impl Iterator<Item = usize>,
+    stop: &StopWhen,
+) -> Result<WarmedBlocks, StateError> {
+    let address = |hashes: &[Hash], index: usize| {
+        hashes
+            .get(index)
+            .filter(|hash| !hash.is_zero())
+            .map(|hash| Address::zero_context_hash(*hash))
+    };
+    let mut warmed = WarmedBlocks::default();
+    let mut blocks: JoinSet<WarmedBlocks> = JoinSet::new();
+    for index in indices {
+        let Some(block) = address(nodes, index) else {
+            continue;
+        };
+        while blocks.len() >= BLOCKS_IN_FLIGHT
+            && let Some(done) = blocks.join_next().await
+        {
+            warmed += done.internal("Block warm-up task failed")?;
+        }
+        if stop() {
+            break;
+        }
+        lore_spawn!(
+            blocks,
+            warm_block(fetch.clone(), block, address(file_metadata, index))
+        );
+    }
+    while let Some(done) = blocks.join_next().await {
+        warmed += done.internal("Block warm-up task failed")?;
+    }
+    Ok(warmed)
+}
+
+/// Fetches the node block at `block` and then the name table it names, beside the file-metadata
+/// block at `metadata`, counting what fails. The node block is read whole
+/// ([`lore_storage::read::load_fragment`]) from the local store, or where the store lacks it, under
+/// one of the cache get permits, by a read that looks locally again and then fetches and stores it;
+/// a failure to store is not counted, as a read's is not. Its content names the name table, so it
+/// is expanded once and released before the name table is fetched. A node block that fails leaves
+/// its name table unfetched.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn warm_block(
+    fetch: WarmFetch,
+    block: Address,
+    metadata: Option<Address>,
+) -> impl Future<Output = WarmedBlocks> {
+    async move {
+        let node_block = async {
+            let load = |session: Option<Arc<StorageSession>>| {
+                lore_storage::read::load_fragment(
+                    fetch.repository.immutable_store(),
+                    fetch.repository.id,
+                    block,
+                    fetch.options,
+                    session,
+                )
+            };
+            let loaded = if let Ok(local) = load(None).await {
+                Ok(local)
+            } else {
+                let _permit = match &fetch.permits {
+                    Some(permits) => permits.acquire().await.ok(),
+                    None => None,
+                };
+                load(Some(fetch.session.clone())).await
+            };
+            let (block_bytes, name_table) = {
+                let Ok((_, content)) = loaded else {
+                    return WarmedBlocks {
+                        blocks: 1,
+                        failures: 1,
+                        ..WarmedBlocks::default()
+                    };
+                };
+                (content.len() as u64, name_table_of(&content))
+            };
+            let mut warmed = WarmedBlocks {
+                blocks: 1,
+                block_bytes,
+                ..WarmedBlocks::default()
+            };
+            if let Some(address) = name_table {
+                let cached = fetch.cache(address, true).await;
+                warmed.name_tables = 1;
+                warmed.name_table_bytes = cached.bytes;
+                warmed.failures = u64::from(cached.failure.is_some());
+            }
+            warmed
+        };
+        let metadata_block = async {
+            let Some(address) = metadata else {
+                return WarmedBlocks::default();
+            };
+            let cached = fetch.cache(address, false).await;
+            WarmedBlocks {
+                file_metadata: 1,
+                file_metadata_bytes: cached.bytes,
+                failures: u64::from(cached.failure.is_some()),
+                ..WarmedBlocks::default()
+            }
+        };
+        let (mut warmed, metadata_warmed) = tokio::join!(node_block, metadata_block);
+        warmed += metadata_warmed;
+        warmed
+    }
+}
+
+/// The name table the node block `content` names: `None` for a block with none, or in a format
+/// other than [`NodeBlockData`], whose name table a listing loads on demand.
+#[lore_macro::test_pub]
+fn name_table_of(content: &[u8]) -> Option<Address> {
+    if content.len() != size_of::<NodeBlockData>() {
+        return None;
+    }
+    let (version, _) =
+        u32::read_from_prefix(&content[offset_of!(NodeBlockData, version)..]).ok()?;
+    let (name_table, _) =
+        Hash::read_from_prefix(&content[offset_of!(NodeBlockData, name_table)..]).ok()?;
+    (version <= NodeBlockFormat::Nametable as u32 && !name_table.is_zero())
+        .then(|| Address::zero_context_hash(name_table))
+}
