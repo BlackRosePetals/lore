@@ -633,12 +633,34 @@ pub(crate) fn temporary_path(path: &Path) -> PathBuf {
     PathBuf::from(temporary)
 }
 
-/// Mark `buckets` dirty again after a fan-out commit that failed once their `.new` files were
-/// written, so that the next flush writes them again rather than leaving their entries only in
-/// those files.
-pub(crate) fn mark_uncommitted_dirty(dirty: &[AtomicBool], buckets: &[usize]) {
-    for &bucket in buckets {
-        dirty[bucket].store(true, Ordering::Relaxed);
+/// The buckets a fan-out commit has written `.new` files for, whose dirty marks writing them
+/// claimed. Dropped before [`Self::complete`], it marks them dirty again, so that their entries are
+/// written again rather than left only in those files.
+pub(crate) struct UnfinishedCommit<'a> {
+    dirty: &'a [AtomicBool; FAN_OUT_LEVEL_MAX],
+    pub(crate) wrote_new: Vec<usize>,
+}
+
+impl<'a> UnfinishedCommit<'a> {
+    /// A commit that has written no `.new` file yet, in the group whose dirty marks `dirty` holds.
+    pub(crate) fn new(dirty: &'a [AtomicBool; FAN_OUT_LEVEL_MAX]) -> Self {
+        Self {
+            dirty,
+            wrote_new: Vec::new(),
+        }
+    }
+
+    /// Record the commit as complete, so that dropping it marks no bucket dirty.
+    pub(crate) fn complete(&mut self) {
+        self.wrote_new.clear();
+    }
+}
+
+impl Drop for UnfinishedCommit<'_> {
+    fn drop(&mut self) {
+        for &bucket in &self.wrote_new {
+            self.dirty[bucket].store(true, Ordering::Relaxed);
+        }
     }
 }
 

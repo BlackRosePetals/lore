@@ -368,9 +368,11 @@ pub struct ImmutableStoreGroup {
     /// two-phase commit (`level.pending` deleted), so a mismatch with `bucket_count` indicates a
     /// pending level transition that needs the two-phase commit on the next flush.
     pub committed_level: std::sync::atomic::AtomicUsize,
-    /// The level a fan-out commit named in the `level.pending` it wrote before a later step of it
-    /// failed, or `0`. Recovery takes that commit as made, and the bucket files on disk are partly
-    /// at its layout, so no bucket is written until the next flush rolls it forward.
+    /// The level a fan-out commit names in the `level.pending` it wrote, until the commit
+    /// completes, or `0`. The commit holds the flush lock throughout, so under it this is non-zero
+    /// only after a commit that failed or was dropped past that point. Recovery takes that commit
+    /// as made, and the bucket files on disk are partly at its layout, so no bucket is written until
+    /// the next flush rolls it forward.
     pub pending_level: std::sync::atomic::AtomicUsize,
     /// Forces the bucket-file writes for this group to be serial.
     ///
@@ -1359,9 +1361,9 @@ impl ImmutableStoreGroup {
 
     /// Whether the group's buckets can only be written by a flush of the whole group. It fanned
     /// out to a layout no commit recorded on disk, and writing a bucket as it is in memory would
-    /// mix two layouts, or a commit failed after writing its `level.pending`, and completing it
-    /// renames the commit's `.new` files over any bucket file written meanwhile. Read under the
-    /// flush lock, which every change to the levels holds.
+    /// mix two layouts, or a commit failed or was dropped after writing its `level.pending`, and
+    /// completing it renames the commit's `.new` files over any bucket file written meanwhile. Read
+    /// under the flush lock, which every change to the levels holds.
     fn fan_out_uncommitted(&self) -> bool {
         let committed = self.committed_level.load(atomic::Ordering::Relaxed);
         self.pending_level.load(atomic::Ordering::Relaxed) != 0
@@ -5632,7 +5634,7 @@ pub(crate) async fn flush_locked_group(
             first_err = Some(e);
         }
 
-        let mut wrote_new: Vec<usize> = Vec::new();
+        let mut commit = crate::local::fan_out::UnfinishedCommit::new(&group.dirty);
         if first_err.is_none() {
             for bucket_index in 0..active_buckets {
                 // Fast path: skip the bucket entirely (no lock acquire) when it's neither dirty nor an old-level slot we need to overwrite. The dirty flag is the cheap proxy for "this bucket has data to flush"; combined with the index < committed_level check (which forces an empty .new to overwrite stale level-N files), this avoids 256× read-lock acquires per group on the common server-fresh-store first flush where most buckets are empty and committed_level == 0.
@@ -5656,7 +5658,7 @@ pub(crate) async fn flush_locked_group(
                 )
                 .await;
                 match res {
-                    Ok(()) => wrote_new.push(bucket_index),
+                    Ok(()) => commit.wrote_new.push(bucket_index),
                     Err(err) => {
                         if first_err.is_none() {
                             first_err = Some(err);
@@ -5666,7 +5668,7 @@ pub(crate) async fn flush_locked_group(
             }
         }
 
-        if wrote_new.is_empty() {
+        if commit.wrote_new.is_empty() {
             // No .new files written for this group — skip the level.pending sentinel entirely. The sentinel exists to drive roll-forward recovery of a partially-completed transition; with no .new files there is no in-progress state to recover, so a direct marker write is sufficient. Restores ~3x throughput on fresh-store-first-flush-with-sync_data when most groups are empty (the common shape on `lore repository create`).
             if first_err.is_none()
                 && let Err(err) = crate::local::fan_out::write_level_marker(
@@ -5694,7 +5696,7 @@ pub(crate) async fn flush_locked_group(
             if first_err.is_none()
                 && let Err(err) = Box::pin(crate::local::fan_out::remove_stale_new_files(
                     &group_path,
-                    &wrote_new,
+                    &commit.wrote_new,
                 ))
                 .await
                 .map_err(|e| {
@@ -5706,7 +5708,6 @@ pub(crate) async fn flush_locked_group(
             {
                 first_err = Some(err);
             }
-            let mut pending_written = false;
             if first_err.is_none() {
                 match crate::local::fan_out::write_level_pending(
                     &group_path,
@@ -5715,7 +5716,9 @@ pub(crate) async fn flush_locked_group(
                 )
                 .await
                 {
-                    Ok(()) => pending_written = true,
+                    Ok(()) => group
+                        .pending_level
+                        .store(active_buckets, atomic::Ordering::Relaxed),
                     Err(e) => {
                         first_err = Some(LocalImmutableStoreError::internal_with_context(
                             e,
@@ -5726,7 +5729,7 @@ pub(crate) async fn flush_locked_group(
             }
 
             if first_err.is_none() {
-                for &bucket_index in &wrote_new {
+                for &bucket_index in &commit.wrote_new {
                     let new_path =
                         crate::local::fan_out::bucket_new_path(&group_path, bucket_index);
                     let final_path = crate::local::fan_out::bucket_path(&group_path, bucket_index);
@@ -5777,13 +5780,8 @@ pub(crate) async fn flush_locked_group(
                 group
                     .committed_level
                     .store(active_buckets, atomic::Ordering::Relaxed);
-            } else {
-                if pending_written {
-                    group
-                        .pending_level
-                        .store(active_buckets, atomic::Ordering::Relaxed);
-                }
-                crate::local::fan_out::mark_uncommitted_dirty(&group.dirty, &wrote_new);
+                group.pending_level.store(0, atomic::Ordering::Relaxed);
+                commit.complete();
             }
         }
     } else if first_err.is_none() {

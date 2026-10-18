@@ -438,6 +438,61 @@ async fn a_fan_out_commit_removes_new_files_it_did_not_write() {
     );
 }
 
+/// A flush dropped part way through a fan-out commit, as a caller giving up on it drops it, leaves
+/// the commit to the next flush. The bucket whose `.new` file it wrote has had its mark claimed:
+/// left reading clean, it would get no file at the new level from the next commit, which writes
+/// only dirty buckets and those below the old level, and a reopen would not find its entries. The
+/// flush here is the group's first, dropped writing its second `.new` file.
+#[tokio::test]
+async fn a_fan_out_commit_dropped_part_way_is_left_to_the_next_flush() {
+    let dir = lore_base::test_util::TempDir::new("is_dropped_commit_");
+    let settings = || ImmutableStoreSettings {
+        fan_out_threshold: 4,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    let partition = Partition::from([5u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(12);
+    let mut stored = vec![];
+    {
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+            .await
+            .expect("store opens");
+        let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+        for payload in &payloads {
+            let address = put_payload(&store, partition, Context::default(), payload, false).await;
+            stored.push((address, payload.clone()));
+        }
+
+        let first = pause_at(PausePoint::Serializing);
+        let flushing = dyn_store.clone();
+        let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+        first.reached.notified().await;
+        let second = pause_at(PausePoint::Serializing);
+        first.resume.notify_one();
+        second.reached.notified().await;
+        flush.abort();
+        assert!(flush.await.is_err(), "the flush was dropped");
+
+        dyn_store
+            .clone()
+            .flush(false)
+            .await
+            .expect("the next flush");
+        let group = &store.group[group_index];
+        assert_eq!(group.pending_level.load(atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            group.committed_level.load(atomic::Ordering::Relaxed),
+            group.bucket_count.load(atomic::Ordering::Relaxed)
+        );
+    }
+
+    let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+        .await
+        .expect("store reopens");
+    assert_payloads_read_back(&store, partition, stored).await;
+}
+
 /// Run the background timer's flush for every group, and nothing else.
 async fn run_delayed_flush(store: &Arc<LocalImmutableStore>) {
     let weak = Arc::downgrade(store);

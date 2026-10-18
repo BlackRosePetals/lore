@@ -54,7 +54,7 @@ pub enum PausePoint {
     Selected,
     /// Compaction has stopped writes to the packfiles it rewrites and not yet rewritten one.
     Stopped,
-    /// A bucket write has copied the bucket and not yet written its file.
+    /// A bucket write has taken the bucket's contents and not yet written its file.
     Serializing,
     /// A sync of every packfile of a packstore has begun and synced none yet.
     Syncing,

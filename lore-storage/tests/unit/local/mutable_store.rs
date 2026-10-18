@@ -383,6 +383,104 @@ async fn a_commit_failing_after_its_pending_marker_is_rolled_forward_before_any_
     );
 }
 
+/// A key in group `07` that is in bucket `bucket` once the group is at 32 buckets.
+fn spread_key(bucket: u8) -> Hash {
+    let mut key = Hash::default();
+    key.data_mut()[0] = 7;
+    key.data_mut()[1] = bucket << 3;
+    key
+}
+
+/// Store a value in each of group `07`'s first six buckets at 32 buckets, which a fan-out
+/// threshold of 2 fans the group out to at its next flush.
+async fn store_spread_keys(store: &Arc<dyn lore_storage::mutable_store::MutableStore>) {
+    for bucket in 0..6u8 {
+        store
+            .clone()
+            .store(
+                Partition::default(),
+                spread_key(bucket),
+                Hash::from_u64(u64::from(bucket) + 1),
+                KeyType::BranchMetadata,
+            )
+            .await
+            .expect("store succeeds");
+    }
+}
+
+/// A flush dropped part way through a fan-out commit, as a caller giving up on it drops it, leaves
+/// the commit to the next flush. The bucket whose `.new` file it wrote has had its mark claimed:
+/// left reading clean, it would get no file at the new level from the next commit, which writes
+/// only dirty buckets and those below the old level, and a reopen would not find its entries. The
+/// flush here is the group's first, dropped writing its second `.new` file.
+#[tokio::test]
+async fn a_fan_out_commit_dropped_part_way_is_left_to_the_next_flush() {
+    use lore_storage::mutable_store::MutableStore;
+    use lore_storage::test_util::PausePoint;
+    let dir = lore_base::test_util::TempDir::new("ms_dropped_commit_");
+    let settings = || MutableStoreSettings {
+        fan_out_threshold: 2,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    {
+        let local = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.path()),
+                settings(),
+                make_in_memory_immutable().await,
+            )
+            .await
+            .expect("store opens"),
+        );
+        let store: Arc<dyn MutableStore> = local.clone();
+        store_spread_keys(&store).await;
+
+        let first = lore_storage::test_util::pause_at(PausePoint::Serializing);
+        let flushing = store.clone();
+        let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+        first.reached.notified().await;
+        let second = lore_storage::test_util::pause_at(PausePoint::Serializing);
+        first.resume.notify_one();
+        second.reached.notified().await;
+        flush.abort();
+        assert!(flush.await.is_err(), "the flush was dropped");
+
+        store.clone().flush(false).await.expect("the next flush");
+        let group = &local.group[7];
+        assert_eq!(group.pending_level.load(atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            group.committed_level.load(atomic::Ordering::Relaxed),
+            group.bucket_count.load(atomic::Ordering::Relaxed)
+        );
+    }
+
+    let reopened: Arc<dyn MutableStore> = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store reopens"),
+    );
+    for bucket in 0..6u8 {
+        assert_eq!(
+            reopened
+                .clone()
+                .load(
+                    Partition::default(),
+                    spread_key(bucket),
+                    KeyType::BranchMetadata
+                )
+                .await
+                .expect("load"),
+            Hash::from_u64(u64::from(bucket) + 1),
+            "value in bucket {bucket} after reopening"
+        );
+    }
+}
+
 /// A fan-out commit removes the `.new` files it did not write before it writes `level.pending`,
 /// so that recovery, which renames every `.new` file it finds, cannot give a bucket the commit
 /// left empty an older commit's file.
