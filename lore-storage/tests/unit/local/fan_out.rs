@@ -169,6 +169,7 @@ async fn commit_if_initial_level_records_the_level_below_the_maximum() {
         commit_if_initial_level(
             &held_flush_guard().await,
             &committed,
+            &AtomicUsize::new(0),
             &bucket_count,
             dir.path(),
             0x2a,
@@ -192,6 +193,7 @@ async fn commit_if_initial_level_creates_the_group_directory() {
     commit_if_initial_level(
         &held_flush_guard().await,
         &committed,
+        &AtomicUsize::new(0),
         &bucket_count,
         dir.path(),
         0x2a,
@@ -218,6 +220,7 @@ async fn commit_if_initial_level_leaves_a_committed_group_alone() {
     commit_if_initial_level(
         &held_flush_guard().await,
         &committed,
+        &AtomicUsize::new(0),
         &bucket_count,
         dir.path(),
         0x2a,
@@ -239,6 +242,7 @@ async fn commit_if_initial_level_leaves_a_group_at_the_maximum_alone() {
     commit_if_initial_level(
         &held_flush_guard().await,
         &committed,
+        &AtomicUsize::new(0),
         &bucket_count,
         dir.path(),
         0x2a,
@@ -246,6 +250,30 @@ async fn commit_if_initial_level_leaves_a_group_at_the_maximum_alone() {
     )
     .await
     .expect("commit the level");
+
+    assert_eq!(read_level_marker(&group_path).await.unwrap(), None);
+    assert_eq!(committed.load(Ordering::Relaxed), 0);
+}
+
+/// A group whose first fan-out commit is pending is left alone: rolling that commit forward
+/// records its level.
+#[tokio::test]
+async fn commit_if_initial_level_leaves_a_group_with_a_commit_pending_alone() {
+    let (dir, group_path) = temp_store_with_group(0x2a);
+    let committed = AtomicUsize::new(0);
+    let bucket_count = AtomicUsize::new(32);
+
+    commit_if_initial_level(
+        &held_flush_guard().await,
+        &committed,
+        &AtomicUsize::new(32),
+        &bucket_count,
+        dir.path(),
+        0x2a,
+        false,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(read_level_marker(&group_path).await.unwrap(), None);
     assert_eq!(committed.load(Ordering::Relaxed), 0);
@@ -263,6 +291,7 @@ async fn commit_if_initial_level_returns_a_marker_it_cannot_write() {
     let committing = commit_if_initial_level(
         &held_flush_guard().await,
         &committed,
+        &AtomicUsize::new(0),
         &bucket_count,
         dir.path(),
         0x2a,
@@ -657,6 +686,65 @@ async fn recover_level_transition_is_idempotent() {
     assert_eq!(first, Some(2));
     assert_eq!(second, None);
     assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(2));
+}
+
+/// The sweep a fan-out commit runs before its `level.pending` removes the temporary file a write
+/// killed before its rename leaves, in each form a write in the group gives one, beside the `.new`
+/// twins the commit did not write, and keeps every other file, any other name ending in `.tmp`
+/// included.
+#[tokio::test]
+async fn remove_stale_files_removes_each_form_of_temporary_file_and_nothing_else() {
+    let dir = temp_group_dir();
+    let temporary = |path: PathBuf| {
+        let mut name = path.into_os_string();
+        name.push(TEMPORARY_SUFFIX);
+        PathBuf::from(name)
+    };
+    let stale = [
+        temporary(bucket_path(dir.path(), 0x1f)),
+        temporary(bucket_new_path(dir.path(), 0x1f)),
+        temporary(dir.path().join(MARKER_FILENAME)),
+        temporary(dir.path().join(LEVEL_PENDING_FILENAME)),
+        bucket_new_path(dir.path(), 0x20),
+    ];
+    let kept = [
+        bucket_path(dir.path(), 0x1f),
+        bucket_new_path(dir.path(), 0x1f),
+        dir.path().join(MARKER_FILENAME),
+        dir.path().join("index_1g.tmp"),
+        dir.path().join("index_100.tmp"),
+        dir.path().join("notes.tmp"),
+    ];
+    for path in stale.iter().chain(&kept) {
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    remove_stale_files(dir.path(), &[0x1f]).await.unwrap();
+
+    for path in &stale {
+        assert!(!path.exists(), "{} was left", path.display());
+    }
+    for path in &kept {
+        assert!(path.exists(), "{} was removed", path.display());
+    }
+}
+
+/// A temporary file the sweep cannot remove, here a directory by that name, is left, and the
+/// sweep removes the rest.
+#[tokio::test]
+async fn remove_stale_files_leaves_a_temporary_file_it_cannot_remove() {
+    let dir = temp_group_dir();
+    let mut unremovable = bucket_path(dir.path(), 0x05).into_os_string();
+    unremovable.push(TEMPORARY_SUFFIX);
+    let unremovable = PathBuf::from(unremovable);
+    std::fs::create_dir_all(unremovable.join("blocker")).unwrap();
+    let stale = bucket_new_path(dir.path(), 0x06);
+    std::fs::write(&stale, b"x").unwrap();
+
+    remove_stale_files(dir.path(), &[]).await.unwrap();
+
+    assert!(unremovable.is_dir());
+    assert!(!stale.exists(), "the stale .new file was left");
 }
 
 #[test]

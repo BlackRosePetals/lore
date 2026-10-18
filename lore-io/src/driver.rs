@@ -302,25 +302,30 @@ impl IoDriver {
     /// and metadata, renames over `final_path`, and with `durable`
     /// best-effort syncs the parent directory.
     ///
-    /// On error the temporary file may be left behind; callers own its
-    /// cleanup.
+    /// A write, sync or rename that fails removes the temporary file in the
+    /// same dispatch, and its error is the one returned: a failure to remove
+    /// the file is not reported over it. `temporary_path` is the write's alone
+    /// while it runs, as another write there would be removed or renamed with it.
     ///
     /// The segments are consumed rather than handed back, and dropped as soon as the kernel has
     /// the bytes — before the sync and the rename, which touch the page cache and the directory
     /// rather than the caller's memory. A caller holding a lock to keep the segments stable
     /// therefore holds it across the gather alone. The drop happens on the thread running the
     /// operation, so anything it releases is released there.
+    ///
+    /// Takes the paths by value so a caller building them for the call hands them over rather than
+    /// having them copied.
     pub async fn write_file_segments_atomic<B: StableBufList>(
         &self,
-        temporary_path: impl AsRef<Path>,
-        final_path: impl AsRef<Path>,
+        temporary_path: impl Into<PathBuf>,
+        final_path: impl Into<PathBuf>,
         options: &OpenOptions,
         buffers: B,
         durable: bool,
     ) -> std::io::Result<()> {
         let std_options = options.to_std();
-        let temporary_path = temporary_path.as_ref().to_path_buf();
-        let final_path = final_path.as_ref().to_path_buf();
+        let temporary_path = temporary_path.into();
+        let final_path = final_path.into();
         match &*self.inner {
             DriverInner::Psync(driver) => {
                 driver

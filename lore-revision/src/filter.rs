@@ -331,9 +331,9 @@ pub fn parse_filter(bytes: &[u8], path: &Path) -> Result<FilterInstance, FilterE
 /// file asked for and nothing downstream can tell, which is the same reason
 /// [`load_filter`] refuses a file it cannot decode whole.
 ///
-/// The driver leaves the sibling behind on failure and gives its cleanup to the
-/// caller, so a failure removes it. Nothing reports it while it exists: it is
-/// named with [`TEMP_FILE_EXTENSION`], which the ignore filter excludes and the
+/// A save whose write, sync or rename fails removes the sibling, and one stopped
+/// part way leaves it. Nothing reports it while it exists: it is named with
+/// [`TEMP_FILE_EXTENSION`], which the ignore filter excludes and the
 /// working-tree scanners skip.
 pub async fn save(filter: &FilterInstance, path: impl AsRef<Path>) -> std::io::Result<()> {
     let path = path.as_ref();
@@ -351,10 +351,9 @@ pub async fn save(filter: &FilterInstance, path: impl AsRef<Path>) -> std::io::R
         }
         out.push('\n');
     }
-    let temp_path = temp_sibling(path);
-    let saved = lore_io::IoDriver::global()
+    lore_io::IoDriver::global()
         .write_file_segments_atomic(
-            &temp_path,
+            temp_sibling(path),
             path,
             &lore_io::OpenOptions::new()
                 .write(true)
@@ -363,14 +362,7 @@ pub async fn save(filter: &FilterInstance, path: impl AsRef<Path>) -> std::io::R
             vec![out.into_bytes()],
             true,
         )
-        .await;
-
-    if saved.is_err() {
-        // The target is unchanged, so the sibling is all there is to clean up.
-        // Its own failure is not worth reporting over the one that got here.
-        let _ = lore_io::IoDriver::global().remove_file(&temp_path).await;
-    }
-    saved
+        .await
 }
 
 /// The temporary file [`save`] builds the new contents of `path` in, beside it

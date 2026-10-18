@@ -554,6 +554,204 @@ async fn a_flush_dropped_while_its_commit_writes_level_pending_runs_the_commit_t
     assert_payloads_read_back(&store, partition, stored).await;
 }
 
+/// Copy the tree at `source` to `destination`: a copy of a store directory with no write in
+/// flight is what a process killed then leaves on disk.
+fn copy_tree(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination).expect("create the copy");
+    for entry in std::fs::read_dir(source).expect("list the store") {
+        let entry = entry.expect("entry");
+        let target = destination.join(entry.file_name());
+        if entry.file_type().expect("type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy a file");
+        }
+    }
+}
+
+/// After a group's second fan-out commit fails once its `level.pending` is on disk, the next flush
+/// rolls it forward before it writes a bucket: a store killed there reads back every entry the
+/// commit held, and each bucket file of the group holds only the entries of its own bucket at the
+/// committed level, as once the flush ends and the store reopens.
+#[tokio::test]
+async fn a_second_commit_failing_after_its_pending_marker_keeps_every_entry_in_its_bucket() {
+    let dir = lore_base::test_util::TempDir::new("is_failed_fan_out_");
+    let killed = lore_base::test_util::TempDir::new("is_failed_fan_out_killed_");
+    let settings = || ImmutableStoreSettings {
+        fan_out_threshold: 4,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    let partition = Partition::from([0x4cu8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(8);
+    let mut stored = vec![];
+    {
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+            .await
+            .expect("store opens");
+        let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+        for payload in &payloads[..2] {
+            let address = put_payload(&store, partition, Context::default(), payload, false).await;
+            stored.push((address, payload.clone()));
+        }
+        dyn_store
+            .clone()
+            .flush(false)
+            .await
+            .expect("flush at level 1");
+        for payload in &payloads[2..5] {
+            let address = put_payload(&store, partition, Context::default(), payload, false).await;
+            stored.push((address, payload.clone()));
+        }
+        let level = lore_storage::local::fan_out::level_for(1, stored.len(), 4);
+        let bucket = stored
+            .iter()
+            .map(|(address, _)| {
+                lore_storage::local::fan_out::bucket_index_for(&address.hash, level)
+            })
+            .find(|&bucket| bucket != 0)
+            .expect("an entry outside bucket 0 at the fanned out level");
+        let blocked = format_bucket_path(&dir.path().join("immutable"), group_index, bucket);
+        super::fail_commit_at_rename(&blocked, || dyn_store.clone().flush(false)).await;
+
+        for payload in &payloads[5..] {
+            let address = put_payload(&store, partition, Context::default(), payload, false).await;
+            stored.push((address, payload.clone()));
+        }
+        let serializing = pause_at(PausePoint::Serializing);
+        let flushing = dyn_store.clone();
+        let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+        serializing.reached.notified().await;
+        copy_tree(dir.path(), killed.path());
+        serializing.resume.notify_one();
+        flush
+            .await
+            .expect("the flush runs")
+            .expect("the next flush");
+    }
+
+    for (store_path, entries) in [(killed.path(), &stored[..5]), (dir.path(), &stored[..])] {
+        let store = LocalImmutableStore::new(Some(store_path.to_path_buf()), settings())
+            .await
+            .expect("store reopens");
+        assert_payloads_read_back(&store, partition, entries.iter().cloned()).await;
+        let level = store.group[group_index]
+            .committed_level
+            .load(atomic::Ordering::Relaxed);
+        assert_eq!(level, 32, "the group fanned out");
+        for bucket_index in 0..BUCKET_COUNT {
+            let path = format_bucket_path(&store_path.join("immutable"), group_index, bucket_index);
+            if !path.exists() {
+                continue;
+            }
+            let file = ImmutableStoreBucket::deserialize_files(path)
+                .await
+                .expect("the bucket file reads");
+            for entry in file.entry.iter() {
+                assert_eq!(
+                    lore_storage::local::fan_out::bucket_index_for(&entry.address.hash, level),
+                    bucket_index,
+                    "an entry in the file of bucket {bucket_index}"
+                );
+            }
+        }
+    }
+}
+
+/// A delayed flush rolls a fan-out commit that failed once its `level.pending` was on disk forward
+/// before it writes a bucket, and then writes the group's buckets.
+#[tokio::test]
+async fn a_delayed_flush_rolls_a_pending_commit_forward_before_it_writes_a_bucket() {
+    let dir = lore_base::test_util::TempDir::new("is_delayed_pending_");
+    let settings = || ImmutableStoreSettings {
+        fan_out_threshold: 4,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    let partition = Partition::from([0x4du8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(5);
+    let pending = format_bucket_path(&dir.path().join("immutable"), group_index, 0)
+        .with_file_name(lore_storage::local::fan_out::LEVEL_PENDING_FILENAME);
+    let mut stored = vec![];
+    {
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+            .await
+            .expect("store opens");
+        let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+        for payload in &payloads {
+            let address = put_payload(&store, partition, Context::default(), payload, false).await;
+            stored.push((address, payload.clone()));
+        }
+        let level = lore_storage::local::fan_out::level_for(1, payloads.len(), 4);
+        let bucket = lore_storage::local::fan_out::bucket_index_for(&stored[0].0.hash, level);
+        let blocked = format_bucket_path(&dir.path().join("immutable"), group_index, bucket);
+        super::fail_commit_at_rename(&blocked, || dyn_store.clone().flush(false)).await;
+
+        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+
+        let group = &store.group[group_index];
+        assert_eq!(group.pending_level.load(atomic::Ordering::Relaxed), 0);
+        assert_eq!(group.committed_level.load(atomic::Ordering::Relaxed), level);
+        assert!(!pending.exists(), "the commit left its level.pending");
+        assert!(
+            group
+                .dirty
+                .iter()
+                .all(|dirty| !dirty.load(atomic::Ordering::Relaxed)),
+            "a bucket was left dirty"
+        );
+    }
+
+    let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+        .await
+        .expect("store reopens");
+    assert_payloads_read_back(&store, partition, stored).await;
+}
+
+/// An eviction in a group whose first fan-out commit is pending writes no level marker: rolling the
+/// commit forward records the group's level.
+#[tokio::test]
+async fn an_eviction_writes_no_level_marker_while_a_commit_is_pending() {
+    let dir = lore_base::test_util::TempDir::new("is_evict_pending_");
+    let store = LocalImmutableStore::new(
+        Some(dir.path().to_path_buf()),
+        ImmutableStoreSettings {
+            fan_out_threshold: 4,
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        },
+    )
+    .await
+    .expect("store opens");
+    let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+    let partition = Partition::from([0x4eu8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(5);
+    let mut addresses = vec![];
+    for payload in &payloads {
+        addresses.push(put_payload(&store, partition, Context::default(), payload, true).await);
+    }
+    let level = lore_storage::local::fan_out::level_for(1, payloads.len(), 4);
+    let bucket = lore_storage::local::fan_out::bucket_index_for(&addresses[0].hash, level);
+    let blocked = format_bucket_path(&dir.path().join("immutable"), group_index, bucket);
+    super::fail_commit_at_rename(&blocked, || dyn_store.clone().flush(false)).await;
+
+    let (evicted, _) = store
+        .clone()
+        .evict_group_sized(group_index, 1, store.path.clone(), true, false)
+        .await;
+
+    assert!(evicted > 0, "nothing was evicted, so no bucket write ran");
+    let marker = format_bucket_path(&dir.path().join("immutable"), group_index, 0)
+        .with_file_name(lore_storage::local::fan_out::MARKER_FILENAME);
+    assert!(!marker.exists(), "the eviction wrote the level marker");
+    assert_eq!(
+        store.group[group_index]
+            .committed_level
+            .load(atomic::Ordering::Relaxed),
+        0
+    );
+}
+
 /// A group directory that cannot be stat'ed at open, as on a transient I/O error, fails the open
 /// rather than being taken for a group never written. Taken for one, the group was laid out at the
 /// initial level, where lookups missed its bucket files, and a write then committed that level
@@ -4276,21 +4474,6 @@ mod obliteration {
             store.clone().get(live, address).await,
             Err(StoreError::AddressNotFound(_))
         ));
-    }
-
-    /// Copy the tree at `source` to `destination`: a copy of a store directory with no write in
-    /// flight is what a process killed then leaves on disk.
-    fn copy_tree(source: &Path, destination: &Path) {
-        std::fs::create_dir_all(destination).expect("create the copy");
-        for entry in std::fs::read_dir(source).expect("list the store") {
-            let entry = entry.expect("entry");
-            let target = destination.join(entry.file_name());
-            if entry.file_type().expect("type").is_dir() {
-                copy_tree(&entry.path(), &target);
-            } else {
-                std::fs::copy(entry.path(), target).expect("copy a file");
-            }
-        }
     }
 
     async fn store_over(dir: &Path) -> (Arc<LocalImmutableStore>, Arc<dyn ImmutableStore>) {

@@ -917,6 +917,37 @@ async fn write_file_segments_atomic_replaces_target() {
     }
 }
 
+/// An atomic write that fails removes its temporary file, here one whose rename meets a directory.
+#[tokio::test]
+async fn a_failed_atomic_write_leaves_no_temporary_file() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-write-atomic-failed-");
+        std::fs::create_dir_all(dir.child("data").join("blocker")).unwrap();
+
+        let written = driver
+            .write_file_segments_atomic(
+                dir.child("data.tmp"),
+                dir.child("data"),
+                &OpenOptions::new().write(true).create(true).truncate(true),
+                vec![pattern(64, 51)],
+                false,
+            )
+            .await;
+
+        assert!(
+            written.is_err(),
+            "{}: the rename succeeded",
+            driver.backend_name()
+        );
+        assert!(
+            !dir.child("data.tmp").exists(),
+            "{}: the temporary file is left behind",
+            driver.backend_name()
+        );
+        assert!(dir.child("data").join("blocker").is_dir());
+    }
+}
+
 /// The segments are released once the kernel has the bytes, so a caller holding a lock to keep
 /// them stable is not held across the sync and the rename. Observed through a guard the segment
 /// list owns: it has to be dropped by the time the call returns, and the file has to be complete.

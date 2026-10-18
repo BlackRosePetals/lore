@@ -159,7 +159,7 @@ pub struct MutableStoreGroup {
     /// or a flush rolls it forward, or `0`. The commit holds the flush lock throughout, so under it
     /// this is non-zero only after a commit that failed past that point. Recovery takes that commit
     /// as made, and the bucket files on disk are partly at its layout, so no bucket is written
-    /// until the next flush rolls it forward.
+    /// until a flush, explicit or delayed, rolls it forward.
     pub pending_level: std::sync::atomic::AtomicUsize,
     /// Makes the whole-group flushes serial: both `flush_all` and the delayed per-bucket
     /// flush hold it, so at most one flusher per group is ever in flight.
@@ -526,11 +526,9 @@ impl MutableStoreBucket {
         path: PathBuf,
         sync_data: bool,
     ) -> Result<(), LocalMutableStoreError> {
-        let temporary_path = crate::local::fan_out::temporary_path(&path);
-        let mut temporary_guard =
-            SerializeFailureGuard::new(&group.dirty[bucket_index], &temporary_path);
+        let mut failure_guard = SerializeFailureGuard::new(&group.dirty[bucket_index]);
 
-        if let Some(parent_path) = temporary_path.parent()
+        if let Some(parent_path) = path.parent()
             && !parent_path.exists()
         {
             let _ = lore_io::IoDriver::global()
@@ -565,10 +563,16 @@ impl MutableStoreBucket {
         #[cfg(feature = "test-util")]
         crate::test_util::pause_point(crate::test_util::PausePoint::Serializing).await;
         lore_io::IoDriver::global()
-            .write_file_segments_atomic(&temporary_path, &path, &file_options, segments, sync_data)
+            .write_file_segments_atomic(
+                crate::local::fan_out::temporary_path(&path),
+                path,
+                &file_options,
+                segments,
+                sync_data,
+            )
             .await
             .internal("writing mutable store bucket")?;
-        temporary_guard.success();
+        failure_guard.success();
 
         Ok(())
     }
@@ -1020,9 +1024,24 @@ impl LocalMutableStore {
                     return;
                 }
 
+                if let Err(err) = crate::local::fan_out::roll_pending_commit_forward(
+                    &group.committed_level,
+                    &group.pending_level,
+                    path,
+                    group_index,
+                    false,
+                )
+                .await
+                {
+                    lore_base::lore_warn!(
+                        "Failed to roll the fan-out commit of group {group_index} forward: {err}"
+                    );
+                    return;
+                }
                 if let Err(err) = crate::local::fan_out::commit_if_initial_level(
                     &flush_guard,
                     &group.committed_level,
+                    &group.pending_level,
                     &group.bucket_count,
                     path,
                     group_index,
@@ -1218,18 +1237,17 @@ impl LocalMutableStore {
                     } else {
                         // Full two-phase commit: pending → renames → marker → delete pending.
                         if first_err.is_none()
-                            && let Err(err) =
-                                Box::pin(crate::local::fan_out::remove_stale_new_files(
-                                    &group_path,
-                                    &commit.wrote_new,
-                                ))
-                                .await
-                                .map_err(|e| {
-                                    LocalMutableStoreError::internal_with_context(
-                                        e,
-                                        "Failed to remove stale .new bucket files",
-                                    )
-                                })
+                            && let Err(err) = Box::pin(crate::local::fan_out::remove_stale_files(
+                                &group_path,
+                                &commit.wrote_new,
+                            ))
+                            .await
+                            .map_err(|e| {
+                                LocalMutableStoreError::internal_with_context(
+                                    e,
+                                    "Failed to remove stale files from the group directory",
+                                )
+                            })
                         {
                             first_err = Some(err);
                         }

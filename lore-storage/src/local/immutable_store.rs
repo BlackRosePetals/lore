@@ -372,7 +372,7 @@ pub struct ImmutableStoreGroup {
     /// or a flush rolls it forward, or `0`. The commit holds the flush lock throughout, so under it
     /// this is non-zero only after a commit that failed past that point. Recovery takes that commit
     /// as made, and the bucket files on disk are partly at its layout, so no bucket is written
-    /// until the next flush rolls it forward.
+    /// until a flush, explicit or delayed, rolls it forward.
     pub pending_level: std::sync::atomic::AtomicUsize,
     /// Forces the bucket-file writes for this group to be serial.
     ///
@@ -825,21 +825,24 @@ impl lore_io::StableBufList for ImmutableBucketWrite {
     }
 }
 
+/// Marks a bucket dirty again when dropped before [`Self::success`], while the write still holds
+/// the bucket's serialize lock, so that a bucket write that failed, or was dropped part way, leaves
+/// the bucket to the next flush.
 pub struct SerializeFailureGuard<'a> {
     success: bool,
     dirty: &'a AtomicBool,
-    path: &'a Path,
 }
 
 impl<'a> SerializeFailureGuard<'a> {
-    pub fn new(dirty: &'a AtomicBool, path: &'a Path) -> Self {
+    /// A guard over `dirty`, the dirty mark of the bucket being written.
+    pub fn new(dirty: &'a AtomicBool) -> Self {
         Self {
             success: false,
             dirty,
-            path,
         }
     }
 
+    /// Records the write as complete, so that dropping the guard leaves the mark alone.
     pub fn success(&mut self) {
         self.success = true;
     }
@@ -848,17 +851,7 @@ impl<'a> SerializeFailureGuard<'a> {
 impl<'a> Drop for SerializeFailureGuard<'a> {
     fn drop(&mut self) {
         if !self.success {
-            // Important to reset flag while lock is still held
             self.dirty.store(true, atomic::Ordering::Relaxed);
-
-            if let Err(err) = std::fs::remove_file(self.path)
-                && err.kind() != std::io::ErrorKind::NotFound
-            {
-                lore_base::lore_warn!(
-                    "Failed to remove temporary file {}: {err:?}",
-                    self.path.display()
-                );
-            }
         }
     }
 }
@@ -1112,9 +1105,7 @@ impl ImmutableStoreBucket {
         path: PathBuf,
         sync_data: bool,
     ) -> Result<(), LocalImmutableStoreError> {
-        let temporary_path = crate::local::fan_out::temporary_path(&path);
-        let mut temporary_guard =
-            SerializeFailureGuard::new(&group.dirty[bucket_index], &temporary_path);
+        let mut failure_guard = SerializeFailureGuard::new(&group.dirty[bucket_index]);
 
         let count = bucket.entry.len();
         if bucket.sorted_index.len() != count {
@@ -1148,7 +1139,7 @@ impl ImmutableStoreBucket {
             contents.finish(header, &[]);
         }
 
-        if let Some(parent_path) = temporary_path.parent()
+        if let Some(parent_path) = path.parent()
             && !parent_path.exists()
         {
             let _ = lore_io::IoDriver::global()
@@ -1161,10 +1152,16 @@ impl ImmutableStoreBucket {
             .create(true)
             .truncate(true);
         lore_io::IoDriver::global()
-            .write_file_segments_atomic(&temporary_path, &path, &file_options, contents, sync_data)
+            .write_file_segments_atomic(
+                crate::local::fan_out::temporary_path(&path),
+                path,
+                &file_options,
+                contents,
+                sync_data,
+            )
             .await
             .internal("Failed to serialize storage bucket")?;
-        temporary_guard.success();
+        failure_guard.success();
 
         Ok(())
     }
@@ -1399,9 +1396,24 @@ impl ImmutableStoreGroup {
                     continue;
                 }
 
+                if let Err(err) = crate::local::fan_out::roll_pending_commit_forward(
+                    &group.committed_level,
+                    &group.pending_level,
+                    path,
+                    group_index,
+                    false,
+                )
+                .await
+                {
+                    lore_base::lore_warn!(
+                        "Failed to roll the fan-out commit of group {group_index} forward: {err}"
+                    );
+                    return;
+                }
                 if let Err(err) = crate::local::fan_out::commit_if_initial_level(
                     &flush_guard,
                     &group.committed_level,
+                    &group.pending_level,
                     &group.bucket_count,
                     path,
                     group_index,
@@ -2754,6 +2766,7 @@ impl LocalImmutableStore {
             crate::local::fan_out::commit_if_initial_level(
                 &flush_guard,
                 &group.committed_level,
+                &group.pending_level,
                 &group.bucket_count,
                 path.as_ref(),
                 group_index,
@@ -2958,6 +2971,7 @@ impl LocalImmutableStore {
                     if let Err(err) = crate::local::fan_out::commit_if_initial_level(
                         &flush_guard,
                         &group.committed_level,
+                        &group.pending_level,
                         &group.bucket_count,
                         path.as_ref(),
                         group_index,
@@ -3920,6 +3934,7 @@ impl LocalImmutableStore {
             crate::local::fan_out::commit_if_initial_level(
                 &flush_guard,
                 &group.committed_level,
+                &group.pending_level,
                 &group.bucket_count,
                 path.as_ref(),
                 group_index,
@@ -5717,7 +5732,7 @@ pub(crate) async fn flush_locked_group(
         } else {
             // Full two-phase commit: pending → renames → marker → delete pending.
             if first_err.is_none()
-                && let Err(err) = Box::pin(crate::local::fan_out::remove_stale_new_files(
+                && let Err(err) = Box::pin(crate::local::fan_out::remove_stale_files(
                     &group_path,
                     &commit.wrote_new,
                 ))
@@ -5725,7 +5740,7 @@ pub(crate) async fn flush_locked_group(
                 .map_err(|e| {
                     LocalImmutableStoreError::internal_with_context(
                         e,
-                        "Failed to remove stale .new bucket files",
+                        "Failed to remove stale files from the group directory",
                     )
                 })
             {

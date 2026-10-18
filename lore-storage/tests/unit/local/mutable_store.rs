@@ -391,10 +391,14 @@ fn spread_key(bucket: u8) -> Hash {
     key
 }
 
-/// Store a value in each of group `07`'s first six buckets at 32 buckets, which a fan-out
-/// threshold of 2 fans the group out to at its next flush.
-async fn store_spread_keys(store: &Arc<dyn lore_storage::mutable_store::MutableStore>) {
-    for bucket in 0..6u8 {
+/// Store a value in each of group `07`'s `buckets` at 32 buckets, `bucket + 1` in `bucket`. Six of
+/// them in one bucket at level 1 fan the group out to 32 at its next flush, at a fan-out threshold
+/// of 2.
+async fn store_spread_keys(
+    store: &Arc<dyn lore_storage::mutable_store::MutableStore>,
+    buckets: std::ops::Range<u8>,
+) {
+    for bucket in buckets {
         store
             .clone()
             .store(
@@ -433,7 +437,7 @@ async fn a_flush_dropped_while_its_commit_writes_new_files_runs_the_commit_to_it
             .expect("store opens"),
         );
         let store: Arc<dyn MutableStore> = local.clone();
-        store_spread_keys(&store).await;
+        store_spread_keys(&store, 0..6).await;
 
         let first = lore_storage::test_util::pause_at(PausePoint::Serializing);
         let flushing = store.clone();
@@ -507,7 +511,7 @@ async fn a_group_directory_that_cannot_be_read_fails_the_open() {
             .expect("store opens"),
         );
         let dyn_store: Arc<dyn MutableStore> = store.clone();
-        store_spread_keys(&dyn_store).await;
+        store_spread_keys(&dyn_store, 0..6).await;
         dyn_store.flush(false).await.expect("flush");
         store.group[7].bucket_count.load(atomic::Ordering::Relaxed)
     };
@@ -584,7 +588,7 @@ async fn a_flush_dropped_while_its_commit_writes_level_pending_runs_the_commit_t
             .expect("store opens"),
         );
         let dyn_store: Arc<dyn MutableStore> = store.clone();
-        store_spread_keys(&dyn_store).await;
+        store_spread_keys(&dyn_store, 0..6).await;
 
         let committing = lore_storage::test_util::pause_at(PausePoint::Committing);
         let flushing = dyn_store.clone();
@@ -636,6 +640,168 @@ async fn a_flush_dropped_while_its_commit_writes_level_pending_runs_the_commit_t
                 .await
                 .expect("load"),
             Hash::from_u64(expected),
+            "value in bucket {bucket} after reopening"
+        );
+    }
+}
+
+/// After a group's second fan-out commit fails once its `level.pending` is on disk and the group is
+/// flushed again, every entry reads back once the store reopens, and each bucket file of the group
+/// holds only the entries of its own bucket at the committed level. The commit fails at the rename
+/// of bucket 0, so that its level-1 file, holding every entry, stays until a roll-forward renames
+/// the commit's file over it.
+#[tokio::test]
+async fn a_second_commit_failing_after_its_pending_marker_keeps_every_entry_in_its_bucket() {
+    use lore_storage::mutable_store::MutableStore;
+    let dir = lore_base::test_util::TempDir::new("ms_failed_fan_out_");
+    let settings = || MutableStoreSettings {
+        fan_out_threshold: 2,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    {
+        let store: Arc<dyn MutableStore> = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.path()),
+                settings(),
+                make_in_memory_immutable().await,
+            )
+            .await
+            .expect("store opens"),
+        );
+        // Bucket 0 is left empty at 32 buckets, so that only the commit replaces its file.
+        store_spread_keys(&store, 1..3).await;
+        store.clone().flush(false).await.expect("flush at level 1");
+        store_spread_keys(&store, 3..7).await;
+        let blocked = format_bucket_path(&dir.path().join("mutable"), 7, 0);
+        let level_one = dir.path().join("level_one_bucket");
+        std::fs::rename(&blocked, &level_one).expect("hold the level-1 file");
+        super::fail_commit_at_rename(&blocked, || store.clone().flush(false)).await;
+        std::fs::rename(&level_one, &blocked).expect("restore the level-1 file");
+
+        store_spread_keys(&store, 7..10).await;
+        store.clone().flush(false).await.expect("the next flush");
+    }
+
+    let reopened = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store reopens"),
+    );
+    let level = reopened.group[7]
+        .committed_level
+        .load(atomic::Ordering::Relaxed);
+    let dyn_store: Arc<dyn MutableStore> = reopened;
+    for bucket in 1..10u8 {
+        assert_eq!(
+            dyn_store
+                .clone()
+                .load(
+                    Partition::default(),
+                    spread_key(bucket),
+                    KeyType::BranchMetadata
+                )
+                .await
+                .expect("load"),
+            Hash::from_u64(u64::from(bucket) + 1),
+            "value in bucket {bucket} after reopening"
+        );
+    }
+    assert_eq!(level, 32, "the group fanned out");
+    for bucket_index in 0..BUCKET_COUNT {
+        let path = format_bucket_path(&dir.path().join("mutable"), 7, bucket_index);
+        if !path.exists() {
+            continue;
+        }
+        let (_, entries, _) = MutableStoreBucket::deserialize_files(path, true)
+            .await
+            .expect("the bucket file reads");
+        for entry in entries.iter() {
+            assert_eq!(
+                lore_storage::local::fan_out::bucket_index_for(&entry.key, level),
+                bucket_index,
+                "an entry in the file of bucket {bucket_index}"
+            );
+        }
+    }
+}
+
+/// A delayed flush rolls a fan-out commit that failed once its `level.pending` was on disk forward
+/// before it writes a bucket, and then writes the bucket.
+#[tokio::test]
+async fn a_delayed_flush_rolls_a_pending_commit_forward_before_it_writes_a_bucket() {
+    use lore_storage::mutable_store::MutableStore;
+    let dir = lore_base::test_util::TempDir::new("ms_delayed_pending_");
+    let settings = || MutableStoreSettings {
+        fan_out_threshold: 2,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    let pending = dir
+        .path()
+        .join("mutable")
+        .join("index")
+        .join("07")
+        .join(lore_storage::local::fan_out::LEVEL_PENDING_FILENAME);
+    {
+        let store = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.path()),
+                settings(),
+                make_in_memory_immutable().await,
+            )
+            .await
+            .expect("store opens"),
+        );
+        let dyn_store: Arc<dyn MutableStore> = store.clone();
+        store_spread_keys(&dyn_store, 0..6).await;
+        let blocked = format_bucket_path(&dir.path().join("mutable"), 7, 0);
+        super::fail_commit_at_rename(&blocked, || dyn_store.clone().flush(false)).await;
+
+        for bucket in 0..32 {
+            LocalMutableStore::flush_delayed(Arc::downgrade(&store), 7, bucket, 0)
+                .await
+                .expect("delayed flush joins");
+        }
+
+        let group = &store.group[7];
+        assert_eq!(group.pending_level.load(atomic::Ordering::Relaxed), 0);
+        assert_eq!(group.committed_level.load(atomic::Ordering::Relaxed), 32);
+        assert!(!pending.exists(), "the commit left its level.pending");
+        assert!(
+            group
+                .dirty
+                .iter()
+                .all(|dirty| !dirty.load(atomic::Ordering::Relaxed)),
+            "a bucket was left dirty"
+        );
+    }
+
+    let reopened: Arc<dyn MutableStore> = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store reopens"),
+    );
+    for bucket in 0..6u8 {
+        assert_eq!(
+            reopened
+                .clone()
+                .load(
+                    Partition::default(),
+                    spread_key(bucket),
+                    KeyType::BranchMetadata
+                )
+                .await
+                .expect("load"),
+            Hash::from_u64(u64::from(bucket) + 1),
             "value in bucket {bucket} after reopening"
         );
     }

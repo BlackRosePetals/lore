@@ -36,6 +36,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   `[server.auth.oidc]`, has no `{id}`. Such a template names the same resource for every partition, so one grant
   matched every partition. The error names the setting
 - `lore-storage`: `local::fan_out::commit_if_initial_level` returns the `std::io::Result` of its level marker write
+- `lore-storage`: `local::fan_out::commit_if_initial_level` takes the group's `pending_level`,
+  `local::fan_out::remove_stale_new_files` is `remove_stale_files`, and
+  `local::immutable_store::SerializeFailureGuard::new` takes only the bucket's dirty mark. `lore-io`:
+  `IoDriver::write_file_segments_atomic` takes its paths as `impl Into<PathBuf>`, so that a caller hands over the paths
+  it builds rather than having them copied, and removes its temporary file when the write, sync or rename fails
 - `lore-storage`: a local immutable store's `put` refuses a fragment whose flags or sizes contradict each other or its
   payload, such as store-managed obliteration flags, two compressors, or a fragment list that is not a whole number of
   references, and stores a flag bit it does not know. A put without its payload to an obliterated association is refused
@@ -286,6 +291,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   dropped commit could leave its buckets out of the next commit, or its `level.pending` could land after the next flush
   found none, and the next open then rolled the commit forward over newer bucket files. Either lost entries after a
   reopen
+- Local stores: the delayed flush completes a fan-out commit that failed after its commit point before it writes a
+  bucket of the group, where the group's buckets waited for an explicit flush. A fan-out commit removes the temporary
+  files that writes stopped before their rename left in its group, and a failed write of an immutable store's info file
+  leaves no temporary file behind
 - Local stores: a store directory that cannot be read as the store opens or loads its packfiles, as after a transient
   I/O error, fails the open or the load, which a later one retries, with the error the read met. A group directory
   taken for one never written was laid out at the initial bucket level, where most of its entries could not be found,

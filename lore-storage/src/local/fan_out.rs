@@ -48,6 +48,10 @@ pub const BUCKET_FILENAME_PREFIX: &str = "index_";
 /// every `.new` is on disk and the `level.pending` sentinel has been written.
 pub const BUCKET_NEW_SUFFIX: &str = ".new";
 
+/// Filename suffix of the file a write of a bucket file, a `.new` twin or a level file goes to
+/// before it is renamed over the file it replaces.
+pub const TEMPORARY_SUFFIX: &str = ".tmp";
+
 /// Magic value at the start of the marker file. Bytes spell `LVNO` on disk.
 #[lore_macro::test_pub]
 const MARKER_MAGIC: u32 = u32::from_le_bytes(*b"LVNO");
@@ -358,7 +362,8 @@ pub async fn read_group_level(group_path: &Path) -> std::io::Result<GroupLevel> 
 /// `store_path` is the store root; the group directory is `<store_path>/index/<gg>`, created when
 /// missing.
 /// `_flush_guard` is the group's held flush lock, which orders the `Relaxed` `committed_level`
-/// store against `flush_all`'s reads of it; it is taken to make the caller prove it holds one.
+/// store against `flush_all`'s reads of it, and the `pending_level` read against the commit that
+/// sets it; it is taken to make the caller prove it holds one.
 ///
 /// A bucket file is only interpretable at the level it was written at, and [`read_group_level`]
 /// reads a marker-less group holding bucket files as [`GroupLevel::PreFanOut`]. Anything a lower
@@ -368,21 +373,25 @@ pub async fn read_group_level(group_path: &Path) -> std::io::Result<GroupLevel> 
 /// between or a marker write that fails.
 ///
 /// A group that already has a marker is left alone, as committing a level is the two-phase
-/// commit's business. So is a group at [`FAN_OUT_LEVEL_MAX`], which already reads back at that
-/// level — keeping this inert for pre-fan-out and server stores, whose groups are all there.
+/// commit's business. So is a group whose fan-out commit is pending, as `pending_level` says:
+/// rolling that commit forward records its level. So is a group at [`FAN_OUT_LEVEL_MAX`], which
+/// already reads back at that level — keeping this inert for pre-fan-out and server stores, whose
+/// groups are all there.
 ///
 /// # Returns
-/// * `Ok(())` when the group's level is recorded, now or before, or needs no marker.
+/// * `Ok(())` when the group's level is recorded, now or before, is left to a pending commit, or
+///   needs no marker.
 /// * `Err(io::Error)` when writing the marker failed, leaving `committed_level` at 0.
 pub async fn commit_if_initial_level(
     _flush_guard: &OwnedMutexGuard<()>,
     committed_level: &AtomicUsize,
+    pending_level: &AtomicUsize,
     bucket_count: &AtomicUsize,
     store_path: &Path,
     group_index: usize,
     sync_data: bool,
 ) -> std::io::Result<()> {
-    if committed_level.load(Ordering::Relaxed) != 0 {
+    if committed_level.load(Ordering::Relaxed) != 0 || pending_level.load(Ordering::Relaxed) != 0 {
         return Ok(());
     }
     let active_buckets = bucket_count.load(Ordering::Relaxed);
@@ -480,15 +489,22 @@ pub async fn write_level_pending(
     Ok(())
 }
 
-/// Remove each `.new` twin in `group_path` of a bucket not in `written`. A fan-out commit stopped
-/// before it wrote `level.pending` leaves its `.new` files, and recovery renames the `.new` file of
-/// every bucket below the level it commits, so a commit removes those it did not write before it
-/// writes `level.pending`: a bucket it left empty would otherwise take an older commit's file, and
-/// with it entries the group has since changed or removed.
+/// Remove what earlier writes left in `group_path`: each `.new` twin of a bucket not in `written`,
+/// and each temporary file of a bucket file, a `.new` twin, the level marker or `level.pending`,
+/// named as [`temporary_path`] names it.
+///
+/// A fan-out commit stopped before it wrote `level.pending` leaves its `.new` files, and recovery
+/// renames the `.new` file of every bucket below the level it commits, so a commit removes those it
+/// did not write before it writes `level.pending`: a bucket it left empty would otherwise take an
+/// older commit's file, and with it entries the group has since changed or removed. A write stopped
+/// before its rename leaves its temporary file, holding its space until a later write of the same
+/// file reuses it, and one that cannot be removed is left, as nothing reads it. No write is using
+/// one: the caller holds the group's flush lock, which every bucket and level file write in the
+/// group holds.
 ///
 /// It runs on every two-phase commit, a group's first included, a cold path, so callers box it:
 /// inline, its listing would grow the future of every group flush.
-pub async fn remove_stale_new_files(group_path: &Path, written: &[usize]) -> std::io::Result<()> {
+pub async fn remove_stale_files(group_path: &Path, written: &[usize]) -> std::io::Result<()> {
     let mut kept = [false; FAN_OUT_LEVEL_MAX];
     for &bucket_index in written {
         if let Some(slot) = kept.get_mut(bucket_index) {
@@ -498,18 +514,21 @@ pub async fn remove_stale_new_files(group_path: &Path, written: &[usize]) -> std
     let mut entries = lore_io::IoDriver::global().read_dir(group_path).await?;
     while let Some(entry) = entries.next().await {
         let entry = entry?;
-        let Some(bucket_index) = entry.file_name.to_str().and_then(new_file_bucket) else {
+        let Some(name) = entry.file_name.to_str() else {
             continue;
         };
-        if kept[bucket_index] {
-            continue;
-        }
+        let temporary = match new_file_bucket(name) {
+            Some(bucket_index) if kept[bucket_index] => continue,
+            Some(_) => false,
+            None if is_temporary_file_name(name) => true,
+            None => continue,
+        };
         match lore_io::IoDriver::global()
             .remove_file(group_path.join(&entry.file_name))
             .await
         {
             Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) if temporary || err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
     }
@@ -522,6 +541,21 @@ fn new_file_bucket(name: &str) -> Option<usize> {
         .strip_prefix(BUCKET_FILENAME_PREFIX)?
         .strip_suffix(BUCKET_NEW_SUFFIX)?;
     parse_hex_byte(bucket)
+}
+
+/// Whether `name` names the temporary file [`temporary_path`] gives a bucket file, a `.new` twin,
+/// the level marker or `level.pending`.
+fn is_temporary_file_name(name: &str) -> bool {
+    let Some(target) = name.strip_suffix(TEMPORARY_SUFFIX) else {
+        return false;
+    };
+    let bucket = target.strip_suffix(BUCKET_NEW_SUFFIX).unwrap_or(target);
+    target == MARKER_FILENAME
+        || target == LEVEL_PENDING_FILENAME
+        || bucket
+            .strip_prefix(BUCKET_FILENAME_PREFIX)
+            .and_then(parse_hex_byte)
+            .is_some()
 }
 
 /// Delete the `level.pending` sentinel. Returns `Ok(())` whether or not it existed.
@@ -607,10 +641,9 @@ async fn write_level_header_file(
     };
     let mut segment = Box::new([0u8; size_of::<LevelMarkerHeader>()]);
     segment.copy_from_slice(header.as_bytes());
-    let temporary = temporary_path(path);
-    let written = lore_io::IoDriver::global()
+    lore_io::IoDriver::global()
         .write_file_segments_atomic(
-            &temporary,
+            temporary_path(path),
             path,
             &lore_io::OpenOptions::new()
                 .write(true)
@@ -619,20 +652,17 @@ async fn write_level_header_file(
             LevelHeaderSegment(segment),
             sync_data,
         )
-        .await;
-    if written.is_err() {
-        let _ = lore_io::IoDriver::global().remove_file(&temporary).await;
-    }
-    written
+        .await
 }
 
 /// The file a write of `path` goes to before it is renamed over `path`: `path` with `.tmp`
 /// appended, so that the temporary file of `index_<bb>.new` is `index_<bb>.new.tmp` and does not
 /// collide with that of `index_<bb>`.
 pub(crate) fn temporary_path(path: &Path) -> PathBuf {
-    let mut temporary = std::ffi::OsString::with_capacity(path.as_os_str().len() + 4);
+    let mut temporary =
+        std::ffi::OsString::with_capacity(path.as_os_str().len() + TEMPORARY_SUFFIX.len());
     temporary.push(path.as_os_str());
-    temporary.push(".tmp");
+    temporary.push(TEMPORARY_SUFFIX);
     PathBuf::from(temporary)
 }
 
