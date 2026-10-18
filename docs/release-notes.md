@@ -274,6 +274,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Local stores: a packfile that cannot be listed or read as the store loads its packfiles, as after a transient I/O
   error, fails the load, which the next access retries. It was left out, and when it was the highest, it was taken for
   a packfile never written: the index entries pointing into it were cleared, and payloads held only locally were lost
+- Local stores: a store that failed to open its next packfile when one filled, as with no file descriptor left, opens
+  one on its next write. Every write failed with `No more packfiles` until the store was reopened
 - Local mutable stores: a store into a bucket whose delayed flush failed starts another. Until an explicit flush, the
   bucket and every later change to it stayed in memory only
 - `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of

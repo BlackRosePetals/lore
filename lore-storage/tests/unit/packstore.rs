@@ -8,6 +8,7 @@ use lore_base::test_util::TempDir;
 use lore_storage::packstore::PackStore;
 use lore_storage::packstore::PackfileSize;
 use lore_storage::test_util::PausePoint;
+use lore_storage::test_util::fail_packfile_opens;
 use lore_storage::test_util::fail_packfile_stats;
 use lore_storage::test_util::fail_packfile_syncs;
 use lore_storage::test_util::fail_packfile_writes;
@@ -57,6 +58,23 @@ async fn a_failed_packfile_stat_fails_the_load_rather_than_dropping_the_packfile
     fail_packfile_stats(1);
     assert!(packstore.sizes().await.is_err());
     assert_eq!(packstore.sizes().await.unwrap(), vec![64, 64]);
+}
+
+/// Opening the next packfile when one fills can fail, as when no descriptor is left, which leaves
+/// none taking writes. The next write opens one, rather than every write failing until the store
+/// is reopened.
+#[tokio::test]
+async fn a_write_after_a_failed_packfile_open_opens_one() {
+    let dir = TempDir::new("packstore-refill-");
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    limit_packfile_size(100);
+    assert_eq!(packstore.store(payload(1)).await.unwrap().id, 1);
+    fail_packfile_opens(1);
+    // Filling packfile 1 takes it off writes, and opening packfile 2 in its place fails.
+    assert_eq!(packstore.store(payload(2)).await.unwrap().id, 1);
+
+    assert_eq!(packstore.store(payload(3)).await.unwrap().id, 2);
+    limit_packfile_size(0);
 }
 
 /// Truncating a packfile discards every empty packfile at the end, keeping the minimum count

@@ -365,6 +365,10 @@ impl PackStore {
     /// packfile is the store's own: on Windows nothing outside this process may write it while it
     /// is open, where the driver shares the files it opens by default.
     async fn open_packfile(path: &Path, id: u32) -> Result<PackFile, PackfileError> {
+        #[cfg(feature = "test-util")]
+        if crate::test_util::take_packfile_open_failure() {
+            return Err(PackfileError::internal("packfile open failed as asked"));
+        }
         let file_path = path.join(id.to_string());
         let file_options = OpenOptions::new().read(true).write(true).create(true);
         #[cfg(target_family = "windows")]
@@ -800,9 +804,16 @@ impl PackStore {
 
         loop {
             let packfiles = self.loaded_packfiles_owned().await?;
-            let (index, mut contents) = self
+            let Some((index, mut contents)) = self
                 .packfile_to_write(&packfiles, size + payload.as_ptr() as usize)
-                .await?;
+                .await
+            else {
+                // None takes writes once opening the next packfile failed, as with no descriptor
+                // left: open one now, failing this store with the reason if that fails again.
+                drop(packfiles);
+                Box::pin(self.refill()).await?;
+                continue;
+            };
             let packfile = &packfiles[index];
             let id = packfile.id;
 
@@ -856,27 +867,35 @@ impl PackStore {
 
     /// The index of the lowest-numbered writeable packfile whose lock is free, with the lock, so
     /// that writes fill low packfiles first and high packfiles empty and can be discarded. When
-    /// every one is locked, the one `spread` picks, so that waiting writes spread over them.
-    /// Writeable ids name packfiles in `packfiles`: an id leaves the packfile list only after
-    /// leaving the writeable list, under both locks.
+    /// every one is locked, the one `spread` picks, so that waiting writes spread over them. None
+    /// when no packfile takes writes. Writeable ids name packfiles in `packfiles`: an id leaves the
+    /// packfile list only after leaving the writeable list, under both locks.
     async fn packfile_to_write<'a>(
         &self,
         packfiles: &'a [PackFile],
         spread: usize,
-    ) -> Result<(usize, RwLockWriteGuard<'a, Contents>), PackfileError> {
+    ) -> Option<(usize, RwLockWriteGuard<'a, Contents>)> {
         let writeable = self.writeable.read().await;
         if writeable.is_empty() {
-            return Err(PackfileError::internal("No more packfiles"));
+            return None;
         }
         for id in writeable.iter() {
             let index = (*id - 1) as usize;
             if let Ok(contents) = packfiles[index].contents.try_write() {
-                return Ok((index, contents));
+                return Some((index, contents));
             }
         }
         let index = (writeable[spread % writeable.len()] - 1) as usize;
         drop(writeable);
-        Ok((index, packfiles[index].contents.write().await))
+        Some((index, packfiles[index].contents.write().await))
+    }
+
+    /// Open packfiles until the minimum count take writes, as when opening one failed and left
+    /// fewer.
+    async fn refill(&self) -> Result<(), PackfileError> {
+        let packfile = self.packfile.write().await;
+        let writeable = self.writeable.write().await;
+        self.fill_writeable(packfile, writeable).await
     }
 
     /// Overwrite `size` bytes at `offset` in packfile `id` with zeros, then sync the packfile. A
