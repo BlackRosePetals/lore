@@ -462,6 +462,18 @@ fn record_published(publish: Option<&Arc<FusedPublish>>, result: &StoreResult) {
     }
 }
 
+/// The size of the next chunk of a fragment list with `remaining` bytes of references left: at most
+/// `max_chunk_size`, and one reference less when a full chunk would leave a single reference. A
+/// fragment list holds at least two references, so the last chunk is never one reference.
+fn list_chunk_size(remaining: usize, max_chunk_size: usize) -> usize {
+    let reference_size = std::mem::size_of::<FragmentReference>();
+    if remaining == max_chunk_size + reference_size {
+        max_chunk_size - reference_size
+    } else {
+        min(remaining, max_chunk_size)
+    }
+}
+
 /// Helper function to write a list of fragment references
 ///
 /// `permit` covers `buffer`, which the caller reserved before allocating it. It is reused for a
@@ -537,7 +549,7 @@ async fn write_fragmentlist_impl(
         let fragment_references = buffer.as_type_slice::<FragmentReference>();
 
         while chunk_offset < size {
-            let chunk_size = min(size - chunk_offset, max_chunk_size);
+            let chunk_size = list_chunk_size(size - chunk_offset, max_chunk_size);
             let chunk_buffer = buffer.slice(chunk_offset..(chunk_offset + chunk_size));
 
             let chunk_fragment_ref_index = chunk_offset / std::mem::size_of::<FragmentReference>();

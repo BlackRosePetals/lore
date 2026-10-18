@@ -261,6 +261,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Local immutable stores: `PayloadStoredLocal` says whether the store holds an entry's payload, whatever flags it was
   put with, so a fragment the local store serves carries it, in `get` and in the C API's
   `LORE_EVENT_STORAGE_GET_FRAGMENT`
+- Writing a file cut into one fragment more than a multiple of 6,553, with a last fragment under 40 bytes, no longer
+  fails, and pushing a file cut into that many fragments no longer fails whatever the size of its last fragment. The
+  file's fragment list ended in a sublist of one reference, which the server refuses, and which the local store refuses
+  where the reference is larger than the fragment it names. The last sublist now holds two references
 - Local stores: a fan-out commit that fails or is stopped part way no longer leaves index entries in the wrong buckets,
   or files that a later commit's recovery takes in, which served other keys' bytes or brought back an obliterated entry.
   A commit that failed after its commit point is completed by the group's next flush. A failed level marker write no

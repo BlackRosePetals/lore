@@ -1,12 +1,20 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use bytes::Bytes;
+use lore_storage::Address;
 use lore_storage::Context;
+use lore_storage::FRAGMENT_SIZE_EXPECTED;
+use lore_storage::FragmentReference;
+use lore_storage::Hash;
 use lore_storage::ImmutableStore;
 use lore_storage::Partition;
 use lore_storage::compress::FRAGMENT_SIZE_THRESHOLD;
 use lore_storage::fragment_engine::*;
 use lore_storage::options::WriteOptions;
+use lore_storage::validate_fragment_list;
+use lore_storage::validate_fragment_metadata;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
 /// Make a buffer of random bytes so chunking has to actually cut it.
 fn mixed_pattern_buffer(size: usize) -> Bytes {
@@ -89,6 +97,82 @@ async fn addressing_a_single_chunk_stores_nothing() {
         }),
         "addressing stored the chunk"
     );
+}
+
+/// A fragment list too long for one fragment is split into sublists the local store and the
+/// server both accept, each holding at least two references, and reads back as written. A list
+/// one reference longer than a full sublist gives its last sublist two references, whatever the
+/// size of the last leaf. A longer one keeps its full first sublist.
+#[tokio::test]
+async fn a_long_fragment_list_splits_into_valid_sublists() {
+    let partition = Partition::from([7u8; 16]);
+    let context = Context::from([7u8; 16]);
+    let reference_size = size_of::<FragmentReference>();
+    let full = FRAGMENT_SIZE_THRESHOLD / reference_size;
+
+    for (count, last_leaf, sublists) in [
+        (full + 1, 10, [full - 1, 2]),
+        (full + 1, FRAGMENT_SIZE_EXPECTED, [full - 1, 2]),
+        (full + 2, 10, [full, 2]),
+    ] {
+        // Lists differing only in their last leaf hold the same bytes, so each has its own store.
+        let dir = lore_base::test_util::TempDir::new("lore-storage-sublists-");
+        let store = lore_storage::local::immutable_store::LocalImmutableStore::new(
+            Some(std::path::PathBuf::from(dir.as_ref())),
+            lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create test store");
+        let references: Vec<FragmentReference> = (0..count)
+            .map(|index| FragmentReference {
+                hash: Hash::default(),
+                offset_content: (index * FRAGMENT_SIZE_EXPECTED) as u64,
+            })
+            .collect();
+        let content_size = (count - 1) * FRAGMENT_SIZE_EXPECTED + last_leaf;
+
+        let (root, _, _) = write_fragmentlist(
+            store.clone(),
+            partition,
+            context,
+            Bytes::copy_from_slice(references.as_bytes()),
+            content_size,
+            WriteOptions::default(),
+            None,
+            lore_storage::write_tracker::WriteContext::none(),
+            None,
+            None,
+        )
+        .await
+        .expect("writing the fragment list");
+
+        let root = store.clone().get(partition, root).await.expect("root list");
+        let root_payload = root.payload.expect("root list payload");
+        assert_eq!(root.fragment.size_content, content_size as u64);
+        validate_fragment_list(&root.fragment, &root_payload).expect("root list");
+
+        let mut lengths = vec![];
+        let mut read_back = vec![];
+        for reference in root_payload.chunks_exact(reference_size) {
+            let reference = FragmentReference::read_from_bytes(reference).expect("reference");
+            let address = Address {
+                context,
+                hash: reference.hash,
+            };
+            let sublist = store
+                .clone()
+                .get(partition, address)
+                .await
+                .expect("sublist");
+            let payload = sublist.payload.expect("sublist payload");
+            validate_fragment_metadata(&sublist.fragment).expect("sublist metadata");
+            validate_fragment_list(&sublist.fragment, &payload).expect("sublist references");
+            lengths.push(payload.len() / reference_size);
+            read_back.extend_from_slice(&payload);
+        }
+        assert_eq!(lengths, sublists, "sublists of a list of {count}");
+        assert_eq!(read_back, references.as_bytes(), "a list of {count}");
+    }
 }
 
 #[tokio::test]
