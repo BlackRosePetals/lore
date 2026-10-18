@@ -59,6 +59,9 @@ pub enum PausePoint {
     Serializing,
     /// A sync of every packfile of a packstore has begun and synced none yet.
     Syncing,
+    /// A fan-out commit's `level.pending` is on disk, and the write has not yet returned to the
+    /// commit.
+    Committing,
 }
 
 /// A hold armed at a [`PausePoint`]: `reached` is notified when a task arrives there, which then

@@ -439,12 +439,11 @@ async fn a_fan_out_commit_removes_new_files_it_did_not_write() {
 }
 
 /// A flush dropped part way through a fan-out commit, as a caller giving up on it drops it, leaves
-/// the commit to the next flush. The bucket whose `.new` file it wrote has had its mark claimed:
-/// left reading clean, it would get no file at the new level from the next commit, which writes
-/// only dirty buckets and those below the old level, and a reopen would not find its entries. The
-/// flush here is the group's first, dropped writing its second `.new` file.
+/// the commit running to its end under the group's flush lock: once the lock is free, the group is
+/// committed, and every entry reads back after a reopen. The flush here is the group's first,
+/// dropped writing its second `.new` file.
 #[tokio::test]
-async fn a_fan_out_commit_dropped_part_way_is_left_to_the_next_flush() {
+async fn a_flush_dropped_while_its_commit_writes_new_files_runs_the_commit_to_its_end() {
     let dir = lore_base::test_util::TempDir::new("is_dropped_commit_");
     let settings = || ImmutableStoreSettings {
         fan_out_threshold: 4,
@@ -473,18 +472,80 @@ async fn a_fan_out_commit_dropped_part_way_is_left_to_the_next_flush() {
         second.reached.notified().await;
         flush.abort();
         assert!(flush.await.is_err(), "the flush was dropped");
+        second.resume.notify_one();
 
+        let group = &store.group[group_index];
+        drop(group.flush_lock.lock().await);
+        assert_eq!(group.pending_level.load(atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            group.committed_level.load(atomic::Ordering::Relaxed),
+            group.bucket_count.load(atomic::Ordering::Relaxed),
+            "the dropped flush's commit ran to its end"
+        );
         dyn_store
             .clone()
             .flush(false)
             .await
             .expect("the next flush");
-        let group = &store.group[group_index];
-        assert_eq!(group.pending_level.load(atomic::Ordering::Relaxed), 0);
-        assert_eq!(
-            group.committed_level.load(atomic::Ordering::Relaxed),
-            group.bucket_count.load(atomic::Ordering::Relaxed)
-        );
+    }
+
+    let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+        .await
+        .expect("store reopens");
+    assert_payloads_read_back(&store, partition, stored).await;
+}
+
+/// A flush dropped once its fan-out commit's `level.pending` is on disk, before the write returned
+/// to the commit, leaves the commit running to its end under the group's flush lock, so a write
+/// that records the group's level and writes a bucket file directly, as an obliterate does, waits
+/// for it. Otherwise the commit left `level.pending` and a `.new` file older than that bucket file
+/// on disk, and the next open rolled the commit forward over the bucket file, losing what it held
+/// since. Here the commit is the group's first.
+#[tokio::test]
+async fn a_flush_dropped_while_its_commit_writes_level_pending_runs_the_commit_to_its_end() {
+    let dir = lore_base::test_util::TempDir::new("is_dropped_pending_");
+    let settings = || ImmutableStoreSettings {
+        fan_out_threshold: 4,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    let partition = Partition::from([7u8; 16]);
+    let (_, payloads) = payloads_in_one_group(5);
+    let mut stored = vec![];
+    {
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+            .await
+            .expect("store opens");
+        let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+        for payload in &payloads[..2] {
+            let address = put_payload(&store, partition, Context::default(), payload, false).await;
+            stored.push((address, payload.clone()));
+        }
+
+        let committing = pause_at(PausePoint::Committing);
+        let flushing = dyn_store.clone();
+        let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+        committing.reached.notified().await;
+        flush.abort();
+        assert!(flush.await.is_err(), "the flush was dropped");
+        committing.resume.notify_one();
+
+        for payload in &payloads[2..4] {
+            let address = put_payload(&store, partition, Context::default(), payload, false).await;
+            stored.push((address, payload.clone()));
+        }
+        // An obliterate writes the bucket holding its tombstone itself, durably.
+        let obliterated =
+            put_payload(&store, partition, Context::default(), &payloads[4], false).await;
+        dyn_store
+            .clone()
+            .obliterate(
+                partition,
+                obliterated,
+                Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate");
     }
 
     let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
@@ -4462,6 +4523,117 @@ mod obliteration {
                 .zip(payloads[1..].iter().cloned()),
         )
         .await;
+    }
+
+    /// An obliterate dropped while it commits its group's fan-out, which a failed flush left
+    /// uncommitted, leaves the commit running to its end under the group's flush lock: once the lock
+    /// is free, the group is committed.
+    #[tokio::test]
+    async fn an_obliterate_dropped_while_it_commits_its_group_runs_the_commit_to_its_end() {
+        let dir = lore_base::test_util::TempDir::new("is_obliterate_dropped_commit_");
+        let settings = || ImmutableStoreSettings {
+            fan_out_threshold: 2,
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        };
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+            .await
+            .expect("store opens");
+        let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+        let partition = Partition::from([0x7au8; 16]);
+        let (group_index, payloads) = payloads_in_one_group(4);
+        let mut addresses = vec![];
+        for payload in &payloads[..2] {
+            addresses.push(put(&dyn_store, partition, payload).await);
+        }
+        dyn_store.clone().flush(false).await.expect("flush");
+        for payload in &payloads[2..] {
+            addresses.push(put(&dyn_store, partition, payload).await);
+        }
+        let pending = format_bucket_path(&dir.join("immutable"), group_index, 0)
+            .with_file_name(lore_storage::local::fan_out::LEVEL_PENDING_FILENAME);
+        std::fs::create_dir_all(&pending).expect("block level.pending");
+        std::fs::write(pending.join("blocker"), b"x").expect("block level.pending");
+        assert!(dyn_store.clone().flush(false).await.is_err());
+        std::fs::remove_dir_all(&pending).expect("unblock level.pending");
+
+        let committing =
+            lore_storage::test_util::pause_at(lore_storage::test_util::PausePoint::Committing);
+        let obliterating = dyn_store.clone();
+        let address = addresses[0];
+        let obliterate = lore_base::lore_spawn!(async move {
+            obliterating
+                .obliterate(
+                    partition,
+                    address,
+                    Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+                )
+                .await
+        });
+        committing.reached.notified().await;
+        obliterate.abort();
+        assert!(obliterate.await.is_err(), "the obliterate was dropped");
+        committing.resume.notify_one();
+
+        let group = &store.group[group_index];
+        drop(group.flush_lock.lock().await);
+        assert_eq!(group.pending_level.load(atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            group.committed_level.load(atomic::Ordering::Relaxed),
+            group.bucket_count.load(atomic::Ordering::Relaxed),
+            "the dropped obliterate's commit ran to its end"
+        );
+    }
+
+    /// An obliterate dropped while it writes the bucket holding its tombstone leaves the write
+    /// running to its end under the group's flush lock: once the lock is free, the tombstone is on
+    /// disk, and a copy of the store reopened then does not find the obliterated entry.
+    #[tokio::test]
+    async fn an_obliterate_dropped_while_it_writes_its_bucket_runs_the_write_to_its_end() {
+        let dir = lore_base::test_util::TempDir::new("is_obliterate_dropped_write_");
+        let settings = || ImmutableStoreSettings {
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        };
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+            .await
+            .expect("store opens");
+        let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+        let partition = Partition::from([0x7bu8; 16]);
+        let (group_index, payloads) = payloads_in_one_group(2);
+        let obliterated = put(&dyn_store, partition, &payloads[0]).await;
+        let kept = put(&dyn_store, partition, &payloads[1]).await;
+        dyn_store.clone().flush(false).await.expect("flush");
+
+        let serializing =
+            lore_storage::test_util::pause_at(lore_storage::test_util::PausePoint::Serializing);
+        let obliterating = dyn_store.clone();
+        let obliterate = lore_base::lore_spawn!(async move {
+            obliterating
+                .obliterate(
+                    partition,
+                    obliterated,
+                    Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+                )
+                .await
+        });
+        serializing.reached.notified().await;
+        obliterate.abort();
+        assert!(obliterate.await.is_err(), "the obliterate was dropped");
+        serializing.resume.notify_one();
+        drop(store.group[group_index].flush_lock.lock().await);
+
+        let killed = lore_base::test_util::TempDir::new("is_obliterate_dropped_write_killed_");
+        copy_tree(dir.path(), killed.path());
+        let reopened = LocalImmutableStore::new(Some(killed.to_path_buf()), settings())
+            .await
+            .expect("store reopens");
+        let reopened_dyn: Arc<dyn ImmutableStore> = reopened.clone();
+        assert!(matches!(
+            reopened_dyn.get(partition, obliterated).await,
+            Err(StoreError::AddressNotFound(_))
+        ));
+        assert_payloads_read_back(&reopened, partition, [(kept, payloads[1].clone())]).await;
     }
 
     /// A fan-out commit that fails after writing its `level.pending` is one the next open's

@@ -474,7 +474,10 @@ pub async fn write_level_pending(
     level: usize,
     sync_data: bool,
 ) -> std::io::Result<()> {
-    write_level_header_file(&group_path.join(LEVEL_PENDING_FILENAME), level, sync_data).await
+    write_level_header_file(&group_path.join(LEVEL_PENDING_FILENAME), level, sync_data).await?;
+    #[cfg(feature = "test-util")]
+    crate::test_util::pause_point(crate::test_util::PausePoint::Committing).await;
+    Ok(())
 }
 
 /// Remove each `.new` twin in `group_path` of a bucket not in `written`. A fan-out commit stopped

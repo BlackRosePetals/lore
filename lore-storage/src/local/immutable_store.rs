@@ -368,11 +368,11 @@ pub struct ImmutableStoreGroup {
     /// two-phase commit (`level.pending` deleted), so a mismatch with `bucket_count` indicates a
     /// pending level transition that needs the two-phase commit on the next flush.
     pub committed_level: std::sync::atomic::AtomicUsize,
-    /// The level a fan-out commit names in the `level.pending` it wrote, until the commit
-    /// completes, or `0`. The commit holds the flush lock throughout, so under it this is non-zero
-    /// only after a commit that failed or was dropped past that point. Recovery takes that commit
-    /// as made, and the bucket files on disk are partly at its layout, so no bucket is written until
-    /// the next flush rolls it forward.
+    /// The level a fan-out commit names in the `level.pending` it wrote, until the commit completes
+    /// or a flush rolls it forward, or `0`. The commit holds the flush lock throughout, so under it
+    /// this is non-zero only after a commit that failed past that point. Recovery takes that commit
+    /// as made, and the bucket files on disk are partly at its layout, so no bucket is written
+    /// until the next flush rolls it forward.
     pub pending_level: std::sync::atomic::AtomicUsize,
     /// Forces the bucket-file writes for this group to be serial.
     ///
@@ -1361,9 +1361,10 @@ impl ImmutableStoreGroup {
 
     /// Whether the group's buckets can only be written by a flush of the whole group. It fanned
     /// out to a layout no commit recorded on disk, and writing a bucket as it is in memory would
-    /// mix two layouts, or a commit failed or was dropped after writing its `level.pending`, and
-    /// completing it renames the commit's `.new` files over any bucket file written meanwhile. Read
-    /// under the flush lock, which every change to the levels holds.
+    /// mix two layouts, or a commit failed after writing its `level.pending`, and completing it
+    /// renames the commit's `.new` files over any bucket file written meanwhile. Read under the
+    /// flush lock, which every change to the levels holds, except by `flush_all`'s scan, which only
+    /// decides whether to flush the group.
     fn fan_out_uncommitted(&self) -> bool {
         let committed = self.committed_level.load(atomic::Ordering::Relaxed);
         self.pending_level.load(atomic::Ordering::Relaxed) != 0
@@ -2726,7 +2727,9 @@ impl LocalImmutableStore {
     /// fan-out is not committed, a bucket is only written with the commit, so the group is flushed.
     /// A group below [`crate::local::fan_out::FAN_OUT_LEVEL_MAX`] with no level marker yet is given
     /// one, and the write fails if it cannot be, see
-    /// [`crate::local::fan_out::commit_if_initial_level`].
+    /// [`crate::local::fan_out::commit_if_initial_level`]. The write runs in a task of its own
+    /// holding the group's flush lock, so that one whose caller is dropped still runs to its end,
+    /// and none of it lands after the lock is released.
     async fn write_bucket_of(
         &self,
         group_index: usize,
@@ -2734,39 +2737,44 @@ impl LocalImmutableStore {
         path: &Arc<PathBuf>,
     ) -> Result<(), StoreError> {
         let group = self.group[group_index].clone();
-        let flush_guard = group.flush_lock.clone().lock_owned().await;
-        let bucket_index = crate::local::fan_out::bucket_index_for(
-            hash,
-            group.bucket_count.load(atomic::Ordering::Relaxed),
-        );
-        group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-        if group.fan_out_uncommitted() {
-            return Box::pin(flush_locked_group(group, group_index, path.clone(), true))
-                .await
-                .forward::<StoreError>("committing the group of an obliterated entry");
-        }
-        crate::local::fan_out::commit_if_initial_level(
-            &flush_guard,
-            &group.committed_level,
-            &group.bucket_count,
-            path.as_ref(),
-            group_index,
-            true,
-        )
+        let hash = *hash;
+        let path = path.clone();
+        lore_base::lore_spawn!(async move {
+            let flush_guard = group.flush_lock.clone().lock_owned().await;
+            let bucket_index = crate::local::fan_out::bucket_index_for(
+                &hash,
+                group.bucket_count.load(atomic::Ordering::Relaxed),
+            );
+            group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+            if group.fan_out_uncommitted() {
+                return flush_locked_group(group, group_index, path, true)
+                    .await
+                    .forward::<StoreError>("committing the group of an obliterated entry");
+            }
+            crate::local::fan_out::commit_if_initial_level(
+                &flush_guard,
+                &group.committed_level,
+                &group.bucket_count,
+                path.as_ref(),
+                group_index,
+                true,
+            )
+            .await
+            .internal("committing the level of the group of an obliterated entry")?;
+            let bucket = group.bucket(bucket_index).clone().read_owned().await;
+            ImmutableStoreBucket::serialize(
+                bucket,
+                group.clone(),
+                path.as_ref(),
+                group_index,
+                bucket_index,
+                true,
+            )
+            .await
+            .forward::<StoreError>("writing the bucket of an obliterated entry")
+        })
         .await
-        .internal("committing the level of the group of an obliterated entry")?;
-        let bucket = group.bucket(bucket_index).clone().read_owned().await;
-        ImmutableStoreBucket::serialize(
-            bucket,
-            group.clone(),
-            path.as_ref(),
-            group_index,
-            bucket_index,
-            true,
-        )
-        .await
-        .forward::<StoreError>("writing the bucket of an obliterated entry")?;
-        Ok(())
+        .internal("writing the bucket of an obliterated entry")?
     }
 
     /// Give the tombstone of `address` back the entry `original` it replaced, as an obliterate
@@ -4122,7 +4130,9 @@ impl LocalImmutableStore {
         }
     }
 
-    /// Immediate flush of all dirty buckets. Parallel across groups, sequential within a group.
+    /// Immediate flush of all dirty buckets. Parallel across groups, sequential within a group. A
+    /// flush dropped part way leaves each group flush it started running to its end, holding the
+    /// group's flush lock, so that no write it started lands after the lock is released.
     async fn flush_all(
         self: Arc<Self>,
         path: Option<Arc<PathBuf>>,
@@ -4132,7 +4142,7 @@ impl LocalImmutableStore {
             return Ok(());
         };
 
-        let mut tasks = JoinSet::new();
+        let mut tasks = lore_base::runtime::DetachingJoinSet::default();
 
         for group_index in 0..self.group.len() {
             let group = self.group[group_index].clone();

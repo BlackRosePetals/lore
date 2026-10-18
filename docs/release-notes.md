@@ -280,9 +280,12 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   a packfile never written: the index entries pointing into it were cleared, and payloads held only locally were lost
 - Local stores: a store that failed to open its next packfile when one filled, as with no file descriptor left, opens
   one on its next write. Every write failed with `No more packfiles` until the store was reopened
-- Local stores: a flush dropped part way through a fan-out commit, as when its caller gives up on it, leaves the commit
-  to the group's next flush. That flush could leave out the buckets the dropped one had written, and their entries were
-  not found after a reopen
+- Local stores: a flush dropped part way, as when its caller gives up on it, runs each group flush it started to its end
+  under the group's flush lock, a fan-out commit included, and an obliterate dropped part way runs the write of its
+  tombstone's bucket to its end. A write either had started could otherwise land after the lock was released: a
+  dropped commit could leave its buckets out of the next commit, or its `level.pending` could land after the next flush
+  found none, and the next open then rolled the commit forward over newer bucket files. Either lost entries after a
+  reopen
 - Local stores: a store directory that cannot be read as the store opens or loads its packfiles, as after a transient
   I/O error, fails the open or the load, which a later one retries, with the error the read met. A group directory
   taken for one never written was laid out at the initial bucket level, where most of its entries could not be found,

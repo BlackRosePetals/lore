@@ -409,12 +409,11 @@ async fn store_spread_keys(store: &Arc<dyn lore_storage::mutable_store::MutableS
 }
 
 /// A flush dropped part way through a fan-out commit, as a caller giving up on it drops it, leaves
-/// the commit to the next flush. The bucket whose `.new` file it wrote has had its mark claimed:
-/// left reading clean, it would get no file at the new level from the next commit, which writes
-/// only dirty buckets and those below the old level, and a reopen would not find its entries. The
-/// flush here is the group's first, dropped writing its second `.new` file.
+/// the commit running to its end under the group's flush lock: once the lock is free, the group is
+/// committed, and every entry reads back after a reopen. The flush here is the group's first,
+/// dropped writing its second `.new` file.
 #[tokio::test]
-async fn a_fan_out_commit_dropped_part_way_is_left_to_the_next_flush() {
+async fn a_flush_dropped_while_its_commit_writes_new_files_runs_the_commit_to_its_end() {
     use lore_storage::mutable_store::MutableStore;
     use lore_storage::test_util::PausePoint;
     let dir = lore_base::test_util::TempDir::new("ms_dropped_commit_");
@@ -445,14 +444,17 @@ async fn a_fan_out_commit_dropped_part_way_is_left_to_the_next_flush() {
         second.reached.notified().await;
         flush.abort();
         assert!(flush.await.is_err(), "the flush was dropped");
+        second.resume.notify_one();
 
-        store.clone().flush(false).await.expect("the next flush");
         let group = &local.group[7];
+        drop(group.flush_lock.lock().await);
         assert_eq!(group.pending_level.load(atomic::Ordering::Relaxed), 0);
         assert_eq!(
             group.committed_level.load(atomic::Ordering::Relaxed),
-            group.bucket_count.load(atomic::Ordering::Relaxed)
+            group.bucket_count.load(atomic::Ordering::Relaxed),
+            "the dropped flush's commit ran to its end"
         );
+        store.clone().flush(false).await.expect("the next flush");
     }
 
     let reopened: Arc<dyn MutableStore> = Arc::new(
@@ -551,6 +553,89 @@ async fn a_group_directory_that_cannot_be_read_fails_the_open() {
                 .await
                 .expect("load"),
             Hash::from_u64(u64::from(bucket) + 1),
+            "value in bucket {bucket} after reopening"
+        );
+    }
+}
+
+/// A flush dropped once its fan-out commit's `level.pending` is on disk, before the write returned
+/// to the commit, leaves the commit running to its end under the group's flush lock, so a delayed
+/// bucket write, which writes the bucket file directly, waits for it. Otherwise the commit left
+/// `level.pending` and a `.new` file older than that bucket file on disk, and the next open rolled
+/// the commit forward over it, losing what it held since. Here the commit is the group's first.
+#[tokio::test]
+async fn a_flush_dropped_while_its_commit_writes_level_pending_runs_the_commit_to_its_end() {
+    use lore_storage::mutable_store::MutableStore;
+    use lore_storage::test_util::PausePoint;
+    let dir = lore_base::test_util::TempDir::new("ms_dropped_pending_");
+    let settings = || MutableStoreSettings {
+        fan_out_threshold: 2,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    {
+        let store = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.path()),
+                settings(),
+                make_in_memory_immutable().await,
+            )
+            .await
+            .expect("store opens"),
+        );
+        let dyn_store: Arc<dyn MutableStore> = store.clone();
+        store_spread_keys(&dyn_store).await;
+
+        let committing = lore_storage::test_util::pause_at(PausePoint::Committing);
+        let flushing = dyn_store.clone();
+        let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+        committing.reached.notified().await;
+        flush.abort();
+        assert!(flush.await.is_err(), "the flush was dropped");
+        committing.resume.notify_one();
+
+        dyn_store
+            .clone()
+            .store(
+                Partition::default(),
+                spread_key(0),
+                Hash::from_u64(100),
+                KeyType::BranchMetadata,
+            )
+            .await
+            .expect("store the newer value");
+        LocalMutableStore::flush_delayed(Arc::downgrade(&store), 7, 0, 0)
+            .await
+            .expect("delayed flush joins");
+        dyn_store.clone().flush(false).await.expect("flush");
+    }
+
+    let reopened: Arc<dyn MutableStore> = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store reopens"),
+    );
+    for bucket in 0..6u8 {
+        let expected = if bucket == 0 {
+            100
+        } else {
+            u64::from(bucket) + 1
+        };
+        assert_eq!(
+            reopened
+                .clone()
+                .load(
+                    Partition::default(),
+                    spread_key(bucket),
+                    KeyType::BranchMetadata
+                )
+                .await
+                .expect("load"),
+            Hash::from_u64(expected),
             "value in bucket {bucket} after reopening"
         );
     }

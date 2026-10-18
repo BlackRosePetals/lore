@@ -258,7 +258,7 @@ async fn migrate_group(
 ) -> Result<(), LocalImmutableStoreError> {
     let group = &store.group[group_index];
 
-    let _flush_guard = group.flush_lock.clone().lock_owned().await;
+    let flush_guard = group.flush_lock.clone().lock_owned().await;
 
     let num_buckets = group.bucket_count.load(Ordering::Relaxed);
     let mut guards: Vec<OwnedRwLockWriteGuard<ImmutableStoreBucket>> =
@@ -303,11 +303,12 @@ async fn migrate_group(
     }
     result?;
 
-    flush_locked_group(
+    flush_locked_group_to_end(
         group.clone(),
         group_index,
         path.clone(),
         true, /* sync data */
+        flush_guard,
     )
     .await?;
 
@@ -368,4 +369,24 @@ pub async fn migrate_groups(
     }
     lore_info!("Oodle local migration: complete");
     Ok(true)
+}
+
+/// [`flush_locked_group`] in a task of its own holding `flush_guard`, so that a flush its caller
+/// drops still runs to its end under the group's flush lock, and no write it started lands after
+/// the lock is released.
+async fn flush_locked_group_to_end(
+    group: Arc<ImmutableStoreGroup>,
+    group_index: usize,
+    path: Arc<PathBuf>,
+    sync_data: bool,
+    flush_guard: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<(), LocalImmutableStoreError> {
+    lore_base::lore_spawn!(async move {
+        let _flush_guard = flush_guard;
+        flush_locked_group(group, group_index, path, sync_data).await
+    })
+    .await
+    .internal("Group flush task failed")
+    .map_err(LocalImmutableStoreError::from)
+    .flatten()
 }

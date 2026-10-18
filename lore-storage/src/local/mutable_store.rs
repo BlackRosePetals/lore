@@ -155,11 +155,11 @@ pub struct MutableStoreGroup {
     /// two-phase commit (`level.pending` deleted), so a mismatch with `bucket_count` indicates a
     /// pending level transition that needs the two-phase commit on the next flush.
     pub committed_level: std::sync::atomic::AtomicUsize,
-    /// The level a fan-out commit names in the `level.pending` it wrote, until the commit
-    /// completes, or `0`. The commit holds the flush lock throughout, so under it this is non-zero
-    /// only after a commit that failed or was dropped past that point. Recovery takes that commit
-    /// as made, and the bucket files on disk are partly at its layout, so no bucket is written until
-    /// the next flush rolls it forward.
+    /// The level a fan-out commit names in the `level.pending` it wrote, until the commit completes
+    /// or a flush rolls it forward, or `0`. The commit holds the flush lock throughout, so under it
+    /// this is non-zero only after a commit that failed past that point. Recovery takes that commit
+    /// as made, and the bucket files on disk are partly at its layout, so no bucket is written
+    /// until the next flush rolls it forward.
     pub pending_level: std::sync::atomic::AtomicUsize,
     /// Makes the whole-group flushes serial: both `flush_all` and the delayed per-bucket
     /// flush hold it, so at most one flusher per group is ever in flight.
@@ -196,9 +196,10 @@ impl MutableStoreGroup {
 
     /// Whether the group's buckets can only be written by a flush of the whole group. It fanned
     /// out to a layout no commit recorded on disk, and writing a bucket as it is in memory would
-    /// mix two layouts, or a commit failed or was dropped after writing its `level.pending`, and
-    /// completing it renames the commit's `.new` files over any bucket file written meanwhile. Read
-    /// under the flush lock, which every change to the levels holds.
+    /// mix two layouts, or a commit failed after writing its `level.pending`, and completing it
+    /// renames the commit's `.new` files over any bucket file written meanwhile. Read under the
+    /// flush lock, which every change to the levels holds, except by `flush_all`'s scan, which only
+    /// decides whether to flush the group.
     fn fan_out_uncommitted(&self) -> bool {
         let committed = self.committed_level.load(atomic::Ordering::Relaxed);
         self.pending_level.load(atomic::Ordering::Relaxed) != 0
@@ -1049,7 +1050,9 @@ impl LocalMutableStore {
         })
     }
 
-    /// Immediate flush of all dirty buckets. Parallel across groups, sequential within a group.
+    /// Immediate flush of all dirty buckets. Parallel across groups, sequential within a group. A
+    /// flush dropped part way leaves each group flush it started running to its end, holding the
+    /// group's flush lock, so that no write it started lands after the lock is released.
     async fn flush_all(
         self: Arc<Self>,
         path: Option<Arc<PathBuf>>,
@@ -1060,7 +1063,7 @@ impl LocalMutableStore {
         };
         let path = Arc::new(path.as_ref().clone());
 
-        let mut tasks = JoinSet::new();
+        let mut tasks = lore_base::runtime::DetachingJoinSet::default();
         let authoritative = self.authoritative;
 
         for (group_index, group) in self.group.iter().enumerate() {
