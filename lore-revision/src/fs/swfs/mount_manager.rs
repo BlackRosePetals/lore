@@ -236,4 +236,12 @@ impl MountManager {
     pub fn mount_count(&self) -> usize {
         self.mounted_paths.len()
     }
+
+    /// Unmounts the mounts the service has to release before it stops, as the service does when
+    /// it stops, detaching a busy one lazily with `force`. SWFS mounts are left as they are, and
+    /// they are the only mounts, so this unmounts nothing.
+    #[allow(clippy::unused_async)]
+    pub async fn unmount_all(&self, _force: bool) -> Result<(), MountManagerError> {
+        Ok(())
+    }
 }

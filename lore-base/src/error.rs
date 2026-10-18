@@ -264,6 +264,15 @@ pub struct DeleteDefault {
     pub branch: String,
 }
 
+// Code 50 stays free so this block does not renumber.
+
+#[derive(Debug, Clone, Error, FfiError)]
+#[error("Mounts are busy: {paths}")]
+#[ffi_code(51)]
+pub struct MountsBusy {
+    pub paths: String,
+}
+
 // ---------------------------------------------------------------------------
 // Already exists (56–63)
 //

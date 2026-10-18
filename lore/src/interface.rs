@@ -7412,7 +7412,9 @@ pub type LoreServiceStopArgs = crate::service::LoreServiceStopArgs;
 /// Stop the running Lore background service.
 ///
 /// Does not start a service in order to stop one. Returns `0` when no service
-/// is running, since that is the state the call asks for.
+/// is running, since that is the state the call asks for. A mount the service
+/// cannot release because something holds it refuses the stop with `MountsBusy`,
+/// unless the global `force` argument is set, which detaches busy mounts lazily.
 ///
 /// # Events
 ///

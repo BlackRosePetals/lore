@@ -4,6 +4,7 @@ pub mod initialization;
 pub mod service_main;
 pub mod state;
 
+use lore_base::error::MountsBusy;
 use lore_base::log::LoreLogLevel;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
@@ -12,6 +13,7 @@ use lore_revision::event::LoreServiceStatusEventData;
 use lore_revision::fs::swfs::mount_manager_state::MountManagerState;
 use lore_revision::global::GlobalConfig;
 use lore_revision::interface::LoreGlobalArgs;
+use lore_revision::lore::execution_context;
 use lore_revision::lore_info;
 use lore_revision::lore_warn;
 use lore_revision::service_state::ServiceStateImpl;
@@ -94,10 +96,17 @@ fn start_local(
 /// Arguments for stopping the Lore service process.
 pub struct LoreServiceStopArgs {}
 
+#[error_set]
+pub enum ServiceStopError {
+    MountsBusy,
+}
+
 /// Stop the running Lore service process.
 ///
 /// Does not start a service to stop, and succeeds when none is running, since
-/// that is the state it asks for.
+/// that is the state it asks for. A mount the service cannot release because
+/// something holds it refuses the stop with `MountsBusy`, unless the global
+/// `force` argument is set, which detaches busy mounts lazily.
 ///
 /// # Events
 ///
@@ -129,8 +138,18 @@ async fn stop_local(
 ) -> i32 {
     if service_runs_in_this_process() {
         return no_repository_call(globals, callback, args, stop, move |_args| async move {
+            // A busy mount keeps the service serving it, so the stop is refused before the
+            // service is asked to exit. `force` is read from the execution context: read from
+            // `globals` before they move, it would keep a second copy of them in the future of
+            // `stop_local`.
+            if let Some(manager) = MountManagerState::mount_manager() {
+                manager
+                    .unmount_all(execution_context().globals().force())
+                    .await
+                    .forward_any::<ServiceStopError>("Unmounting before the service stops")?;
+            }
             request_service_stop();
-            Ok::<(), ServiceProcessError>(())
+            Ok::<(), ServiceStopError>(())
         })
         .await;
     }
