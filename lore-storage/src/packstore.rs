@@ -312,25 +312,26 @@ impl PackStore {
 
         let paths = std::fs::read_dir(path)
             .internal_with(|| format!("Failed to read packstore directory {}", path.display()))?;
+        // A packfile that cannot be listed or read fails the load, which a later one retries: left
+        // out, the highest would be taken for one never written, and every payload in it for lost.
         let mut packfile_count = 0;
         for entry in paths {
-            let Ok(entry) = entry else {
+            let entry = entry.internal_with(|| {
+                format!("Failed to read packstore directory {}", path.display())
+            })?;
+            let file_name = entry.file_name();
+            let Some(file_id) = file_name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
                 continue;
             };
-            let Ok(file_meta) = IoDriver::global().metadata(entry.path()).await else {
-                continue;
-            };
+            let file_path = entry.path();
+            let file_meta = Self::packfile_metadata(&file_path)
+                .await
+                .internal_with(|| {
+                    format!("Failed reading packstore file {}", file_path.display())
+                })?;
             if !file_meta.is_file() {
                 continue;
             }
-
-            let file_name = entry.file_name();
-            let Some(file_id) = file_name.to_str() else {
-                continue;
-            };
-            let Ok(file_id) = file_id.parse::<u32>() else {
-                continue;
-            };
             packfile_count = packfile_count.max(file_id);
         }
 
@@ -348,6 +349,15 @@ impl PackStore {
             packfiles.push(file);
         }
         Ok((packfiles, writeable, loaded_size))
+    }
+
+    /// The metadata of the packfile at `path`.
+    async fn packfile_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+        #[cfg(feature = "test-util")]
+        if crate::test_util::take_packfile_stat_failure() {
+            return Err(std::io::Error::other("packfile stat failed as asked"));
+        }
+        IoDriver::global().metadata(path).await
     }
 
     /// Open packfile `id` in `path` with its size, creating it empty when there is no file. An

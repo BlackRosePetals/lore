@@ -271,6 +271,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Immutable stores: compaction writes and syncs only the index buckets it changes, rather than every bucket of the group
   for each packfile it rewrites. In a group of 256 buckets, as on a server, that was 256 synced writes per packfile, and
   could stall the store for minutes
+- Local stores: a packfile that cannot be listed or read as the store loads its packfiles, as after a transient I/O
+  error, fails the load, which the next access retries. It was left out, and when it was the highest, it was taken for
+  a packfile never written: the index entries pointing into it were cleared, and payloads held only locally were lost
 - Local mutable stores: a store into a bucket whose delayed flush failed starts another. Until an explicit flush, the
   bucket and every later change to it stayed in memory only
 - `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of

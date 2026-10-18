@@ -3,7 +3,7 @@
 //! Counters, served remote payloads and hooks the read and write paths consult under
 //! `test-util`, so a test can count the decodes, hashes and fetches a read costs, answer a remote
 //! fetch without a remote, order what concurrent reads, stores and compactions do, fail packfile
-//! writes and syncs or keep writes in flight, and interrupt a payload gate hold.
+//! writes, syncs and metadata reads or keep writes in flight, and interrupt a payload gate hold.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -29,6 +29,7 @@ thread_local! {
     static PAUSES: RefCell<Vec<(PausePoint, Arc<Pause>)>> = const { RefCell::new(Vec::new()) };
     static FAILED_WRITES: Cell<usize> = const { Cell::new(0) };
     static FAILED_SYNCS: Cell<usize> = const { Cell::new(0) };
+    static FAILED_STATS: Cell<usize> = const { Cell::new(0) };
     static IN_FLIGHT: RefCell<Option<Arc<InFlight>>> = const { RefCell::new(None) };
     static HOLD_INTERRUPT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static PACKFILE_SIZE_LIMIT: Cell<u64> = const { Cell::new(0) };
@@ -107,6 +108,17 @@ pub(crate) fn packfile_sync_result() -> std::io::Result<()> {
         return Err(std::io::Error::other("packfile sync failed as asked"));
     }
     Ok(())
+}
+
+/// Makes the next `count` reads of a packfile's metadata on this thread fail, as when the packfiles
+/// load.
+pub fn fail_packfile_stats(count: usize) {
+    FAILED_STATS.with(|failed| failed.set(count));
+}
+
+/// Whether this read of a packfile's metadata fails, as [`fail_packfile_stats`] asked.
+pub(crate) fn take_packfile_stat_failure() -> bool {
+    take_failure(&FAILED_STATS)
 }
 
 /// Whether this operation fails, taking one of the failures `failures` counts.

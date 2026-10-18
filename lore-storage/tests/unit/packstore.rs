@@ -8,6 +8,7 @@ use lore_base::test_util::TempDir;
 use lore_storage::packstore::PackStore;
 use lore_storage::packstore::PackfileSize;
 use lore_storage::test_util::PausePoint;
+use lore_storage::test_util::fail_packfile_stats;
 use lore_storage::test_util::fail_packfile_syncs;
 use lore_storage::test_util::fail_packfile_writes;
 use lore_storage::test_util::hold_packfile_write;
@@ -36,6 +37,26 @@ async fn a_write_goes_to_the_lowest_writeable_packfile() {
     for byte in 3..8 {
         assert_eq!(packstore.store(payload(byte)).await.unwrap().id, 1);
     }
+}
+
+/// A packfile whose metadata cannot be read as the packfiles load, as after a transient I/O
+/// error, fails the load rather than being left out. Left out, packfile 2 would be taken for one
+/// never written, as packfile 1 takes writes and no other is opened, and every payload in it for
+/// lost. The next load reads both.
+#[tokio::test]
+async fn a_failed_packfile_stat_fails_the_load_rather_than_dropping_the_packfile() {
+    let dir = TempDir::new("packstore-stat-");
+    {
+        let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+        packstore.store(payload(1)).await.unwrap();
+        packstore.stop_writes(&[1]).await.unwrap();
+        assert_eq!(packstore.store(payload(2)).await.unwrap().id, 2);
+    }
+
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    fail_packfile_stats(1);
+    assert!(packstore.sizes().await.is_err());
+    assert_eq!(packstore.sizes().await.unwrap(), vec![64, 64]);
 }
 
 /// Truncating a packfile discards every empty packfile at the end, keeping the minimum count
