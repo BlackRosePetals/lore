@@ -1584,6 +1584,80 @@ async fn compaction_rewrites_a_packfile_with_orphaned_payloads() {
     assert_payloads_read_back(&store, partition, local).await;
 }
 
+/// A rewrite writes the buckets it moved entries in, not every bucket of the group: in a group of
+/// 256 buckets holding a few entries, every other bucket holds nothing in the packfile, and
+/// writing each, synced, made one compaction pass thousands of fsyncs.
+#[tokio::test]
+async fn compaction_writes_only_the_buckets_it_changed() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_buckets_");
+    let settings = || ImmutableStoreSettings {
+        initial_fan_out_level: BUCKET_COUNT,
+        ..client_settings()
+    };
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+        .await
+        .unwrap();
+
+    let partition = Partition::from([0x13u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    let mut addresses = vec![];
+    let mut local = vec![];
+    for (index, payload) in payloads.iter().enumerate() {
+        let durable = index < 2;
+        let address = put_payload(&store, partition, Context::default(), payload, durable).await;
+        addresses.push(address);
+        if !durable {
+            local.push((address, payload.clone()));
+        }
+    }
+    store.clone().flush(true).await.unwrap();
+    // Compaction passes over a group with a bucket not loaded.
+    store.deserialize_all_buckets().await.unwrap();
+
+    assert!(compact_group(&store, group_index).await);
+    assert_eq!(
+        store.group[group_index]
+            .packstore
+            .total_size()
+            .await
+            .unwrap(),
+        2 * 4096,
+        "the packfile is rewritten"
+    );
+    let mut group_path = dir.join("immutable").join("index");
+    lore_storage::local::fan_out::push_group_dir(&mut group_path, group_index);
+    let bucket_files = std::fs::read_dir(&group_path)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("index_") && !name.contains('.'))
+        })
+        .count();
+    let mut buckets: Vec<usize> = addresses
+        .iter()
+        .map(|address| lore_storage::local::fan_out::bucket_index_for(&address.hash, BUCKET_COUNT))
+        .collect();
+    buckets.sort_unstable();
+    buckets.dedup();
+    assert!(
+        bucket_files <= buckets.len(),
+        "{bucket_files} bucket files for entries in {} buckets",
+        buckets.len()
+    );
+    assert_payloads_read_back(&store, partition, local.clone()).await;
+
+    drop(store);
+    let reopened = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(&reopened, partition, local).await;
+}
+
 /// Store one durable and `local` non-durable payloads of 4 KiB in one group, in reverse hash
 /// order so that any rewrite moves them, and compact it once eviction has orphaned the durable
 /// one. Returns the group's packfile bytes, and whether the local payloads stayed where they were

@@ -3859,10 +3859,13 @@ impl LocalImmutableStore {
     /// writes, see [`Self::compact_bucket_packfile`], and truncate `packfile` once nothing can
     /// point into it: every copy and bucket file write succeeded, no bucket kept an entry in it,
     /// and the bucket count did not change, which a fan-out moving entries out of the sweep
-    /// would. Every bucket file is written durably first, whatever `sync_data` the store uses,
-    /// from a copy taken before the group's packfiles are synced and written after, so that no
-    /// index file left on disk points into the truncated packfile or at payload bytes not yet
-    /// stored, and the sync holds up no lookup or insert in the bucket. The payload gate is drained
+    /// would. Every bucket it moved an entry in, or holding a change not yet written, is written
+    /// durably first, whatever `sync_data` the store uses, from a copy taken before the group's
+    /// packfiles are synced and written after, so that no index file left on disk points into the
+    /// truncated packfile or at payload bytes not yet stored, and the sync holds up no lookup or
+    /// insert in the bucket. A bucket left clean is as its file has it, and holds nothing in
+    /// `packfile` but what a failed copy kept, which keeps the packfile too, so its file is left
+    /// alone: in a group of 256 buckets, most hold nothing in any one packfile. The payload gate is drained
     /// before the truncate, so that a read that found a location in `packfile` before its entry
     /// moved has loaded it. A fan-out, or a failed bucket write, sync or truncate, which is
     /// returned, ends the rewrite, and the buckets it moved stay dirty for the next flush.
@@ -3887,7 +3890,10 @@ impl LocalImmutableStore {
             if group.bucket_count.load(atomic::Ordering::Relaxed) != bucket_count {
                 return Ok(Rewrite::Interrupted);
             }
-            group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+            // Every bucket write holds the flush lock and marks the bucket again if it fails.
+            if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
+                continue;
+            }
             crate::local::fan_out::commit_if_initial_level(
                 &flush_guard,
                 &group.committed_level,

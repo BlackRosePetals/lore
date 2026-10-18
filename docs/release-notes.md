@@ -268,6 +268,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Local stores: a group of the store index no longer reopens at the wrong bucket layout, where most of its entries could
   not be found, when its directory cannot be listed at open, as when the process is out of file descriptors, when a new
   store is stopped before its first index flush, or when writing a group's level marker fails
+- Immutable stores: compaction writes and syncs only the index buckets it changes, rather than every bucket of the group
+  for each packfile it rewrites. In a group of 256 buckets, as on a server, that was 256 synced writes per packfile, and
+  could stall the store for minutes
 - Local mutable stores: a store into a bucket whose delayed flush failed starts another. Until an explicit flush, the
   bucket and every later change to it stayed in memory only
 - `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of
