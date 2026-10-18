@@ -16,6 +16,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use lore_storage::CallerBuffer;
+use lore_storage::Loan;
 use lore_storage::LocalImmutableStore;
 use lore_storage::PayloadRead;
 use lore_storage::StoreError;
@@ -924,16 +925,20 @@ impl Work {
                 };
                 let mut held = ReadBuffer {
                     bytes: vec![0xA5u8; capacity],
-                    finished: false,
+                    loan: None,
                 };
-                // SAFETY: `held` stays valid until the read completes, leaked if the read is
-                // dropped unfinished, and nothing else touches it meanwhile.
+                // SAFETY: `held` keeps the memory until its loan is returned, and nothing else
+                // touches it meanwhile.
                 let mut destination =
                     unsafe { CallerBuffer::new(held.bytes.as_mut_ptr(), capacity) };
+                held.loan = Some(destination.loan());
                 let settled = self.model.settled(slot);
                 let result = store.get_into(partition, address, &mut destination).await;
-                held.finished = true;
-                let buffer = std::mem::take(&mut held.bytes);
+                drop(destination);
+                let Some(buffer) = held.take() else {
+                    self.violation("get-into-kept-the-buffer", key, variant, "");
+                    return Ok(());
+                };
                 let settled = self.still(slot, settled);
                 let found = Found::Entry {
                     full: true,
@@ -1475,18 +1480,37 @@ impl Work {
     }
 }
 
-/// The destination of a read into a caller's buffer, leaked when the read is dropped unfinished:
-/// the store's read may still land after its future is gone, and `CallerBuffer::new` requires the
-/// memory to stay valid until it does.
+/// The destination of a read into a caller's buffer, kept until the store lets go of it: a read
+/// dropped unfinished may still write it after its future is gone, so its memory then goes to a
+/// task that frees it once the loan on it is returned. Memory whose loan is not seen returned, as
+/// when no runtime is left to wait on it or the runtime's shutdown drops that task, is leaked.
 struct ReadBuffer {
     bytes: Vec<u8>,
-    finished: bool,
+    loan: Option<Loan>,
+}
+
+impl ReadBuffer {
+    /// The bytes, once the store let go of them, as it has when the read finished.
+    fn take(&mut self) -> Option<Vec<u8>> {
+        if !self.loan.as_ref().is_none_or(Loan::is_returned) {
+            return None;
+        }
+        self.loan = None;
+        Some(std::mem::take(&mut self.bytes))
+    }
 }
 
 impl Drop for ReadBuffer {
     fn drop(&mut self) {
-        if !self.finished {
-            std::mem::take(&mut self.bytes).leak();
+        let Some(loan) = self.loan.take() else {
+            return;
+        };
+        let bytes = std::mem::ManuallyDrop::new(std::mem::take(&mut self.bytes));
+        if tokio::runtime::Handle::try_current().is_ok() {
+            lore_base::lore_spawn!(async move {
+                loan.returned().await;
+                drop(std::mem::ManuallyDrop::into_inner(bytes));
+            });
         }
     }
 }
