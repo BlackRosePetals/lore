@@ -279,6 +279,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Local stores: a flush dropped part way through a fan-out commit, as when its caller gives up on it, leaves the commit
   to the group's next flush. That flush could leave out the buckets the dropped one had written, and their entries were
   not found after a reopen
+- Local stores: a store directory that cannot be read as the store opens or loads its packfiles, as after a transient
+  I/O error, fails the open or the load, which a later one retries, with the error the read met. A group directory
+  taken for one never written was laid out at the initial bucket level, where most of its entries could not be found,
+  and a later write then committed that level over its bucket files
 - Local mutable stores: a store into a bucket whose delayed flush failed starts another. Until an explicit flush, the
   bucket and every later change to it stayed in memory only
 - `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of

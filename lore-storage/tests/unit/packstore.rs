@@ -8,6 +8,7 @@ use lore_base::test_util::TempDir;
 use lore_storage::packstore::PackStore;
 use lore_storage::packstore::PackfileSize;
 use lore_storage::test_util::PausePoint;
+use lore_storage::test_util::fail_directory_stats;
 use lore_storage::test_util::fail_packfile_opens;
 use lore_storage::test_util::fail_packfile_stats;
 use lore_storage::test_util::fail_packfile_syncs;
@@ -58,6 +59,23 @@ async fn a_failed_packfile_stat_fails_the_load_rather_than_dropping_the_packfile
     fail_packfile_stats(1);
     assert!(packstore.sizes().await.is_err());
     assert_eq!(packstore.sizes().await.unwrap(), vec![64, 64]);
+}
+
+/// A packstore directory that cannot be stat'ed as the packfiles load fails the load, with the
+/// error the stat met, rather than being taken for one missing and created. The next load reads
+/// the packfiles.
+#[tokio::test]
+async fn a_failed_directory_stat_fails_the_load() {
+    let dir = TempDir::new("packstore-dir-stat-");
+    {
+        let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+        packstore.store(payload(1)).await.unwrap();
+    }
+
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    fail_directory_stats(1);
+    assert!(packstore.sizes().await.is_err());
+    assert_eq!(packstore.sizes().await.unwrap(), vec![64]);
 }
 
 /// Opening the next packfile when one fills can fail, as when no descriptor is left, which leaves

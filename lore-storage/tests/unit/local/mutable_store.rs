@@ -481,6 +481,81 @@ async fn a_fan_out_commit_dropped_part_way_is_left_to_the_next_flush() {
     }
 }
 
+/// A group directory that cannot be stat'ed at open, as on a transient I/O error, fails the open
+/// rather than being taken for a group never written. Taken for one, the group was laid out at the
+/// initial level, where lookups missed its bucket files, and a write then committed that level
+/// over them. The next open reads the group at the level it was written at.
+#[tokio::test]
+async fn a_group_directory_that_cannot_be_read_fails_the_open() {
+    use lore_storage::mutable_store::MutableStore;
+    let dir = lore_base::test_util::TempDir::new("ms_group_stat_");
+    let settings = || MutableStoreSettings {
+        fan_out_threshold: 2,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    let level = {
+        let store = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.path()),
+                settings(),
+                make_in_memory_immutable().await,
+            )
+            .await
+            .expect("store opens"),
+        );
+        let dyn_store: Arc<dyn MutableStore> = store.clone();
+        store_spread_keys(&dyn_store).await;
+        dyn_store.flush(false).await.expect("flush");
+        store.group[7].bucket_count.load(atomic::Ordering::Relaxed)
+    };
+    assert!(level > 1, "the group fanned out");
+
+    lore_storage::test_util::fail_directory_stats(1);
+    assert!(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .is_err(),
+        "an open that could not read a group directory went on as if the group were unwritten"
+    );
+
+    let reopened = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store reopens"),
+    );
+    assert_eq!(
+        reopened.group[7]
+            .bucket_count
+            .load(atomic::Ordering::Relaxed),
+        level
+    );
+    let reopened: Arc<dyn MutableStore> = reopened;
+    for bucket in 0..6u8 {
+        assert_eq!(
+            reopened
+                .clone()
+                .load(
+                    Partition::default(),
+                    spread_key(bucket),
+                    KeyType::BranchMetadata
+                )
+                .await
+                .expect("load"),
+            Hash::from_u64(u64::from(bucket) + 1),
+            "value in bucket {bucket} after reopening"
+        );
+    }
+}
+
 /// A fan-out commit removes the `.new` files it did not write before it writes `level.pending`,
 /// so that recovery, which renames every `.new` file it finds, cannot give a bucket the commit
 /// left empty an older commit's file.

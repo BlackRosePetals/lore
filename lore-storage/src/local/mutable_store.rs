@@ -861,8 +861,21 @@ impl LocalMutableStore {
                 }
                 let group_path = crate::local::fan_out::group_dir_path(&index_path, group_index);
                 lore_base::lore_spawn!(tasks, async move {
-                    if !group_path.exists() {
-                        return (group_index, Ok(GroupLevel::Unwritten));
+                    // A group directory that cannot be read fails the open: taken for one never
+                    // written, the group would be laid out at the initial level, where lookups
+                    // miss its bucket files, and a write would commit that level over them.
+                    match crate::fs_util::exists(&group_path).await {
+                        Ok(true) => {}
+                        Ok(false) => return (group_index, Ok(GroupLevel::Unwritten)),
+                        Err(err) => {
+                            return (
+                                group_index,
+                                Err(LocalMutableStoreError::internal_with_context(
+                                    err,
+                                    "Failed to read group directory",
+                                )),
+                            );
+                        }
                     }
                     // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
                     if let Err(err) =

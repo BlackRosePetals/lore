@@ -3,8 +3,8 @@
 //! Counters, served remote payloads and hooks the read and write paths consult under
 //! `test-util`, so a test can count the decodes, hashes and fetches a read costs, answer a remote
 //! fetch without a remote, order what concurrent reads, stores and compactions do, fail packfile
-//! opens, writes, syncs and metadata reads or keep writes in flight, and interrupt a payload gate
-//! hold.
+//! opens, writes, syncs and metadata reads and store directory stats or keep writes in flight, and
+//! interrupt a payload gate hold.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -32,6 +32,7 @@ thread_local! {
     static FAILED_SYNCS: Cell<usize> = const { Cell::new(0) };
     static FAILED_STATS: Cell<usize> = const { Cell::new(0) };
     static FAILED_OPENS: Cell<usize> = const { Cell::new(0) };
+    static FAILED_DIRECTORY_STATS: Cell<usize> = const { Cell::new(0) };
     static IN_FLIGHT: RefCell<Option<Arc<InFlight>>> = const { RefCell::new(None) };
     static HOLD_INTERRUPT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static PACKFILE_SIZE_LIMIT: Cell<u64> = const { Cell::new(0) };
@@ -131,6 +132,17 @@ pub fn fail_packfile_opens(count: usize) {
 /// Whether this packfile open fails, as [`fail_packfile_opens`] asked.
 pub(crate) fn take_packfile_open_failure() -> bool {
     take_failure(&FAILED_OPENS)
+}
+
+/// Makes the next `count` checks on this thread of whether a store directory exists fail, as
+/// when a stat meets a transient I/O error.
+pub fn fail_directory_stats(count: usize) {
+    FAILED_DIRECTORY_STATS.with(|failed| failed.set(count));
+}
+
+/// Whether this check of a store directory fails, as [`fail_directory_stats`] asked.
+pub(crate) fn take_directory_stat_failure() -> bool {
+    take_failure(&FAILED_DIRECTORY_STATS)
 }
 
 /// Whether this operation fails, taking one of the failures `failures` counts.

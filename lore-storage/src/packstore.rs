@@ -301,7 +301,10 @@ impl PackStore {
     /// found, with the ascending ids of those under the size limit and their total size in bytes.
     /// A packfile missing below the highest id is created empty.
     async fn load_packfiles(path: &Path) -> Result<(Vec<PackFile>, Vec<u32>, u64), PackfileError> {
-        if !path.exists() {
+        let exists = crate::fs_util::exists(path)
+            .await
+            .internal_with(|| format!("Failed to read packstore directory {}", path.display()))?;
+        if !exists {
             IoDriver::global()
                 .create_dir_all(path)
                 .await

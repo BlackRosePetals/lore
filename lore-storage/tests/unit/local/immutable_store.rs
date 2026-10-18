@@ -493,6 +493,57 @@ async fn a_fan_out_commit_dropped_part_way_is_left_to_the_next_flush() {
     assert_payloads_read_back(&store, partition, stored).await;
 }
 
+/// A group directory that cannot be stat'ed at open, as on a transient I/O error, fails the open
+/// rather than being taken for a group never written. Taken for one, the group was laid out at the
+/// initial level, where lookups missed its bucket files, and a write then committed that level
+/// over them. The next open reads the group at the level it was written at.
+#[tokio::test]
+async fn a_group_directory_that_cannot_be_read_fails_the_open() {
+    let dir = lore_base::test_util::TempDir::new("is_group_stat_");
+    let settings = || ImmutableStoreSettings {
+        fan_out_threshold: 4,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    let partition = Partition::from([6u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(12);
+    let mut stored = vec![];
+    let level = {
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+            .await
+            .expect("store opens");
+        for payload in &payloads {
+            let address = put_payload(&store, partition, Context::default(), payload, false).await;
+            stored.push((address, payload.clone()));
+        }
+        let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+        dyn_store.flush(false).await.expect("flush");
+        store.group[group_index]
+            .bucket_count
+            .load(atomic::Ordering::Relaxed)
+    };
+    assert!(level > 1, "the group fanned out");
+
+    lore_storage::test_util::fail_directory_stats(1);
+    assert!(
+        LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+            .await
+            .is_err(),
+        "an open that could not read a group directory went on as if the group were unwritten"
+    );
+
+    let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+        .await
+        .expect("store reopens");
+    assert_eq!(
+        store.group[group_index]
+            .bucket_count
+            .load(atomic::Ordering::Relaxed),
+        level
+    );
+    assert_payloads_read_back(&store, partition, stored).await;
+}
+
 /// Run the background timer's flush for every group, and nothing else.
 async fn run_delayed_flush(store: &Arc<LocalImmutableStore>) {
     let weak = Arc::downgrade(store);
