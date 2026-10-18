@@ -33,9 +33,9 @@ pub use lore_base::version::LORE_LIBRARY_VERSION;
 /// consumer aliases this into scope as `lore_error_set`.
 pub use lore_error_set as error_set;
 
-/// Time allowed for the shutdown work that has to be driven from a synchronous caller.
-/// Matches the runtime shutdown timeout in `lore_revision::interface::shutdown`, which
-/// runs immediately after it.
+/// Time allowed for each wait shutdown drives from a synchronous caller: the drains before the
+/// runtime shutdown, whose timeout in `lore_revision::interface::shutdown` it matches, and the
+/// reads of calls cut short after it.
 const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Shuts the library down, returning whether this call was the one that did it.
@@ -47,6 +47,9 @@ const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Claiming the shutdown also closes admission, so calls that arrive while the
 /// drains below are still running fail instead of being admitted onto runtimes
 /// that are about to go away.
+///
+/// Safe only once every call has completed. Calls still executing are cancelled at best effort: one
+/// not stopped in time may use the memory passed to it after this returns.
 pub fn shutdown() -> bool {
     if !lore_base::runtime::claim_runtime_shutdown() {
         lore_base::lore_warn!("Shutdown was already called");
@@ -77,6 +80,8 @@ pub fn shutdown() -> bool {
     lore_revision::interface::drop_connections();
 
     lore_revision::interface::shutdown();
+
+    storage::lent::await_abandoned(SHUTDOWN_WAIT);
 
     // Services this process started are otherwise collected when the next
     // service call comes, and after a shutdown none will. A program whose

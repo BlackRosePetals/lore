@@ -7796,7 +7796,10 @@ pub extern "C" fn lore_log_configure(config: &LoreLogConfig) -> i32 {
 }
 
 /// Shut the library down, stopping its worker threads and releasing the
-/// resources it holds. Call this once, when no further calls will be made.
+/// resources it holds. Call this once, when no further calls will be made and
+/// every call made has completed. The library makes a best effort to cancel
+/// calls still executing safely, but a call it does not stop in time may still
+/// use the memory passed to it after this returns.
 ///
 /// Returns 0 on success and a non-zero value on failure.
 #[unsafe(no_mangle)]

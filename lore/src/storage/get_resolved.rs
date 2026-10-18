@@ -162,24 +162,30 @@ async fn get_resolved_local(
             }
             let effective = store.effective_flags(per_call)?;
             let mut reuse = crate::storage::store::SessionReuse::default();
+            let mut lent = crate::storage::lent::LentBuffers::default();
 
-            crate::storage::fan_out_items!(items, "get_resolved", |item| {
+            let result = crate::storage::fan_out_items!(items, "get_resolved", |item| {
                 let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
-                async move { get_resolved_item(store, &item, effective, session).await }
-            })
+                let lender = lent.lender(&item.data_out);
+                async move { get_resolved_item(store, &item, effective, session, lender).await }
+            });
+            lent.returned().await;
+            result
         },
     )
     .await
 }
 
-/// Resolve and read one item, emitting its `HEADER` ... `ITEM_COMPLETE` sequence.
-/// Returns the item's own error so the call-level reduction can pick the dominant failure.
+/// Resolve and read one item, emitting its `HEADER` ... `ITEM_COMPLETE` sequence, into the item's
+/// `data_out` through `lender` when it supplies one. Returns the item's own error so the call-level
+/// reduction can pick the dominant failure.
 async fn get_resolved_item(
     store: Arc<StoreInternal>,
     item: &LoreStorageGetResolvedItem,
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
+    lender: Option<crate::storage::lent::ItemLender>,
 ) -> Result<(), StorageError> {
     if item.partition == Partition::default() {
         return emit_item_complete(
@@ -220,8 +226,8 @@ async fn get_resolved_item(
         .await;
     }
 
-    if item.data_out.is_supplied() {
-        return get_resolved_item_into(store, item, read_options, remote_session).await;
+    if let Some(lender) = lender {
+        return get_resolved_item_into(store, item, read_options, remote_session, lender).await;
     }
 
     if item.streaming != 0 {
@@ -281,13 +287,9 @@ async fn get_resolved_item_into(
     item: &LoreStorageGetResolvedItem,
     read_options: lore_storage::ReadOptions,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
+    lender: crate::storage::lent::ItemLender,
 ) -> Result<(), StorageError> {
-    // SAFETY: `data_out` names caller memory that stays valid, and untouched by anyone else, for
-    // the duration of the call this future is wholly within. `len` bounds the read.
-    let mut dst = unsafe {
-        lore_storage::CallerBuffer::new(item.data_out.ptr.cast::<u8>(), item.data_out.len)
-    };
-
+    let mut dst = lender.lend(&item.data_out);
     match lore_storage::read_resolved_into_buffer(
         store.immutable.clone(),
         store.mutable.clone(),

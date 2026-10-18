@@ -38,7 +38,14 @@
 //
 // The library copies argument data before it starts the call. The caller may
 // free or reuse the argument memory once the call returns. This holds for
-// synchronous and asynchronous calls.
+// synchronous and asynchronous calls, except for the memory a lore_bytes_mut_t
+// names, which the library writes while the call runs: see lore_bytes_mut_t.
+//
+// Call lore_shutdown only once every call has completed: a synchronous call has
+// returned, and an asynchronous one has delivered END. The library makes a best
+// effort to cancel calls still executing safely, but a call it does not stop in
+// time may still use the library and the memory passed to it after
+// lore_shutdown returns.
 //
 // Structures
 //
@@ -5262,9 +5269,10 @@ typedef struct lore_storage_put_args_t {
 // A null pointer or zero length means no buffer is supplied, which is what a zero-initialized
 // value says, as does a length no allocation can have.
 //
-// The memory must stay valid, and reach nobody else, for the duration of the call it is passed to.
-// The buffers supplied by the items of one call must not overlap: the items run alongside each
-// other, so two covering the same byte would write it at once.
+// The memory must stay valid, and reach nobody else, until the call it is passed to completes: a
+// synchronous call returns, and an asynchronous one delivers `END`. The buffers supplied by the
+// items of one call must not overlap: the items run alongside each other, so two covering the same
+// byte would write it at once.
 typedef struct lore_bytes_mut_t {
   // Pointer to the start of the writable slice.
   void *ptr;
@@ -12383,7 +12391,10 @@ void lore_notification_unsubscribe_async(const struct lore_global_args_t *global
 int32_t lore_log_configure(const struct lore_log_config_t *config);
 
 // Shut the library down, stopping its worker threads and releasing the
-// resources it holds. Call this once, when no further calls will be made.
+// resources it holds. Call this once, when no further calls will be made and
+// every call made has completed. The library makes a best effort to cancel
+// calls still executing safely, but a call it does not stop in time may still
+// use the memory passed to it after this returns.
 //
 // Returns 0 on success and a non-zero value on failure.
 int32_t lore_shutdown(void);

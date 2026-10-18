@@ -283,6 +283,16 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   I/O error, fails the open or the load, which a later one retries, with the error the read met. A group directory
   taken for one never written was laid out at the initial bucket level, where most of its entries could not be found,
   and a later write then committed that level over its bucket files
+- `lore-storage`: a read of fragmented content into a buffer of its own reads each whole leaf the local store holds
+  straight into its place in that buffer, and expands a compressed leaf there, as a read into a caller's buffer already
+  did. Each leaf was read into a buffer of its own and copied
+- C API: an item reading into `data_out` that stops part way no longer writes the caller's buffer after its call
+  completes. A read's I/O runs to its end even when the read is dropped, so a call now waits for every read it lent a
+  buffer to before it completes. `lore_bytes_mut_t` states that `data_out` must stay valid until then; the header's
+  preamble said argument memory could be freed once an asynchronous call returned. The preamble and `lore_shutdown`
+  state that `lore_shutdown` is safe only once every call has completed
+- `lore-storage`: a read of fragmented content fails when its fragment list's offsets are not strictly increasing. It
+  succeeded, with part of the content holding whatever was in memory before, or the bytes of the wrong leaf
 - Local mutable stores: a store into a bucket whose delayed flush failed starts another. Until an explicit flush, the
   bucket and every later change to it stayed in memory only
 - `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of

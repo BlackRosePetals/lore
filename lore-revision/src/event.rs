@@ -402,9 +402,10 @@ impl serde::Serialize for LoreBytes {
 /// A null pointer or zero length means no buffer is supplied, which is what a zero-initialized
 /// value says, as does a length no allocation can have.
 ///
-/// The memory must stay valid, and reach nobody else, for the duration of the call it is passed to.
-/// The buffers supplied by the items of one call must not overlap: the items run alongside each
-/// other, so two covering the same byte would write it at once.
+/// The memory must stay valid, and reach nobody else, until the call it is passed to completes: a
+/// synchronous call returns, and an asynchronous one delivers `END`. The buffers supplied by the
+/// items of one call must not overlap: the items run alongside each other, so two covering the same
+/// byte would write it at once.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct LoreBytesMut {

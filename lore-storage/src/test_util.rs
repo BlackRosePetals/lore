@@ -3,8 +3,8 @@
 //! Counters, served remote payloads and hooks the read and write paths consult under
 //! `test-util`, so a test can count the decodes, hashes and fetches a read costs, answer a remote
 //! fetch without a remote, order what concurrent reads, stores and compactions do, fail packfile
-//! opens, writes, syncs and metadata reads and store directory stats or keep writes in flight, and
-//! interrupt a payload gate hold.
+//! opens, writes, syncs and metadata reads and store directory stats or keep writes in flight,
+//! interrupt a payload gate hold, and hold a read's memory past the read.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -334,4 +334,192 @@ pub fn remote_resolved(key: Hash) -> Option<(Hash, Fragment, Bytes)> {
             .rfind(|(served, ..)| *served == key)
             .map(|(_, resolved, fragment, payload)| (*resolved, *fragment, payload.clone()))
     })
+}
+
+/// How a [`HoldingStore`] answers a `get_into` whose memory it holds.
+#[derive(Clone, Copy)]
+pub enum HeldAnswer {
+    /// Never, as a read dropped while an operation it started is in flight never sees it end.
+    Never,
+    /// That it placed the payload, leaving the holder of the memory to write it.
+    Placed,
+}
+
+/// Delegating store holding the memory of every `get_into` of one address, as an I/O operation
+/// holds a read's memory past the read's future: the memory goes to the receiver
+/// [`HoldingStore::wrap`] returns, and the read is answered as its [`HeldAnswer`] says.
+pub struct HoldingStore {
+    inner: Arc<dyn crate::immutable_store::ImmutableStore>,
+    address: Address,
+    answer: HeldAnswer,
+    held: tokio::sync::mpsc::UnboundedSender<crate::CallerBuffer>,
+}
+
+impl HoldingStore {
+    /// `inner`, holding the memory of every `get_into` of `address`, and where that memory goes.
+    pub fn wrap(
+        inner: Arc<dyn crate::immutable_store::ImmutableStore>,
+        address: Address,
+        answer: HeldAnswer,
+    ) -> (
+        Arc<dyn crate::immutable_store::ImmutableStore>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::CallerBuffer>,
+    ) {
+        let (held, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(HoldingStore {
+            inner,
+            address,
+            answer,
+            held,
+        });
+        (store, receiver)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::immutable_store::ImmutableStore for HoldingStore {
+    async fn get(
+        self: Arc<Self>,
+        partition: crate::types::Partition,
+        address: Address,
+    ) -> Result<crate::store_types::StoreGetData, crate::immutable_store::StoreError> {
+        self.inner.clone().get(partition, address).await
+    }
+
+    async fn get_into(
+        self: Arc<Self>,
+        partition: crate::types::Partition,
+        address: Address,
+        dst: &mut crate::CallerBuffer,
+    ) -> Result<(Fragment, crate::store_types::PayloadRead), crate::immutable_store::StoreError>
+    {
+        if address != self.address {
+            return self.inner.clone().get_into(partition, address, dst).await;
+        }
+        match self.answer {
+            HeldAnswer::Never => {
+                let _ = self.held.send(dst.split_off(0));
+                std::future::pending().await
+            }
+            HeldAnswer::Placed => {
+                let stored = self.inner.clone().get_metadata(partition, address).await?;
+                let _ = self.held.send(dst.split_off(0));
+                Ok((stored.fragment, crate::store_types::PayloadRead::IntoBuffer))
+            }
+        }
+    }
+
+    fn is_local(&self) -> bool {
+        self.inner.is_local()
+    }
+
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: crate::types::Partition,
+        address: Address,
+    ) -> Result<crate::store_types::StoreGetData, crate::immutable_store::StoreError> {
+        self.inner.clone().get_metadata(partition, address).await
+    }
+
+    async fn query(
+        self: Arc<Self>,
+        partition: crate::types::Partition,
+        addresses: &[Address],
+        results: &mut [crate::store_types::StoreMatchResult],
+    ) -> Result<(), crate::immutable_store::StoreError> {
+        self.inner
+            .clone()
+            .query(partition, addresses, results)
+            .await
+    }
+
+    async fn put(
+        self: Arc<Self>,
+        partition: crate::types::Partition,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+        force: bool,
+    ) -> Result<(), crate::immutable_store::StoreError> {
+        self.inner
+            .clone()
+            .put(partition, address, fragment, payload, force)
+            .await
+    }
+
+    async fn obliterate(
+        self: Arc<Self>,
+        partition: crate::types::Partition,
+        address: Address,
+        stats: Arc<crate::store_types::StoreObliterateStats>,
+    ) -> Result<(), crate::immutable_store::StoreError> {
+        self.inner
+            .clone()
+            .obliterate(partition, address, stats)
+            .await
+    }
+
+    async fn evict(
+        self: Arc<Self>,
+        max_capacity: usize,
+        sync_data: bool,
+        sink: Option<crate::gc_event::GcEventSinkRef>,
+    ) -> Result<usize, crate::immutable_store::StoreError> {
+        self.inner
+            .clone()
+            .evict(max_capacity, sync_data, sink)
+            .await
+    }
+
+    async fn compact(
+        self: Arc<Self>,
+        max_size: usize,
+        at: Option<usize>,
+        sync_data: bool,
+        sink: Option<crate::gc_event::GcEventSinkRef>,
+    ) -> Result<Option<usize>, crate::immutable_store::StoreError> {
+        self.inner
+            .clone()
+            .compact(max_size, at, sync_data, sink)
+            .await
+    }
+
+    async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+        self.inner.clone().compact_resume_at().await
+    }
+
+    fn max_query_batch(&self) -> Option<usize> {
+        self.inner.max_query_batch()
+    }
+
+    async fn flush(
+        self: Arc<Self>,
+        sync_data: bool,
+    ) -> Result<(), crate::immutable_store::StoreError> {
+        self.inner.clone().flush(sync_data).await
+    }
+
+    async fn verify(self: Arc<Self>, heal: bool) -> Result<(), crate::immutable_store::StoreError> {
+        self.inner.clone().verify(heal).await
+    }
+
+    async fn copy(
+        self: Arc<Self>,
+        source_partition: crate::types::Partition,
+        source_address: Address,
+        destination_partition: crate::types::Partition,
+        destination_context: crate::types::Context,
+        behavior: crate::immutable_store::CopyBehavior,
+    ) -> Result<(), crate::immutable_store::StoreError> {
+        self.inner
+            .clone()
+            .copy(
+                source_partition,
+                source_address,
+                destination_partition,
+                destination_context,
+                behavior,
+            )
+            .await
+    }
 }

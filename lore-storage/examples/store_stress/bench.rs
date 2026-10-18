@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 //! Throughput and latency of the store's hot paths, so that a change to the store can be held to
 //! no regression: puts of new payloads, puts of payloads already stored, gets, reads into a
-//! caller's buffer, and queries, each measured on its own over a populated store.
+//! caller's buffer, reads into buffers every task lends under one loan, and queries, each measured
+//! on its own over a populated store.
 //!
 //! Every fragment and payload is built before anything is timed, so that what is measured is the
 //! store. A round of new puts stores `--new-per-round` addresses no round stored before, reusing
@@ -18,6 +19,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use lore_storage::CallerBuffer;
 use lore_storage::Fragment;
+use lore_storage::Lender;
 use lore_storage::LocalImmutableStore;
 use lore_storage::StoreMatchResult;
 use lore_storage::immutable_store::ImmutableStore;
@@ -33,6 +35,7 @@ enum Mode {
     PutStored,
     Get,
     GetInto,
+    GetIntoShared,
     Query,
 }
 
@@ -43,6 +46,7 @@ impl Mode {
             Mode::PutStored => "put-stored",
             Mode::Get => "get",
             Mode::GetInto => "get-into",
+            Mode::GetIntoShared => "get-into-shared",
             Mode::Query => "query",
         }
     }
@@ -70,6 +74,7 @@ pub async fn main(args: &Args) -> u8 {
                 Mode::PutStored,
                 Mode::Get,
                 Mode::GetInto,
+                Mode::GetIntoShared,
                 Mode::Query,
             ]
             .into_iter()
@@ -207,9 +212,10 @@ async fn run_tasks(
     let done = Arc::new(AtomicU64::new(0));
     let cursor = Arc::new(AtomicU64::new(first));
     let latencies = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let lender = Lender::new();
     let mut set = tokio::task::JoinSet::new();
     for task in 0..tasks {
-        let (store, config, payloads, stop, done, cursor, latencies) = (
+        let (store, config, payloads, stop, done, cursor, latencies, lender) = (
             store.clone(),
             config.clone(),
             payloads.clone(),
@@ -217,6 +223,7 @@ async fn run_tasks(
             done.clone(),
             cursor.clone(),
             latencies.clone(),
+            lender.clone(),
         );
         lore_base::lore_spawn!(set, async move {
             let mut rng = Rng::new(task as u64 * 7919 + 1);
@@ -252,6 +259,15 @@ async fn run_tasks(
                         // SAFETY: `buffer` outlives the read and nothing else touches it meanwhile.
                         let mut destination =
                             unsafe { CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+                        let _ = store
+                            .clone()
+                            .get_into(partition, address, &mut destination)
+                            .await;
+                    }
+                    Mode::GetIntoShared => {
+                        // SAFETY: `buffer` outlives the read and nothing else touches it meanwhile.
+                        let mut destination =
+                            unsafe { lender.lend(buffer.as_mut_ptr(), buffer.len()) };
                         let _ = store
                             .clone()
                             .get_into(partition, address, &mut destination)

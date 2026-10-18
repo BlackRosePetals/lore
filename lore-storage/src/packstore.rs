@@ -21,6 +21,8 @@ use zerocopy::FromBytes;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
+use crate::caller_buffer::CallerBuffer;
+
 #[error_set]
 pub enum PackfileError {}
 
@@ -92,68 +94,6 @@ async fn packfile_read(file: &IoFile, offset: usize, size: usize) -> Result<Byte
     )
 }
 
-/// A caller-owned destination for a scattering read. The pointer and length stay valid and
-/// untouched for the duration of the read.
-pub struct CallerBuffer {
-    ptr: *mut u8,
-    len: usize,
-}
-
-impl CallerBuffer {
-    /// # Safety
-    ///
-    /// `ptr` must point to `len` writable bytes that stay valid, and are not
-    /// read or written by anyone else, until the read using this buffer
-    /// completes.
-    pub unsafe fn new(ptr: *mut u8, len: usize) -> Self {
-        CallerBuffer { ptr, len }
-    }
-
-    /// The address the buffer starts at, for a read that takes ownership of its destination.
-    fn address(&self) -> usize {
-        self.ptr as usize
-    }
-
-    /// The capacity available, in bytes.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Whether the buffer has no capacity.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// The destination as a slice.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: as CallerBuffer::new.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-
-    /// Split at `at`, keeping `..at` and returning `at..`, as [`bytes::BytesMut::split_off`] does.
-    ///
-    /// The two name disjoint memory, so each can be written on its own.
-    pub fn split_off(&mut self, at: usize) -> CallerBuffer {
-        assert!(at <= self.len, "split index out of bounds");
-        // SAFETY: `at` is within this buffer, so the tail names a part of the memory the contract
-        // on `new` already covers, and the head gives it up by shrinking.
-        let tail = unsafe { CallerBuffer::new(self.ptr.add(at), self.len - at) };
-        self.len = at;
-        tail
-    }
-}
-
-// SAFETY: one read holds the buffer at a time, and the contract on `new` makes the memory
-// exclusive for that read's duration.
-unsafe impl Send for CallerBuffer {}
-
-impl lore_io::StableBufListMut for CallerBuffer {
-    fn byte_segments_mut(&mut self) -> impl Iterator<Item = &mut [u8]> {
-        // SAFETY: as CallerBuffer::new.
-        std::iter::once(unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) })
-    }
-}
-
 /// Read `len` bytes at `offset` into `dst`, scattering straight into it and allocating nothing.
 async fn packfile_read_into(
     file: &IoFile,
@@ -161,13 +101,12 @@ async fn packfile_read_into(
     dst: &mut CallerBuffer,
     len: usize,
 ) -> Result<(), PackfileError> {
-    let address = dst.address();
-    crate::fs_util::retry_transient(move || {
-        // SAFETY: `dst` is borrowed for this whole call, so the memory it names stays valid and
-        // reaches nobody else. A scattering read consumes the buffer it is given, so each attempt
-        // takes its own handle to that memory; `retry_transient` never overlaps two of them.
-        let buffer = unsafe { CallerBuffer::new(address as *mut u8, len) };
-        file.read_exact_vectored_at(buffer, offset as u64)
+    crate::fs_util::retry_transient(|| {
+        // SAFETY: `len` is within `dst`, as the one caller checks. A scattering read keeps the
+        // handle it is given until the read completes, even past a dropped future, so each attempt
+        // takes its own: `retry_transient` never overlaps two, and the holder of `dst` writes
+        // nothing through it while one lives, as `CallerBuffer` requires.
+        file.read_exact_vectored_at(unsafe { dst.prefix(len) }, offset as u64)
     })
     .await
     .internal("Failed reading from packstore file into caller buffer")?;

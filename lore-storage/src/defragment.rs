@@ -6,7 +6,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use bytes::BytesMut;
 use lore_io::IoDriver;
 use lore_io::IoFile;
 use lore_io::OpenOptions;
@@ -1276,86 +1275,15 @@ pub async fn defragment_pipeline_leaves(
     joined(walk_result).and(joined(fetch_result))
 }
 
-/// A destination a defragmenting read divides among the leaves it walks.
-///
-/// Each leaf writes one disjoint piece, so a target only has to hand those pieces out and let each
-/// be written on its own. [`BytesMut`] holds the pieces of a buffer the read allocates;
-/// [`CallerBuffer`](crate::CallerBuffer) holds the pieces of one the caller already owns, which the
-/// leaves then write without the content being assembled anywhere else first.
-pub trait DefragmentTarget: Send + 'static {
-    /// The bytes this piece covers.
-    fn len(&self) -> usize;
-
-    /// Whether this piece covers no bytes.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Split at `at`, keeping `..at` and returning `at..`.
-    fn split_off(&mut self, at: usize) -> Self;
-
-    /// The piece as a slice, for a leaf that holds its bytes and only has to place them.
-    fn as_mut_slice(&mut self) -> &mut [u8];
-
-    /// This piece as memory a read can land in, for a leaf that can be read into place rather than
-    /// loaded and copied.
-    ///
-    /// `None` for a target the read has no way to write into directly, which is answered by loading
-    /// the leaf and copying it in. The handle names the same memory as the piece it was taken from,
-    /// so the piece must not be written through while it is alive.
-    fn as_caller_buffer(&mut self) -> Option<crate::CallerBuffer>;
-}
-
-impl DefragmentTarget for BytesMut {
-    fn len(&self) -> usize {
-        BytesMut::len(self)
-    }
-
-    fn split_off(&mut self, at: usize) -> Self {
-        BytesMut::split_off(self, at)
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        self
-    }
-
-    fn as_caller_buffer(&mut self) -> Option<crate::CallerBuffer> {
-        None
-    }
-}
-
-impl DefragmentTarget for crate::CallerBuffer {
-    fn len(&self) -> usize {
-        crate::CallerBuffer::len(self)
-    }
-
-    fn split_off(&mut self, at: usize) -> Self {
-        crate::CallerBuffer::split_off(self, at)
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        crate::CallerBuffer::as_mut_slice(self)
-    }
-
-    fn as_caller_buffer(&mut self) -> Option<crate::CallerBuffer> {
-        let piece = crate::CallerBuffer::as_mut_slice(self);
-        let (ptr, len) = (piece.as_mut_ptr(), piece.len());
-        // SAFETY: the handle names exactly this piece and nothing wider, so it inherits the contract
-        // `CallerBuffer::new` was first constructed under. Its user drops it before this piece is
-        // written through again.
-        Some(unsafe { crate::CallerBuffer::new(ptr, len) })
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-pub async fn read_defragment<Target: DefragmentTarget>(
+pub async fn read_defragment(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
     range: Range<usize>,
     fragment: Fragment,
     source_buffer: Bytes,
-    mut target: Target,
+    mut target: crate::CallerBuffer,
     options: ReadOptions,
     depth: usize,
     remote_session: Option<Arc<StorageSession>>,
@@ -1394,19 +1322,13 @@ pub async fn read_defragment<Target: DefragmentTarget>(
         range.end = range.start + target.len();
     }
 
-    // Find the first and last fragment that overlaps the requested range
-    let mut fragment_begin = 0;
-    let mut fragment_end = fragment_list.len();
-    while (fragment_begin < (fragment_list.len() - 1))
-        && (offset > fragment_list[fragment_begin + 1].offset_content as usize)
-    {
-        fragment_begin += 1;
-    }
-    while ((fragment_end - 1) > fragment_begin)
-        && (fragment_list[fragment_end - 1].offset_content as usize > (offset + range.len()))
-    {
-        fragment_end -= 1;
-    }
+    let level_end = fragment_list[0]
+        .offset_content
+        .checked_add(fragment.size_content)
+        .ok_or_else(|| StorageError::internal("fragment list content window overflows"))?;
+    let window = offset as u64..(offset + range.len()) as u64;
+    let wanted = wanted_entries(fragment_list, level_end, &window)?.unwrap_or(0..0);
+    let (fragment_begin, fragment_end) = (wanted.start, wanted.end);
 
     let mut subreads = JoinSet::new();
 
@@ -1465,6 +1387,11 @@ pub async fn read_defragment<Target: DefragmentTarget>(
             break;
         }
     }
+    if result.is_ok() && target_end != 0 {
+        result = Err(StorageError::internal(format!(
+            "Defragmenting malformed fragment list, {target_end} bytes of the range are in no entry"
+        )));
+    }
 
     drop(source_buffer);
 
@@ -1483,16 +1410,15 @@ pub async fn read_defragment<Target: DefragmentTarget>(
 /// and nothing is copied out of it.
 ///
 /// `false` leaves the leaf to be loaded and cut instead: the range clips it, so it is not the whole
-/// content its address names; the leaf is not the size the list claimed for it; `target` is memory
-/// the read cannot write into directly; or the read declined, which the assembling path answers by
-/// reaching the remote and healing.
+/// content its address names; the leaf is not the size the list claimed for it; or the read
+/// declined, which the assembling path answers by reaching the remote and healing.
 #[allow(clippy::too_many_arguments)]
-async fn place_whole_leaf<Target: DefragmentTarget>(
+async fn place_whole_leaf(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
     range: &Range<usize>,
-    target: &mut Target,
+    target: &mut crate::CallerBuffer,
     options: ReadOptions,
     depth: usize,
     remote_session: Option<Arc<StorageSession>>,
@@ -1500,16 +1426,13 @@ async fn place_whole_leaf<Target: DefragmentTarget>(
     if range.start != 0 {
         return Ok(false);
     }
-    let Some(mut dst) = target.as_caller_buffer() else {
-        return Ok(false);
-    };
 
-    let piece = dst.len();
+    let piece = target.len();
     match crate::read::read_content_into_buffer(
         store,
         partition,
         address,
-        &mut dst,
+        target,
         options,
         crate::read::RootSource::LocalOrRemote,
         depth,
@@ -1525,12 +1448,12 @@ async fn place_whole_leaf<Target: DefragmentTarget>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn read_defragment_subread<Target: DefragmentTarget>(
+fn read_defragment_subread(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
     range: Range<usize>,
-    mut target: Target,
+    mut target: crate::CallerBuffer,
     options: ReadOptions,
     depth: usize,
     remote_session: Option<Arc<StorageSession>>,

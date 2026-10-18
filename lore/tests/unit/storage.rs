@@ -5,8 +5,11 @@ use lore_storage::StorageError;
 
 mod call;
 mod close;
+mod get;
 mod get_resolved;
 mod handle;
+mod held;
+mod lent;
 mod open;
 mod store;
 

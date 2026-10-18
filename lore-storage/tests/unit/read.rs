@@ -580,7 +580,8 @@ async fn a_whole_compressed_read_into_a_slice_loads_its_payload_once() {
 }
 
 /// A whole read into a slice reads each payload it needs from the local store once, a payload that
-/// is the content and a list with its leaves alike, into memory of its own rather than placed.
+/// is the content and a list with its leaves alike, into memory of its own rather than the slice:
+/// the list's leaves are placed in the buffer the read assembles the content in.
 #[tokio::test]
 async fn a_whole_read_into_a_slice_reads_each_local_payload_once() {
     let (_dir, store) = make_test_store().await;
@@ -590,7 +591,7 @@ async fn a_whole_read_into_a_slice_reads_each_local_payload_once() {
     let whole = put_whole(&store, partition, context, &payload).await;
     let (list, content) = put_two_leaf_list(&store, partition, context).await;
 
-    for (address, expected, reads) in [(whole, payload.to_vec(), 1), (list, content, 3)] {
+    for (address, expected, reads) in [(whole, payload.to_vec(), (0, 1)), (list, content, (2, 1))] {
         let (counting, counts) = CountingReadStore::wrap(store.clone());
         let mut slice = vec![0u8; expected.len()];
         read_into(
@@ -606,7 +607,7 @@ async fn a_whole_read_into_a_slice_reads_each_local_payload_once() {
         .expect("read into the slice");
 
         assert_eq!(slice, expected);
-        assert_eq!((counts.gets_into(), counts.gets()), (0, reads));
+        assert_eq!((counts.gets_into(), counts.gets()), reads);
     }
 }
 
@@ -971,6 +972,117 @@ async fn a_fragmented_read_places_every_payload() {
         counts.gets(),
         0,
         "a buffer was allocated for a payload the store could have placed"
+    );
+}
+
+/// A fragmented read assembling into a buffer of its own reads each whole leaf into its place
+/// there, so only the list is handed back in a buffer of its own. A read into a slice assembles the
+/// same way, see [`a_whole_read_into_a_slice_reads_each_local_payload_once`].
+#[tokio::test]
+async fn an_assembled_fragmented_read_places_every_whole_leaf() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([0x8d; 16]);
+    let context = Context::from([0x8d; 16]);
+    let (root_address, content) = put_two_leaf_list(&store, partition, context).await;
+
+    let (counting, counts) = CountingReadStore::wrap(store);
+    let (_fragment, bytes) = read(
+        counting,
+        partition,
+        root_address,
+        None,
+        ReadOptions::default().no_remote(),
+        None,
+    )
+    .await
+    .expect("read fragmented content");
+    assert_eq!(bytes.as_ref(), content.as_slice());
+    assert_eq!(counts.gets_into(), 2, "a leaf was not read into place");
+    assert_eq!(
+        counts.gets(),
+        1,
+        "a buffer was allocated for a leaf the store could have placed"
+    );
+}
+
+/// Read `address` into a lent buffer, drop the read once the store holds its memory for `held`,
+/// and check the loan stays out until the holder lets go, after the holder's write.
+async fn drop_a_held_read(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    held: Address,
+    size: usize,
+) -> Vec<u8> {
+    let (holding, mut holds) = lore_storage::test_util::HoldingStore::wrap(
+        store,
+        held,
+        lore_storage::test_util::HeldAnswer::Never,
+    );
+
+    let mut buffer = vec![0u8; size];
+    // SAFETY: the buffer outlives the loan, which is awaited before the buffer is read.
+    let mut dst = unsafe { CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+    let loan = dst.loan();
+    let mut piece = tokio::select! {
+        _ = read_into_buffer(
+            holding,
+            partition,
+            address,
+            None,
+            &mut dst,
+            ReadOptions::default().no_remote(),
+            None,
+        ) => panic!("a held read answered"),
+        piece = holds.recv() => piece.expect("the store holds the read's memory"),
+    };
+    drop(dst);
+    assert!(
+        !loan.is_returned(),
+        "the loan came back while the read's memory was still held"
+    );
+
+    piece.as_mut_slice().fill(0x5a);
+    drop(piece);
+    tokio::time::timeout(Duration::from_secs(5), loan.returned())
+        .await
+        .expect("the loan comes back once the holder lets go");
+    buffer
+}
+
+/// A read dropped while an operation it started still holds the caller's memory, as an I/O
+/// operation does past its future, keeps the loan out until that operation lets go.
+#[tokio::test]
+async fn a_dropped_read_keeps_its_loan_until_its_memory_is_let_go() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([0x8e; 16]);
+    let payload = Bytes::from(vec![0x11u8; 64]);
+    let address = put_whole(&store, partition, Context::from([0x8e; 16]), &payload).await;
+
+    let buffer = drop_a_held_read(store, partition, address, address, payload.len()).await;
+    assert!(
+        buffer.iter().all(|byte| *byte == 0x5a),
+        "the holder's write did not land before the loan came back"
+    );
+}
+
+/// Dropping a fragmented read aborts its leaves' tasks, and the loan still stays out until a leaf's
+/// memory, held past its task, is let go.
+#[tokio::test]
+async fn a_dropped_fragmented_read_keeps_its_loan_until_a_leaf_is_let_go() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([0x8f; 16]);
+    let context = Context::from([0x8f; 16]);
+    let (root_address, content) = put_two_leaf_list(&store, partition, context).await;
+    let second_leaf = Address {
+        hash: hash::hash_slice(&content[64..]),
+        context,
+    };
+
+    let buffer = drop_a_held_read(store, partition, root_address, second_leaf, content.len()).await;
+    assert!(
+        buffer[64..].iter().all(|byte| *byte == 0x5a),
+        "the leaf holder's write did not land before the loan came back"
     );
 }
 
@@ -2064,7 +2176,7 @@ mod tree {
     pub(super) const LEAVES: usize = 4;
     pub(super) const CONTENT: usize = LEAF * LEAVES;
 
-    async fn put_leaf(
+    pub(super) async fn put_leaf(
         store: &Arc<dyn ImmutableStore>,
         partition: Partition,
         context: Context,
@@ -2095,7 +2207,7 @@ mod tree {
 
     /// Build a list fragment. Returns its address whether or not it was stored, so a
     /// caller can reference a list the store does not hold.
-    async fn put_list(
+    pub(super) async fn put_list(
         store: &Arc<dyn ImmutableStore>,
         partition: Partition,
         context: Context,
@@ -2196,6 +2308,35 @@ mod tree {
         .await;
 
         (root, payloads.concat())
+    }
+}
+
+/// A fragment list whose offsets are out of order fails the read: one leaves part of the content
+/// in no entry, which a read that succeeded would hand back as bytes nothing wrote, and one
+/// starting past zero ends in an entry covering the whole range, which would hand back the bytes
+/// of the wrong leaf.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fragment_list_with_offsets_out_of_order_fails_the_read() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([0x3a; 16]);
+    let context = Context::from([0x3a; 16]);
+    let lists: [[(u8, usize, u64); 3]; 2] = [
+        [(0xB0, 100, 0), (0xB1, 100, 100), (0xB2, 100, 50)],
+        [(0xC0, 50, 100), (0xC1, 50, 150), (0xC2, 150, 100)],
+    ];
+    for entries in lists {
+        let mut references = vec![];
+        for (fill, size, offset_content) in entries {
+            let leaf = tree::put_leaf(&store, partition, context, vec![fill; size]).await;
+            references.push(lore_storage::FragmentReference {
+                hash: leaf.hash,
+                offset_content,
+            });
+        }
+        let list = tree::put_list(&store, partition, context, &references, 150, true).await;
+
+        let result = read(store.clone(), partition, list, None, no_remote(), None).await;
+        assert!(result.is_err(), "{entries:?}: {result:?}");
     }
 }
 

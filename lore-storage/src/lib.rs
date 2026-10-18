@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod caller_buffer;
 pub mod chunker;
 pub mod compress;
 pub mod concurrency;
@@ -39,6 +40,9 @@ pub mod write;
 pub mod write_stats;
 pub mod write_tracker;
 
+pub use caller_buffer::CallerBuffer;
+pub use caller_buffer::Lender;
+pub use caller_buffer::Loan;
 // Re-export compress types
 pub use compress::COMPRESSION_MODE;
 pub use compress::CompressionMode;
@@ -124,7 +128,6 @@ pub use mutable_store::MutableStore;
 pub use options::ReadOptions;
 pub use options::WriteOptions;
 // Re-export packstore
-pub use packstore::CallerBuffer;
 pub use packstore::PackStore;
 pub use packstore::PackStoreRef;
 pub use packstore::PackfileError;

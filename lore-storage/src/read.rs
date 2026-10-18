@@ -9,7 +9,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-use bytes::BytesMut;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::KeyType;
@@ -1145,11 +1144,8 @@ fn deliver_root_into_buffer(
             return copy_into_buffer(&cut_content(&buffer, content)?, dst);
         }
 
-        let assembled = destination(dst.as_mut_slice(), content.len())?;
-
-        // SAFETY: `dst` is borrowed for this whole call, so the memory the walk divides among the
-        // leaves stays valid and reaches nobody else, and the slice it is taken from bounds it.
-        let target = unsafe { crate::CallerBuffer::new(assembled.as_mut_ptr(), assembled.len()) };
+        crate::validate_buffer_capacity(content.len(), dst.len())
+            .forward::<StorageError>("writing content into the caller's memory")?;
         read_defragment(
             store,
             partition,
@@ -1157,7 +1153,9 @@ fn deliver_root_into_buffer(
             content.clone(),
             fragment,
             buffer,
-            target,
+            // SAFETY: `content.len()` is within `dst`, as checked above, and the holder of `dst`
+            // writes nothing through it while the prefix lives, as `CallerBuffer` requires.
+            unsafe { dst.prefix(content.len()) },
             options,
             depth,
             remote_session,
@@ -1222,7 +1220,8 @@ fn read_range_into_buffer(
 /// content one fragment holds is cut from that fragment and copied in once. The zero hash names
 /// empty content, which writes nothing and asks no store.
 ///
-/// The contents of `dst` are unspecified when this fails.
+/// The contents of `dst` are unspecified when this fails. A read dropped part-way may still write
+/// `dst` until the loan on it ([`CallerBuffer::loan`](crate::CallerBuffer::loan)) is returned.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -1971,7 +1970,8 @@ pub fn read_resolved_stream(
 /// does. Anything else is resolved through [`resolve_root`] and delivered into `dst` by
 /// [`deliver_root_into_buffer`], assembled nowhere else.
 ///
-/// The contents of `dst` are unspecified when this fails.
+/// The contents of `dst` are unspecified when this fails. A read dropped part-way may still write
+/// `dst` until the loan on it ([`CallerBuffer::loan`](crate::CallerBuffer::loan)) is returned.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -2180,33 +2180,37 @@ fn read_root_content(
         }
 
         if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
-            let mut target_buffer = BytesMut::with_capacity(range.len());
-            // Safety: the capacity was just reserved, and read_defragment fully writes the range
-            // before the buffer is read back.
-            unsafe {
-                target_buffer.set_len(range.len());
-            }
-            let target_size = target_buffer.len();
-            let target = target_buffer.split();
+            let size = range.len();
+            let mut content = crate::CallerBuffer::allocate(size);
             read_defragment(
-                store, partition, address, range, fragment, buffer, target, options, 0, session,
+                store,
+                partition,
+                address,
+                range,
+                fragment,
+                buffer,
+                // SAFETY: `size` is the length of `content`, which nothing writes through: the
+                // walk returns once every handle it gave out is gone, and `content` drops with
+                // this future.
+                unsafe { content.prefix(size) },
+                options,
+                0,
+                session,
             )
             .await?;
-            if !target_buffer.try_reclaim(target_size) {
-                return Err(StorageError::internal(
-                    "failed to reclaim buffer after defragmenting",
-                ));
-            }
-            // Safety: try_reclaim just confirmed the split-off target bytes are back in this
-            // buffer's capacity, and read_defragment initialized all of them.
-            unsafe {
-                target_buffer.set_len(target_size);
-            }
-            Ok(target_buffer.freeze())
+            assembled(content)
         } else {
             cut_content(&buffer, range)
         }
     }
+}
+
+/// The content a walk assembled into `content`, which a walk that succeeds writes whole, handed
+/// back without a copy.
+fn assembled(content: crate::CallerBuffer) -> Result<Bytes, StorageError> {
+    // SAFETY: the walk succeeded, so it wrote every byte of its range.
+    unsafe { content.into_bytes() }
+        .ok_or_else(|| StorageError::internal("failed to reclaim buffer after defragmenting"))
 }
 
 /// The `range` of `buffer`, content one fragment holds, failing rather than panicking where the
