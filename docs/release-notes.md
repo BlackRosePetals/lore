@@ -137,6 +137,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore-storage`: a flush of a local store no longer reports success while a bucket write it overlapped, which failed
+  or was dropped part way, left entries unwritten
 - `lore-storage`: a flush or an obliterate of a local store dropped part way, as a command that stops waiting for it
   drops it, left the bucket writes it had started running with nothing keeping the store claimed, so another process,
   or a store opened on the directory in the same process, could write the same bucket files meanwhile. Once a fan-out

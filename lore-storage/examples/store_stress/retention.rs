@@ -1117,9 +1117,10 @@ fn a_writer_killed_at_every_pause_point_leaves_a_consistent_store(
         Op::Load(4),
     ];
     // Each case: the pause point, the call reaching it, and the reads the call may change.
-    let cases: [(&str, Vec<Op>, &[usize]); 14] = [
+    let cases: [(&str, Vec<Op>, &[usize]); 16] = [
         ("reserved", vec![put(y)], &[2]),
         ("written", vec![put(y)], &[2]),
+        ("scanning", vec![put(y)], &[2]),
         ("serializing", vec![put(y)], &[2]),
         ("committing", vec![put(y), put(z)], &[2, 3, 4]),
         ("serializing", vec![Op::Obliterate(x, LOCAL)], &[0]),
@@ -1137,6 +1138,7 @@ fn a_writer_killed_at_every_pause_point_leaves_a_consistent_store(
         ("serializing", vec![Op::Compact], &[1]),
         ("evicting", vec![Op::Compact], &[1]),
         ("serializing", vec![Op::Evict], &[1]),
+        ("scanning", vec![Op::Store(2, 2)], &[6]),
         ("serializing", vec![Op::Store(2, 2)], &[6]),
         (
             "committing",

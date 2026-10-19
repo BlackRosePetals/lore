@@ -1589,12 +1589,19 @@ impl ImmutableStoreGroup {
     /// out to a layout no commit recorded on disk, and writing a bucket as it is in memory would
     /// mix two layouts, or a commit failed after writing its `level.pending`, and completing it
     /// renames the commit's `.new` files over any bucket file written meanwhile. Read under the
-    /// flush lock, which every change to the levels holds, except by `flush_all`'s scan, which only
-    /// decides whether to flush the group.
+    /// flush lock, which every change to the levels holds.
     fn fan_out_uncommitted(&self) -> bool {
         let committed = self.committed_level.load(atomic::Ordering::Relaxed);
         self.pending_level.load(atomic::Ordering::Relaxed) != 0
             || (committed != 0 && committed != self.bucket_count.load(atomic::Ordering::Relaxed))
+    }
+
+    /// Whether a flush can skip the group: no bucket is flagged and no fan-out awaits its commit.
+    /// Read under the flush lock, under which every bucket write claims a bucket's flag and flags it
+    /// again when the write fails or is dropped, see [`SerializeFailureGuard`]; read without the
+    /// lock, a group whose write is failing reads as clean.
+    fn nothing_to_flush(&self) -> bool {
+        !self.fan_out_uncommitted() && !(0..self.dirty.len()).any(|bucket| self.needs_flush(bucket))
     }
 
     /// Writes out the group's flagged buckets after `delay` seconds, each after rolling forward a
@@ -4958,18 +4965,17 @@ impl LocalImmutableStore {
         for group_index in 0..self.group.len() {
             let group = self.group[group_index].clone();
 
-            // Lock-free scan: a group with no dirty bucket has taken no write since the last
-            // flush, so it has nothing to serialize and owes no marker. A marker-less group
-            // reloads at bucket_count = 256, correct for an empty group at any level, and its
-            // first write fires the two-phase commit. Empty groups cost ~nothing per flush.
-            //
-            // Unless a bucket write holds the group's flush lock: it may have claimed a bucket's
-            // mark, before this scan, and not written the file yet. Every bucket write claims
-            // and writes under the lock, so a group whose lock is free once its marks read clean
-            // has every write claimed before then on disk, and one whose lock is held is waited
-            // for, so that this flush does not return before a write it covers has landed.
-            let any_dirty = (0..group.dirty.len()).any(|bucket| group.needs_flush(bucket));
-            if !any_dirty && !group.fan_out_uncommitted() && group.flush_lock.try_lock().is_ok() {
+            // A group with no bucket flagged has taken no write since the last flush, so it has
+            // nothing to serialize and owes no marker. A marker-less group reloads at
+            // bucket_count = 256, correct for an empty group at any level, and its first write
+            // fires the two-phase commit. Empty groups cost ~nothing per flush.
+            #[cfg(feature = "test-util")]
+            crate::test_util::pause_point(crate::test_util::PausePoint::Scanning).await;
+            if group
+                .flush_lock
+                .try_lock()
+                .is_ok_and(|_held| group.nothing_to_flush())
+            {
                 continue;
             }
 
@@ -5917,8 +5923,15 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         // over a store with nothing to write would tell every other process its in-memory
         // state is worthless, after every read-only command. Access stamps change no
         // entry and are written under a read claim.
+        //
+        // Each group is read under its flush lock, once every bucket write it had in flight
+        // has landed: a write claims a bucket's mark under the lock and sets it again if it
+        // fails, see [`SerializeFailureGuard`], so a group read clean while a write ran may
+        // have a bucket to write once the write has ended.
         let mut pending = PendingFlush::Nothing;
         for group in &self.group {
+            let _held =
+                crate::local::fan_out::await_bucket_write(&group.flush_lock, &group.writes).await;
             match group.pending_flush() {
                 PendingFlush::Changes => {
                     pending = PendingFlush::Changes;
@@ -5930,10 +5943,6 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         }
         let intent = match pending {
             PendingFlush::Nothing => {
-                for group in &self.group {
-                    crate::local::fan_out::await_bucket_write(&group.flush_lock, &group.writes)
-                        .await;
-                }
                 // Nothing is flagged, so a flock an earlier span left held over state
                 // since written has nothing to keep it.
                 self.note_flushed();
@@ -6532,8 +6541,8 @@ pub(crate) async fn flush_locked_group(
     })?;
 
     // Re-check under the lock: another flusher may have drained this group
-    // while we waited. The scan that got us here is lock-free and stale by
-    // now, so skip the redundant fan-out check, path selection and - in the
+    // while we waited. The scan that got us here released the lock before
+    // this task took it, so it is stale: skip the redundant fan-out check, path selection and - in the
     // two-phase branch - the needless level-marker write. A pending level
     // transition (`committed_level != active_buckets`) still has to be
     // completed even with no dirty bucket, so it is never skipped.

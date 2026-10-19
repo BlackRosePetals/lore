@@ -682,18 +682,21 @@ pub(crate) fn temporary_path(path: &Path) -> PathBuf {
     PathBuf::from(temporary)
 }
 
-/// Wait for a bucket write that holds `flush_lock`, as one another flush claimed before this one
-/// read the group clean, or that a dropped flush left in flight, so that a flush finding nothing
-/// flagged does not return before that write has landed.
+/// Take `flush_lock` once every bucket write in the group has landed: one holding the lock, or one
+/// a dropped flush left in flight. Flags read under the returned guard include a bucket such a
+/// write flagged again when it failed, see [`crate::local::immutable_store::SerializeFailureGuard`].
 pub(crate) async fn await_bucket_write(
     flush_lock: &Arc<tokio::sync::Mutex<()>>,
     writes: &GroupWrites,
-) {
-    if flush_lock.try_lock().is_err() || writes.try_write().is_err() {
-        // Boxed: a write in flight is rare, and carried inline the wait would be part of every
-        // flush's future.
-        drop(Box::pin(lock_flush(flush_lock, writes)).await);
+) -> OwnedMutexGuard<()> {
+    if let Ok(guard) = Arc::clone(flush_lock).try_lock_owned()
+        && writes.try_write().is_ok()
+    {
+        return guard;
     }
+    // Boxed: a write in flight is rare, and carried inline the wait would be part of every
+    // flush's future.
+    Box::pin(lock_flush(flush_lock, writes)).await
 }
 
 /// The writes in flight in a store's group. Each bucket and level file write in the group holds a

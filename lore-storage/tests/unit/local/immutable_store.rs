@@ -41,6 +41,7 @@ use crate::store_fixture::assert_payloads_read_back;
 use crate::store_fixture::compact_group_toward;
 use crate::store_fixture::group_entries;
 use crate::store_fixture::payloads_in_one_group;
+use crate::store_fixture::payloads_in_two_groups;
 use crate::store_fixture::payloads_of_size_in_one_group;
 use crate::store_fixture::put_payload;
 use crate::store_fixture::try_compact_group_toward;
@@ -374,6 +375,113 @@ async fn a_flush_waits_for_a_bucket_write_another_flush_claimed() {
     pause.resume.notify_one();
     delayed.await.expect("delayed flush");
     flush.await.expect("flush task").expect("flush");
+}
+
+/// A flush that finds a group's lock held by a bucket write reads the group once the write has
+/// ended. A write that ends without landing flags the bucket again before it releases the lock, so
+/// the flush writes the bucket; returned instead, it would acknowledge an entry that is only in
+/// memory.
+#[tokio::test]
+async fn a_flush_writes_a_bucket_whose_claimed_write_did_not_land() {
+    let dir = lore_base::test_util::TempDir::new("is_flush_write_failed_");
+    let store = LocalImmutableStore::new(
+        Some(dir.path().to_path_buf()),
+        ImmutableStoreSettings {
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        },
+    )
+    .await
+    .expect("store opens");
+    let partition = Partition::from([9u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+    let address = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+    let group = &store.group[group_index];
+
+    // A write that took the lock and claimed the mark, and has not written the file.
+    let writing = group.flush_lock.clone().lock_owned().await;
+    assert!(group.dirty[0].swap(false, atomic::Ordering::Relaxed));
+    let flushing: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+    let mut flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut flush)
+            .await
+            .is_err(),
+        "the flush returned while a claimed bucket write held the group"
+    );
+    // The write ends without landing, which flags the bucket again before the lock goes.
+    group.dirty[0].store(true, atomic::Ordering::Relaxed);
+    drop(writing);
+    flush.await.expect("flush task").expect("flush");
+
+    assert_bucket_file_holds(&store, group_index, address).await;
+}
+
+/// A flush with a bucket to write skips the groups it finds clean, each read under the group's
+/// flush lock. A bucket write in one of them that claimed a mark and ends without landing flags
+/// the bucket again before it releases the lock; read before the lock, the group would be skipped
+/// with the bucket left in memory.
+#[tokio::test]
+async fn a_flush_skips_no_group_whose_claimed_write_did_not_land() {
+    let dir = lore_base::test_util::TempDir::new("is_flush_skip_failed_");
+    let store = LocalImmutableStore::new(
+        Some(dir.path().to_path_buf()),
+        ImmutableStoreSettings {
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        },
+    )
+    .await
+    .expect("store opens");
+    let partition = Partition::from([9u8; 16]);
+    let mut groups = payloads_in_two_groups(1);
+    groups.sort_by_key(|(group_index, _)| *group_index);
+    let [(flagged_group, flagged), (claimed_group, claimed)] = groups;
+    let flagged = put_payload(&store, partition, Context::default(), &flagged[0], false).await;
+    let claimed = put_payload(&store, partition, Context::default(), &claimed[0], false).await;
+    let group = &store.group[claimed_group];
+
+    // A write that took the lock of the later group and claimed the mark, and has not written
+    // the file. The flush is held before it tries each group's lock, so that the write can end
+    // between its reads of the two groups.
+    let writing = group.flush_lock.clone().lock_owned().await;
+    assert!(group.dirty[0].swap(false, atomic::Ordering::Relaxed));
+    let scanning: Vec<_> = (0..=claimed_group)
+        .map(|_| pause_at(PausePoint::Scanning))
+        .collect();
+    let flushing: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+    let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    for pause in &scanning[..claimed_group] {
+        pause.reached.notified().await;
+        pause.resume.notify_one();
+    }
+    scanning[claimed_group].reached.notified().await;
+    // The write ends without landing, which flags the bucket again before the lock goes.
+    group.dirty[0].store(true, atomic::Ordering::Relaxed);
+    drop(writing);
+    scanning[claimed_group].resume.notify_one();
+    flush.await.expect("flush task").expect("flush");
+
+    assert_bucket_file_holds(&store, flagged_group, flagged).await;
+    assert_bucket_file_holds(&store, claimed_group, claimed).await;
+}
+
+/// Assert that the file of bucket 0 of group `group_index` holds `address`.
+async fn assert_bucket_file_holds(
+    store: &LocalImmutableStore,
+    group_index: usize,
+    address: Address,
+) {
+    let root = store.path.clone().expect("a disk-backed store has a path");
+    let written =
+        ImmutableStoreBucket::deserialize_files(format_bucket_path(&root, group_index, 0))
+            .await
+            .expect("the bucket file reads")
+            .entry;
+    assert!(
+        written.iter().any(|entry| entry.address == address),
+        "group {group_index}: the flush acknowledged an entry its bucket file does not hold"
+    );
 }
 
 /// A fan-out commit removes the `.new` files it did not write before it writes `level.pending`.

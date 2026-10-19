@@ -192,13 +192,14 @@ async fn run_delayed_flush(store: &Arc<LocalMutableStore>) {
     }
 }
 
-/// A flush waits for a bucket write holding the group's flush lock, which may have claimed a
-/// bucket's mark and not written its file yet: the group reads clean, and skipping it would let
-/// the flush return with an entry acknowledged before it still unwritten.
+/// A flush that finds a group's lock held by a bucket write reads the group once the write has
+/// ended. A write that ends without landing flags the bucket again before it releases the lock, so
+/// the flush writes the bucket; returned instead, it would acknowledge an entry that is only in
+/// memory.
 #[tokio::test]
-async fn a_flush_waits_for_a_bucket_write_holding_the_group() {
+async fn a_flush_writes_a_bucket_whose_claimed_write_did_not_land() {
     use lore_storage::mutable_store::MutableStore;
-    let dir = lore_base::test_util::TempDir::new("ms_flush_claimed_");
+    let dir = lore_base::test_util::TempDir::new("ms_flush_write_failed_");
     let store = Arc::new(
         LocalMutableStore::new(
             Some(dir.path()),
@@ -212,7 +213,8 @@ async fn a_flush_waits_for_a_bucket_write_holding_the_group() {
         .expect("store opens"),
     );
     let keys = store_keys(&store, Partition::default(), 1).await;
-    let group = &store.group[keys[0].data()[0] as usize];
+    let group_index = keys[0].data()[0] as usize;
+    let group = &store.group[group_index];
 
     // A write that took the lock and claimed the mark, and has not written the file.
     let writing = group.flush_lock.clone().lock_owned().await;
@@ -225,8 +227,77 @@ async fn a_flush_waits_for_a_bucket_write_holding_the_group() {
             .is_err(),
         "the flush returned while a claimed bucket write held the group"
     );
+    // The write ends without landing, which flags the bucket again before the lock goes.
+    group.dirty[0].store(true, atomic::Ordering::Relaxed);
     drop(writing);
     flush.await.expect("flush task").expect("flush");
+
+    assert_bucket_file_holds(dir.path(), group_index, &keys[0]).await;
+}
+
+/// A flush with a bucket to write skips the groups it finds clean, each read under the group's
+/// flush lock, as in the immutable store's test of this name: a bucket write in one of them that
+/// ends without landing flags the bucket again before it releases the lock.
+#[tokio::test]
+async fn a_flush_skips_no_group_whose_claimed_write_did_not_land() {
+    use lore_storage::mutable_store::MutableStore;
+    use lore_storage::test_util::PausePoint;
+    let dir = lore_base::test_util::TempDir::new("ms_flush_skip_failed_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            MutableStoreSettings {
+                flush_delay_seconds: 3600,
+                ..client_settings()
+            },
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store opens"),
+    );
+    let keys = store_keys(&store, Partition::default(), 2).await;
+    let group = &store.group[1];
+
+    // A write that took the lock of group 1 and claimed the mark, and has not written the file.
+    // The flush is held before it tries each group's lock, so that the write can end between
+    // its reads of groups 0 and 1.
+    let writing = group.flush_lock.clone().lock_owned().await;
+    assert!(group.dirty[0].swap(false, atomic::Ordering::Relaxed));
+    let scanning = [
+        lore_storage::test_util::pause_at(PausePoint::Scanning),
+        lore_storage::test_util::pause_at(PausePoint::Scanning),
+    ];
+    let flushing: Arc<dyn MutableStore> = store.clone();
+    let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    scanning[0].reached.notified().await;
+    scanning[0].resume.notify_one();
+    scanning[1].reached.notified().await;
+    // The write ends without landing, which flags the bucket again before the lock goes.
+    group.dirty[0].store(true, atomic::Ordering::Relaxed);
+    drop(writing);
+    scanning[1].resume.notify_one();
+    flush.await.expect("flush task").expect("flush");
+
+    for (group_index, key) in keys.iter().enumerate() {
+        assert_bucket_file_holds(dir.path(), group_index, key).await;
+    }
+}
+
+/// Assert that the file of bucket 0 of group `group_index` under `dir` holds `key`, whose first
+/// two bytes name it among the keys [`store_keys`] stores.
+async fn assert_bucket_file_holds(dir: &Path, group_index: usize, key: &Hash) {
+    let (_, written, _) = MutableStoreBucket::deserialize_files(
+        format_bucket_path(&dir.join("mutable"), group_index, 0),
+        false,
+    )
+    .await
+    .expect("the bucket file reads");
+    assert!(
+        written
+            .iter()
+            .any(|entry| entry.key.data()[..2] == key.data()[..2]),
+        "group {group_index}: the flush acknowledged a key its bucket file does not hold"
+    );
 }
 
 /// A delayed flush that cannot write its group's level marker finishes and leaves the bucket

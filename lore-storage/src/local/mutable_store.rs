@@ -295,12 +295,23 @@ impl MutableStoreGroup {
     /// out to a layout no commit recorded on disk, and writing a bucket as it is in memory would
     /// mix two layouts, or a commit failed after writing its `level.pending`, and completing it
     /// renames the commit's `.new` files over any bucket file written meanwhile. Read under the
-    /// flush lock, which every change to the levels holds, except by `flush_all`'s scan, which only
-    /// decides whether to flush the group.
+    /// flush lock, which every change to the levels holds.
     fn fan_out_uncommitted(&self) -> bool {
         let committed = self.committed_level.load(atomic::Ordering::Relaxed);
         self.pending_level.load(atomic::Ordering::Relaxed) != 0
             || (committed != 0 && committed != self.bucket_count.load(atomic::Ordering::Relaxed))
+    }
+
+    /// Whether a flush can skip the group: no bucket is flagged and no fan-out awaits its commit.
+    /// Read under the flush lock, under which every bucket write claims a bucket's flag and flags it
+    /// again when the write fails or is dropped, see [`SerializeFailureGuard`]; read without the
+    /// lock, a group whose write is failing reads as clean.
+    fn nothing_to_flush(&self) -> bool {
+        !self.fan_out_uncommitted()
+            && !self
+                .dirty
+                .iter()
+                .any(|flag| flag.load(atomic::Ordering::Relaxed))
     }
 }
 
@@ -1510,14 +1521,13 @@ impl LocalMutableStore {
         let authoritative = self.authoritative;
 
         for (group_index, group) in self.group.iter().enumerate() {
-            // Lock-free scan: skip entire group if nothing is dirty and no fan-out awaits its commit,
-            // unless a bucket write holds the group's flush lock: it may have claimed a bucket's
-            // mark and not written the file yet, and this flush must not return before it has.
-            let any_dirty = group
-                .dirty
-                .iter()
-                .any(|flag| flag.load(atomic::Ordering::Relaxed));
-            if !any_dirty && !group.fan_out_uncommitted() && group.flush_lock.try_lock().is_ok() {
+            #[cfg(feature = "test-util")]
+            crate::test_util::pause_point(crate::test_util::PausePoint::Scanning).await;
+            if group
+                .flush_lock
+                .try_lock()
+                .is_ok_and(|_held| group.nothing_to_flush())
+            {
                 continue;
             }
 
@@ -1552,8 +1562,8 @@ impl LocalMutableStore {
                 })?;
 
                 // Re-check under the lock: another flusher may have drained this group
-                // while we waited. The scan that got us here is lock-free and stale by
-                // now, so skip the redundant fan-out check, path selection and - in the
+                // while we waited. The scan that got us here released the lock before
+                // this task took it, so it is stale: skip the redundant fan-out check, path selection and - in the
                 // two-phase branch - the needless level-marker write. A pending level
                 // transition (`committed_level != active_buckets`) still has to be
                 // completed even with no dirty bucket, so it is never skipped.
@@ -2226,16 +2236,21 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         // Claimed to write only when a bucket is flagged, for the reason the immutable
         // store's `flush` gives: this runs after commands and on every handle close, and a
         // write claim over nothing to write would invalidate every other process's state.
-        let flagged = self.group.iter().any(|group| {
-            group
+        // Each group is read under its flush lock, as there, once every bucket write it had in
+        // flight has landed or flagged its bucket again.
+        let mut flagged = false;
+        for group in &self.group {
+            let _held =
+                crate::local::fan_out::await_bucket_write(&group.flush_lock, &group.writes).await;
+            flagged = group
                 .dirty
                 .iter()
-                .any(|flag| flag.load(atomic::Ordering::Relaxed))
-        });
-        if !flagged {
-            for group in &self.group {
-                crate::local::fan_out::await_bucket_write(&group.flush_lock, &group.writes).await;
+                .any(|flag| flag.load(atomic::Ordering::Relaxed));
+            if flagged {
+                break;
             }
+        }
+        if !flagged {
             self.note_flushed();
             return Ok(());
         }

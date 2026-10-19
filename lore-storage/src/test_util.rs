@@ -47,7 +47,7 @@ tokio::task_local! {
     static UNVALIDATED_PUTS: ();
 }
 
-/// A point where [`pause_at`] holds a store, a read or a compaction.
+/// A point where [`pause_at`] holds a store, a read, a flush or a compaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PausePoint {
     /// A packfile write has reserved its range and not yet written it.
@@ -69,6 +69,9 @@ pub enum PausePoint {
     Committing,
     /// A size eviction is about to check for a stop or a fan-out and evict from its next bucket.
     Evicting,
+    /// A flush is about to try a group's flush lock, under which it reads whether the group has
+    /// anything to write.
+    Scanning,
 }
 
 /// A task the store runs of its own accord rather than for a caller, see [`count_store_tasks`].
@@ -125,7 +128,7 @@ pub struct Pause {
 }
 
 /// Holds the next task on this thread to reach `point` there until the returned pause is resumed.
-/// Only that one task is held.
+/// Only that one task is held. Pauses armed at one point are taken in the order they were armed.
 pub fn pause_at(point: PausePoint) -> Arc<Pause> {
     let pause = Arc::new(Pause::default());
     PAUSES.with(|pauses| pauses.borrow_mut().push((point, pause.clone())));
@@ -137,7 +140,7 @@ pub(crate) async fn pause_point(point: PausePoint) {
     let pause = PAUSES.with(|pauses| {
         let mut pauses = pauses.borrow_mut();
         let position = pauses.iter().position(|(armed, _)| *armed == point)?;
-        Some(pauses.swap_remove(position).1)
+        Some(pauses.remove(position).1)
     });
     if let Some(pause) = pause {
         pause.reached.notify_one();
