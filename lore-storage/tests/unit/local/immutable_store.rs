@@ -9332,3 +9332,99 @@ async fn a_bucket_file_with_torn_sizes_has_its_entries_checked() {
         0
     );
 }
+
+/// A group at the full bucket level records no level for a bucket write outside a flush, so its
+/// first flush runs the fan-out commit. The commit writes a bucket emptied since such a write:
+/// left out, its file keeps the entries memory removed, which the next open loads back, pointing
+/// into packfile ranges compaction reuses.
+#[tokio::test]
+async fn the_first_flush_writes_a_bucket_emptied_since_its_file_was_written() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_first_flush_emptied_");
+    let partition = Partition::from([0x48u8; 16]);
+    // Two payloads of one bucket: the first hash byte chooses the group, the second the bucket.
+    let mut first_in_bucket: HashMap<[u8; 2], Vec<u8>> = HashMap::new();
+    let (group_index, bucket_index, kept, obliterated) = (0u32..)
+        .find_map(|seed| {
+            let payload =
+                format!("payload {seed} of a bucket emptied before its first flush").into_bytes();
+            let hash = hash::hash_slice(&payload);
+            let bucket = [hash.data()[0], hash.data()[1]];
+            let earlier = first_in_bucket.insert(bucket, payload.clone())?;
+            Some((
+                usize::from(bucket[0]),
+                usize::from(bucket[1]),
+                earlier,
+                payload,
+            ))
+        })
+        .expect("two payloads hashing into one bucket");
+
+    // Kept across holds, so that the eviction below finds the entries the obliterate's claim left.
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            reuse_state_across_holds: true,
+            ..server_settings()
+        },
+    )
+    .await
+    .unwrap();
+    let kept = put_payload(&store, partition, Context::default(), &kept, false).await;
+    let obliterated = put_payload(&store, partition, Context::default(), &obliterated, false).await;
+    store
+        .clone()
+        .obliterate(
+            partition,
+            obliterated,
+            Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+        )
+        .await
+        .expect("obliterate");
+    let group = &store.group[group_index];
+    assert_eq!(
+        group.committed_level.load(atomic::Ordering::Relaxed),
+        0,
+        "the obliterate's bucket write records no level for a group at the full level"
+    );
+    let bucket_path = format_bucket_path(
+        store.path.as_ref().expect("a disk-backed store has a path"),
+        group_index,
+        bucket_index,
+    );
+    assert_eq!(
+        ImmutableStoreBucket::deserialize_files(bucket_path.clone())
+            .await
+            .unwrap()
+            .entry
+            .len(),
+        2,
+        "the obliterate wrote the bucket with the entry and the tombstone"
+    );
+
+    assert_eq!(
+        store.clone().evict(1, false, None).await.unwrap(),
+        2,
+        "a capacity of one evicts the entry and the tombstone"
+    );
+    store.clone().flush(false).await.unwrap();
+
+    assert!(
+        ImmutableStoreBucket::deserialize_files(bucket_path)
+            .await
+            .unwrap()
+            .entry
+            .is_empty(),
+        "the group's first flush wrote the emptied bucket"
+    );
+    drop(store);
+    let reopened = LocalImmutableStore::new(Some(dir.to_path_buf()), server_settings())
+        .await
+        .unwrap();
+    let err = reopened
+        .get(partition, kept)
+        .await
+        .expect_err("an evicted entry is not loaded back");
+    assert!(matches!(err, StoreError::AddressNotFound(_)));
+}

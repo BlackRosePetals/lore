@@ -6595,7 +6595,7 @@ pub(crate) async fn flush_locked_group(
     }
 
     if needs_two_phase_commit && first_err.is_none() {
-        // T10 two-phase commit. Every [0..active_buckets] bucket gets a .new file (skipping empties at index >= committed_level since no old file exists there to overwrite). After all .new files are durable, write level.pending as the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
+        // T10 two-phase commit. Every flagged bucket, and every bucket below committed_level, gets a .new file; a clean bucket at or past committed_level has no file, or one that matches it. A flagged bucket is written empty as well: a bucket write outside a flush, or a layout older than the level markers, may have left it a file holding entries since removed. After all .new files are durable, write level.pending as the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
         if let Err(e) = lore_io::IoDriver::global()
             .create_dir_all(&group_path)
             .await
@@ -6619,16 +6619,6 @@ pub(crate) async fn flush_locked_group(
                     continue;
                 }
                 let bucket = group.bucket(bucket_index).clone().read_owned().await;
-                // Re-check after lock acquire — concurrent paths may have just dirtied or undirtied this bucket.
-                if bucket.entry.is_empty() && !must_overwrite_old {
-                    // Nothing to write and no older file to overwrite, so the flags
-                    // are settled here: left set, they would keep the store claimed
-                    // after a flush with nothing more to do. Cleared under the read
-                    // lock, which every writer is excluded by.
-                    group.dirty[bucket_index].store(false, atomic::Ordering::Relaxed);
-                    group.soft_dirty[bucket_index].store(false, atomic::Ordering::Relaxed);
-                    continue;
-                }
                 let res = ImmutableStoreBucket::serialize_to_new(
                     bucket,
                     group.clone(),

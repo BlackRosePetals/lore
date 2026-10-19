@@ -137,6 +137,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- A local immutable store's first flush of a group at the full bucket level, which every group of a server store is
+  at, writes a bucket emptied since an obliterate, a size eviction or a compaction wrote its file. The flush left the
+  file, which kept the removed entries; the next open loaded them back, pointing into packfile ranges compaction had
+  since reused, and a read served another payload's bytes for them without error
 - Opening a mutable store whose `version` file cannot be read fails rather than taking the store for one without a
   version. Taken for one, the open stamped the store `Initial` under a write claim, and every later open stamped it
   again and advanced the epoch, so every other process retaining the store reloaded it at each use. A store already
