@@ -542,6 +542,16 @@ impl GrpcReplica {
 
 #[async_trait]
 impl ImmutableStore for GrpcReplica {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     fn isolates_partitions(&self) -> bool {
         true
     }

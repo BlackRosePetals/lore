@@ -296,11 +296,10 @@ impl IoDriver {
         Ok((IoFile::new(self.clone(), Arc::new(file)), metadata, head))
     }
 
-    /// The storage layer's atomic whole-file write as a single backend
-    /// dispatch: creates `temporary_path` (per `options`), writes the
-    /// gathered contents of all segments, with `durable` syncs file data
-    /// and metadata, renames over `final_path`, and with `durable`
-    /// best-effort syncs the parent directory.
+    /// The storage layer's atomic whole-file write as a single job on the syscall pool, whatever
+    /// the backend: creates `temporary_path` (per `options`), writes the gathered contents of all
+    /// segments, with `durable` syncs file data and metadata, renames over `final_path`, and with
+    /// `durable` best-effort syncs the parent directory.
     ///
     /// A write, sync or rename that fails removes the temporary file in the
     /// same dispatch, and its error is the one returned: a failure to remove
@@ -315,54 +314,32 @@ impl IoDriver {
     ///
     /// Takes the paths by value so a caller building them for the call hands them over rather than
     /// having them copied.
-    pub async fn write_file_segments_atomic<B: StableBufList>(
+    ///
+    /// `completion` is dropped on the thread running the operation once the operation has ended,
+    /// the rename and the directory sync included, whether or not the call is still awaited. The
+    /// operation runs to its end after the call is dropped, so a caller that may drop it part way
+    /// passes a value whose drop says the write has landed.
+    pub async fn write_file_segments_atomic<B: StableBufList, C: Send + 'static>(
         &self,
         temporary_path: impl Into<PathBuf>,
         final_path: impl Into<PathBuf>,
         options: &OpenOptions,
         buffers: B,
         durable: bool,
+        completion: C,
     ) -> std::io::Result<()> {
-        let std_options = options.to_std();
-        let temporary_path = temporary_path.into();
-        let final_path = final_path.into();
-        match &*self.inner {
-            DriverInner::Psync(driver) => {
-                driver
-                    .write_file_segments_atomic(
-                        std_options,
-                        temporary_path,
-                        final_path,
-                        buffers,
-                        durable,
-                    )
-                    .await
-            }
-            #[cfg(target_os = "linux")]
-            DriverInner::Uring(driver) => {
-                driver
-                    .write_file_segments_atomic(
-                        std_options,
-                        temporary_path,
-                        final_path,
-                        buffers,
-                        durable,
-                    )
-                    .await
-            }
-            #[cfg(target_family = "windows")]
-            DriverInner::Iocp(driver) => {
-                driver
-                    .write_file_segments_atomic(
-                        std_options,
-                        temporary_path,
-                        final_path,
-                        buffers,
-                        durable,
-                    )
-                    .await
-            }
-        }
+        // Every backend runs this on the syscall pool, as one job, so it goes there directly:
+        // dispatched through a backend, its arguments would be carried at each level.
+        PsyncDriver
+            .write_file_segments_atomic(
+                options.to_std(),
+                temporary_path.into(),
+                final_path.into(),
+                buffers,
+                durable,
+                completion,
+            )
+            .await
     }
 
     /// Creates (or truncates, per `options`) `path` and writes the
@@ -577,14 +554,15 @@ impl IoDriver {
         }
     }
 
-    pub(crate) async fn set_len_raw(&self, file: Arc<File>, len: u64) -> std::io::Result<()> {
-        match &*self.inner {
-            DriverInner::Psync(driver) => driver.set_len(file, len).await,
-            #[cfg(target_os = "linux")]
-            DriverInner::Uring(driver) => driver.set_len(file, len).await,
-            #[cfg(target_family = "windows")]
-            DriverInner::Iocp(driver) => driver.set_len(file, len).await,
-        }
+    /// Every backend runs this on the syscall pool, so it goes there directly, as
+    /// [`Self::write_file_segments_atomic`] does.
+    pub(crate) async fn set_len_raw<C: Send + 'static>(
+        &self,
+        file: Arc<File>,
+        len: u64,
+        completion: C,
+    ) -> std::io::Result<()> {
+        PsyncDriver.set_len(file, len, completion).await
     }
 
     /// Reads an entire file into pooled memory as a single backend

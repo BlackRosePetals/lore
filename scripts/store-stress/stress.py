@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
-"""Drive the local immutable store stress suite: kill loops, crash and fault sweeps, disk-full
-and descriptor-exhaustion runs, GC storms and long soaks, each checked by the harness's verifier.
+"""Drive the local store stress suite: kill loops, crash and fault sweeps, disk-full and
+descriptor-exhaustion runs, GC storms, deterministic scenarios, and processes sharing a store in
+calls, scripted and at random, each checked by the harness's verifier.
 
 Run by hand, on Linux; see README.md beside this file. Every campaign writes to
 <results>/<campaign>-<time>/: one directory per run with the command lines and logs, a copy of the
@@ -120,7 +121,7 @@ class Campaign:
         self.reports = {}
         self.started = time.time()
         self.rng = random.Random(args.seed)
-        print(f"campaign {self.root}", flush=True)
+        print(f"campaign {self.root} seed {args.seed}", flush=True)
 
     def out_of_time(self):
         return time.time() - self.started >= self.args.minutes * 60
@@ -134,9 +135,8 @@ class Campaign:
     def command(self, *args):
         return [str(self.binary), *[str(arg) for arg in args]]
 
-    def run(self, command, log, env=None, timeout=None, kill_after=None, prefix=None):
-        """Run `command`, its output to `log`, killing it with SIGKILL after `kill_after` seconds.
-        Returns (exit code or -signal, killed by us)."""
+    def start(self, command, log, env=None, prefix=None):
+        """Start `command`, its command line and output to `log`, and return the process."""
         full_env = dict(os.environ)
         full_env.setdefault("LORE_IO_BACKEND", "psync")
         if env:
@@ -148,25 +148,30 @@ class Campaign:
             if env:
                 output.write((json.dumps(env) + "\n").encode())
             output.flush()
-            process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, env=full_env)
-            killed = False
-            deadline = time.time() + (timeout or 3600)
-            while True:
-                try:
-                    code = process.wait(timeout=0.02)
-                    break
-                except subprocess.TimeoutExpired:
-                    pass
-                now = time.time()
-                if kill_after is not None and now - (deadline - (timeout or 3600)) >= kill_after:
-                    process.send_signal(signal.SIGKILL)
-                    killed = True
-                    kill_after = None
-                if now >= deadline:
-                    process.send_signal(signal.SIGKILL)
-                    process.wait()
-                    return (-9, False)
-            return (code, killed)
+            return subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, env=full_env)
+
+    def run(self, command, log, env=None, timeout=None, kill_after=None, prefix=None):
+        """Run `command`, its output to `log`, killing it with SIGKILL after `kill_after` seconds.
+        Returns (exit code or -signal, killed by us)."""
+        process = self.start(command, log, env, prefix)
+        killed = False
+        deadline = time.time() + (timeout or 3600)
+        while True:
+            try:
+                code = process.wait(timeout=0.02)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.time()
+            if kill_after is not None and now - (deadline - (timeout or 3600)) >= kill_after:
+                process.send_signal(signal.SIGKILL)
+                killed = True
+                kill_after = None
+            if now >= deadline:
+                process.send_signal(signal.SIGKILL)
+                process.wait()
+                return (-9, False)
+        return (code, killed)
 
     def verify(self, store, run_dir, deep=False, label="verify", copy=False):
         """Check `store`, or with `copy` a copy of it, leaving the store as the kill left it for the
@@ -224,6 +229,9 @@ class Campaign:
                     # Obliterate takes a list it cannot load as done, so the refusal is never seen.
                     if name != "refused-without-payload":
                         self.coverage[f"lists {name}"] += int(value)
+            elif line.startswith("COVERAGE calls "):
+                _, _, name, count = line.split()
+                self.coverage[f"calls {name}"] += int(count)
             elif line.startswith("COVERAGE shapes "):
                 parts = line.split()[2:]
                 for name, value in zip(["max-level", "max-packfiles", "max-writeable", "settled", "max-unsettled"], parts):
@@ -291,7 +299,8 @@ class Campaign:
         return lines
 
     def summary(self):
-        lines = [f"campaign {self.root.name}: {self.runs} runs in {(time.time() - self.started) / 60:.1f} min"]
+        lines = [f"campaign {self.root.name}: {self.runs} runs in {(time.time() - self.started) / 60:.1f} min, "
+                 f"seed {self.args.seed}"]
         lines.append("violations (runs listed for the first few):")
         for name, count in sorted(self.violations.items(), key=lambda item: -item[1]):
             known_as = known(name)
@@ -766,25 +775,141 @@ def descriptor_exhaustion(campaign):
         shutil.rmtree(store, ignore_errors=True)
 
 
-def scenarios(campaign):
-    run_dir = campaign.run_dir("scenarios")
+def deterministic(campaign, command):
+    """Run every deterministic case the harness's `command` runs, `scenario` or `retention`, under
+    both builds, and the production build again on uring."""
+    run_dir = campaign.run_dir(command)
     production = campaign.args.binary_na or campaign.args.binary
     passes = [("assertions", campaign.args.binary, "psync"), ("production", production, "psync"),
               ("production-uring", production, "uring")]
     for label, binary, io in passes:
         log = run_dir / f"{label}.log"
         # Scenarios that inject faults run a workload under the shim.
-        campaign.run([str(binary), "scenario", "all", "--scratch", str(campaign.scratch / f"scenarios-{label}")], log,
+        campaign.run([str(binary), command, "all", "--scratch", str(campaign.scratch / f"{command}-{label}")], log,
                      env={"LORE_IO_BACKEND": io, "STRESS_SHIM": str(campaign.args.shim)}, timeout=7200)
         for line in log.read_text(errors="replace").splitlines():
             if line.startswith("FAIL "):
                 name = line.split(":")[0][5:]
-                campaign.record(run_dir, None, {f"scenario {name} ({label})": 1})
+                campaign.record(run_dir, None, {f"{command} {name} ({label})": 1})
             if line.startswith("REPORT "):
                 name, _, detail = line[7:].partition(": ")
-                campaign.reports[f"scenario {name}"] = detail
+                campaign.reports[f"{command} {name}"] = detail
             if line.startswith(("PASS ", "FAIL ", "REPORT ")):
                 print(f"  {label}: {line[:220]}", flush=True)
+
+
+def multi_process(campaign):
+    """Rounds of processes sharing one store directory in calls, some keeping their stores between
+    calls and some opening them for each, killed with SIGKILL and restarted at random moments, some
+    under the shim's faults. Each round is verified on a copy, a quarter of them deeply, and the
+    next round carries on from what the last left."""
+    rng = campaign.rng
+    while not campaign.out_of_time():
+        store = campaign.scratch / f"shared-{campaign.runs + 1:05d}"
+        prepare = campaign.run_dir("shared-prepare")
+        # Low fan-out thresholds, so that both stores' groups fan out through their levels.
+        options = random_store_options(rng, "client") + ["--fan-out-threshold", rng.choice([2, 3, 8, 24])]
+        # One process first, which fixes the keyspace and writes what a store's first opening does.
+        campaign.run(campaign.command("calls", store, *options, "--seconds", 1), prepare / "prepare.log", timeout=600)
+        for round_index in range(rng.randint(1, 3)):
+            if campaign.out_of_time():
+                break
+            run_dir = campaign.run_dir(f"shared-r{round_index}")
+            shared_round(campaign, store, run_dir)
+            classes = campaign.verify(store, run_dir, deep=rng.random() < 0.25, copy=True)
+            if classes and campaign.args.stop_on_new and any(known(name) is None for name in classes):
+                return
+        if not campaign.args.keep:
+            shutil.rmtree(store, ignore_errors=True)
+
+
+def calls_options(rng, keeps):
+    """Options of one process of a shared round."""
+    options = [
+        "--run-seed", rng.randrange(1, 1 << 30),
+        "--tasks", rng.choice([1, 2, 4, 8]),
+        "--call-ops", rng.choice([4, 16, 64]),
+        "--pause-ms", rng.choice([0, 5, 50]),
+        "--unflushed", rng.choice([0, 0.2, 0.5]),
+        # A delayed flush that fires during the round, now and then.
+        "--flush-delay", rng.choice([3600, 3600, 3600, 1]),
+        "--hot-keys", rng.choice([4, 48, 512]),
+        "--hot-share", rng.choice([0.0, 0.3, 0.8]),
+        "--threads", rng.choice([2, 4, 8]),
+        "--compact-max-size", rng.choice(["1", "1,256k,4m,64m", "64k"]),
+        "--evict-max-capacity", rng.choice(["1", "1,4096,1m", "100"]),
+        "--hang-seconds", 60,
+    ]
+    mix = rng.choice(MIXES)
+    if mix:
+        options += ["--mix", mix]
+    if rng.random() < 0.5:
+        options.append("--serialize-flushes")
+    if rng.random() < 0.15:
+        options += ["--cancel", rng.choice([0.01, 0.05]), "--cancel-us", rng.choice([50, 500, 5000])]
+    if keeps:
+        options.append("--keeps")
+    return options
+
+
+def shared_round(campaign, store, run_dir):
+    """Run `--processes` processes on `store` for a while, half of them keeping their stores, each
+    killed now and then, and started again in its place once it is gone."""
+    rng = campaign.rng
+    seconds = rng.choice([5, 10, 20])
+    deadline = time.time() + seconds
+    slots = []
+
+    def start(slot):
+        keeps = slot % 2 == 0
+        remaining = max(0.5, deadline - time.time())
+        env = backend(rng, 0.1)
+        if rng.random() < 0.15:
+            # Faults on the immutable store's files, which the store meets on its own: the
+            # mutable store's are left alone, so that its flock is never held past a call.
+            op = rng.choice(ALL_OPS)
+            env.update({"LORE_IO_BACKEND": "psync", "LD_PRELOAD": str(campaign.args.shim),
+                        "STRESS_PATH": str(store / "immutable"), "STRESS_OPS": op,
+                        "STRESS_FAIL_ERRNO": ",".join(rng.sample(NATURAL_ERRNOS[op], k=1)),
+                        "STRESS_FAIL_PROB": str(rng.choice([0.001, 0.01])), "STRESS_SEED": str(rng.randrange(1 << 30))})
+        log = run_dir / f"p{slot}.log"
+        command = campaign.command("calls", store, *calls_options(rng, keeps), "--seconds", f"{remaining:.1f}")
+        return campaign.start(command, log, env=env)
+
+    def reap(slot, killed):
+        """Wait for the process in `slot`, mark it dead in the journal, which ends any generation
+        it left unended, and take its log, then start another in its place while the round
+        lasts."""
+        process = slots[slot]
+        code = process.wait()
+        with open(store / "stress.journal", "a") as journal:
+            journal.write(f"0 g dead pid={process.pid}\n")
+        if not killed and code not in (0, 1):
+            campaign.failures[f"calls-exit-{code}"] += 1
+        campaign.parse_work(run_dir / f"p{slot}.log", run_dir)
+        slots[slot] = start(slot) if time.time() < deadline - 0.5 else None
+
+    for slot in range(campaign.args.processes):
+        slots.append(start(slot))
+    while time.time() < deadline:
+        time.sleep(rng.uniform(0.05, 0.5))
+        for slot, process in enumerate(slots):
+            if process is not None and process.poll() is not None:
+                reap(slot, False)
+        slot = rng.randrange(len(slots))
+        if rng.random() < 0.3 and slots[slot] is not None and slots[slot].poll() is None:
+            slots[slot].send_signal(signal.SIGKILL)
+            reap(slot, True)
+    for slot, process in enumerate(slots):
+        if process is None:
+            continue
+        try:
+            process.wait(timeout=180)
+            reap(slot, False)
+        except subprocess.TimeoutExpired:
+            process.send_signal(signal.SIGKILL)
+            reap(slot, True)
+            campaign.record(run_dir, store, {"calls-did-not-end": 1})
 
 
 def build(args):
@@ -803,7 +928,9 @@ MODES = {
     "fault-sweep": fault_sweep,
     "disk-full": disk_full,
     "emfile": descriptor_exhaustion,
-    "scenarios": scenarios,
+    "scenarios": lambda campaign: deterministic(campaign, "scenario"),
+    "retention": lambda campaign: deterministic(campaign, "retention"),
+    "multi-process": multi_process,
 }
 
 
@@ -824,6 +951,7 @@ def main():
     parser.add_argument("--generations", type=int, default=6, help="most runs per store directory in a kill loop")
     parser.add_argument("--points", type=int, default=40, help="kill points per crash-sweep base, four times the "
                         "fault points per fault-sweep base")
+    parser.add_argument("--processes", type=int, default=4, help="processes sharing a store in a multi-process round")
     parser.add_argument("--keep", action="store_true", help="keep scratch stores")
     parser.add_argument("--stop-on-new", action="store_true", help="stop at the first new violation class")
     args = parser.parse_args()
@@ -835,8 +963,8 @@ def main():
         return report(args.dir or args.results)
     modes = list(MODES) if args.mode == "all" else [args.mode]
     for mode in modes:
-        if mode == "scenarios":
-            # Scenarios run under both builds: assertions catch what production hides.
+        if mode in ("scenarios", "retention"):
+            # Deterministic cases run under both builds: assertions catch what production hides.
             scenario_args = argparse.Namespace(**vars(args))
             scenario_args.binary_na = args.binary
             scenario_args.binary = args.assertions_binary

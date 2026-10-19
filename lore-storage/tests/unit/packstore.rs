@@ -109,7 +109,7 @@ async fn truncate_discards_the_empty_packfiles_at_the_end() {
     packstore.stop_writes(&[3]).await.unwrap();
     assert_eq!(packstore.sizes().await.unwrap(), vec![64, 0, 64, 0]);
 
-    packstore.truncate(3).await.unwrap();
+    packstore.truncate(3, ()).await.unwrap();
 
     assert_eq!(packstore.sizes().await.unwrap(), vec![64, 0]);
     assert_eq!(packstore.store(payload(3)).await.unwrap().id, 2);
@@ -236,9 +236,9 @@ async fn truncating_empties_or_removes_the_packfile_files() {
     assert_eq!(packstore.store(payload(2)).await.unwrap().id, 2);
     packstore.stop_writes(&[2]).await.unwrap();
 
-    packstore.truncate(1).await.unwrap();
+    packstore.truncate(1, ()).await.unwrap();
     assert_eq!(std::fs::metadata(pack.join("1")).unwrap().len(), 0);
-    packstore.truncate(2).await.unwrap();
+    packstore.truncate(2, ()).await.unwrap();
 
     assert_eq!(packstore.sizes().await.unwrap(), vec![0]);
     assert_eq!(std::fs::metadata(pack.join("1")).unwrap().len(), 0);
@@ -263,7 +263,7 @@ async fn a_failed_truncate_is_reported_and_takes_no_writes() {
     let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
     packstore.stop_writes(&[1]).await.unwrap();
 
-    assert!(packstore.truncate(1).await.is_err());
+    assert!(packstore.truncate(1, ()).await.is_err());
 
     assert_ne!(packstore.store(payload(3)).await.unwrap().id, 1);
 }
@@ -287,7 +287,7 @@ async fn a_writeable_packfile_is_not_truncated() {
     let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
     packstore.store(payload(1)).await.unwrap();
 
-    assert!(packstore.truncate(1).await.is_err());
+    assert!(packstore.truncate(1, ()).await.is_err());
 
     assert_eq!(packstore.load(1, 0, 64).await.unwrap(), payload(1));
 }
@@ -538,6 +538,35 @@ async fn an_abandoned_write_holds_the_packfile_list_until_it_completes() {
     assert_eq!(stop.await.unwrap().unwrap(), vec![64]);
 }
 
+/// A truncate abandoned in flight keeps its completion until it lands, as the driver keeps a
+/// truncate it was handed, so the share of its group's writes a store passes keeps the flock, and
+/// the group's next flush, waiting until the packfile is empty.
+#[tokio::test]
+async fn an_abandoned_truncate_keeps_its_completion_until_it_lands() {
+    let dir = TempDir::new("packstore-abandoned-truncate-");
+    let packstore = Arc::new(PackStore::new(Some(dir.to_path_buf()), 1, None));
+    packstore.store(payload(1)).await.unwrap();
+    packstore.stop_writes(&[1]).await.unwrap();
+    let writes: Arc<tokio::sync::RwLock<()>> = Arc::default();
+
+    let in_flight = lore_storage::test_util::hold_store_write();
+    let truncate = {
+        let packstore = packstore.clone();
+        let share = Arc::clone(&writes).read_owned().await;
+        lore_base::lore_spawn!(async move { packstore.truncate(1, share).await })
+    };
+    in_flight.issued.notified().await;
+    truncate.abort();
+    assert!(truncate.await.unwrap_err().is_cancelled());
+    assert!(
+        writes.try_write().is_err(),
+        "the abandoned truncate keeps its completion"
+    );
+
+    in_flight.complete();
+    assert!(writes.try_write().is_ok(), "until it lands");
+}
+
 /// Obliterating a range overwrites it with zeros and syncs the packfile, leaving the payloads
 /// beside it as they were.
 #[tokio::test]
@@ -639,6 +668,35 @@ async fn a_packfile_that_fills_is_synced_and_settled() {
     assert_eq!(sizes[0], PackfileSize { id: 2, size: 0 });
 }
 
+/// A packfile filled and closed before its settling sync took the packfile list reopens dirty and
+/// not settled, so that bucket files go on recording its size and the next flush syncs it.
+#[tokio::test]
+async fn a_packfile_closed_before_it_settled_reopens_unsettled() {
+    const LIMIT: u64 = 3 * 1024 * 1024 * 1024;
+    let dir = TempDir::new("packstore-closed-unsettled-");
+    let pack = packfiles_on_disk(&dir, &[]);
+    std::fs::File::create(pack.join("1"))
+        .unwrap()
+        .set_len(LIMIT - 32)
+        .unwrap();
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    assert_eq!(packstore.store(payload(1)).await.unwrap().id, 1);
+    assert!(
+        packstore.release_files(),
+        "closed before the settling sync ran"
+    );
+
+    packstore.resume().await.unwrap();
+    assert!(!packstore.is_settled(1).await);
+    assert!(packstore.is_dirty(1).await);
+    let mut sizes = [PackfileSize::default(); 4];
+    let count = packstore.unsettled_sizes(&mut sizes).await.unwrap();
+    assert!(sizes[..count].contains(&PackfileSize {
+        id: 1,
+        size: (LIMIT + 32) as u32
+    }));
+}
+
 /// A packfile opened at the size limit is taken to be settled, until it is truncated.
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -657,7 +715,7 @@ async fn a_packfile_opened_at_the_size_limit_is_settled() {
     assert_eq!(packstore.unsettled_sizes(&mut sizes).await, Some(1));
     assert_eq!(sizes[0], PackfileSize { id: 2, size: 0 });
 
-    packstore.truncate(1).await.unwrap();
+    packstore.truncate(1, ()).await.unwrap();
     assert_eq!(packstore.unsettled_sizes(&mut sizes).await, Some(1));
     assert_eq!(sizes[0], PackfileSize { id: 1, size: 0 });
 }
@@ -696,6 +754,31 @@ async fn unsettled_sizes_leave_out_packfiles_not_loaded() {
     assert!(!pack.join("1").exists(), "no packfile is opened");
 }
 
+/// A packfile closed holding a write no sync covered keeps its size among the unsettled sizes
+/// without being opened again, and the next flush that syncs opens and syncs it. Once synced, a
+/// closed packfile is left out.
+#[tokio::test]
+async fn a_closed_packfile_keeps_its_unsettled_size_and_its_sync() {
+    let dir = TempDir::new("packstore-released-");
+    let packstore = PackStore::new(Some(dir.to_path_buf()), 1, None);
+    assert_eq!(packstore.store(payload(1)).await.unwrap().id, 1);
+    packstore.release_files();
+
+    let mut sizes = [PackfileSize::default(); 2];
+    assert_eq!(packstore.unsettled_sizes(&mut sizes).await, Some(1));
+    assert_eq!(sizes[0], PackfileSize { id: 1, size: 64 });
+    assert_eq!(
+        packstore.open_packfiles().await,
+        0,
+        "and no packfile is opened"
+    );
+
+    packstore.flush_all(true).await.unwrap();
+    assert!(!packstore.is_dirty(1).await, "the flush synced it");
+    packstore.release_files();
+    assert_eq!(packstore.unsettled_sizes(&mut sizes).await, Some(0));
+}
+
 /// A packfile shorter when opened than recorded, or missing, is short of the recorded size, and a
 /// truncated packfile counts as opened empty.
 #[tokio::test]
@@ -716,6 +799,6 @@ async fn a_packfile_shorter_when_opened_than_recorded_is_short_of_it() {
     assert_eq!(packstore.opened_lengths().await.unwrap(), vec![64, 64]);
 
     packstore.stop_writes(&[1]).await.unwrap();
-    packstore.truncate(1).await.unwrap();
+    packstore.truncate(1, ()).await.unwrap();
     assert_eq!(packstore.opened_lengths().await.unwrap(), vec![0, 64]);
 }

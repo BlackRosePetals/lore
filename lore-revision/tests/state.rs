@@ -2697,6 +2697,16 @@ mod block_single_flight {
 
     #[async_trait]
     impl ImmutableStore for CountingStore {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         async fn get(
             self: Arc<Self>,
             partition: Partition,

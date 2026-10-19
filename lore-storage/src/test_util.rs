@@ -33,7 +33,8 @@ thread_local! {
     static FAILED_STATS: Cell<usize> = const { Cell::new(0) };
     static FAILED_OPENS: Cell<usize> = const { Cell::new(0) };
     static FAILED_DIRECTORY_STATS: Cell<usize> = const { Cell::new(0) };
-    static IN_FLIGHT: RefCell<Option<Arc<InFlight>>> = const { RefCell::new(None) };
+    static PACKFILE_IN_FLIGHT: RefCell<Option<Arc<InFlight>>> = const { RefCell::new(None) };
+    static STORE_WRITE_IN_FLIGHT: RefCell<Option<Arc<InFlight>>> = const { RefCell::new(None) };
     static HOLD_INTERRUPT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static PACKFILE_SIZE_LIMIT: Cell<u64> = const { Cell::new(0) };
 }
@@ -168,38 +169,65 @@ pub(crate) fn packfile_size_limit() -> Option<u64> {
     PACKFILE_SIZE_LIMIT.with(|size| Some(size.get()).filter(|limit| *limit != 0))
 }
 
-/// A packfile write [`hold_packfile_write`] keeps in flight: it never completes, and the buffer it
-/// was issued with is kept until [`InFlight::complete`], as a driver keeps it until the kernel is
-/// done with the write. `issued` is notified once the write is issued.
+/// A write [`hold_packfile_write`] or [`hold_store_write`] keeps in flight: it never completes,
+/// and what it was issued with, a packfile write's buffer or another write's completion, is kept
+/// until [`InFlight::complete`], as a driver keeps it until the kernel is done with the write.
+/// `issued` is notified once the write is issued.
 #[derive(Default)]
 pub struct InFlight {
     pub issued: Notify,
-    buffer: parking_lot::Mutex<Option<Box<dyn std::any::Any + Send>>>,
+    kept: parking_lot::Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 impl InFlight {
-    /// Drops the buffer the write was issued with, as the driver does once the write completes.
+    /// Drops what the write was issued with, as the driver does once the write completes.
     pub fn complete(&self) {
-        drop(self.buffer.lock().take());
+        drop(self.kept.lock().take());
+    }
+
+    /// Keeps `kept` and parks the write for good.
+    async fn park<T>(&self, kept: Box<dyn std::any::Any + Send>) -> T {
+        *self.kept.lock() = Some(kept);
+        self.issued.notify_one();
+        std::future::pending().await
     }
 }
 
 /// Keeps the next packfile write on this thread in flight, see [`InFlight`].
 pub fn hold_packfile_write() -> Arc<InFlight> {
+    hold_write(&PACKFILE_IN_FLIGHT)
+}
+
+/// Keeps the next bucket, level file, truncate or epoch write on this thread in flight, see
+/// [`InFlight`].
+pub fn hold_store_write() -> Arc<InFlight> {
+    hold_write(&STORE_WRITE_IN_FLIGHT)
+}
+
+/// Arms `held` on this thread with a new [`InFlight`].
+fn hold_write(
+    held: &'static std::thread::LocalKey<RefCell<Option<Arc<InFlight>>>>,
+) -> Arc<InFlight> {
     let in_flight = Arc::new(InFlight::default());
-    IN_FLIGHT.with(|held| *held.borrow_mut() = Some(in_flight.clone()));
+    held.with(|held| *held.borrow_mut() = Some(in_flight.clone()));
     in_flight
 }
 
 /// Parks this packfile write for good, keeping a copy of `buffer` in the [`InFlight`] that
 /// [`hold_packfile_write`] armed on this thread, if any.
 pub(crate) async fn park_packfile_write<B: Clone + Send + 'static>(buffer: &B) {
-    let Some(in_flight) = IN_FLIGHT.with(|held| held.borrow_mut().take()) else {
-        return;
-    };
-    *in_flight.buffer.lock() = Some(Box::new(buffer.clone()));
-    in_flight.issued.notify_one();
-    std::future::pending::<()>().await;
+    if let Some(in_flight) = PACKFILE_IN_FLIGHT.with(|held| held.borrow_mut().take()) {
+        in_flight.park::<()>(Box::new(buffer.clone())).await;
+    }
+}
+
+/// Parks this write for good, keeping `completion` in the [`InFlight`] that [`hold_store_write`]
+/// armed on this thread, if any, and otherwise hands it back.
+pub(crate) async fn park_store_write<C: Send + 'static>(completion: C) -> C {
+    match STORE_WRITE_IN_FLIGHT.with(|held| held.borrow_mut().take()) {
+        Some(in_flight) => in_flight.park(Box::new(completion)).await,
+        None => completion,
+    }
 }
 
 /// Runs `puts`, letting the puts it makes store fragments that pass only the size checks, for
@@ -381,6 +409,14 @@ impl HoldingStore {
 
 #[async_trait::async_trait]
 impl crate::immutable_store::ImmutableStore for HoldingStore {
+    /// Joins the claim of the store this one wraps.
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<crate::local::store_lock::StoreGuard>, crate::immutable_store::StoreError>
+    {
+        self.inner.clone().hold_for_command().await
+    }
+
     async fn get(
         self: Arc<Self>,
         partition: crate::types::Partition,

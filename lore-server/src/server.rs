@@ -43,6 +43,7 @@ use lore_storage::assume_server_policies;
 use lore_storage::compress::COMPRESSION_MODE;
 use lore_storage::hash::StringHash;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
+use lore_storage::local::store_lock::StoreHold;
 use lore_telemetry::execution_state::ServerExecutionState;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
 use lore_transport::make_user_agent_with_component;
@@ -220,7 +221,9 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
         runtime_shutdown_timeout as u64,
     ));
 
-    result
+    // Released only now that the runtime has dropped every request task and what it spawned:
+    // until then one could still be using the store files.
+    result.map(drop)
 }
 
 /// Waits for a shutdown signal, then drains all endpoints within the given timeout.
@@ -1343,6 +1346,7 @@ async fn create_local_store(
             atime: true,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
+            reuse_state_across_holds: true, /* Server mode, claimed for its life once configured: keeps what it loaded before the claim */
         },
     )
     .await
@@ -1387,6 +1391,7 @@ async fn configure_local_mutable_store(
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
             authoritative: true, /* Server local store is the source of truth, not a cache */
+            reuse_state_across_holds: true, /* Server mode, claimed for its life once configured: keeps what it loaded before the claim */
         },
         immutable_store,
     )
@@ -1880,7 +1885,10 @@ impl ResourceDetectorProvider for PluginResourceDetectorProvider<'_> {
     }
 }
 
-async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> Result<()> {
+/// Serves until shutdown, and returns the hold on the stores it served, for the caller to release
+/// once the runtime has shut down. Request work runs in tasks of its own that closing the
+/// endpoints does not stop, so the stores stay claimed until the runtime has dropped them.
+async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> Result<StoreHold> {
     // Initialize metrics and tracing telemetry, returns a guard that will cleanup when it falls out
     // of scope
     let (mut settings, settings_hash) = settings;
@@ -2052,6 +2060,29 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         true
     } else {
         false
+    };
+
+    // **Claimed for as long as the server serves them.** The claim says which process is
+    // using a store, and a server uses its stores for its whole life; without one, every
+    // request that finds no other in flight would take and release the flock and read
+    // the epoch file on its own. Taken before anything serves, and released once the
+    // runtime has shut down, see `server_main`. A server in maintenance mode serves no
+    // store, so it claims none, and leaves the stores free for the maintenance it is
+    // running for.
+    let hold = if is_maintenance {
+        StoreHold::default()
+    } else {
+        let immutable_span = immutable_store
+            .clone()
+            .hold_for_command()
+            .await
+            .map_err(anyhow::Error::from)?;
+        let mutable_span = mutable_store
+            .clone()
+            .hold_for_command()
+            .await
+            .map_err(anyhow::Error::from)?;
+        StoreHold::new(immutable_span.into_iter().chain(mutable_span).collect())
     };
 
     let jwt_verifier = match settings.server.auth.as_ref() {
@@ -2446,17 +2477,21 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         });
     }
 
-    lore_spawn!(async move {
-        if let Some(store) = local_store() {
-            crate::store::memory_stats_reporter(
-                Arc::downgrade(&store),
-                telemetry
-                    .metrics
-                    .map(|m| Duration::from_millis(m.sample_interval_millis)),
-            )
-            .await;
-        }
-    });
+    // Not in maintenance mode, which claims no store: each count would claim it, and reload
+    // what the maintenance changed.
+    if !is_maintenance {
+        lore_spawn!(async move {
+            if let Some(store) = local_store() {
+                crate::store::memory_stats_reporter(
+                    Arc::downgrade(&store),
+                    telemetry
+                        .metrics
+                        .map(|m| Duration::from_millis(m.sample_interval_millis)),
+                )
+                .await;
+            }
+        });
+    }
 
     up_gauge.record(1, &up_attributes);
     wait_for_shutdown(endpoints, shutdown_tx, connection_close_timeout).await?;
@@ -2466,7 +2501,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let _ = immutable_store.flush(true).await;
     let _ = mutable_store.flush(true).await;
 
-    Ok(())
+    Ok(hold)
 }
 
 fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, message: &str) {

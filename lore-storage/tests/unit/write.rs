@@ -464,6 +464,16 @@ struct FailingPutStore {
 
 #[async_trait::async_trait]
 impl ImmutableStore for FailingPutStore {
+    /// Joins the claim of the store this one wraps.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+    }
+
     async fn get_metadata(
         self: Arc<Self>,
         partition: Partition,
@@ -847,6 +857,16 @@ struct DelayingPutStore {
 
 #[async_trait::async_trait]
 impl ImmutableStore for DelayingPutStore {
+    /// Joins the claim of the store this one wraps.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+    }
+
     async fn get_metadata(
         self: Arc<Self>,
         partition: Partition,
@@ -1123,6 +1143,16 @@ struct CountingPutStore {
 
 #[async_trait::async_trait]
 impl ImmutableStore for CountingPutStore {
+    /// Joins the claim of the store this one wraps.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+    }
+
     async fn get_metadata(
         self: Arc<Self>,
         partition: Partition,

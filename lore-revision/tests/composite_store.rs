@@ -146,6 +146,16 @@ mod tests {
 
     #[async_trait]
     impl lore_storage::MutableStore for TestStore<'_> {
+        /// Nothing on disk to claim.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            Ok(None)
+        }
+
         async fn load(
             self: Arc<Self>,
             _repository: Partition,
@@ -226,6 +236,16 @@ mod tests {
 
     #[async_trait]
     impl lore_storage::ImmutableStore for TestStore<'static> {
+        /// Nothing on disk to claim.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            Ok(None)
+        }
+
         async fn get_metadata(
             self: Arc<Self>,
             partition: Partition,
@@ -1338,6 +1358,89 @@ mod tests {
                     .await
                     .expect("local confirmation failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchFull));
+            })
+            .await;
+    }
+
+    /// **A get that caches what the durable store returned keeps the local store claimed past the
+    /// span it ran in, until the cache write ends.** The get returns once it has spawned the
+    /// write, so it claims the local store before the spawn: the span's end then leaves the flock
+    /// held rather than releasing it before the write first runs, which on a single-threaded
+    /// runtime is after the span has ended.
+    #[tokio::test]
+    async fn a_cached_get_keeps_the_local_flock_past_its_span_until_the_cache_write_ends() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let dir = lore_base::test_util::TempDir::new("composite-cache-claim-");
+                let local = immutable::LocalImmutableStore::new(
+                    Some(dir.to_path_buf()),
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+                let lock = local.lock.clone().expect("a disk-backed store has a lock");
+                let local_store: Arc<dyn ImmutableStore> = local;
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let composite_store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+                let repository: Partition = random::<RepositoryId>();
+                let (fragment, address, payload) = generate_random();
+                durable_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .expect("Put to durable failed");
+
+                let span = composite_store
+                    .clone()
+                    .hold_for_command()
+                    .await
+                    .expect("span");
+                let result = composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("get");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
+                drop(span);
+                assert!(
+                    lock.is_held(),
+                    "the cache write keeps the local flock past the span"
+                );
+
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+                    while !matches!(
+                        local_store.clone().get(repository, address).await,
+                        Ok(StoreGetData {
+                            match_made: StoreMatch::MatchFull,
+                            ..
+                        })
+                    ) {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the cache write lands");
+                local_store.clone().flush(true).await.expect("flush");
+                assert!(
+                    !lock.is_held(),
+                    "the flock goes once the cache write has ended and been flushed"
+                );
             })
             .await;
     }
@@ -2519,6 +2622,69 @@ mod tests {
         }
     }
 
+    /// **A composite claims the local store it wraps.**
+    ///
+    /// The replicas and the durable upstream are remote and have nothing to claim, so
+    /// the local target's claim is the whole of it. A composite answering `None` would
+    /// let a storage handle open holding nothing and then read and write a store no
+    /// process has claimed — silently, since an empty claim is indistinguishable from
+    /// a store that needed none.
+    #[tokio::test]
+    async fn a_composite_claims_the_local_store_it_wraps() {
+        use lore_storage::local::immutable_store::ImmutableStoreSettings;
+        use lore_storage::local::immutable_store::LocalImmutableStore;
+
+        let local_dir = lore_base::test_util::TempDir::new("lore-composite-claim-local-");
+        let durable_dir = lore_base::test_util::TempDir::new("lore-composite-claim-durable-");
+
+        let execution = setup_test_execution();
+        let local_path = local_dir.path().to_path_buf();
+        let durable_path = durable_dir.path().to_path_buf();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let local: Arc<dyn lore_storage::ImmutableStore> = LocalImmutableStore::new(
+                    Some(local_path.clone()),
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local store");
+                // A store of its own as the durable target, so the claim can be seen to land
+                // on the local store and not on the one a durable read would reach.
+                let durable: Arc<dyn lore_storage::ImmutableStore> = LocalImmutableStore::new(
+                    Some(durable_path.clone()),
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable store");
+                let composite = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_local("local".to_string(), local)
+                        .expect("local target")
+                        .with_durable("durable".to_string(), durable)
+                        .expect("durable target")
+                        .build()
+                        .expect("composite builds"),
+                );
+
+                let claim = composite.hold_for_command().await.expect("claim taken");
+                assert!(
+                    claim.is_some(),
+                    "a composite wrapping a store with files on disk must claim it, \
+                     not inherit the default that claims nothing"
+                );
+                // A lock opened on a store directory shares that directory's state, so it
+                // reports what the composite's claim holds.
+                let held = |path: &std::path::Path| {
+                    lore_storage::local::store_lock::StoreLock::new(path.join("immutable"), false)
+                        .expect("a store directory")
+                        .is_held()
+                };
+                assert!(held(&local_path), "the claim holds the local store");
+                assert!(!held(&durable_path), "and not the durable one");
+            })
+            .await;
+    }
+
     /// A put whose content the durable store already holds, under an association the local store
     /// can name, is a write the durable store can answer with a copy. The caller supplying the
     /// payload is what makes naming that source its own to use, since ingress verified the payload
@@ -3335,6 +3501,16 @@ mod tests {
 
         #[async_trait]
         impl ImmutableStore for DelayStore {
+            /// Nothing on disk to claim.
+            async fn hold_for_command(
+                self: std::sync::Arc<Self>,
+            ) -> std::result::Result<
+                Option<lore_storage::local::store_lock::StoreGuard>,
+                lore_storage::StoreError,
+            > {
+                Ok(None)
+            }
+
             /// Answers from the same configured result as `get`, minus the payload, so a metadata
             /// lookup and a full read of the same address agree on whether it is there.
             async fn get_metadata(
@@ -4322,6 +4498,16 @@ mod tests {
 
         #[async_trait]
         impl ImmutableStore for CountingStore {
+            /// Joins the claim of the store this one wraps.
+            async fn hold_for_command(
+                self: std::sync::Arc<Self>,
+            ) -> std::result::Result<
+                Option<lore_storage::local::store_lock::StoreGuard>,
+                lore_storage::StoreError,
+            > {
+                lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+            }
+
             async fn get_metadata(
                 self: Arc<Self>,
                 partition: Partition,

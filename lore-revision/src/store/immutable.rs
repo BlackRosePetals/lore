@@ -22,7 +22,8 @@ pub fn set_background_flush_delay(seconds: NonZeroU64) {
 }
 
 /// The settings a client disk store opens with: local fragments protected from eviction, writes
-/// verified as `verify_write` says, and the background flush [`set_background_flush_delay`] set.
+/// verified as `verify_write` says, the background flush [`set_background_flush_delay`] set, and
+/// state reused across holds where this process retains stores ([`crate::store::retain_stores`]).
 pub(crate) fn client_settings(verify_write: bool) -> ImmutableStoreSettings {
     let seconds = BACKGROUND_FLUSH_SECONDS.load(Ordering::Relaxed);
     let defaults = ImmutableStoreSettings::default();
@@ -35,6 +36,7 @@ pub(crate) fn client_settings(verify_write: bool) -> ImmutableStoreSettings {
         } else {
             defaults.flush_delay_seconds
         },
+        reuse_state_across_holds: crate::store::retain_stores(),
         ..defaults
     }
 }

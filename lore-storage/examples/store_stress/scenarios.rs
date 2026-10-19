@@ -22,6 +22,7 @@ use lore_storage::StoreObliterateStats;
 use lore_storage::immutable_store::ImmutableStore;
 use lore_storage::local::immutable_store::CompactionInstruments;
 use lore_storage::local::immutable_store::ImmutableStoreGroup;
+use lore_storage::local::immutable_store::Lookup;
 use lore_storage::test_util::Pause;
 use lore_storage::test_util::PausePoint;
 use lore_storage::test_util::pause_at;
@@ -32,7 +33,8 @@ use crate::model::Served;
 use crate::snapshot::copy_tree;
 use crate::verify::Report;
 
-const GROUP: u8 = 0x10;
+/// The group every key of the scenarios' keyspace lands in.
+pub const GROUP: u8 = 0x10;
 const LIMIT: u64 = 3 * 1024 * 1024 * 1024;
 
 enum Outcome {
@@ -102,21 +104,10 @@ pub async fn main(args: &Args) -> u8 {
         || std::env::temp_dir().join(format!("store-stress-scenarios-{}", std::process::id())),
         PathBuf::from,
     );
-    let all = scenarios();
-    if name == "list" {
-        for (name, _) in &all {
-            println!("{name}");
-        }
-        return 0;
-    }
-    let selected: Vec<_> = all
-        .into_iter()
-        .filter(|(scenario, _)| name == "all" || name.split(',').any(|wanted| wanted == *scenario))
-        .collect();
-    if selected.is_empty() {
-        eprintln!("no scenario named {name}");
-        return 2;
-    }
+    let selected = match select(&name, scenarios()) {
+        Ok(selected) => selected,
+        Err(code) => return code,
+    };
     if selected.len() > 1 {
         // Each in a process of its own: the release profile aborts on a panic, as from a debug
         // assertion, which would end the others with it.
@@ -155,6 +146,27 @@ pub async fn main(args: &Args) -> u8 {
         let _ = std::fs::remove_dir_all(&scratch);
     }
     u8::from(failed > 0)
+}
+
+/// The entries of `all` that `name` names: every one for `all`, or those a comma-separated list
+/// names. `list` prints their names instead, and a name that matches none is an error; both end the
+/// run with the code returned.
+pub fn select<T>(name: &str, all: Vec<(&'static str, T)>) -> Result<Vec<(&'static str, T)>, u8> {
+    if name == "list" {
+        for (name, _) in &all {
+            println!("{name}");
+        }
+        return Err(0);
+    }
+    let selected: Vec<_> = all
+        .into_iter()
+        .filter(|(entry, _)| name == "all" || name.split(',').any(|wanted| wanted == *entry))
+        .collect();
+    if selected.is_empty() {
+        eprintln!("no entry named {name}");
+        return Err(2);
+    }
+    Ok(selected)
 }
 
 fn run_each_in_a_process(selected: &[(&'static str, Scenario)], scratch: &Path, keep: bool) -> u8 {
@@ -200,7 +212,7 @@ fn run_each_in_a_process(selected: &[(&'static str, Scenario)], scratch: &Path, 
 }
 
 /// The keyspace scenarios use: every key in group [`GROUP`], placement and size picked by search.
-fn config(fan_out_threshold: usize) -> Config {
+pub fn config(fan_out_threshold: usize) -> Config {
     let mut config = Config::from_args(&Args::parse(std::iter::empty()));
     config.seed = 7;
     config.keys = 1 << 22;
@@ -211,8 +223,8 @@ fn config(fan_out_threshold: usize) -> Config {
 }
 
 /// Keys of `config` whose hash's bucket byte lies in `buckets` and whose payload length lies in
-/// `lengths`, `count` of them, none in `taken`, which they are added to.
-fn keys(
+/// `lengths`, `count` of them, none a fragment list or in `taken`, which they are added to.
+pub fn keys(
     config: &Config,
     buckets: std::ops::Range<u8>,
     lengths: std::ops::Range<usize>,
@@ -224,7 +236,7 @@ fn keys(
         if found.len() == count {
             break;
         }
-        if taken.contains(&key) {
+        if taken.contains(&key) || config.is_list(key) {
             continue;
         }
         let bucket = config.hash(key).data()[1];
@@ -574,7 +586,8 @@ fn write_level_pending(group_dir: &Path, level: u32) {
     std::fs::write(group_dir.join("level.pending"), bytes).expect("level.pending");
 }
 
-fn group_dir(dir: &Path) -> PathBuf {
+/// The directory of group [`GROUP`] of the immutable store in `dir`.
+pub fn group_dir(dir: &Path) -> PathBuf {
     dir.join("immutable")
         .join("index")
         .join(format!("{GROUP:02x}"))
@@ -1685,7 +1698,7 @@ async fn put_refuses_invalid_fragments(dir: PathBuf) -> Outcome {
             .await;
         if result.is_ok() {
             let found = store
-                .find(config.partition(0), config.address(key, 0))
+                .find(config.partition(0), config.address(key, 0), Lookup::Read)
                 .await;
             if let Ok(found) = &found
                 && crate::work::kept_sanitized(found)
@@ -1739,7 +1752,7 @@ async fn flags_agree_with_payload_after_deduplication(dir: PathBuf) -> Outcome {
         )
         .await;
     let found = store
-        .find(config.partition(2), config.address(key, 2))
+        .find(config.partition(2), config.address(key, 2), Lookup::Read)
         .await;
     match (stored, found) {
         (Ok(()), Ok(found)) => {

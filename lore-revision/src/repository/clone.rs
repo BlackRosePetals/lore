@@ -1116,19 +1116,17 @@ pub async fn clone(
     };
 
     let local_init_fut = async move {
-        {
-            let _repository = repository::create_local(
-                path,
-                &write_token,
-                repository_id,
-                default_branch_id,
-                default_branch_name,
-                repository_config,
-                no_tracking,
-            )
-            .await
-            .forward::<CloneError>("Failed to initialize repository on disk")?;
-        }
+        let created = repository::create_local(
+            path,
+            &write_token,
+            repository_id,
+            default_branch_id,
+            default_branch_name,
+            repository_config,
+            no_tracking,
+        )
+        .await
+        .forward::<CloneError>("Failed to initialize repository on disk")?;
         lore_debug!("Initialized repository on disk in {}", path.display());
 
         // Share the outer write token to whichever context we load. The Client
@@ -1140,9 +1138,13 @@ pub async fn clone(
         // `store_latest`) see a context with write capability and can populate
         // the (in-memory or on-disk) mutable store.
         let load_token = Some(write_token.share());
-        repository::load_and_connect_with_token(path, access, load_token)
+        let loaded = repository::load_and_connect_with_token(path, access, load_token)
             .await
-            .forward::<CloneError>("Failed to load revision state")
+            .forward::<CloneError>("Failed to load revision state");
+        // Kept until the loaded context has claimed the stores, so it joins the created
+        // context's claims and finds the stores current rather than reading them again.
+        drop(created);
+        loaded
     };
 
     let (repository, prefetched_branch) = tokio::try_join!(local_init_fut, prefetch_branch_fut)?;

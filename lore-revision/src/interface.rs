@@ -701,9 +701,13 @@ pub struct LoreGlobalArgs {
     pub compress_task_limit: u64,
     /// Keep store references alive after a repository call completes to avoid
     /// repeated store open/close cycles for consecutive API calls in the same process.
+    /// The stores stay locked meanwhile, so another process using them waits. With
+    /// `LORE_STORE_RETAIN` set to `1` or `true` in the environment of the process running
+    /// the call, the stores are kept after every call whether or not this is set,
+    /// unlocked, and the next call reloads them only if another process changed them.
     pub store_keep_alive: u8,
-    /// Duration in seconds to keep store references alive. Only used when
-    /// `store_keep_alive` is set. 0 means use the default (10 seconds).
+    /// Duration in seconds to keep store references alive, when `store_keep_alive` or
+    /// `LORE_STORE_RETAIN` is set. 0 means use the default (10 seconds).
     pub store_keep_alive_seconds: u64,
     /// Force sync data to storage media during store flush
     pub sync_data: u8,
@@ -908,11 +912,11 @@ impl LoreGlobalArgs {
         std::time::Duration::from_millis(interval_ms)
     }
 
-    /// Returns the store keep-alive duration if enabled.
-    /// When `store_keep_alive` is not set, returns `None`.
-    /// When set with `store_keep_alive_seconds` of 0, uses the default duration.
+    /// Returns how long stores are kept after a call: `None` when neither `store_keep_alive`
+    /// is set nor this process retains stores ([`crate::store::retain_stores`]), and the
+    /// default duration where `store_keep_alive_seconds` is 0.
     pub fn store_keep_alive_duration(&self) -> Option<std::time::Duration> {
-        if self.store_keep_alive == 0 {
+        if self.store_keep_alive == 0 && !crate::store::retain_stores() {
             return None;
         }
         let seconds = if self.store_keep_alive_seconds == 0 {

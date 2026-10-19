@@ -168,6 +168,7 @@ async fn commit_if_initial_level_records_the_level_below_the_maximum() {
 
         commit_if_initial_level(
             &held_flush_guard().await,
+            &std::sync::Arc::default(),
             &committed,
             &AtomicUsize::new(0),
             &bucket_count,
@@ -192,6 +193,7 @@ async fn commit_if_initial_level_creates_the_group_directory() {
 
     commit_if_initial_level(
         &held_flush_guard().await,
+        &std::sync::Arc::default(),
         &committed,
         &AtomicUsize::new(0),
         &bucket_count,
@@ -219,6 +221,7 @@ async fn commit_if_initial_level_leaves_a_committed_group_alone() {
 
     commit_if_initial_level(
         &held_flush_guard().await,
+        &std::sync::Arc::default(),
         &committed,
         &AtomicUsize::new(0),
         &bucket_count,
@@ -241,6 +244,7 @@ async fn commit_if_initial_level_leaves_a_group_at_the_maximum_alone() {
 
     commit_if_initial_level(
         &held_flush_guard().await,
+        &std::sync::Arc::default(),
         &committed,
         &AtomicUsize::new(0),
         &bucket_count,
@@ -265,6 +269,7 @@ async fn commit_if_initial_level_leaves_a_group_with_a_commit_pending_alone() {
 
     commit_if_initial_level(
         &held_flush_guard().await,
+        &std::sync::Arc::default(),
         &committed,
         &AtomicUsize::new(32),
         &bucket_count,
@@ -290,6 +295,7 @@ async fn commit_if_initial_level_returns_a_marker_it_cannot_write() {
 
     let committing = commit_if_initial_level(
         &held_flush_guard().await,
+        &std::sync::Arc::default(),
         &committed,
         &AtomicUsize::new(0),
         &bucket_count,
@@ -307,7 +313,9 @@ async fn commit_if_initial_level_returns_a_marker_it_cannot_write() {
 async fn write_then_read_round_trip_every_ladder_value() {
     for &level in &LEVEL_LADDER {
         let dir = temp_group_dir();
-        write_level_marker(dir.path(), level, true).await.unwrap();
+        write_level_marker(dir.path(), level, true, None)
+            .await
+            .unwrap();
         assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(level));
     }
 }
@@ -356,7 +364,11 @@ async fn a_failed_marker_write_leaves_no_temporary_file() {
     let marker = dir.path().join(MARKER_FILENAME);
     std::fs::create_dir(&marker).unwrap();
     std::fs::write(marker.join("blocker"), b"x").unwrap();
-    assert!(write_level_marker(dir.path(), 32, false).await.is_err());
+    assert!(
+        write_level_marker(dir.path(), 32, false, None)
+            .await
+            .is_err()
+    );
     let mut temporary = marker.into_os_string();
     temporary.push(".tmp");
     assert!(!PathBuf::from(temporary).exists());
@@ -365,8 +377,12 @@ async fn a_failed_marker_write_leaves_no_temporary_file() {
 #[tokio::test]
 async fn write_level_marker_overwrites_existing() {
     let dir = temp_group_dir();
-    write_level_marker(dir.path(), 1, false).await.unwrap();
-    write_level_marker(dir.path(), 64, false).await.unwrap();
+    write_level_marker(dir.path(), 1, false, None)
+        .await
+        .unwrap();
+    write_level_marker(dir.path(), 64, false, None)
+        .await
+        .unwrap();
     assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(64));
 }
 
@@ -376,12 +392,16 @@ async fn write_level_marker_overwrites_existing() {
 async fn an_unsynced_marker_write_replaces_the_file() {
     let dir = temp_group_dir();
     let marker = dir.path().join(MARKER_FILENAME);
-    write_level_marker(dir.path(), 1, false).await.unwrap();
+    write_level_marker(dir.path(), 1, false, None)
+        .await
+        .unwrap();
     let written = std::fs::read(&marker).unwrap();
     let link = dir.path().join("last_written");
     std::fs::hard_link(&marker, &link).unwrap();
 
-    write_level_marker(dir.path(), 64, false).await.unwrap();
+    write_level_marker(dir.path(), 64, false, None)
+        .await
+        .unwrap();
 
     assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(64));
     assert_eq!(
@@ -394,7 +414,9 @@ async fn an_unsynced_marker_write_replaces_the_file() {
 #[tokio::test]
 async fn marker_file_is_exactly_16_bytes() {
     let dir = temp_group_dir();
-    write_level_marker(dir.path(), 32, false).await.unwrap();
+    write_level_marker(dir.path(), 32, false, None)
+        .await
+        .unwrap();
     let metadata = std::fs::metadata(dir.path().join(MARKER_FILENAME)).unwrap();
     assert_eq!(metadata.len(), 16);
 }
@@ -409,7 +431,9 @@ async fn read_level_pending_missing_returns_none() {
 async fn level_pending_round_trip_every_ladder_value() {
     for &level in &LEVEL_LADDER {
         let dir = temp_group_dir();
-        write_level_pending(dir.path(), level, false).await.unwrap();
+        write_level_pending(dir.path(), level, false, None)
+            .await
+            .unwrap();
         assert_eq!(read_level_pending(dir.path()).await.unwrap(), Some(level));
     }
 }
@@ -420,7 +444,9 @@ async fn delete_level_pending_is_idempotent() {
     // Delete on missing file succeeds.
     delete_level_pending(dir.path()).await.unwrap();
     // Delete after write removes it.
-    write_level_pending(dir.path(), 32, false).await.unwrap();
+    write_level_pending(dir.path(), 32, false, None)
+        .await
+        .unwrap();
     delete_level_pending(dir.path()).await.unwrap();
     assert_eq!(read_level_pending(dir.path()).await.unwrap(), None);
     // Second delete is also fine.
@@ -496,12 +522,18 @@ fn every_path_formatter_agrees_with_hex_formatting() {
 #[tokio::test]
 async fn recovery_keeps_the_pending_level_when_a_rename_fails() {
     let dir = temp_group_dir();
-    write_level_pending(dir.path(), 32, false).await.unwrap();
+    write_level_pending(dir.path(), 32, false, None)
+        .await
+        .unwrap();
     std::fs::write(bucket_new_path(dir.path(), 0), b"twin").unwrap();
     std::fs::create_dir(bucket_path(dir.path(), 0)).unwrap();
     std::fs::write(bucket_path(dir.path(), 0).join("blocker"), b"x").unwrap();
 
-    assert!(recover_level_transition(dir.path(), false).await.is_err());
+    assert!(
+        recover_level_transition(dir.path(), false, None)
+            .await
+            .is_err()
+    );
 
     assert_eq!(read_level_pending(dir.path()).await.unwrap(), Some(32));
     assert_eq!(read_level_marker(dir.path()).await.unwrap(), None);
@@ -522,8 +554,12 @@ async fn group_has_buckets_empty_directory_is_false() {
 #[tokio::test]
 async fn group_has_buckets_level_files_alone_are_false() {
     let dir = temp_group_dir();
-    write_level_marker(dir.path(), 32, false).await.unwrap();
-    write_level_pending(dir.path(), 64, false).await.unwrap();
+    write_level_marker(dir.path(), 32, false, None)
+        .await
+        .unwrap();
+    write_level_pending(dir.path(), 64, false, None)
+        .await
+        .unwrap();
     assert!(!group_has_buckets(dir.path()).await.unwrap());
 }
 
@@ -582,7 +618,9 @@ fn unwritten_group_level_is_max_without_fan_out_awareness() {
 async fn read_group_level_marker_wins_over_bucket_files() {
     let dir = temp_group_dir();
     std::fs::write(bucket_path(dir.path(), 0x37), b"bucket").unwrap();
-    write_level_marker(dir.path(), 64, false).await.unwrap();
+    write_level_marker(dir.path(), 64, false, None)
+        .await
+        .unwrap();
     assert_eq!(
         read_group_level(dir.path()).await.unwrap(),
         GroupLevel::Marked(64)
@@ -620,7 +658,9 @@ async fn read_group_level_propagates_a_corrupt_marker() {
 async fn recover_level_transition_no_pending_is_noop() {
     let dir = temp_group_dir();
     assert_eq!(
-        recover_level_transition(dir.path(), false).await.unwrap(),
+        recover_level_transition(dir.path(), false, None)
+            .await
+            .unwrap(),
         None
     );
     // No marker should be created when there's nothing to recover.
@@ -634,9 +674,13 @@ async fn recover_level_transition_renames_all_new_files() {
     for bb in 0..4 {
         std::fs::write(bucket_new_path(dir.path(), bb), [bb as u8; 8]).unwrap();
     }
-    write_level_pending(dir.path(), 4, false).await.unwrap();
+    write_level_pending(dir.path(), 4, false, None)
+        .await
+        .unwrap();
 
-    let recovered = recover_level_transition(dir.path(), false).await.unwrap();
+    let recovered = recover_level_transition(dir.path(), false, None)
+        .await
+        .unwrap();
     assert_eq!(recovered, Some(4));
 
     // All .new files renamed to final.
@@ -657,9 +701,13 @@ async fn recover_level_transition_skips_already_renamed_buckets() {
     // Mid-rename state: bb=0 already renamed (final present, no .new); bb=1 still .new.
     std::fs::write(bucket_path(dir.path(), 0), b"final-0").unwrap();
     std::fs::write(bucket_new_path(dir.path(), 1), b"new-1").unwrap();
-    write_level_pending(dir.path(), 2, false).await.unwrap();
+    write_level_pending(dir.path(), 2, false, None)
+        .await
+        .unwrap();
 
-    let recovered = recover_level_transition(dir.path(), false).await.unwrap();
+    let recovered = recover_level_transition(dir.path(), false, None)
+        .await
+        .unwrap();
     assert_eq!(recovered, Some(2));
 
     assert_eq!(
@@ -678,10 +726,16 @@ async fn recover_level_transition_is_idempotent() {
     for bb in 0..2 {
         std::fs::write(bucket_new_path(dir.path(), bb), [bb as u8; 4]).unwrap();
     }
-    write_level_pending(dir.path(), 2, false).await.unwrap();
+    write_level_pending(dir.path(), 2, false, None)
+        .await
+        .unwrap();
 
-    let first = recover_level_transition(dir.path(), false).await.unwrap();
-    let second = recover_level_transition(dir.path(), false).await.unwrap();
+    let first = recover_level_transition(dir.path(), false, None)
+        .await
+        .unwrap();
+    let second = recover_level_transition(dir.path(), false, None)
+        .await
+        .unwrap();
     // First run rolls forward; second run is a no-op since pending is gone.
     assert_eq!(first, Some(2));
     assert_eq!(second, None);
@@ -804,4 +858,23 @@ async fn existing_group_dirs_of_a_missing_index_is_no_groups() {
         .expect("a missing index is an answer");
 
     assert!(existing.iter().all(|&exists| !exists));
+}
+
+/// **Taking a group's flush lock waits for the group's writes in flight**, which a flush dropped
+/// part way leaves running after it let the lock go: the next holder must not write the group's
+/// files under them.
+#[tokio::test]
+async fn taking_the_flush_lock_waits_for_the_group_s_writes_in_flight() {
+    use futures::FutureExt;
+
+    let flush_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    let writes: std::sync::Arc<GroupWrites> = std::sync::Arc::default();
+    let in_flight = std::sync::Arc::clone(&writes).read_owned().await;
+    let mut locking = std::pin::pin!(lock_flush(&flush_lock, &writes));
+    assert!(
+        (&mut locking).now_or_never().is_none(),
+        "the lock waits while a write is in flight"
+    );
+    drop(in_flight);
+    let _guard = locking.await;
 }

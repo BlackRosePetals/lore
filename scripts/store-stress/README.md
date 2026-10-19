@@ -1,16 +1,20 @@
 # Local store stress suite
 
 A stress and crash suite for the local immutable store (`lore-storage/src/local/immutable_store.rs`
-and `lore-storage/src/packstore.rs`), run by hand when the store changes, not in CI. It runs on
-Linux.
+and `lore-storage/src/packstore.rs`), and for the local stores shared by processes
+(`lore-storage/src/local/store_lock.rs`, with `lore-storage/src/local/mutable_store.rs`), run by
+hand when the stores change, not in CI. It runs on Linux.
 
-It looks for three things:
+It looks for four things:
 
 - **Corruption.** Every payload read back, and every payload location read straight from the
   packfiles, must be the bytes stored for that hash.
 - **Loss.** An entry a flush acknowledged must survive the process being killed afterwards.
 - **Broken guarantees.** An obliterated association must stay obliterated, `put` must refuse
   invalid fragments, and an entry's flags must agree with its data.
+- **Stale state.** A process that keeps its stores between calls must reload a store another
+  process wrote to since, and only then, and no update another process acknowledged may be lost,
+  in either store.
 
 It builds every extreme that arises on its own, short of a machine failure. Nothing outside the
 store writes over or removes its files. A power loss or kernel crash is out of scope for the runs;
@@ -31,7 +35,10 @@ a durability gap only such a failure would expose is reported, not tested for.
 - packfiles filling at the size limit, fan-outs through every level, and buckets too large to read
   in one piece;
 - both I/O backends, `psync` and `uring`;
-- crash windows reproduced exactly from snapshots taken at the store's test pause points.
+- crash windows reproduced exactly from snapshots taken at the store's test pause points;
+- several processes using one store directory in calls, some keeping their stores between calls
+  and some opening them for each, killed at random moments, in calls or between them, with changes
+  unflushed or with a fan-out commit half made.
 
 ## Parts
 
@@ -52,6 +59,27 @@ a durability gap only such a failure would expose is reported, not tested for.
     `--cancel <share>`, it drops that share of operations unfinished. With `--liveness`, once the
     run ends, it ends the shim's faults and checks that the store takes puts and flushes again in
     the same process.
+  - `calls <dir>` runs the same workload, with the mutable store's stores, loads, swaps and lists
+    added, as one of several processes using `<dir>` at once, in calls as client processes make
+    them: a call claims both stores, runs a random number of operations on a random number of
+    tasks, flushes, and lets its claims go, and the process pauses before the next. With
+    `--keeps`, a process keeps its stores between calls, reusing their state across holds of their
+    locks while their epochs are unchanged, as `LORE_STORE_RETAIN` has the client do, and ends a
+    share of its calls (`--unflushed`) with the stores unflushed, which keeps their flocks until a
+    later call flushes them. Without it, a process opens its stores afresh for
+    each call, its claims joining the claims they were opened under.
+
+    The processes append to one journal, whose line order is then theirs, each store object's life
+    a generation of its own. A call reads what the others appended once it has claimed the stores,
+    which no other process uses until it lets them go, so what the journal settled holds for the
+    whole call: every read is held to it as `work` holds reads to its own run. Every process swaps
+    two shared counters up by compare-and-swap, from a value it loads or from the last one it saw,
+    and a load below what the journal settled or a swap that succeeds from it is a lost update. A
+    call also holds the loads its claims made to the journal: a kept store reloads at its claim
+    when another process acknowledged a write to it since, never more than once, and not at all
+    when no other process could have written, and stores opened afresh load once each. The
+    orchestrator appends `0 g dead pid=<pid>` once a process is gone, which ends what it left
+    running in the journal.
   - `verify <dir> [--deep]` checks the store against the journal and against its own files.
     - It audits the files as the kill left them, before an open recovers anything.
     - It reopens the store and loads the whole index, then checks every entry: sort order, bucket
@@ -68,10 +96,27 @@ a durability gap only such a failure would expose is reported, not tested for.
       operation succeeded, and stays settled until an obliterate, or an eviction or compaction
       pass that may have taken it, ran after it.
     - `--deep` then compacts every group, flushes with a sync, reopens, and checks again.
+    - Where the journal records mutable operations, it holds each mutable key to the value the
+      journal settled, or to one some process stored, and `list` to the loads. It holds each
+      counter to the swaps: every swap a flush settled is in its value, no two settled swaps
+      started from the same value, and every increment it holds was started by some process.
   - `scenario <name>|all|list` runs deterministic scenarios. Each drives a store to an exact
     point, snapshots its directory there (what a process killed there leaves), and opens the
     snapshot. A scenario passes, fails, or reports a loss only a machine failure would expose,
     which the orchestrator lists apart.
+  - `retention <name>|all|list` runs deterministic interleavings of calls. Each script runs
+    three `client` processes on a directory of its own, two keeping their stores and one opening
+    them for each call, and sends one request at a time over their stdin, so the interleaving is
+    the script's. Each reply names how many times each store loaded during the request and what
+    each operation found, and the script checks both: a kept store after another process's put,
+    durable put, fragment list, obliterate, copy, eviction, compaction, fan-out through every
+    level, mutable store and swap; readers leaving a kept store current; a call waiting for
+    another process's unflushed changes until it flushes or its delayed flush writes them, and for
+    both its stores where it changed only the mutable one; and a writer killed with SIGKILL with
+    changes unflushed, in the middle of a call, or in the middle of a fan-out commit of either
+    store, which the next claim rolls forward.
+  - `client <dir> [--keeps]` is the store client `retention` drives, serving one request per line
+    on stdin; see `client.rs` for the requests.
   - `info <dir>` prints a store's layout.
 - `crashpoint.c` is an LD_PRELOAD shim. It kills its process before or after the N-th file
   operation on the store, or with only part of a write done, or fails operations with an errno.
@@ -90,6 +135,8 @@ From the repository root:
 ulimit -n 65536
 python3 scripts/store-stress/stress.py build              # shim, and the harness built twice
 python3 scripts/store-stress/stress.py scenarios          # every scenario, under both builds
+python3 scripts/store-stress/stress.py retention          # every retention script, under both builds
+python3 scripts/store-stress/stress.py multi-process --minutes 10 --processes 6
 python3 scripts/store-stress/stress.py kill-loop --minutes 30
 python3 scripts/store-stress/stress.py all --minutes 20   # every mode in turn, 20 minutes each
 ```
@@ -112,11 +159,14 @@ The modes:
 | `disk-full` | Runs stores on a tmpfs of a few megabytes, in a container (`docker`, `--image` with the host's libc), until the disk fills, keeps writing, frees space, writes again, and verifies. |
 | `emfile` | Runs stores under a descriptor limit low enough that opens fail, then verifies with a normal limit. |
 | `scenarios` | Every deterministic scenario, under both builds, and the production build again on `uring`. |
+| `retention` | Every retention script, under both builds, and the production build again on `uring`. |
+| `multi-process` | Rounds of `--processes` `calls` processes on one store directory, half of them keeping their stores, each killed with SIGKILL at random moments and started again, some under the shim's faults on the immutable store's files, the store's options random and its fan-out threshold low. Each round is verified on a copy, a quarter of them deeply, and the next round carries on from what the last left. |
 
 Useful options:
 
 - `--minutes` is the time budget per mode.
-- `--seed` replays a campaign's random choices.
+- `--seed` replays a campaign's random choices; the summary records it.
+- `--processes` is how many processes share a store in a `multi-process` round.
 - `--keep` keeps scratch stores.
 - `--stop-on-new` stops at the first violation class not listed in `KNOWN` in `stress.py`.
 
@@ -143,6 +193,10 @@ LD_PRELOAD=target/store-stress/crashpoint.so STRESS_PATH=/tmp/s1/immutable STRES
     STRESS_TEAR=1 $B work /tmp/s1 --seconds 10
 $B verify /tmp/s1
 $B scenario list
+$B calls /tmp/s2 --keys 400 --fan-out-threshold 3 --seconds 0      # fixes the keyspace
+$B calls /tmp/s2 --keeps --seconds 20 & $B calls /tmp/s2 --seconds 20 & wait
+$B verify /tmp/s2
+$B retention list
 ```
 
 `bench <dir>` measures the store's hot paths: puts of new payloads, puts of stored ones, gets,
@@ -154,7 +208,8 @@ $B bench /tmp/b --tasks 8 --rounds 5 --seconds 2 [--modes put-new,get] [--new-pe
 ```
 
 `work` takes `--help`-less options. Each has a default; see `work.rs`, `model.rs` and
-`stress.py` (`random_store_options`, `random_run_options`). Options naming the keyspace
+`stress.py` (`random_store_options`, `random_run_options`). `calls` takes `work`'s and its own,
+see `calls.rs` and `calls_options` in `stress.py`. Options naming the keyspace
 (`--seed`, `--keys`, `--groups`, `--partitions`, `--contexts`, `--evictable-partitions`,
 `--max-payload`, `--real-hash`, `--server`, `--fan-out-threshold`, `--initial-level`, `--lists`)
 are fixed in
@@ -162,5 +217,5 @@ are fixed in
 
 ## Known defects
 
-None open. `KNOWN` in `stress.py` maps the violation classes of a defect being worked on to it, so
-that they do not drown new findings; the orchestrator labels those classes `known`.
+`KNOWN` in `stress.py` maps the violation classes of a defect being worked on to it, so that they
+do not drown new findings; the orchestrator labels those classes `known`.

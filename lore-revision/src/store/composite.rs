@@ -19,6 +19,7 @@ use lore_base::lore_spawn;
 use lore_base::runtime::DetachingJoinSet;
 use lore_error_set::prelude::*;
 use lore_storage::immutable_store::CopyBehavior;
+use lore_storage::immutable_store::claim_for_task;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_CONTEXT_ATTRIBUTE_NAME;
@@ -786,7 +787,9 @@ impl CompositeStore {
                         };
                         let cache_counter = self.instruments.counter_local_caching.clone();
                         local_cache_will_be_warm = true;
+                        let joined = local_store.try_join_claim();
                         lore_spawn!(async move {
+                            let _claim = claim_for_task(&local_store, joined).await;
                             fragment.flags |= FragmentFlags::PayloadStoredLocal
                                 | FragmentFlags::PayloadStoredDurable;
                             let put_result = local_store
@@ -899,7 +902,9 @@ impl CompositeStore {
             let fragment = best_result.inner().fragment;
             let partition = best_result.inner().partition;
             let cache_counter = self.instruments.counter_local_caching.clone();
+            let joined = local_store.try_join_claim();
             lore_spawn!(async move {
+                let _claim = claim_for_task(&local_store, joined).await;
                 let put_result = local_store
                     .put(
                         partition, address, fragment, None,  /* payload */
@@ -942,7 +947,9 @@ impl CompositeStore {
             };
             // It is worthwhile caching this new copy so we know of its existence in the
             // other partition, in case we are ever asked for it.
+            let joined = self.local.target.try_join_claim();
             lore_spawn!(async move {
+                let _claim = claim_for_task(&self.local.target, joined).await;
                 let (mut destination_fragment, destination_payload, record_locally) =
                     if let Some((fragment, payload)) = composite_behavior.supplied {
                         // A put already found the local store short of a full match, and the
@@ -1065,6 +1072,26 @@ impl CompositeStore {
 
 #[async_trait]
 impl ImmutableStore for CompositeStore {
+    /// Claims the local store, which is the only one of these with files to claim.
+    ///
+    /// The replicas and the durable upstream are remote and have no flock of their
+    /// own, so the local target's claim is the whole of it. Answering `None` here
+    /// would open a handle holding nothing, which then reads and writes a store no
+    /// process has claimed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the local store's claim cannot be taken.
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, lore_storage::StoreError> {
+        self.local.target.clone().hold_for_command().await
+    }
+
+    fn try_join_claim(&self) -> Option<lore_storage::local::store_lock::StoreGuard> {
+        self.local.target.try_join_claim()
+    }
+
     /// The local store is the one a read is served from without leaving the process, so its setting
     /// is the one that decides whether bytes can cross a partition here.
     fn isolates_partitions(&self) -> bool {
@@ -1199,7 +1226,9 @@ impl ImmutableStore for CompositeStore {
                             let match_partition = resolved.partition;
                             let address = *address;
                             let cache_counter = self.instruments.counter_local_caching.clone();
+                            let joined = self.local.target.try_join_claim();
                             lore_spawn!(async move {
+                                let _claim = claim_for_task(&store.local.target, joined).await;
                                 let _permit = permit;
                                 let result = store.get_metadata(match_partition, address).await;
                                 count_result("get_metadata_after_query", &cache_counter, &result);
@@ -1369,7 +1398,9 @@ impl ImmutableStore for CompositeStore {
             };
             fragment.flags |= FragmentFlags::PayloadStoredLocal;
             let cache_counter = self.instruments.counter_local_caching.clone();
+            let joined = local.try_join_claim();
             lore_spawn!(async move {
+                let _claim = claim_for_task(&local, joined).await;
                 let put_result = local
                     .put(partition, address, fragment, local_payload, force)
                     .await;
@@ -1394,8 +1425,10 @@ impl ImmutableStore for CompositeStore {
         if !self.local_durable {
             // Detached obliterate local store if it is not the durable store
             let local = self.local.target.clone();
+            let joined = local.try_join_claim();
 
             lore_spawn!(async move {
+                let _claim = claim_for_task(&local, joined).await;
                 // The overall stats we care about returning are those from the durable store, so we
                 // construct a stats instance dedicated to the local obliteration.
                 let stats = Arc::new(StoreObliterateStats::default());

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! Offline checks of a store directory: its files as a killed process left them, then the store
-//! reopened, its index against its packfiles, and every key against the journal.
+//! reopened, its index against its packfiles, every key against the journal, and the mutable
+//! store's keys and counters against it, see [`crate::mutable::verify`].
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -105,6 +106,7 @@ pub async fn main(args: &Args) -> u8 {
     audit_files(&dir, &config, &mut report);
 
     let mut code = check_store(&dir, &config, &history, &mut report, "first open", false).await;
+    crate::mutable::verify(&dir, &config, &history, &mut report).await;
     if code == 0 && args.flag("deep") {
         code = deep(&dir, &config, &history, &mut report).await;
     }
@@ -135,6 +137,13 @@ async fn deep(dir: &Path, config: &Config, history: &History, report: &mut Repor
             return 0;
         };
         let store: Arc<dyn ImmutableStore> = store;
+        let _span = match store.clone().hold_for_command().await {
+            Ok(span) => span,
+            Err(err) => {
+                report.violation("claim-failed", format!("deep reopen: {err}"));
+                return 0;
+            }
+        };
         let mut at = None;
         loop {
             match store.clone().compact(1, at, true, None).await {
@@ -287,6 +296,14 @@ async fn check_store(
     };
     println!("{phase}: opened in {:.3}s", opened.elapsed().as_secs_f64());
     let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+    // Claimed as a command claims a store, so that the checks take no claim each.
+    let _span = match dyn_store.clone().hold_for_command().await {
+        Ok(span) => span,
+        Err(err) => {
+            report.violation("claim-failed", format!("{phase}: {err}"));
+            return 0;
+        }
+    };
     let loaded = Instant::now();
     if let Err(err) = dyn_store.clone().load_index().await {
         report.violation("load-index-failed", format!("{phase}: {err}"));

@@ -361,6 +361,7 @@ pub async fn save(filter: &FilterInstance, path: impl AsRef<Path>) -> std::io::R
                 .truncate(true),
             vec![out.into_bytes()],
             true,
+            (),
         )
         .await
 }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use lore_base::error::*;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::runtime;
+use lore_error_set::ForwardAny;
 use lore_error_set::ForwardStrict;
 use lore_error_set::WrapInternal;
 use lore_error_set::error_set;
@@ -38,6 +39,7 @@ use crate::repository::RemoteState;
 use crate::repository::RepositoryConfig;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryPaths;
+use crate::repository::claim_opened_stores;
 use crate::repository::create_client_immutable_store;
 use crate::repository::create_client_mutable_store;
 use crate::repository::load_repository_config_from_dot_dir;
@@ -180,7 +182,7 @@ impl MountResources {
             .internal("Creating write directory for SWFS mount")?;
         let dot_directory = instance_directory.join(DOT_LORE);
 
-        let immutable_store = create_client_immutable_store(
+        let (immutable_store, opening) = create_client_immutable_store(
             config,
             &dot_directory,
             config
@@ -198,26 +200,35 @@ impl MountResources {
         .await
         .internal("Creating immutable store")?;
 
-        let mutable_store =
-            create_client_mutable_store(config, &dot_directory, immutable_store.clone())
-                .await
-                .internal("Creating mutable store")?;
+        // A mount uses its stores for as long as it is mounted, so it claims them for that
+        // long, as a command does for its duration; the operations it serves then take
+        // nothing of their own.
+        let (immutable_store, mutable_store, stores) =
+            claim_opened_stores(immutable_store, opening, |immutable_store| {
+                create_client_mutable_store(config, &dot_directory, immutable_store)
+            })
+            .await
+            .forward_any::<SwfsMountError>("Creating and claiming the stores for the mount")?;
 
         let name = hex::encode(instance_id.data());
 
-        let repository = Arc::new(RepositoryContext::new_with_state(
-            Some(RepositoryPaths::new(
-                mount_path.as_ref().to_path_buf(),
-                dot_directory,
-            )),
-            immutable_store,
-            mutable_store,
-            repository_id,
-            instance_id,
-            RemoteState::Offline,
-            Arc::new(Filter::default()),
-            Some(Arc::new(InvalidFilesystemProvider {})),
-        ));
+        let mutable_store: Arc<dyn lore_storage::MutableStore> = mutable_store;
+        let repository = Arc::new(
+            RepositoryContext::new_with_state(
+                Some(RepositoryPaths::new(
+                    mount_path.as_ref().to_path_buf(),
+                    dot_directory,
+                )),
+                immutable_store,
+                mutable_store,
+                repository_id,
+                instance_id,
+                RemoteState::Offline,
+                Arc::new(Filter::default()),
+                Some(Arc::new(InvalidFilesystemProvider {})),
+            )
+            .with_store_hold(stores),
+        );
         repository.set_disable_cache(false);
 
         let repo_path = mount_path

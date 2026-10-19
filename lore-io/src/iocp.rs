@@ -781,19 +781,6 @@ impl IocpDriver {
             .await
     }
 
-    pub(crate) async fn write_file_segments_atomic<B: StableBufList>(
-        &self,
-        options: std::fs::OpenOptions,
-        temporary_path: PathBuf,
-        final_path: PathBuf,
-        buffers: B,
-        durable: bool,
-    ) -> std::io::Result<()> {
-        PsyncDriver
-            .write_file_segments_atomic(options, temporary_path, final_path, buffers, durable)
-            .await
-    }
-
     pub(crate) async fn metadata(&self, path: PathBuf) -> std::io::Result<std::fs::Metadata> {
         PsyncDriver.metadata(path).await
     }
@@ -807,10 +794,6 @@ impl IocpDriver {
         file: Arc<File>,
     ) -> std::io::Result<std::fs::Metadata> {
         PsyncDriver.file_metadata(file).await
-    }
-
-    pub(crate) async fn set_len(&self, file: Arc<File>, len: u64) -> std::io::Result<()> {
-        PsyncDriver.set_len(file, len).await
     }
 
     pub(crate) async fn rename(&self, from: PathBuf, to: PathBuf) -> std::io::Result<()> {

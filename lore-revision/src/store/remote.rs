@@ -136,6 +136,16 @@ fn unsupported_as_internal(err: StoreError) -> StoreError {
 
 #[async_trait]
 impl store::ImmutableStore for RemoteImmutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     /// The peer answers exact addresses only, so nothing it returns can have come from another
     /// partition.
     fn isolates_partitions(&self) -> bool {
@@ -369,6 +379,16 @@ impl RemoteMutableStore {
 
 #[async_trait]
 impl store::MutableStore for RemoteMutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn load(
         self: Arc<Self>,
         partition: Partition,

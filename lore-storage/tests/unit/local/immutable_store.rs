@@ -21,6 +21,7 @@ use lore_storage::hash;
 use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::StoreError;
 use lore_storage::local::immutable_store::info::info_path_for_store_root;
+use lore_storage::local::store_lock::Intent;
 use lore_storage::store_types::StoreMatch;
 use lore_storage::store_types::StoreMatchResult;
 use lore_storage::test_util::PausePoint;
@@ -112,11 +113,14 @@ async fn deserialize_scatters_a_bucket_larger_than_the_head_read() {
     }
 }
 
-/// Client-shaped settings: the ones a repository store is opened with.
+/// Client-shaped settings: the ones a repository store is opened with in a process that retains
+/// stores. A test builds a store's state under one claim and examines it under the next, so the
+/// store keeps its state across holds.
 fn client_settings() -> ImmutableStoreSettings {
     ImmutableStoreSettings {
         protect_local_fragment: true,
         implicit_durable_stored: false,
+        reuse_state_across_holds: true,
         ..Default::default()
     }
 }
@@ -221,7 +225,7 @@ async fn a_durable_mark_on_a_local_entry_reaches_the_index_only_with_background_
         }
         let found = open_flushing(dir.path(), flush_background)
             .await
-            .find(partition, address)
+            .find(partition, address, Lookup::Read)
             .await
             .expect("the local entry was flushed");
         assert_eq!(
@@ -274,7 +278,7 @@ async fn a_durable_copy_reaches_the_index_only_with_background_flush() {
         }
         let found = open_flushing(dir.path(), flush_background)
             .await
-            .find(destination, address)
+            .find(destination, address, Lookup::Read)
             .await
             .expect("the source entry was flushed");
         assert_eq!(
@@ -1523,7 +1527,7 @@ async fn store_initializes_group_bucket_count_from_settings_level_1() {
     )
     .await
     .unwrap();
-    for group in &store.group {
+    for group in store.group.iter() {
         assert_eq!(group.bucket_count.load(Ordering::Relaxed), 1);
     }
 }
@@ -1540,7 +1544,7 @@ async fn store_initializes_group_bucket_count_from_settings_level_256() {
     )
     .await
     .unwrap();
-    for group in &store.group {
+    for group in store.group.iter() {
         assert_eq!(
             group.bucket_count.load(Ordering::Relaxed),
             lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX
@@ -1555,10 +1559,9 @@ async fn group_compaction_reports_a_finished_group_complete() {
     use lore_storage::immutable_store::ImmutableStore;
 
     let dir = lore_base::test_util::TempDir::new("is_stop_report_");
-    let store =
-        LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
-            .await
-            .unwrap();
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
 
     let partition = Partition::from([0x0cu8; 16]);
     let (group_index, payloads) = payloads_in_one_group(8);
@@ -2783,6 +2786,30 @@ async fn populated_bucket(store: &Arc<LocalImmutableStore>) -> (usize, usize) {
     panic!("a put must populate a bucket");
 }
 
+/// A delayed flush far enough out that no test meets it.
+const QUIET_FLUSH_DELAY_SECONDS: u64 = 60 * 60;
+
+/// Default settings with the delayed flush pushed past any test's length, keeping the store's
+/// state across holds as [`client_settings`] does. A put of a fragment not stored durably
+/// schedules a sweep a few seconds out, and a test that ran long enough to meet it would have the
+/// flags it asserts on flushed underneath it.
+fn quiet_settings() -> ImmutableStoreSettings {
+    ImmutableStoreSettings {
+        flush_delay_seconds: QUIET_FLUSH_DELAY_SECONDS,
+        reuse_state_across_holds: true,
+        ..Default::default()
+    }
+}
+
+/// Puts a non-empty directory where a bucket's file goes, so neither a write to that
+/// path nor a rename over it can succeed.
+fn block_bucket_file(store: &LocalImmutableStore, group_index: usize, bucket_index: usize) {
+    let root = store.path.clone().expect("a disk-backed store has a path");
+    let file = format_bucket_path(&root, group_index, bucket_index);
+    let _ = std::fs::remove_file(&file);
+    std::fs::create_dir_all(file.join("occupied")).expect("a directory where the bucket file goes");
+}
+
 /// Store one fragment in `store`, set its last-access stamp to `stamp`, and clear the dirty
 /// flag of the bucket it landed in. Returns that bucket and the address naming the entry.
 async fn backdated_fragment(
@@ -2815,7 +2842,7 @@ async fn backdated_fragment(
         .unwrap();
 
     let (group_index, bucket_index) = populated_bucket(store).await;
-    let group = &store.group[group_index];
+    let group = store.group[group_index].clone();
     group.bucket(bucket_index).write().await.entry[0]
         .data
         .last_access = stamp;
@@ -2824,11 +2851,13 @@ async fn backdated_fragment(
     ((group_index, bucket_index), partition, address)
 }
 
-/// Resolve one backdated fragment in an in-memory store. Returns the stamp its entry carries
-/// afterward and whether the resolve marked the bucket for rewrite.
-async fn resolve_one_fragment(atime: bool, stamp: u64) -> (u64, bool) {
-    use lore_storage::immutable_store::ImmutableStore;
-
+/// Resolves one backdated fragment and reports its stamp and its bucket's dirty
+/// flag.
+///
+/// `lookup` decides which half of the stamping rule is under test: a read updates
+/// the stamp and marks the bucket for flush without marking it changed, and a write
+/// marks it changed.
+async fn resolve_one_fragment(atime: bool, stamp: u64, lookup: Lookup) -> (u64, bool) {
     let store = LocalImmutableStore::new(
         None,
         ImmutableStoreSettings {
@@ -2841,14 +2870,9 @@ async fn resolve_one_fragment(atime: bool, stamp: u64) -> (u64, bool) {
 
     let ((group_index, bucket_index), partition, address) = backdated_fragment(&store, stamp).await;
 
-    let mut results = [StoreMatchResult::default(); 1];
-    store
-        .clone()
-        .query(partition, &[address], &mut results)
-        .await
-        .unwrap();
+    store.find(partition, address, lookup).await.unwrap();
 
-    let group = &store.group[group_index];
+    let group = store.group[group_index].clone();
     (
         group.bucket(bucket_index).read().await.entry[0]
             .data
@@ -2865,7 +2889,9 @@ async fn resolve_one_fragment(atime: bool, stamp: u64) -> (u64, bool) {
 async fn a_small_move_advances_the_stamp_without_dirtying_the_bucket() {
     let recent = LocalImmutableStore::last_access().saturating_sub(10);
 
-    let (last_access, dirty) = resolve_one_fragment(true, recent).await;
+    // On a write, so that the granularity threshold is the only thing keeping the
+    // bucket clean — on a read it would stay clean whatever the move.
+    let (last_access, dirty) = resolve_one_fragment(true, recent, Lookup::Write).await;
 
     assert!(last_access > recent, "a resolve always advances the stamp");
     assert!(!dirty, "a small move must not schedule a rewrite");
@@ -2874,16 +2900,716 @@ async fn a_small_move_advances_the_stamp_without_dirtying_the_bucket() {
 /// A stamp that moved past the window is worth a bucket rewrite of its own.
 #[tokio::test]
 async fn a_stale_stamp_dirties_the_bucket_holding_it() {
-    let (_last_access, dirty) = resolve_one_fragment(true, STALE_ACCESS).await;
+    let (_last_access, dirty) = resolve_one_fragment(true, STALE_ACCESS, Lookup::Write).await;
+    assert!(
+        dirty,
+        "a stamp this far behind, on a write, has to reach disk"
+    );
 
-    assert!(dirty, "a stamp this far behind has to reach disk");
+    let (_last_access, dirty) = resolve_one_fragment(true, STALE_ACCESS, Lookup::Read).await;
+    assert!(
+        !dirty,
+        "but a read does not mark it changed: a read holds no write claim, so a \
+         change it recorded would be unaccounted for"
+    );
+}
+
+/// **The legacy packfile upgrade runs under a claim, and only it pays for one.**
+///
+/// The upgrade rewrites every entry's packfile reference, writes new per-group
+/// packfiles and unlinks the old pack directory. Unclaimed, two processes opening
+/// the same legacy store both run it, and a third reading those packfiles sees them
+/// deleted underneath it and is never told the store changed.
+///
+/// The epoch file is the observable: a write claim advances it, and an ordinary open
+/// of a store that has its info file — which takes a read claim and never writes —
+/// leaves it as it was. That the ordinary case announces nothing is half the point,
+/// since a top-level `pack` directory exists only on a legacy store and no other open
+/// should pay for this.
+#[tokio::test]
+async fn a_legacy_packfile_upgrade_runs_under_a_claim() {
+    let ordinary = lore_base::test_util::TempDir::new("is_open_plain_");
+    let open = || {
+        LocalImmutableStore::new(
+            Some(ordinary.to_path_buf()),
+            ImmutableStoreSettings::default(),
+        )
+    };
+    // The first open gives the store its info file, which is a write of its own.
+    drop(open().await.unwrap());
+    let epoch = ordinary.to_path_buf().join("immutable").join("epoch");
+    let before = std::fs::read(&epoch).ok();
+    drop(open().await.unwrap());
+    assert_eq!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "an ordinary open reads and writes nothing, so it announces nothing"
+    );
+
+    let legacy = lore_base::test_util::TempDir::new("is_open_legacy_");
+    let immutable = legacy.to_path_buf().join("immutable");
+    // A top-level pack directory is what marks a store as pre-per-group. The info file
+    // is there already, so the upgrade is the only thing the open writes.
+    std::fs::create_dir_all(immutable.join("pack")).expect("legacy pack directory");
+    lore_storage::local::immutable_store::info::write_info_file(
+        &lore_storage::local::immutable_store::info::ImmutableStoreInfo::default(),
+        &info_path_for_store_root(&immutable),
+    )
+    .await
+    .expect("an info file");
+
+    let store = LocalImmutableStore::new(
+        Some(legacy.to_path_buf()),
+        ImmutableStoreSettings::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        immutable.join("epoch").exists(),
+        "the upgrade must claim the store, which announces itself by writing the epoch"
+    );
+    assert!(
+        !store.lock.as_ref().unwrap().is_held(),
+        "and the claim must not outlive the open that took it"
+    );
+}
+
+/// **A read's access stamp marks the bucket for flush but not as changed.**
+///
+/// The stamp ranks fragments for eviction. Recorded on a read it has no claim
+/// behind it — a read hold never marks the store dirty — so a dirtied bucket would
+/// be unflushed state nothing accounts for: released over, then dropped by the next
+/// reload, or worse, enough to make `note_flushed` refuse to clear so that a
+/// read-heavy process holds the store against every other one for as long as it
+/// runs.
+///
+/// On a write there is already a write claim and the epoch has already moved, so
+/// keeping it costs nothing — and a `put` of content the store already has is still
+/// a touch of that content, which is what the ranking is for.
+#[tokio::test]
+async fn a_read_stamp_leaves_the_bucket_clean_and_a_write_stamp_does_not() {
+    let dir = lore_base::test_util::TempDir::new("is_atime_dirty_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+
+    let ((group_index, bucket_index), partition, address) =
+        backdated_fragment(&store, STALE_ACCESS).await;
+    let group = store.group[group_index].clone();
+    let dirty = || group.dirty[bucket_index].load(atomic::Ordering::Relaxed);
+    assert!(!dirty(), "the helper leaves the bucket clean");
+
+    store
+        .find(partition, address, Lookup::Read)
+        .await
+        .expect("finds");
+    assert!(
+        !dirty(),
+        "a read's stamp is not a change: it holds no write claim, so it must not \
+         mark the store as having unflushed modifications"
+    );
+    assert!(
+        group.needs_flush(bucket_index),
+        "but it is worth writing — a client reads far more than it writes, so \
+         ranking that ignored reads would rank on almost nothing"
+    );
+
+    // Backdate again: the first lookup moved the stamp to now, so a second would
+    // not cross the granularity threshold.
+    group.bucket(bucket_index).write().await.entry[0]
+        .data
+        .last_access = STALE_ACCESS;
+
+    store
+        .find(partition, address, Lookup::Write)
+        .await
+        .expect("finds");
+    assert!(
+        dirty(),
+        "a write's stamp is worth keeping: the claim and the epoch are already paid"
+    );
+}
+
+/// **A background pass that found no work leaves the store unclaimed.**
+///
+/// A write claim marks the store dirty before the caller writes, and only a flush
+/// clears that — so a pass which evicts or compacts nothing would keep the flock
+/// on a store nobody is using. The evictor and compactor run on a timer for the
+/// life of the process, unattended, which is how a process that has finished with
+/// a store ends up holding it against every other process indefinitely.
+#[tokio::test]
+async fn a_background_pass_with_nothing_to_do_releases_the_store() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_gc_claim_");
+    let store =
+        LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+            .await
+            .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    assert!(!lock.is_held(), "nothing has used the store yet");
+    let before = std::fs::read(dir.to_path_buf().join("immutable").join("epoch")).ok();
+
+    // An empty store, with caps far above anything in it: there is nothing to
+    // evict and nothing to compact. (Not `usize::MAX` — the per-group target
+    // multiplies the cap by a percentage before dividing, which overflows.)
+    const ROOMY: usize = 1 << 30;
+    store.clone().evict(ROOMY, false, None).await.unwrap();
+    assert!(
+        !lock.is_held(),
+        "an eviction pass that evicted nothing must not keep the store claimed"
+    );
+
+    store
+        .clone()
+        .compact(ROOMY, None, false, None)
+        .await
+        .unwrap();
+    assert!(
+        !lock.is_held(),
+        "nor must a compaction pass that compacted nothing"
+    );
+
+    // **And neither may announce a change.** Releasing the flock is not enough: a
+    // write claim advances the epoch as it is taken, and an advance tells every
+    // other process on this store that its entire in-memory state is invalid. These
+    // passes run on a timer for the life of the process, so a pass that claims to
+    // write while doing nothing makes every peer discard and re-read the store
+    // several times a minute over nothing at all.
+    assert_eq!(
+        std::fs::read(dir.to_path_buf().join("immutable").join("epoch")).ok(),
+        before,
+        "a pass that changed nothing must not tell anyone it did"
+    );
+}
+
+/// **A reload clears the record of having loaded, not just the contents.**
+///
+/// `deserialize_all_buckets` short-circuits on a store-level latch. Left set across
+/// a reload — which empties every bucket and forgets every packstore — it makes the
+/// call a permanent no-op, and the three callers that need every bucket loaded
+/// (packfile compaction, verify, the legacy packfile upgrade) are each handed a
+/// store they believe is complete and which holds nothing. Compaction in particular
+/// then reads a total size of zero, decides the store is under its cap, and never
+/// runs again for the life of the process.
+#[tokio::test]
+async fn a_reload_clears_the_record_of_having_loaded_every_bucket() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_reload_latch_");
+    let store =
+        LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+            .await
+            .unwrap();
+
+    let payload = vec![0x4du8; 128];
+    let address = Address {
+        hash: lore_storage::hash::hash_slice(&payload),
+        context: Context::default(),
+    };
+    store
+        .clone()
+        .put(
+            Partition::from([0x91u8; 16]),
+            address,
+            Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            },
+            Some(Bytes::from(payload)),
+            false,
+        )
+        .await
+        .unwrap();
+    store.clone().flush(true).await.unwrap();
+
+    store.deserialize_all_buckets().await.unwrap();
+    assert!(
+        store.deserialized_all.load(atomic::Ordering::Relaxed),
+        "the store has loaded every bucket"
+    );
+
+    store.refresh().await.unwrap();
+
+    assert!(
+        !store.deserialized_all.load(atomic::Ordering::Relaxed),
+        "a reload discarded those buckets, so the store must not still claim to hold them"
+    );
+    // And the claim is not merely reset but honest: loading again finds the fragment
+    // the reload dropped, rather than short-circuiting over an empty store.
+    store.deserialize_all_buckets().await.unwrap();
+    let group = &store.group[address.hash.data()[0] as usize];
+    let slot = lore_storage::local::fan_out::bucket_index_for(
+        &address.hash,
+        group.bucket_count.load(atomic::Ordering::Relaxed),
+    );
+    assert!(
+        !group.bucket(slot).read().await.entry.is_empty(),
+        "the fragment the reload dropped is loaded again"
+    );
+}
+
+/// **A store reloads at its first claim after its flock was released, although the epoch is
+/// unchanged, unless it reuses its state across holds.** The record of having loaded every
+/// bucket, which a reload clears, says which happened.
+#[tokio::test]
+async fn a_released_store_reloads_at_its_next_claim_unless_it_reuses_state_across_holds() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    for reuse_state_across_holds in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("is_reuse_across_holds_");
+        let store = LocalImmutableStore::new(
+            Some(dir.to_path_buf()),
+            ImmutableStoreSettings {
+                reuse_state_across_holds,
+                ..quiet_settings()
+            },
+        )
+        .await
+        .unwrap();
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+        let span = store.clone().hold_for_command().await.unwrap();
+        store.deserialize_all_buckets().await.unwrap();
+        drop(span);
+        assert!(!lock.is_held(), "the flock is released between the claims");
+
+        let _claim = store.hold(Intent::Read).await.unwrap();
+        assert_eq!(
+            store.deserialized_all.load(atomic::Ordering::Relaxed),
+            reuse_state_across_holds,
+            "the store keeps what it loaded only if it reuses its state across holds"
+        );
+    }
+}
+
+/// **A reload empties a bucket without replacing what identifies it.**
+///
+/// `serialize_lock` is how two writers to one bucket exclude each other, and it is
+/// held through an `Arc` clone taken before the write starts. Assigning a default
+/// bucket over it hands out a *fresh* lock, so a writer holding the old clone
+/// excludes against a mutex nobody else takes — the exclusion silently stops
+/// existing at the moment a reload happens, which is when writers are least
+/// expected to be tidy.
+#[tokio::test]
+async fn a_reload_keeps_the_lock_that_orders_writes_to_a_bucket() {
+    let dir = lore_base::test_util::TempDir::new("is_reset_identity_");
+    let store =
+        LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+            .await
+            .unwrap();
+
+    let group = &store.group[0];
+    let bucket = group.bucket(0);
+    bucket
+        .write()
+        .await
+        .entry
+        .push(ImmutableStoreEntry::default());
+    let before = Arc::clone(&bucket.read().await.serialize_lock);
+
+    group.invalidate(BUCKET_COUNT, 0, 1).await;
+
+    let after = Arc::clone(&bucket.read().await.serialize_lock);
+    assert!(
+        bucket.read().await.entry.is_empty(),
+        "the contents must go, which is the point of a reload"
+    );
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "but the lock that orders writes to this bucket must be the same one"
+    );
+}
+
+/// **A delayed flush with nothing to write claims nothing.**
+///
+/// It wakes long after the operation that scheduled it, usually after that
+/// command's own flush has written everything. Claiming to write then would
+/// advance the epoch and tell every other process on the store that its state is
+/// worthless, over a sweep that writes nothing.
+#[tokio::test]
+async fn a_delayed_flush_with_nothing_to_write_claims_nothing() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_delayed_quiet_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let ((group_index, _), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
+    store.group[group_index].dirty[0].store(true, atomic::Ordering::Relaxed);
+    store.clone().flush(true).await.unwrap();
+
+    let epoch = dir.to_path_buf().join("immutable").join("epoch");
+    let before = std::fs::read(&epoch).ok();
+    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+
+    assert_eq!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "a sweep that writes nothing announces nothing"
+    );
+    assert!(!store.lock.as_ref().unwrap().is_held());
+}
+
+/// **A delayed flush with no bucket flagged writes no level marker, even for a group never
+/// written, and claims nothing.** A group's marker goes on disk before its first bucket file, so a
+/// group with no bucket to write has none to commit, and claiming to write would advance the epoch
+/// over a sweep that writes nothing.
+#[tokio::test]
+async fn a_delayed_flush_writes_no_level_marker_for_a_group_with_nothing_flagged() {
+    let dir = lore_base::test_util::TempDir::new("is_delayed_no_marker_");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            initial_fan_out_level: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let immutable = dir.to_path_buf().join("immutable");
+    let epoch = immutable.join("epoch");
+    let marker = lore_storage::local::fan_out::group_dir_path(&immutable.join("index"), 0)
+        .join(lore_storage::local::fan_out::MARKER_FILENAME);
+    let before = std::fs::read(&epoch).ok();
+
+    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), 0, 0).await;
+
+    assert_eq!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "the sweep claimed nothing to write"
+    );
+    assert!(!marker.exists(), "and wrote no level marker");
+    assert!(!store.lock.as_ref().unwrap().is_held());
+}
+
+/// **A delayed flush releases the flock a span left to it.** The span ends while the flush is
+/// writing one bucket, with another still flagged, so the flock outlives the span. The flush's
+/// own guard is what releases it once both are written: a flush the span had covered would hold
+/// no guard, and leave the flock held with nothing left to release it.
+#[tokio::test]
+async fn a_delayed_flush_releases_the_flock_a_span_left_to_it() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_delayed_span_release_");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        },
+    )
+    .await
+    .expect("store opens");
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let (group_index, payloads) = payloads_in_one_group(8);
+    let first = &payloads[0];
+    let second = payloads
+        .iter()
+        .find(|payload| hash::hash_slice(payload).data()[1] != hash::hash_slice(first).data()[1])
+        .expect("two of the payloads fall in different buckets");
+    let partition = Partition::from([9u8; 16]);
+
+    let span = store.clone().hold_for_command().await.expect("claims");
+    put_payload(&store, partition, Context::default(), first, false).await;
+    put_payload(&store, partition, Context::default(), second, false).await;
+    let pause = pause_at(PausePoint::Serializing);
+    let flush = lore_base::lore_spawn!(ImmutableStoreGroup::flush_delayed(
+        Arc::downgrade(&store),
+        group_index,
+        0
+    ));
+    pause.reached.notified().await;
+    drop(span);
+    assert!(
+        lock.is_held(),
+        "the bucket the flush has yet to write keeps the flock past the span"
+    );
+
+    pause.resume.notify_one();
+    flush.await.expect("delayed flush");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while lock.is_held() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the flush released the flock once it had written both buckets"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// **An open store holds the claim; a closed one holds nothing.**
+///
+/// The flock says which process is using the store, so it belongs to the span
+/// during which one is — a handle from open to close, or a command. Operations
+/// inside that span join the claim rather than taking one each, which is both
+/// what makes the flock mean "in use" and what keeps a per-operation lock
+/// acquisition and epoch read off every call.
+///
+/// Between spans nothing is held, which is what lets another process take the
+/// store even while this one keeps the last state in memory.
+#[tokio::test]
+async fn a_claim_spans_the_use_of_a_store_not_each_operation() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_claim_");
+    let store =
+        LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+            .await
+            .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+    let partition = Partition::from([0x33u8; 16]);
+    let address = Address {
+        hash: lore_storage::hash::hash_slice(b"absent"),
+        context: Context::default(),
+    };
+    let mut results = [StoreMatchResult::default(); 1];
+
+    assert!(!lock.is_held(), "a store nobody is using is not claimed");
+    store
+        .clone()
+        .query(partition, &[address], &mut results)
+        .await
+        .unwrap();
+    assert!(
+        !lock.is_held(),
+        "and an operation on its own leaves it unclaimed once it returns"
+    );
+
+    {
+        let _claim = store.clone().hold_for_command().await.unwrap();
+        assert!(lock.is_held(), "a claimed store is held");
+        store
+            .clone()
+            .query(partition, &[address], &mut results)
+            .await
+            .unwrap();
+        assert!(
+            lock.is_held(),
+            "an operation inside the claim joins it rather than releasing on the way out"
+        );
+    }
+    assert!(
+        !lock.is_held(),
+        "and the claim goes when whoever took it is done"
+    );
+}
+
+/// **A store serves what another process wrote, not what it had cached.**
+///
+/// Two stores over one directory, which is what two processes are. The first
+/// caches an empty bucket by looking for an address that is not there; the second
+/// then writes that address and flushes. The first must find it on its next
+/// operation — which it can only do by noticing the epoch moved and dropping the
+/// bucket it had.
+///
+/// This is the whole point of the epoch, and it is the only end-to-end exercise of
+/// [`ImmutableStoreGroup::invalidate`]: the lock-interleave probe drives reads
+/// only, so nothing there ever advances an epoch or reaches a refresh.
+#[tokio::test]
+async fn a_store_drops_what_another_one_changed_underneath_it() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_refresh_");
+    let partition = Partition::from([0x11u8; 16]);
+    let payload = vec![0x7eu8; 512];
+    let address = Address {
+        hash: lore_storage::hash::hash_slice(&payload),
+        context: Context::default(),
+    };
+
+    let reader =
+        LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+            .await
+            .unwrap();
+
+    // Caches the bucket, empty, and observes the epoch as it stands.
+    let mut results = [StoreMatchResult::default(); 1];
+    reader
+        .clone()
+        .query(partition, &[address], &mut results)
+        .await
+        .unwrap();
+    assert_eq!(
+        results[0].match_made,
+        StoreMatch::MatchNone,
+        "nothing has been written yet"
+    );
+
+    {
+        let writer =
+            LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+                .await
+                .unwrap();
+        writer
+            .clone()
+            .put(
+                partition,
+                address,
+                Fragment {
+                    flags: 0,
+                    size_payload: payload.len() as u32,
+                    size_content: payload.len() as u64,
+                },
+                Some(Bytes::from(payload.clone())),
+                false,
+            )
+            .await
+            .unwrap();
+        writer.clone().flush(true).await.unwrap();
+    }
+
+    let mut results = [StoreMatchResult::default(); 1];
+    reader
+        .clone()
+        .query(partition, &[address], &mut results)
+        .await
+        .unwrap();
+    assert_eq!(
+        results[0].match_made,
+        StoreMatch::MatchFull,
+        "the cached empty bucket must have been dropped and re-read"
+    );
+}
+
+/// **A read into the caller's buffer serves what another process wrote, as a query does.**
+///
+/// `get_into` is how a block load reads the local store, so it claims the store like any
+/// other operation: the claim is what notices the epoch moved and drops the empty bucket
+/// this store cached on its first look.
+#[tokio::test]
+async fn a_read_into_a_callers_buffer_serves_what_another_store_wrote() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_refresh_into_");
+    let partition = Partition::from([0x12u8; 16]);
+    let payload = vec![0x5du8; 512];
+    let address = Address {
+        hash: lore_storage::hash::hash_slice(&payload),
+        context: Context::default(),
+    };
+
+    let reader =
+        LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+            .await
+            .unwrap();
+    let mut buffer = vec![0u8; payload.len()];
+    // SAFETY: the buffer outlives both reads, and nothing else touches it.
+    let mut dst = unsafe { lore_storage::CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+
+    // Caches the bucket, empty, and observes the epoch as it stands.
+    assert!(
+        reader
+            .clone()
+            .get_into(partition, address, &mut dst)
+            .await
+            .is_err(),
+        "nothing has been written yet"
+    );
+
+    {
+        let writer =
+            LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+                .await
+                .unwrap();
+        writer
+            .clone()
+            .put(
+                partition,
+                address,
+                Fragment {
+                    flags: 0,
+                    size_payload: payload.len() as u32,
+                    size_content: payload.len() as u64,
+                },
+                Some(Bytes::from(payload.clone())),
+                false,
+            )
+            .await
+            .unwrap();
+        writer.clone().flush(true).await.unwrap();
+    }
+
+    let (_fragment, read) = reader
+        .clone()
+        .get_into(partition, address, &mut dst)
+        .await
+        .expect("the cached empty bucket must have been dropped and re-read");
+    assert!(
+        matches!(read, lore_storage::store_types::PayloadRead::IntoBuffer),
+        "the payload is the content, so it lands in the caller's buffer"
+    );
+    assert_eq!(buffer, payload);
+}
+
+/// **A store given its info file as it opens announces it.** The info file is store state
+/// like any other, so writing it takes a write claim, which advances the epoch before the
+/// file is written; the claim ends with the open.
+#[tokio::test]
+async fn opening_a_store_with_no_info_file_writes_one_under_a_write_claim() {
+    let dir = lore_base::test_util::TempDir::new("is_info_open_");
+    let store =
+        LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+            .await
+            .unwrap();
+
+    let immutable = dir.to_path_buf().join("immutable");
+    assert!(
+        info_path_for_store_root(&immutable).exists(),
+        "the open gave the store its info file"
+    );
+    assert!(
+        immutable.join("epoch").exists(),
+        "under a write claim, which announced it"
+    );
+    assert!(
+        !store.lock.as_ref().unwrap().is_held(),
+        "and the claim ended with the open"
+    );
+}
+
+/// **A store reloads the info another one wrote.** The info file is part of what a store
+/// keeps from disk, so a change to it advances the epoch, and a store that finds the epoch
+/// moved reads it again with everything else.
+#[tokio::test]
+async fn a_store_reloads_the_info_another_one_wrote() {
+    let dir = lore_base::test_util::TempDir::new("is_info_reload_");
+    let open =
+        || LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default());
+    let reader = open().await.unwrap();
+    let writer = open().await.unwrap();
+    assert_eq!(
+        reader.info.read().await.next_group_index_to_migrate_oodle,
+        -1,
+        "a fresh store has nothing to migrate"
+    );
+
+    writer
+        .update_store_info(|info| info.next_group_index_to_migrate_oodle = 7)
+        .await
+        .expect("updates the info file");
+    assert!(
+        !writer.lock.as_ref().unwrap().is_held(),
+        "the update lets the store go once the file is written"
+    );
+
+    let _hold = reader.hold(Intent::Read).await.expect("claims");
+    assert_eq!(
+        reader.info.read().await.next_group_index_to_migrate_oodle,
+        7,
+        "the reload read the info file again"
+    );
 }
 
 /// A store that never reclaims records no access, so a resolve neither moves the stamp nor
 /// dirties the bucket holding it.
 #[tokio::test]
 async fn a_resolve_records_nothing_without_atime() {
-    let (last_access, dirty) = resolve_one_fragment(false, STALE_ACCESS).await;
+    let (last_access, dirty) = resolve_one_fragment(false, STALE_ACCESS, Lookup::Write).await;
 
     assert_eq!(last_access, STALE_ACCESS);
     assert!(!dirty);
@@ -2896,20 +3622,18 @@ async fn a_stamp_reaches_the_bucket_file() {
     use lore_storage::immutable_store::ImmutableStore;
 
     let dir = lore_base::test_util::TempDir::new("is_atime_persist_");
-    let store =
-        LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
-            .await
-            .unwrap();
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
 
     let ((group_index, bucket_index), partition, address) =
         backdated_fragment(&store, STALE_ACCESS).await;
 
-    let mut results = [StoreMatchResult::default(); 1];
-    store
-        .clone()
-        .query(partition, &[address], &mut results)
-        .await
-        .unwrap();
+    // Driven as a read, which is the case that matters: a client reads far more
+    // than it writes, so a stamp that only outlived writes would rank on almost
+    // nothing. A read marks the bucket for the next flush without marking the store
+    // as changed, so the flush writes it under a read claim.
+    store.find(partition, address, Lookup::Read).await.unwrap();
     store.clone().flush(true).await.unwrap();
 
     let root = store.path.clone().expect("a disk-backed store has a path");
@@ -2927,6 +3651,1209 @@ async fn a_stamp_reaches_the_bucket_file() {
         entry[0].data.last_access > STALE_ACCESS,
         "the stamp a resolve made must survive the flush"
     );
+}
+
+/// **A flush with nothing to write announces nothing.** It runs after every
+/// command, read-only ones included, and on every handle close; claiming to write
+/// over nothing would make every other process on the store reload after each.
+#[tokio::test]
+async fn a_flush_with_nothing_to_write_announces_nothing() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_flush_quiet_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
+    store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    store.clone().flush(true).await.unwrap();
+
+    let epoch = dir.to_path_buf().join("immutable").join("epoch");
+    let before = std::fs::read(&epoch).ok();
+    {
+        let _span = store.clone().hold_for_command().await.unwrap();
+        store.clone().flush(true).await.unwrap();
+    }
+    store.clone().flush(true).await.unwrap();
+
+    assert_eq!(std::fs::read(&epoch).ok(), before, "nothing was written");
+    assert!(!lock.is_held(), "and nothing is left claimed");
+}
+
+/// **A read's access stamp reaches disk without announcing a change**, on the
+/// regular flush path a group takes once its level is committed.
+#[tokio::test]
+async fn a_read_stamp_reaches_disk_without_announcing_a_change() {
+    let dir = lore_base::test_util::TempDir::new("is_stamp_quiet_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let ((group_index, bucket_index), partition, address) =
+        backdated_fragment(&store, STALE_ACCESS).await;
+    // Written once as a change, so the group's level is committed and the stamp below
+    // goes through the regular path.
+    store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    lore_storage::immutable_store::ImmutableStore::flush(store.clone(), true)
+        .await
+        .unwrap();
+    assert!(!lock.is_held());
+
+    let epoch = dir.to_path_buf().join("immutable").join("epoch");
+    let before = std::fs::read(&epoch).ok();
+    store.find(partition, address, Lookup::Read).await.unwrap();
+    lore_storage::immutable_store::ImmutableStore::flush(store.clone(), true)
+        .await
+        .unwrap();
+
+    let root = store.path.clone().expect("a disk-backed store has a path");
+    let entry = ImmutableStoreBucket::deserialize_files(format_bucket_path(
+        &root,
+        group_index,
+        bucket_index,
+    ))
+    .await
+    .unwrap()
+    .entry;
+    assert!(
+        entry[0].data.last_access > STALE_ACCESS,
+        "the stamp reached disk"
+    );
+    assert_eq!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "without telling any other process the store changed"
+    );
+    assert!(!lock.is_held(), "and without keeping the store claimed");
+}
+
+/// **A write keeps the store claimed until it is flushed**, so no other process can
+/// read a store this one has changed and not yet written.
+#[tokio::test]
+async fn a_write_keeps_the_store_claimed_until_it_is_flushed() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_write_claim_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    backdated_fragment(&store, STALE_ACCESS).await;
+    assert!(lock.is_held(), "an unflushed write holds the store");
+
+    store.clone().flush(true).await.unwrap();
+    assert!(!lock.is_held(), "and the flush that settles it releases it");
+}
+
+/// **A read through the store records its stamp as a read**: flagged for flush,
+/// never as a change, and never keeping the store claimed.
+#[tokio::test]
+async fn a_read_through_the_store_records_its_stamp_as_a_read() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_query_stamp_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let ((group_index, bucket_index), partition, address) =
+        backdated_fragment(&store, STALE_ACCESS).await;
+
+    let mut results = [StoreMatchResult::default(); 1];
+    store
+        .clone()
+        .query(partition, &[address], &mut results)
+        .await
+        .unwrap();
+    let group = &store.group[group_index];
+    assert!(
+        !group.dirty[bucket_index].load(atomic::Ordering::Relaxed),
+        "a query is not a change"
+    );
+    assert!(
+        group.needs_flush(bucket_index),
+        "but its stamp is worth writing"
+    );
+
+    store.note_flushed();
+    assert!(
+        !lock.is_held(),
+        "and a stamp alone never keeps the store claimed"
+    );
+}
+
+/// **An eviction writes what it evicted and releases the store.** Nothing else
+/// schedules those buckets for writing, so a pass that left them dirty would hold
+/// the flock for as long as the process kept the store.
+#[tokio::test]
+async fn an_eviction_writes_what_it_evicted_and_releases_the_store() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_evict_write_");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            protect_local_fragment: false,
+            ..quiet_settings()
+        },
+    )
+    .await
+    .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
+    store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    store.clone().flush(true).await.unwrap();
+    let epoch = dir.to_path_buf().join("immutable").join("epoch");
+    let before = std::fs::read(&epoch).ok();
+
+    let evicted = store.clone().evict(1, false, None).await.unwrap();
+    assert!(evicted > 0, "a cap of one evicts the fragment");
+    assert!(!lock.is_held(), "the pass wrote what it evicted and let go");
+    assert_ne!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "an eviction is a change, and says so"
+    );
+
+    let root = store.path.clone().expect("a disk-backed store has a path");
+    let entry = ImmutableStoreBucket::deserialize_files(format_bucket_path(
+        &root,
+        group_index,
+        bucket_index,
+    ))
+    .await
+    .unwrap()
+    .entry;
+    assert!(entry.is_empty(), "the eviction reached disk");
+}
+
+/// **A healing verify releases the store.** Its flush runs inside the pass's own
+/// write claim, so the pass itself has to release what that claim marked.
+#[tokio::test]
+async fn a_healing_verify_releases_the_store() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_verify_release_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
+    store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    store.clone().flush(true).await.unwrap();
+
+    store.clone().verify(true).await.unwrap();
+    assert!(
+        !lock.is_held(),
+        "a verify that healed nothing leaves nothing claimed"
+    );
+}
+
+/// **A flush settles a bucket it has nothing to write for.** An emptied bucket above
+/// the committed level has no file to write and none to overwrite; its flags left
+/// set would keep the store claimed after the flush.
+#[tokio::test]
+async fn a_flush_settles_an_emptied_bucket_it_has_nothing_to_write_for() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_empty_settle_");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            initial_fan_out_level: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let group = store.group[0].clone();
+    let _ = group.bucket(0);
+    group.dirty[0].store(true, atomic::Ordering::Relaxed);
+    group.soft_dirty[0].store(true, atomic::Ordering::Relaxed);
+
+    store.clone().flush(true).await.unwrap();
+    assert!(!group.needs_flush(0), "the flags were settled");
+    assert!(!lock.is_held(), "so nothing keeps the store claimed");
+}
+
+/// **A background pass with nothing to do takes no claim at all.** It runs on a timer
+/// for the life of the process, including while nothing has the store open, and a
+/// process with nothing open blocks nobody: a pass that claimed the store just to look
+/// would wait on, and then hold out, every other process using it.
+#[tokio::test]
+async fn a_background_pass_with_nothing_to_do_takes_no_claim() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_gc_unclaimed_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    // Another process's claim: a second description of the lock file excludes this
+    // process's own.
+    let elsewhere = lore_base::fs::lock::FSLock::acquire_exact_path(
+        &dir.to_path_buf().join("immutable").join("lock"),
+    )
+    .await
+    .expect("takes the store's lock");
+
+    const ROOMY: usize = 1 << 30;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.clone().evict(ROOMY, false, None),
+    )
+    .await
+    .expect("an eviction pass with nothing to evict does not wait for the store")
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.clone().compact(ROOMY, None, false, None),
+    )
+    .await
+    .expect("nor does a compaction pass with nothing to compact")
+    .unwrap();
+    drop(elsewhere);
+}
+
+/// **A background pass with work to do leaves a store in use elsewhere for later.** It
+/// runs on a timer, so nothing is lost by running another time — where queueing behind
+/// a hold with no bound would keep the pass, and the permit `stop_gc` waits for, for as
+/// long as the other process kept the store.
+#[tokio::test]
+async fn a_background_pass_leaves_a_store_in_use_for_later() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_gc_deferred_");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            protect_local_fragment: false,
+            ..quiet_settings()
+        },
+    )
+    .await
+    .unwrap();
+    let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
+    store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    store.clone().flush(true).await.unwrap();
+
+    let elsewhere = lore_base::fs::lock::FSLock::acquire_exact_path(
+        &dir.to_path_buf().join("immutable").join("lock"),
+    )
+    .await
+    .expect("another process takes the store's lock");
+    let evicted = tokio::time::timeout(Duration::from_secs(5), store.clone().evict(1, false, None))
+        .await
+        .expect("an eviction pass does not wait for a store another process holds")
+        .unwrap();
+    assert_eq!(evicted, 0, "and evicts nothing from it");
+    let compacted = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.clone().compact(1, None, false, None),
+    )
+    .await
+    .expect("nor does a compaction pass")
+    .unwrap();
+    assert_eq!(compacted, None);
+
+    drop(elsewhere);
+    let evicted = store.clone().evict(1, false, None).await.unwrap();
+    assert!(
+        evicted > 0,
+        "and a later pass evicts once the store is free"
+    );
+}
+
+/// **A compaction pass measures the store under its claim.** The claim reloads a store
+/// another process has changed, so a pass measures what is on disk now rather than what
+/// this store held in memory; one that measured first would claim to write, and
+/// compact, a store another process had already shrunk under its cap.
+#[tokio::test]
+async fn a_compaction_pass_decides_again_from_a_store_its_claim_reloaded() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_recheck_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
+    store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    store.clone().flush(true).await.unwrap();
+    let held_in_memory = store.packstore_total_size().await;
+    assert!(
+        held_in_memory > 0,
+        "the fragment's payload is in a packfile"
+    );
+
+    // Another store on the directory empties that packfile, as its own compaction would,
+    // under a write claim that announces it.
+    let other = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    {
+        let _claim = other.hold(Intent::Write).await.unwrap();
+        assert_eq!(other.packstore_total_size().await, held_in_memory);
+        // Out of the set being written first, as compaction takes it: a packfile still
+        // open for writes cannot be truncated.
+        let packstore = &other.group[group_index].packstore;
+        let _ = packstore.stop_writes(&[1]).await;
+        let _ = packstore.truncate(1, ()).await;
+        assert_eq!(
+            other.packstore_total_size().await,
+            0,
+            "the packfile is emptied"
+        );
+    }
+    other.note_flushed();
+
+    let epoch = dir.to_path_buf().join("immutable").join("epoch");
+    let before = std::fs::read(&epoch).ok();
+    let compacted = store
+        .clone()
+        .compact(held_in_memory, None, false, None)
+        .await
+        .unwrap();
+    assert_eq!(compacted, None, "reloaded, the store is under its cap");
+    assert_eq!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "so the pass never claims to write"
+    );
+}
+
+/// **A compaction whose write claim reloaded the store rewrites nothing.** The claim is
+/// taken after the pass has loaded every bucket; a reload in between empties them, and
+/// a pass that went on would rewrite packfiles against buckets that no longer describe
+/// them — truncating payloads still referenced on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compaction_whose_write_claim_reloaded_the_store_rewrites_nothing() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_reload_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let ((group_index, bucket_index), partition, address) =
+        backdated_fragment(&store, STALE_ACCESS).await;
+    store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    store.clone().flush(true).await.unwrap();
+
+    // Held, so the pass stops between the buckets it loads and the write claim it takes.
+    let permit = store
+        .compaction
+        .acquire()
+        .await
+        .expect("the compaction permit");
+    let pass = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { store.compact(1, None, false, None).await })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !store.deserialized_all.load(atomic::Ordering::Relaxed) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pass loads every bucket"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    // Another store on the directory announces a write, which the pass's store learns of
+    // only when it next claims to write.
+    let other = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    drop(other.hold(Intent::Write).await.unwrap());
+    other.note_flushed();
+
+    drop(permit);
+    let compacted = tokio::time::timeout(Duration::from_secs(10), pass)
+        .await
+        .expect("the pass ends")
+        .expect("the task completes")
+        .expect("compacts");
+    assert_eq!(
+        compacted, None,
+        "a pass that found its buckets reloaded stops where it began"
+    );
+
+    let reopened = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let verified = reopened
+        .clone()
+        .verify_fragment(address, partition, StoreMatch::MatchFull, false)
+        .await
+        .expect("the fragment is still indexed, with its payload where the index says");
+    assert!(
+        verified.verification_result.is_ok(),
+        "and the payload is intact"
+    );
+}
+
+/// **A verify that finds nothing releases the store.** A healing verify claims to
+/// write, which marks the store dirty as the claim is taken, so a verify that returned
+/// early without releasing — at an address it does not hold, or a bucket it cannot
+/// load — would keep the store claimed.
+#[tokio::test]
+async fn a_verify_of_an_absent_address_releases_the_store() {
+    let dir = lore_base::test_util::TempDir::new("is_verify_absent_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+    let absent = Address {
+        hash: lore_storage::hash::hash_slice(b"never stored"),
+        context: Context::default(),
+    };
+    let verified = store
+        .clone()
+        .verify_fragment(
+            absent,
+            Partition::from([0x11u8; 16]),
+            StoreMatch::MatchFull,
+            true,
+        )
+        .await;
+    assert!(verified.is_err(), "there is nothing at that address");
+    assert!(
+        !lock.is_held(),
+        "and the verify that found so leaves nothing claimed"
+    );
+}
+
+/// **A change that fails to reach disk keeps its flag and the store's claim**, whether
+/// the write was synced or not. The flag is cleared as the write begins, so a failure
+/// that left it clear would never write the change, and a flush scan would find the
+/// store clean and release its flock over state that is only in memory.
+#[tokio::test]
+async fn a_change_that_fails_to_reach_disk_keeps_its_flag_and_the_claim() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    for sync_data in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("is_failed_change_");
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+            .await
+            .unwrap();
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+        let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
+        let group = store.group[group_index].clone();
+        // Written once, so the group's level is committed and the write below takes the
+        // regular path to the bucket's own file.
+        group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+        store.clone().flush(true).await.unwrap();
+        assert!(!lock.is_held());
+
+        block_bucket_file(&store, group_index, bucket_index);
+        // A change, made the way every change is: under a write claim.
+        drop(store.hold(Intent::Write).await.unwrap());
+        group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+
+        assert!(
+            store.clone().flush(sync_data).await.is_err(),
+            "sync_data {sync_data}: the bucket cannot be written"
+        );
+        assert!(
+            group.dirty[bucket_index].load(atomic::Ordering::Relaxed),
+            "sync_data {sync_data}: the change keeps its flag, to be written again"
+        );
+        assert!(
+            lock.is_held(),
+            "sync_data {sync_data}: and the store stays claimed while it is not on disk"
+        );
+    }
+}
+
+/// **An access stamp that fails to reach disk stays a stamp**: its flag is re-armed to
+/// be written again, and it neither becomes a change nor keeps the store claimed.
+#[tokio::test]
+async fn a_stamp_that_fails_to_reach_disk_stays_a_stamp() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    for sync_data in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("is_failed_stamp_");
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+            .await
+            .unwrap();
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+        let ((group_index, bucket_index), partition, address) =
+            backdated_fragment(&store, STALE_ACCESS).await;
+        let group = store.group[group_index].clone();
+        group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+        store.clone().flush(true).await.unwrap();
+
+        block_bucket_file(&store, group_index, bucket_index);
+        store.find(partition, address, Lookup::Read).await.unwrap();
+        assert!(
+            group.soft_dirty[bucket_index].load(atomic::Ordering::Relaxed),
+            "the read stamped the bucket"
+        );
+
+        assert!(
+            store.clone().flush(sync_data).await.is_err(),
+            "sync_data {sync_data}: the bucket cannot be written"
+        );
+        assert!(
+            group.soft_dirty[bucket_index].load(atomic::Ordering::Relaxed),
+            "sync_data {sync_data}: the stamp keeps its flag, to be written again"
+        );
+        assert!(
+            !group.dirty[bucket_index].load(atomic::Ordering::Relaxed),
+            "sync_data {sync_data}: and is still not a change"
+        );
+        assert!(
+            !lock.is_held(),
+            "sync_data {sync_data}: so it keeps nothing claimed"
+        );
+    }
+}
+
+/// **A flush that fails to commit its level keeps the store claimed until a flush commits it.**
+/// The failure here is at the commit point of a level transition, after the buckets are
+/// written to their `.new` files. No commit point records those files, so the buckets stay
+/// flagged for the next flush to write again, and a flagged bucket keeps the flock. The flush
+/// that commits the level releases it.
+#[tokio::test]
+async fn a_flush_that_fails_to_commit_its_level_keeps_the_store_claimed_until_one_commits_it() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_failed_flush_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
+    store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+
+    // A group's first flush commits its level through `level.pending`, after writing
+    // its buckets; a directory there fails the commit.
+    let root = store.path.clone().expect("a disk-backed store has a path");
+    let mut group_path = root.as_path().join("index");
+    lore_storage::local::fan_out::push_group_dir(&mut group_path, group_index);
+    std::fs::create_dir_all(
+        group_path
+            .join(lore_storage::local::fan_out::LEVEL_PENDING_FILENAME)
+            .join("occupied"),
+    )
+    .expect("a directory where the commit point goes");
+
+    assert!(
+        store.clone().flush(true).await.is_err(),
+        "the level cannot be committed"
+    );
+    assert!(
+        store.group[group_index].needs_flush(bucket_index),
+        "the bucket stays flagged"
+    );
+    assert!(lock.is_held(), "and keeps the store claimed");
+
+    std::fs::remove_dir_all(group_path.join(lore_storage::local::fan_out::LEVEL_PENDING_FILENAME))
+        .expect("the commit point is freed");
+    store
+        .clone()
+        .flush(true)
+        .await
+        .expect("the level is committed");
+    assert!(!store.group[group_index].needs_flush(bucket_index));
+    assert!(!lock.is_held(), "and the store is released");
+}
+
+/// **A flush reloads a store another one changed before it writes.** Its flags can be
+/// set on state that no longer describes the directory, and a flush that wrote them
+/// without reloading first would put back a bucket the other store had since
+/// rewritten — losing the entry that store added.
+#[tokio::test]
+async fn a_flush_reloads_a_changed_store_before_it_writes() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_flush_reload_");
+    let settings = || ImmutableStoreSettings {
+        isolate_partitions: true,
+        ..quiet_settings()
+    };
+    let mine = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+        .await
+        .unwrap();
+    let ((group_index, bucket_index), _, address) = backdated_fragment(&mine, STALE_ACCESS).await;
+    mine.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    mine.clone().flush(true).await.unwrap();
+
+    // Another store on the directory adds the same content under a second partition.
+    let theirs = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+        .await
+        .unwrap();
+    let payload = vec![0x22u8; 128];
+    theirs
+        .clone()
+        .put(
+            Partition::from([0x44u8; 16]),
+            address,
+            Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            },
+            Some(Bytes::from(payload)),
+            false,
+        )
+        .await
+        .unwrap();
+    theirs.clone().flush(true).await.unwrap();
+
+    // A flag on this store's copy of the bucket, which no longer describes it.
+    mine.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    mine.clone().flush(true).await.unwrap();
+
+    let root = mine.path.clone().expect("a disk-backed store has a path");
+    let entry = ImmutableStoreBucket::deserialize_files(format_bucket_path(
+        &root,
+        group_index,
+        bucket_index,
+    ))
+    .await
+    .unwrap()
+    .entry;
+    assert_eq!(
+        entry.len(),
+        2,
+        "the entry the other store added is still on disk"
+    );
+}
+
+/// **A flush of a change announces it, even with no write claim behind the flag.** A
+/// bucket can be marked changed under a read claim — a load that upgrades what it read
+/// marks the bucket for rewrite — and the flush that writes it is then the first to
+/// claim to write, so it is the one that must advance the epoch.
+#[tokio::test]
+async fn a_flush_of_a_change_announces_it_without_a_write_claim_behind_it() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_flush_announce_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
+    store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    store.clone().flush(true).await.unwrap();
+    assert!(!lock.is_held());
+
+    let epoch = dir.to_path_buf().join("immutable").join("epoch");
+    let before = std::fs::read(&epoch).ok();
+    store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    store.clone().flush(true).await.unwrap();
+
+    assert_ne!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "the change is announced"
+    );
+    assert!(
+        !lock.is_held(),
+        "and the flush that wrote it lets the store go"
+    );
+}
+
+/// **A delayed flush writes access stamps without announcing a change.** It claims only
+/// as far as its work needs, as an explicit flush does: stamps under a read claim.
+#[tokio::test]
+async fn a_delayed_flush_writes_stamps_without_announcing_them() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_delayed_stamps_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let ((group_index, bucket_index), partition, address) =
+        backdated_fragment(&store, STALE_ACCESS).await;
+    store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    store.clone().flush(true).await.unwrap();
+
+    let epoch = dir.to_path_buf().join("immutable").join("epoch");
+    let before = std::fs::read(&epoch).ok();
+    store.find(partition, address, Lookup::Read).await.unwrap();
+    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+
+    let root = store.path.clone().expect("a disk-backed store has a path");
+    let entry = ImmutableStoreBucket::deserialize_files(format_bucket_path(
+        &root,
+        group_index,
+        bucket_index,
+    ))
+    .await
+    .unwrap()
+    .entry;
+    assert!(
+        entry[0].data.last_access > STALE_ACCESS,
+        "the stamp reached disk"
+    );
+    assert_eq!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "without announcing a change"
+    );
+    assert!(!lock.is_held(), "and without keeping the store claimed");
+}
+
+/// **A bucket flagged while a sweep runs schedules the next sweep.** The running sweep
+/// may already have passed that bucket, so leaving the bucket to it would leave it
+/// flagged, keeping the store claimed with nothing coming to write it.
+#[tokio::test]
+async fn a_bucket_flagged_while_a_sweep_runs_schedules_the_next() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_sweep_schedule_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let ((group_index, _), partition, address) = backdated_fragment(&store, STALE_ACCESS).await;
+    let group = store.group[group_index].clone();
+    assert!(
+        group.scheduled.load(atomic::Ordering::Relaxed),
+        "the put scheduled a sweep"
+    );
+
+    // That sweep has woken, and is still running.
+    group.scheduled.store(false, atomic::Ordering::Relaxed);
+    let running = group.flush.lock().await.len();
+
+    // The same content under another context lands in the same group.
+    let payload = vec![0x22u8; 128];
+    store
+        .clone()
+        .put(
+            partition,
+            Address {
+                hash: address.hash,
+                context: Context::from([0x44u8; 16]),
+            },
+            Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            },
+            Some(Bytes::from(payload)),
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        group.flush.lock().await.len(),
+        running + 1,
+        "a write during a running sweep schedules another"
+    );
+    assert!(group.scheduled.load(atomic::Ordering::Relaxed));
+}
+
+/// **A reload takes the levels a fresh survey read and drops every flag.** A group
+/// left at its old level would address buckets by the wrong layout, and a flag left
+/// set would flush state the reload has just discarded.
+#[tokio::test]
+async fn invalidating_a_group_takes_the_surveyed_levels_and_clears_its_flags() {
+    let store = LocalImmutableStore::new(None, ImmutableStoreSettings::default())
+        .await
+        .unwrap();
+    let group = store.group[0].clone();
+    let _ = group.bucket(3);
+    group.dirty[3].store(true, atomic::Ordering::Relaxed);
+    group.soft_dirty[5].store(true, atomic::Ordering::Relaxed);
+
+    group.invalidate(64, 32, 7).await;
+
+    assert!(
+        !group.needs_flush(3) && !group.needs_flush(5),
+        "no flag survives a reload"
+    );
+    assert_eq!(group.bucket_count.load(atomic::Ordering::Relaxed), 64);
+    assert_eq!(group.committed_level.load(atomic::Ordering::Relaxed), 32);
+    assert_eq!(group.serialize_version.load(atomic::Ordering::Relaxed), 7);
+}
+
+/// **A write inside a span keeps the flock past the span until it is flushed.** The
+/// operation itself takes nothing; the bucket it flags is what the span's end finds.
+#[tokio::test]
+async fn a_write_inside_a_span_keeps_the_flock_past_the_span_until_flushed() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_span_write_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+    let span = store.clone().hold_for_command().await.unwrap();
+    let payload = vec![0x3cu8; 64];
+    let address = Address {
+        hash: lore_storage::hash::hash_slice(&payload),
+        context: Context::default(),
+    };
+    store
+        .clone()
+        .put(
+            Partition::from([0x77u8; 16]),
+            address,
+            Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            },
+            Some(Bytes::from(payload)),
+            false,
+        )
+        .await
+        .unwrap();
+    drop(span);
+    assert!(
+        lock.is_held(),
+        "the bucket the write flagged keeps the flock past the span"
+    );
+
+    store.clone().flush(true).await.unwrap();
+    assert!(
+        !lock.is_held(),
+        "and the flush that writes it releases the flock"
+    );
+}
+
+/// **A store kept over its deleted directory reloads from it recreated, and empty.** The
+/// next use of the path is handed the kept store, whose claim must neither fail to take the
+/// flock in a directory that is gone nor serve what the deleted directory held.
+#[tokio::test]
+async fn a_store_kept_over_its_deleted_directory_reloads_it_recreated_and_empty() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_deleted_dir_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let payload = vec![0x2du8; 64];
+    let partition = Partition::from([0x2du8; 16]);
+    let address = Address {
+        hash: lore_storage::hash::hash_slice(&payload),
+        context: Context::default(),
+    };
+    let span = store.clone().hold_for_command().await.unwrap();
+    store
+        .clone()
+        .put(
+            partition,
+            address,
+            Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            },
+            Some(Bytes::from(payload)),
+            false,
+        )
+        .await
+        .unwrap();
+    store.clone().flush(true).await.unwrap();
+    drop(span);
+
+    std::fs::remove_dir_all(dir.join("immutable")).expect("deletes the store directory");
+    let _span = store
+        .clone()
+        .hold_for_command()
+        .await
+        .expect("claims the store over its recreated directory");
+
+    let found = store.find(partition, address, Lookup::Read).await.unwrap();
+    assert_ne!(
+        found.matching,
+        StoreMatch::MatchFull,
+        "nothing of the deleted directory is served"
+    );
+}
+
+/// **A store holds no packfile open between uses.** The handles close as the flock goes,
+/// so another process the lock admits finds none of this process's on a packfile it
+/// writes or removes, and open again at the next use that reaches them. The size the GC
+/// counters carry for the loaded packfiles goes and returns with them, so a reopen is not
+/// counted on top of the first load.
+#[tokio::test]
+async fn a_store_holds_no_packfile_open_between_uses() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    async fn open_packfiles(store: &LocalImmutableStore) -> usize {
+        let mut open = 0;
+        for group in store.group.iter() {
+            open += group.packstore.open_packfiles().await;
+        }
+        open
+    }
+
+    let dir = lore_base::test_util::TempDir::new("is_release_files_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    store.set_gc_caps(usize::MAX, usize::MAX, false);
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+    let payload = Bytes::from(vec![0x5au8; 96]);
+    let partition = Partition::from([0x51u8; 16]);
+    let address = Address {
+        hash: lore_storage::hash::hash_slice(&payload),
+        context: Context::default(),
+    };
+    let span = store.clone().hold_for_command().await.unwrap();
+    store
+        .clone()
+        .put(
+            partition,
+            address,
+            Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            },
+            Some(payload.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+    store.clone().flush(true).await.unwrap();
+    assert!(
+        open_packfiles(&store).await > 0,
+        "the write opened the group's packfiles"
+    );
+    drop(span);
+    assert!(!lock.is_held());
+    assert_eq!(
+        open_packfiles(&store).await,
+        0,
+        "and the end of the use closed them"
+    );
+
+    let span = store.clone().hold_for_command().await.unwrap();
+    let got = store.clone().get(partition, address).await.unwrap();
+    assert_eq!(
+        got.payload.as_ref(),
+        Some(&payload),
+        "the next use reads through reopened packfiles"
+    );
+    assert!(open_packfiles(&store).await > 0);
+    let counted = store.gc_counters.loaded_size();
+    assert!(counted > 0, "the reopen counted the packfiles' size");
+    drop(span);
+    assert_eq!(open_packfiles(&store).await, 0);
+    assert_eq!(
+        store.gc_counters.loaded_size(),
+        0,
+        "closing took the size out of the GC counters"
+    );
+
+    let span = store.clone().hold_for_command().await.unwrap();
+    let got = store.clone().get(partition, address).await.unwrap();
+    assert_eq!(got.payload.as_ref(), Some(&payload));
+    assert_eq!(
+        store.gc_counters.loaded_size(),
+        counted,
+        "and a reopen counts them once, not on top of the first load"
+    );
+    drop(span);
+}
+
+/// Whether the flock of the store over `dir` is free to another open file description, which a
+/// holder in this process excludes as a holder in another process would.
+async fn flock_free(dir: &Path) -> bool {
+    lore_base::fs::lock::FSLock::try_acquire_exact_path(&dir.join("immutable").join("lock"))
+        .await
+        .expect("attempts the flock")
+        .is_some()
+}
+
+/// Waits until `released` reports the flock gone, failing after ten seconds.
+async fn until_released(released: impl AsyncFn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !released().await {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the flock goes once the write lands");
+}
+
+/// Puts a payload in a task of its own, held in flight at its packfile write, and drops the put
+/// there, leaving the write to the driver as a dropped put does.
+async fn abandon_a_packfile_write(
+    store: &Arc<LocalImmutableStore>,
+) -> Arc<lore_storage::test_util::InFlight> {
+    let in_flight = lore_storage::test_util::hold_packfile_write();
+    let put = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move {
+            put_payload(
+                &store,
+                Partition::default(),
+                Context::default(),
+                &[0x6bu8; 64],
+                false,
+            )
+            .await
+        })
+    };
+    in_flight.issued.notified().await;
+    put.abort();
+    assert!(put.await.unwrap_err().is_cancelled());
+    in_flight
+}
+
+/// **A packfile write abandoned in flight keeps the flock until it lands, past the store that
+/// issued it.** The driver runs a write to its end after its future is dropped, and a process
+/// the flock admitted meanwhile would size the packfile without it and write over its range.
+/// Here a flagged bucket keeps the flock as the write's own claim goes, so no release is tried
+/// before the store is dropped.
+#[tokio::test]
+async fn an_abandoned_packfile_write_keeps_the_flock_past_its_store_until_it_lands() {
+    let dir = lore_base::test_util::TempDir::new("is_abandoned_write_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    put_payload(
+        &store,
+        Partition::default(),
+        Context::default(),
+        &[0x6au8; 64],
+        false,
+    )
+    .await;
+    let in_flight = abandon_a_packfile_write(&store).await;
+    drop(store);
+    assert!(
+        !flock_free(dir.path()).await,
+        "the write in flight keeps the flock past its store"
+    );
+
+    in_flight.complete();
+    until_released(async || flock_free(dir.path()).await).await;
+}
+
+/// **A use that ends with a packfile write in flight keeps the flock until the write lands.**
+#[tokio::test]
+async fn a_use_ending_with_a_packfile_write_in_flight_keeps_the_flock_until_it_lands() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_write_past_use_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let span = store.clone().hold_for_command().await.unwrap();
+    let in_flight = abandon_a_packfile_write(&store).await;
+    drop(span);
+    assert!(
+        lock.is_held(),
+        "the write in flight keeps the flock past the use"
+    );
+
+    in_flight.complete();
+    until_released(async || !lock.is_held()).await;
+}
+
+/// **A store joins only a claim this process already holds, and without waiting.** Outside a
+/// span, and for a store with nothing on disk, there is nothing to join; inside a span the join
+/// is a counted guard, which keeps the flock past the span until it is dropped.
+#[tokio::test]
+async fn a_store_joins_only_a_claim_it_already_holds() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let in_memory = LocalImmutableStore::new(None, quiet_settings())
+        .await
+        .unwrap();
+    assert!(in_memory.try_join_claim().is_none());
+
+    let dir = lore_base::test_util::TempDir::new("is_try_join_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    assert!(
+        store.try_join_claim().is_none(),
+        "nothing to join outside a span"
+    );
+
+    let span = store.clone().hold_for_command().await.unwrap();
+    let joined = store.try_join_claim().expect("the span's claim to join");
+    drop(span);
+    assert!(
+        lock.is_held(),
+        "the joined claim keeps the flock past the span"
+    );
+    drop(joined);
+    assert!(!lock.is_held());
+}
+
+/// **A bucket write abandoned in flight keeps its group's writes in flight until it lands.** The
+/// driver finishes the write after the flush that dispatched it is dropped, so the group's next
+/// flush, and the release of the flock, wait for the write rather than for that flush.
+#[tokio::test]
+async fn a_bucket_write_abandoned_in_flight_holds_its_group_until_it_lands() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_abandoned_write_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    put_payload(
+        &store,
+        Partition::default(),
+        Context::default(),
+        b"abandoned",
+        false,
+    )
+    .await;
+
+    let in_flight = lore_storage::test_util::hold_store_write();
+    let flush = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { store.flush(false).await })
+    };
+    in_flight.issued.notified().await;
+    flush.abort();
+    assert!(flush.await.unwrap_err().is_cancelled());
+    assert!(
+        store
+            .group
+            .iter()
+            .any(|group| group.writes.try_write().is_err()),
+        "the abandoned write keeps its group's writes in flight"
+    );
+
+    in_flight.complete();
+    assert!(
+        store
+            .group
+            .iter()
+            .all(|group| group.writes.try_write().is_ok()),
+        "until it lands"
+    );
+}
+
+/// **A write in flight keeps the flock past the last guard, and the release follows it**, so that
+/// no other process takes the store while a write this one dispatched has yet to land.
+#[tokio::test]
+async fn a_write_in_flight_keeps_the_flock_until_it_lands() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_write_in_flight_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+    let span = store.clone().hold_for_command().await.unwrap();
+    let in_flight = Arc::clone(&store.group[0].writes).read_owned().await;
+    drop(span);
+    assert!(lock.is_held(), "the write in flight keeps the flock");
+
+    drop(in_flight);
+    while lock.is_held() {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
 }
 
 fn payload_data(pack_file: u32, encoding: u32, storage: u32) -> ImmutableData {
@@ -3287,7 +5214,7 @@ async fn healing_a_corrupt_payload_drops_the_associations_that_named_it() {
     let group_index = hash.data()[0] as usize;
     let found = store
         .clone()
-        .find(partition, address)
+        .find(partition, address, Lookup::Read)
         .await
         .expect("the entry is there to corrupt");
     store.group[group_index]
@@ -3519,7 +5446,7 @@ async fn healing_the_last_entry_in_a_bucket_survives_reopening_the_store() {
         let group_index = hash.data()[0] as usize;
         let found = store
             .clone()
-            .find(partition, address)
+            .find(partition, address, Lookup::Read)
             .await
             .expect("the entry is there to corrupt");
         store.group[group_index]
@@ -3623,7 +5550,7 @@ async fn verifying_an_obliterated_fragment_reports_nothing_and_heals_nothing() {
 
     let tombstone = store
         .clone()
-        .find(partition, address)
+        .find(partition, address, Lookup::Read)
         .await
         .expect("the tombstone is in the index");
     assert_eq!(tombstone.matching, StoreMatch::MatchFull);
@@ -3655,7 +5582,7 @@ async fn verifying_an_obliterated_fragment_reports_nothing_and_heals_nothing() {
 
     let after = store
         .clone()
-        .find(partition, address)
+        .find(partition, address, Lookup::Read)
         .await
         .expect("the tombstone is still in the index");
     assert_eq!(
@@ -4326,6 +6253,7 @@ mod copy_source {
 /// An obliterated association stays obliterated whatever is stored under the others.
 mod obliteration {
     use lore_storage::immutable_store::ImmutableStore;
+    use lore_storage::immutable_store::claim_for_task;
 
     use super::*;
 
@@ -4546,12 +6474,20 @@ mod obliteration {
         let partition = Partition::from([0x76u8; 16]);
         let address = put(&dyn_store, partition, &payload).await;
 
+        // Each task holds a claim of its own, as spawned work does: one covered by the other's
+        // guard would run on with no flock once that guard goes.
         let pause = pause_at(PausePoint::Located);
         let reading = dyn_store.clone();
-        let read = lore_base::lore_spawn!(async move { reading.get(partition, address).await });
+        let claim = claim_for_task(&dyn_store, None).await;
+        let read = lore_base::lore_spawn!(async move {
+            let _claim = claim;
+            reading.get(partition, address).await
+        });
         pause.reached.notified().await;
         let obliterating = dyn_store.clone();
+        let claim = claim_for_task(&dyn_store, None).await;
         let obliterate_task = lore_base::lore_spawn!(async move {
+            let _claim = claim;
             obliterating
                 .obliterate(
                     partition,
@@ -4605,9 +6541,12 @@ mod obliteration {
             .expect("load the index");
 
         assert_eq!(addresses[0].hash.data()[0] as usize, group_index);
+        // Each task holds a claim of its own, for the reason the test above gives.
         let pause = pause_at(PausePoint::Stopped);
         let compacting = dyn_store.clone();
+        let claim = claim_for_task(&dyn_store, None).await;
         let compaction = lore_base::lore_spawn!(async move {
+            let _claim = claim;
             let mut at = None;
             while let Ok(Some(next)) = compacting.clone().compact(1, at, false, None).await {
                 at = Some(next);
@@ -4616,7 +6555,9 @@ mod obliteration {
         pause.reached.notified().await;
         let obliterating = dyn_store.clone();
         let target = addresses[0];
+        let claim = claim_for_task(&dyn_store, None).await;
         let mut obliterate_task = lore_base::lore_spawn!(async move {
+            let _claim = claim;
             obliterating
                 .obliterate(
                     partition,
@@ -5206,7 +7147,10 @@ mod put_validation {
             .await
             .expect("put of the representation alone");
         for partition in [stored, described] {
-            let found = store.find(partition, address).await.expect("find");
+            let found = store
+                .find(partition, address, Lookup::Read)
+                .await
+                .expect("find");
             assert_ne!(found.data.pack_file, 0, "the entry holds the payload");
             assert_ne!(
                 found.data.flags & F::PayloadStoredLocal,
@@ -5225,7 +7169,10 @@ mod put_validation {
             )
             .await
             .expect("put of the representation marked durable");
-        let found = store.find(stored, address).await.expect("find");
+        let found = store
+            .find(stored, address, Lookup::Read)
+            .await
+            .expect("find");
         assert_eq!(
             found.data.flags & F::PayloadStored,
             (F::PayloadStoredLocal | F::PayloadStoredDurable).bits(),
@@ -5247,7 +7194,7 @@ mod put_validation {
             )
             .await
             .expect("put of a representation claimed local");
-        let found = store.find(stored, other).await.expect("find");
+        let found = store.find(stored, other, Lookup::Read).await.expect("find");
         assert_eq!(found.data.pack_file, 0);
         assert_eq!(
             found.data.flags & F::PayloadStored,
@@ -5301,7 +7248,10 @@ mod put_validation {
         let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
             .await
             .expect("store reopens");
-        let found = store.find(partition, address).await.expect("find");
+        let found = store
+            .find(partition, address, Lookup::Read)
+            .await
+            .expect("find");
         assert_eq!(found.data.flags & F::PayloadStoredLocal, 0);
         let dyn_store: Arc<dyn ImmutableStore> = store.clone();
         let got = dyn_store

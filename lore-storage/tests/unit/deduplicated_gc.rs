@@ -116,13 +116,15 @@ struct Pass {
     protect: bool,
 }
 
-/// A store in `dir` protecting local payloads as `pass` says, with its whole index loaded.
+/// A store in `dir` protecting local payloads as `pass` says, with its whole index loaded, and
+/// kept across holds so the passes run over the index it loaded.
 async fn open_store(dir: &Path, pass: Pass) -> Arc<LocalImmutableStore> {
     let store = LocalImmutableStore::new(
         Some(dir.to_path_buf()),
         ImmutableStoreSettings {
             protect_local_fragment: pass.protect,
             implicit_durable_stored: false,
+            reuse_state_across_holds: true,
             ..Default::default()
         },
     )

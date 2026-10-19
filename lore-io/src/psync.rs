@@ -231,13 +231,14 @@ impl PsyncDriver {
             .await
     }
 
-    pub(crate) async fn write_file_segments_atomic<B: StableBufList>(
+    pub(crate) async fn write_file_segments_atomic<B: StableBufList, C: Send + 'static>(
         &self,
         options: std::fs::OpenOptions,
         temporary_path: PathBuf,
         final_path: PathBuf,
         buffers: B,
         durable: bool,
+        completion: C,
     ) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || {
@@ -252,6 +253,7 @@ impl PsyncDriver {
                     // caller already handles.
                     let _ = sync_parent_dir(&final_path);
                 }
+                drop(completion);
                 written
             })
             .await
@@ -306,9 +308,18 @@ impl PsyncDriver {
         SyscallPool::global().submit(move || file.metadata()).await
     }
 
-    pub(crate) async fn set_len(&self, file: Arc<File>, len: u64) -> std::io::Result<()> {
+    pub(crate) async fn set_len<C: Send + 'static>(
+        &self,
+        file: Arc<File>,
+        len: u64,
+        completion: C,
+    ) -> std::io::Result<()> {
         SyscallPool::global()
-            .submit(move || retry_on_interrupt(|| file.set_len(len)))
+            .submit(move || {
+                let set = retry_on_interrupt(|| file.set_len(len));
+                drop(completion);
+                set
+            })
             .await
     }
 

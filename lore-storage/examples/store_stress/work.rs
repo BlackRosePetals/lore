@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! The randomized workload: concurrent tasks storing, reading, copying and obliterating keys,
-//! flushing, compacting and evicting, each operation journaled, and every payload read back
-//! checked against its key.
+//! flushing, compacting and evicting, and with a mutable store, storing, loading, swapping and
+//! listing mutable keys, each operation journaled, and every payload read back checked against its
+//! key. `work` runs it for one process's life; `calls` runs it in calls, see [`crate::calls`].
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -18,6 +19,7 @@ use std::time::Instant;
 use lore_storage::CallerBuffer;
 use lore_storage::Loan;
 use lore_storage::LocalImmutableStore;
+use lore_storage::LocalMutableStore;
 use lore_storage::PayloadRead;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
@@ -25,14 +27,19 @@ use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
 use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::ImmutableStore;
+use lore_storage::local::immutable_store::Lookup;
 use parking_lot::Mutex;
+use parking_lot::RwLock;
 
 use crate::args::Args;
 use crate::coverage;
+use crate::journal::History;
 use crate::journal::Journal;
+use crate::journal::Store;
 use crate::model::Config;
 use crate::model::Rng;
 use crate::model::Served;
+use crate::mutable;
 use crate::online;
 use crate::online::Effect;
 use crate::online::Outcome;
@@ -43,7 +50,7 @@ use crate::shim;
 pub const EXIT_VIOLATION: u8 = 99;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Kind {
+pub enum Kind {
     Put,
     PutForce,
     PutMeta,
@@ -63,10 +70,14 @@ enum Kind {
     FailWrite,
     FailSync,
     PutInvalid,
+    MutableStore,
+    MutableLoad,
+    MutableSwap,
+    MutableList,
 }
 
 impl Kind {
-    const ALL: [(Kind, &'static str, f64); 19] = [
+    const ALL: [(Kind, &'static str, f64); 23] = [
         (Kind::Put, "put", 30.0),
         (Kind::PutForce, "putf", 2.0),
         (Kind::PutMeta, "putm", 3.0),
@@ -86,6 +97,10 @@ impl Kind {
         (Kind::FailWrite, "failwrite", 0.0),
         (Kind::FailSync, "failsync", 0.0),
         (Kind::PutInvalid, "putbad", 0.0),
+        (Kind::MutableStore, "mstore", 0.0),
+        (Kind::MutableLoad, "mload", 0.0),
+        (Kind::MutableSwap, "mswap", 0.0),
+        (Kind::MutableList, "mlist", 0.0),
     ];
 
     fn name(self) -> &'static str {
@@ -111,13 +126,13 @@ const OPEN: usize = Kind::ALL.len();
 const END: usize = Kind::ALL.len() + 1;
 const PROBE: usize = Kind::ALL.len() + 2;
 
-struct Mix {
+pub struct Mix {
     weights: Vec<(Kind, f64)>,
     total: f64,
 }
 
 impl Mix {
-    fn parse(spec: Option<&str>) -> Mix {
+    pub fn parse(spec: Option<&str>) -> Mix {
         let mut weights: Vec<(Kind, f64)> = Kind::ALL
             .iter()
             .map(|(kind, _, weight)| (*kind, *weight))
@@ -146,7 +161,7 @@ impl Mix {
         Mix { weights, total }
     }
 
-    fn pick(&self, rng: &mut Rng) -> Kind {
+    pub fn pick(&self, rng: &mut Rng) -> Kind {
         let mut roll = (rng.next() >> 11) as f64 / (1u64 << 53) as f64 * self.total;
         for (kind, weight) in &self.weights {
             if roll < *weight {
@@ -158,7 +173,7 @@ impl Mix {
     }
 }
 
-struct Options {
+pub struct Options {
     seconds: f64,
     max_ops: u64,
     tasks: usize,
@@ -184,6 +199,35 @@ struct Options {
     liveness: bool,
 }
 
+impl Options {
+    /// The options `args` give, for a store whose delayed flush waits `flush_delay` seconds.
+    pub fn from_args(args: &Args, flush_delay: u64) -> Options {
+        Options {
+            seconds: args.float("seconds", 10.0),
+            max_ops: args.number("ops", u64::MAX),
+            tasks: args.number("tasks", 16).max(1) as usize,
+            hot_keys: args.number("hot-keys", 48).max(1),
+            hot_share: args.float("hot-share", 0.3),
+            compact_max_size: sizes(args, "compact-max-size", "1,256k,4m,64m"),
+            evict_max_capacity: sizes(args, "evict-max-capacity", "1,4096,1m"),
+            sync_gc: args.flag("sync-gc"),
+            end: args.string("end", "flush"),
+            stop_on_violation: args.flag("stop-on-violation"),
+            hang_seconds: args.number("hang-seconds", 120),
+            heal: args.flag("heal"),
+            gc_tasks: args.number("gc-tasks", 2) as usize,
+            gc_pause_ms: args.number("gc-pause-ms", 5),
+            serialize_flushes: args.flag("serialize-flushes"),
+            strong_flushes: args.flag("serialize-flushes")
+                && flush_delay >= 1000
+                && !args.flag("background-gc"),
+            cancel: args.float("cancel", 0.0),
+            cancel_us: args.number("cancel-us", 2000),
+            liveness: args.flag("liveness"),
+        }
+    }
+}
+
 /// Counters per operation kind: run, succeeded, and failures by message.
 #[derive(Default)]
 struct Stats {
@@ -192,18 +236,23 @@ struct Stats {
     errors: BTreeMap<String, u64>,
 }
 
-struct Work {
+pub struct Work {
     config: Config,
-    store: Arc<LocalImmutableStore>,
+    /// The stores the operations run against: one for a `work` run, and for `calls`, the pair of
+    /// the call running, or none between the calls of a process that opens them afresh.
+    immutable: RwLock<Option<Arc<LocalImmutableStore>>>,
+    mutable: RwLock<Option<Arc<LocalMutableStore>>>,
     journal: Arc<Journal>,
     options: Options,
     mix: Mix,
     stop: AtomicBool,
     started_ops: AtomicU64,
+    /// The operations started past which the workers stop.
+    limit: AtomicU64,
     progress: Arc<AtomicU64>,
     violations: AtomicUsize,
     stats: Mutex<BTreeMap<Kind, Stats>>,
-    /// Keys an obliterate ran for in this run, which a read racing it may see zeroed.
+    /// Keys an obliterate ran for, which a read racing it may see zeroed.
     obliterating: Mutex<std::collections::HashSet<u64>>,
     overlaps: coverage::Overlaps,
     serial: tokio::sync::Mutex<()>,
@@ -213,6 +262,8 @@ struct Work {
     /// the list's payload, and refused one otherwise, as when the list or a child is not there.
     lists: [AtomicUsize; 4],
     model: online::Model,
+    /// What the mutable operations of a call hold their reads to.
+    call: Mutex<mutable::CallView>,
 }
 
 pub async fn main(args: &Args) -> u8 {
@@ -239,40 +290,18 @@ fn sizes(args: &Args, name: &str, default: &str) -> Vec<usize> {
 
 #[expect(
     clippy::exit,
-    reason = "a hung store and the exit end mode both leave without dropping the store"
+    reason = "the exit end mode leaves without dropping the store"
 )]
 async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
     let config = Config::load_or_create(dir, args).map_err(|err| err.to_string())?;
     let journal = Arc::new(Journal::open(dir).map_err(|err| err.to_string())?);
-    let mut rng = Rng::new(args.number("run-seed", journal.generation) ^ config.seed);
+    let mut rng = Rng::new(args.number("run-seed", journal.generation()) ^ config.seed);
     let flush_background = match args.get("flush-background") {
         Some(value) => value == "true",
         None => rng.chance(0.5),
     };
     let flush_delay = args.number("flush-delay", rng.below(3));
-    let options = Options {
-        seconds: args.float("seconds", 10.0),
-        max_ops: args.number("ops", u64::MAX),
-        tasks: args.number("tasks", 16).max(1) as usize,
-        hot_keys: args.number("hot-keys", 48).max(1),
-        hot_share: args.float("hot-share", 0.3),
-        compact_max_size: sizes(args, "compact-max-size", "1,256k,4m,64m"),
-        evict_max_capacity: sizes(args, "evict-max-capacity", "1,4096,1m"),
-        sync_gc: args.flag("sync-gc"),
-        end: args.string("end", "flush"),
-        stop_on_violation: args.flag("stop-on-violation"),
-        hang_seconds: args.number("hang-seconds", 120),
-        heal: args.flag("heal"),
-        gc_tasks: args.number("gc-tasks", 2) as usize,
-        gc_pause_ms: args.number("gc-pause-ms", 5),
-        serialize_flushes: args.flag("serialize-flushes"),
-        strong_flushes: args.flag("serialize-flushes")
-            && flush_delay >= 1000
-            && !args.flag("background-gc"),
-        cancel: args.float("cancel", 0.0),
-        cancel_us: args.number("cancel-us", 2000),
-        liveness: args.flag("liveness"),
-    };
+    let options = Options::from_args(args, flush_delay);
     let mut mix_spec = args.string("mix", "");
     if config.real_hash && !mix_spec.contains("verify=") {
         mix_spec.push_str(",verify=0.05");
@@ -293,13 +322,7 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
         "g start pid={} flush_background={flush_background} flush_delay={flush_delay}",
         std::process::id()
     ));
-    let overlaps = coverage::Overlaps::new(
-        Kind::ALL
-            .iter()
-            .map(|(_, name, _)| *name)
-            .chain(ACTIVITIES)
-            .collect(),
-    );
+    let overlaps = coverage::Overlaps::new(kind_names());
     overlaps.register_with_shim();
     let opening = overlaps.start(OPEN);
     let opened = Instant::now();
@@ -311,7 +334,7 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
     .map_err(|err| format!("open: {err}"))?;
     println!(
         "opened generation {} in {:.3}s (flush_background={flush_background}, flush_delay={flush_delay})",
-        journal.generation,
+        journal.generation(),
         opened.elapsed().as_secs_f64()
     );
     let dyn_store: Arc<dyn ImmutableStore> = store.clone();
@@ -342,86 +365,20 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
     }
     drop(opening);
 
-    let earlier = crate::journal::History::load(dir).map_err(|err| err.to_string())?;
-    // The model starts from what the journal settled for the variants eviction may not take.
-    let model = online::Model::new(!config.server && !options.heal);
-    for &(key, variant) in earlier.events.keys() {
-        if !config.evictable(variant) {
-            let state = State::from(earlier.expect(key, variant, false));
-            model.seed((key, variant), state, earlier.obliterated(key, variant));
-        }
-    }
-    let progress = Arc::new(AtomicU64::new(0));
-    let work = Arc::new(Work {
-        config,
-        store,
-        journal: journal.clone(),
-        options,
-        mix,
-        stop: AtomicBool::new(false),
-        started_ops: AtomicU64::new(0),
-        progress: progress.clone(),
-        violations: AtomicUsize::new(0),
-        stats: Mutex::new(BTreeMap::new()),
-        obliterating: Mutex::new(earlier.obliterated_keys),
-        overlaps,
-        serial: tokio::sync::Mutex::new(()),
-        gc: Arc::new(coverage::GcCounts::default()),
-        shapes: coverage::Shapes::default(),
-        lists: Default::default(),
-        model,
-    });
-
-    let hang_seconds = work.options.hang_seconds;
-    let watchdog_progress = progress.clone();
-    let watchdog_stop = Arc::new(AtomicBool::new(false));
-    let watchdog_done = watchdog_stop.clone();
-    let watchdog_journal = journal.clone();
-    std::thread::spawn(move || {
-        // A second with a thread waiting on the storage, as on a sync it has not finished, is the
-        // disk's, up to a limit: a hang is `hang_seconds` without progress the storage does not
-        // explain, or a stall of any kind past the limit.
-        const STORAGE_STALL_LIMIT: u64 = 600;
-        let mut last = watchdog_progress.load(Ordering::Relaxed);
-        let (mut still, mut on_storage) = (0, 0);
-        while !watchdog_done.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_secs(1));
-            let now = watchdog_progress.load(Ordering::Relaxed);
-            if now == last {
-                still += 1;
-                on_storage += u64::from(waiting_on_storage());
-                if still - on_storage >= hang_seconds || still >= STORAGE_STALL_LIMIT {
-                    eprintln!(
-                        "HANG: no operation finished for {still}s, {on_storage}s of it waiting \
-                         on the storage"
-                    );
-                    watchdog_journal.log(format_args!("v hang 0 0 no-progress-{still}s"));
-                    dump_threads();
-                    std::process::exit(i32::from(EXIT_VIOLATION) + 1);
-                }
-            } else {
-                if still >= hang_seconds {
-                    eprintln!(
-                        "STORAGE-STALL: no operation finished for {still}s, {on_storage}s of it \
-                         waiting on the storage"
-                    );
-                }
-                (still, on_storage) = (0, 0);
-                last = now;
-            }
-        }
-    });
+    let earlier = History::load(dir).map_err(|err| err.to_string())?;
+    let work = Arc::new(Work::new(config, journal.clone(), options, mix, overlaps));
+    work.use_stores(Some(store), None);
+    work.learn(&earlier, earlier.events.keys().copied());
+    let watchdog_stop = watch_for_hangs(
+        work.progress.clone(),
+        work.options.hang_seconds,
+        journal.clone(),
+    );
 
     let started = Instant::now();
     let mut tasks = tokio::task::JoinSet::new();
-    for index in 0..work.options.tasks {
-        let work = work.clone();
-        lore_base::lore_spawn!(tasks, async move { work.worker(index).await });
-    }
-    for index in 0..work.options.gc_tasks {
-        let work = work.clone();
-        lore_base::lore_spawn!(tasks, async move { work.gc_worker(index).await });
-    }
+    let seed = work.config.seed ^ (journal.generation() << 32);
+    work.spawn_workers(&mut tasks, seed, work.options.tasks, work.options.gc_tasks);
     let sampler = {
         let work = work.clone();
         lore_base::lore_spawn!(async move {
@@ -430,14 +387,15 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
             } else {
                 work.config.groups.clone()
             };
-            let store: Arc<dyn ImmutableStore> = work.store.clone();
+            let store = work.immutable();
+            let dyn_store: Arc<dyn ImmutableStore> = store.clone();
             while !work.stop.load(Ordering::Relaxed) {
-                work.shapes.sample(&work.store, &groups).await;
+                work.shapes.sample(&store, &groups).await;
                 // The trait's remaining questions, which a service asks of a store now and then. A
                 // store is unavailable while a bucket lock stays held past the timeout, which a
                 // busy store may do; the watchdog catches one held for good.
-                let _ = store.clone().fragment_count().await;
-                if !store.clone().is_available(Duration::from_secs(5)).await {
+                let _ = dyn_store.clone().fragment_count().await;
+                if !dyn_store.clone().is_available(Duration::from_secs(5)).await {
                     println!("NOTE store-unavailable: a bucket lock was held past 5s");
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -470,7 +428,7 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
         work.probe().await;
     }
     let _ending = work.overlaps.start(END);
-    let dyn_store: Arc<dyn ImmutableStore> = work.store.clone();
+    let dyn_store = work.dyn_store();
     if rng.chance(0.3) {
         // As a process shutting down does: collection stops for good, with passes in flight.
         dyn_store.clone().stop_gc(true).await;
@@ -478,12 +436,12 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
     match work.options.end.as_str() {
         "flush" | "sync" => {
             let sync = work.options.end == "sync";
-            let id = journal.flush_start(sync, work.options.strong_flushes);
+            let id = journal.flush_start(Store::Immutable, sync, work.options.strong_flushes);
             let flushed = dyn_store.clone().flush(sync).await;
             if let Err(err) = &flushed {
                 eprintln!("final flush failed: {err}");
             }
-            journal.flush_end(id, flushed.is_ok());
+            journal.flush_end(Store::Immutable, id, flushed.is_ok());
             journal.log(format_args!("g end"));
         }
         "abort" => std::process::abort(),
@@ -499,6 +457,16 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
         std::process::exit(0);
     }
     Ok(0)
+}
+
+/// The names of the operation kinds and of the activities tracked with them, in the order
+/// [`coverage::Overlaps`] counts them.
+pub fn kind_names() -> Vec<&'static str> {
+    Kind::ALL
+        .iter()
+        .map(|(_, name, _)| *name)
+        .chain(ACTIVITIES)
+        .collect()
 }
 
 /// The errors a file operation meets from the system rather than the store: EIO, ENOSPC, EDQUOT,
@@ -596,6 +564,55 @@ pub fn invalid_fragment(
     (name, fragment, Some(payload))
 }
 
+/// Watch `progress` from a thread of its own until the returned flag is set, and end the process as
+/// hung once it stops for `hang_seconds` that a thread waiting on the storage does not explain, or
+/// for any reason past a limit. A second spent waiting on the storage, as on a sync it has not
+/// finished, is the disk's.
+#[expect(
+    clippy::exit,
+    reason = "a hung process leaves without the store, which the hang holds"
+)]
+pub fn watch_for_hangs(
+    progress: Arc<AtomicU64>,
+    hang_seconds: u64,
+    journal: Arc<Journal>,
+) -> Arc<AtomicBool> {
+    const STORAGE_STALL_LIMIT: u64 = 600;
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = stop.clone();
+    std::thread::spawn(move || {
+        let mut last = progress.load(Ordering::Relaxed);
+        let (mut still, mut on_storage) = (0, 0);
+        while !done.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(1));
+            let now = progress.load(Ordering::Relaxed);
+            if now == last {
+                still += 1;
+                on_storage += u64::from(waiting_on_storage());
+                if still - on_storage >= hang_seconds || still >= STORAGE_STALL_LIMIT {
+                    eprintln!(
+                        "HANG: no operation finished for {still}s, {on_storage}s of it waiting \
+                         on the storage"
+                    );
+                    journal.log(format_args!("v hang 0 0 no-progress-{still}s"));
+                    dump_threads();
+                    std::process::exit(i32::from(EXIT_VIOLATION) + 1);
+                }
+            } else {
+                if still >= hang_seconds {
+                    eprintln!(
+                        "STORAGE-STALL: no operation finished for {still}s, {on_storage}s of it \
+                         waiting on the storage"
+                    );
+                }
+                (still, on_storage) = (0, 0);
+                last = now;
+            }
+        }
+    });
+    stop
+}
+
 /// Whether a thread of this process waits in the kernel uninterruptibly, as on a sync or a read the
 /// storage has not finished.
 fn waiting_on_storage() -> bool {
@@ -664,6 +681,113 @@ fn prefill_near_limit(dir: &Path, config: &Config, near: u64) {
 }
 
 impl Work {
+    /// The workload of one process over `config`, counting which operations run alongside which
+    /// in `overlaps`. It runs against the stores [`Self::use_stores`] gives it.
+    pub fn new(
+        config: Config,
+        journal: Arc<Journal>,
+        options: Options,
+        mix: Mix,
+        overlaps: coverage::Overlaps,
+    ) -> Work {
+        let model = online::Model::new(!config.server && !options.heal);
+        Work {
+            config,
+            immutable: RwLock::new(None),
+            mutable: RwLock::new(None),
+            journal,
+            limit: AtomicU64::new(options.max_ops),
+            options,
+            mix,
+            stop: AtomicBool::new(false),
+            started_ops: AtomicU64::new(0),
+            progress: Arc::new(AtomicU64::new(0)),
+            violations: AtomicUsize::new(0),
+            stats: Mutex::new(BTreeMap::new()),
+            obliterating: Mutex::default(),
+            overlaps,
+            serial: tokio::sync::Mutex::new(()),
+            gc: Arc::new(coverage::GcCounts::default()),
+            shapes: coverage::Shapes::default(),
+            lists: Default::default(),
+            model,
+            call: Mutex::default(),
+        }
+    }
+
+    /// Hold the model to what `history` settled for `slots`, those of them eviction may not take,
+    /// and note the keys obliterated there.
+    pub fn learn(&self, history: &History, slots: impl IntoIterator<Item = (u64, u32)>) {
+        let mut obliterating = self.obliterating.lock();
+        for (key, variant) in slots {
+            let obliterated = history.obliterated(key, variant);
+            if obliterated {
+                obliterating.insert(key);
+            }
+            if !self.config.evictable(variant) {
+                let state = State::from(history.expect(key, variant, false));
+                self.model.seed((key, variant), state, obliterated);
+            }
+        }
+    }
+
+    /// Start a call: its mutable operations hold their reads to what `history` settled.
+    pub fn begin_call(&self, history: &History) {
+        self.call.lock().begin(history);
+    }
+
+    /// The swaps of each counter that succeeded in this process.
+    pub fn increments(&self) -> BTreeMap<u64, u64> {
+        self.call.lock().increments.clone()
+    }
+
+    /// Run the operations from now on against `immutable` and `mutable`.
+    pub fn use_stores(
+        &self,
+        immutable: Option<Arc<LocalImmutableStore>>,
+        mutable: Option<Arc<LocalMutableStore>>,
+    ) {
+        *self.immutable.write() = immutable;
+        *self.mutable.write() = mutable;
+    }
+
+    /// Let the workers start `ops` more operations.
+    pub fn allow(&self, ops: u64) {
+        let started = self.started_ops.load(Ordering::Relaxed);
+        self.limit.store(started + ops, Ordering::Relaxed);
+    }
+
+    /// The operations finished so far, which [`watch_for_hangs`] follows.
+    pub fn progress(&self) -> Arc<AtomicU64> {
+        self.progress.clone()
+    }
+
+    /// The violations seen so far.
+    pub fn violations(&self) -> usize {
+        self.violations.load(Ordering::Relaxed)
+    }
+
+    /// Spawn `tasks` workers and `gc_tasks` compaction and eviction workers into `set`, seeded
+    /// from `seed`.
+    pub fn spawn_workers(
+        self: &Arc<Self>,
+        set: &mut tokio::task::JoinSet<()>,
+        seed: u64,
+        tasks: usize,
+        gc_tasks: usize,
+    ) {
+        for index in 0..tasks as u64 {
+            let work = self.clone();
+            let seed = seed ^ index.wrapping_mul(7919);
+            lore_base::lore_spawn!(set, async move { work.worker(seed).await });
+        }
+        for index in 0..gc_tasks as u64 {
+            let work = self.clone();
+            let seed = seed ^ 0x6C00 ^ index.wrapping_mul(104_729);
+            lore_base::lore_spawn!(set, async move { work.gc_worker(seed).await });
+        }
+    }
+
     fn pick_key(&self, rng: &mut Rng) -> u64 {
         if rng.chance(self.options.hot_share) {
             // A window of hot keys that moves with the run, so that the same keys meet each
@@ -679,7 +803,9 @@ impl Work {
         rng.below(u64::from(self.config.variants())) as u32
     }
 
-    fn violation(&self, class: &str, key: u64, variant: u32, detail: &str) {
+    /// Record a violation of class `class` at `key` under `variant`: in the journal, where
+    /// `verify` reports it, and on stderr.
+    pub fn violation(&self, class: &str, key: u64, variant: u32, detail: &str) {
         self.violations.fetch_add(1, Ordering::Relaxed);
         let detail = detail.replace([' ', '\n'], "_");
         self.journal
@@ -712,12 +838,14 @@ impl Work {
         }
     }
 
-    fn report(&self, elapsed: f64) {
+    /// Print what the run did: per operation kind, how many ran and succeeded, why the others
+    /// failed, and what the run covered.
+    pub fn report(&self, elapsed: f64) {
         let stats = self.stats.lock();
         let total: u64 = stats.values().map(|stats| stats.run).sum();
         println!(
             "generation {} ran {total} operations in {elapsed:.1}s ({:.0}/s), {} violations",
-            self.journal.generation,
+            self.journal.generation(),
             total as f64 / elapsed.max(0.001),
             self.violations.load(Ordering::Relaxed)
         );
@@ -800,12 +928,10 @@ impl Work {
         }
     }
 
-    async fn worker(self: Arc<Self>, index: usize) {
-        let mut rng = Rng::new(
-            self.config.seed ^ (self.journal.generation << 32) ^ (index as u64).wrapping_mul(7919),
-        );
+    async fn worker(self: Arc<Self>, seed: u64) {
+        let mut rng = Rng::new(seed);
         while !self.stop.load(Ordering::Relaxed)
-            && self.started_ops.fetch_add(1, Ordering::Relaxed) < self.options.max_ops
+            && self.started_ops.fetch_add(1, Ordering::Relaxed) < self.limit.load(Ordering::Relaxed)
         {
             let kind = self.mix.pick(&mut rng);
             let running = self.overlaps.start(kind as usize);
@@ -819,15 +945,10 @@ impl Work {
     /// Compaction and eviction without pause, alongside the workers: each pass compacts toward a
     /// size, which evicts by size first, or evicts toward a capacity, and now and then a stop
     /// request cuts a pass short.
-    async fn gc_worker(self: Arc<Self>, index: usize) {
-        let mut rng = Rng::new(
-            self.config.seed
-                ^ (self.journal.generation << 32)
-                ^ 0x6C00
-                ^ (index as u64).wrapping_mul(104_729),
-        );
+    async fn gc_worker(self: Arc<Self>, seed: u64) {
+        let mut rng = Rng::new(seed);
         while !self.stop.load(Ordering::Relaxed)
-            && self.started_ops.load(Ordering::Relaxed) < self.options.max_ops
+            && self.started_ops.load(Ordering::Relaxed) < self.limit.load(Ordering::Relaxed)
         {
             let kind = match rng.below(10) {
                 0..=5 => Kind::Compact,
@@ -846,8 +967,15 @@ impl Work {
         }
     }
 
+    fn immutable(&self) -> Arc<LocalImmutableStore> {
+        self.immutable
+            .read()
+            .clone()
+            .expect("operations run while the work has stores")
+    }
+
     fn dyn_store(&self) -> Arc<dyn ImmutableStore> {
-        self.store.clone()
+        self.immutable()
     }
 
     /// Whether the model follows `variant`, one eviction may not take.
@@ -1137,9 +1265,11 @@ impl Work {
                     true => Some(self.serial.lock().await),
                     false => None,
                 };
-                let id = self.journal.flush_start(sync, self.options.strong_flushes);
+                let id =
+                    self.journal
+                        .flush_start(Store::Immutable, sync, self.options.strong_flushes);
                 let result = store.flush(sync).await;
-                self.journal.flush_end(id, result.is_ok());
+                self.journal.flush_end(Store::Immutable, id, result.is_ok());
                 result.map_err(|err| err.to_string())
             }
             Kind::Compact => {
@@ -1210,7 +1340,10 @@ impl Work {
                     .put(partition, address, fragment, payload, false)
                     .await;
                 if result.is_ok()
-                    && let Ok(found) = self.store.find(partition, address).await
+                    && let Ok(found) = self
+                        .immutable()
+                        .find(partition, address, Lookup::Read)
+                        .await
                     && !kept_sanitized(&found)
                 {
                     self.violation(
@@ -1236,6 +1369,29 @@ impl Work {
                 lore_storage::test_util::fail_packfile_syncs(1);
                 Ok(())
             }
+            Kind::MutableStore | Kind::MutableLoad | Kind::MutableSwap | Kind::MutableList => {
+                self.mutable_operation(kind, rng).await
+            }
+        }
+    }
+
+    /// Run a mutable operation, holding what it reads to the call's view.
+    async fn mutable_operation(&self, kind: Kind, rng: &mut Rng) -> Result<(), String> {
+        let Some(store) = self.mutable.read().clone() else {
+            return Err("no mutable store".to_string());
+        };
+        let violation = |class: &str, key: u64, detail: &str| self.violation(class, key, 0, detail);
+        let context = mutable::Context {
+            store,
+            journal: &self.journal,
+            view: &self.call,
+            violation: &violation,
+        };
+        match kind {
+            Kind::MutableStore => mutable::store(&context, rng).await,
+            Kind::MutableLoad => mutable::load(&context, rng).await,
+            Kind::MutableSwap => mutable::swap(&context, rng).await,
+            _ => mutable::list_all(&context).await,
         }
     }
 
@@ -1439,9 +1595,12 @@ impl Work {
                 failures.push(format!("put of key {key}: {message}"));
             }
         }
-        let id = self.journal.flush_start(false, self.options.strong_flushes);
+        let id = self
+            .journal
+            .flush_start(Store::Immutable, false, self.options.strong_flushes);
         let flushed = self.dyn_store().flush(false).await;
-        self.journal.flush_end(id, flushed.is_ok());
+        self.journal
+            .flush_end(Store::Immutable, id, flushed.is_ok());
         match flushed {
             // A packfile whose sync failed never settles, and with more unsettled packfiles than a
             // bucket file records the sizes of, a plain flush syncs them instead, which fails for

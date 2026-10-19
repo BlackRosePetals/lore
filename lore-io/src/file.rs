@@ -18,6 +18,8 @@ pub struct OpenOptions {
     create: bool,
     create_new: bool,
     truncate: bool,
+    #[cfg(not(target_family = "windows"))]
+    custom_flags: i32,
     #[cfg(target_family = "windows")]
     share_mode: Option<u32>,
 }
@@ -49,6 +51,15 @@ impl OpenOptions {
 
     pub fn truncate(mut self, truncate: bool) -> OpenOptions {
         self.truncate = truncate;
+        self
+    }
+
+    /// Adds `flags` to the flags of the `open(2)` call, mirroring
+    /// `std::os::unix::fs::OpenOptionsExt::custom_flags`. For a caller that must not follow a
+    /// link at the path, or wait on a FIFO there, while it holds other locks.
+    #[cfg(not(target_family = "windows"))]
+    pub fn custom_flags(mut self, flags: i32) -> OpenOptions {
+        self.custom_flags |= flags;
         self
     }
 
@@ -93,6 +104,12 @@ impl OpenOptions {
             .create(self.create)
             .create_new(self.create_new)
             .truncate(self.truncate);
+        #[cfg(not(target_family = "windows"))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.custom_flags(self.custom_flags);
+        }
         #[cfg(target_family = "windows")]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -279,7 +296,12 @@ impl IoFile {
     }
 
     /// Sets the file length, extending it with a hole that reads as zeros or truncating it.
-    pub async fn set_len(&self, len: u64) -> std::io::Result<()> {
-        self.driver.set_len_raw(Arc::clone(&self.file), len).await
+    ///
+    /// `completion` is dropped once the length is set, whether or not the call is still awaited,
+    /// as [`crate::IoDriver::write_file_segments_atomic`] drops its own.
+    pub async fn set_len<C: Send + 'static>(&self, len: u64, completion: C) -> std::io::Result<()> {
+        self.driver
+            .set_len_raw(Arc::clone(&self.file), len, completion)
+            .await
     }
 }

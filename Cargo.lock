@@ -2745,6 +2745,7 @@ dependencies = [
  "ring",
  "rs-consul",
  "rustls",
+ "serde",
  "serde_dynamo",
  "serde_json",
  "tokio",

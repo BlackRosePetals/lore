@@ -164,7 +164,13 @@ def test_login_without_a_browser_completes_the_device_grant(oidc_env, make_repo)
 
 
 @pytest.mark.smoke
-@pytest.mark.skipif(sys.platform != "linux", reason="Stubs the browser through xdg-open")
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Stubs the browser through xdg-open"
+)
+@pytest.mark.runs_in_process(
+    "stubs the browser on the PATH of the process carrying out the login, which a relayed "
+    "call does not carry"
+)
 def test_login_with_a_browser_opens_the_verification_url(
     oidc_env, make_repo, scratch_dir
 ):

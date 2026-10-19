@@ -26,6 +26,7 @@ use lore_storage::FragmentFlags;
 use lore_storage::FragmentReference;
 use lore_storage::Hash;
 use lore_storage::ImmutableStoreSettings;
+use lore_storage::MutableStoreSettings;
 use lore_storage::Partition;
 
 use crate::args::Args;
@@ -210,6 +211,18 @@ impl Config {
             initial_fan_out_level: self.initial_level,
             fan_out_threshold: self.fan_out_threshold,
             ..ImmutableStoreSettings::default()
+        }
+    }
+
+    /// The settings the mutable store is opened with, reusing its state across holds of its lock
+    /// when `reuse`.
+    pub fn mutable_settings(&self, flush_delay_seconds: u64, reuse: bool) -> MutableStoreSettings {
+        MutableStoreSettings {
+            flush_delay_seconds,
+            initial_fan_out_level: self.initial_level,
+            fan_out_threshold: self.fan_out_threshold,
+            reuse_state_across_holds: reuse,
+            ..MutableStoreSettings::default()
         }
     }
 

@@ -1756,6 +1756,16 @@ impl AwsImmutableStore {
 
 #[async_trait]
 impl ImmutableStoreTrait for AwsImmutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     /// Durable storage for every tenant at once, so a payload is only ever served to the partition
     /// that holds an association for it.
     fn isolates_partitions(&self) -> bool {

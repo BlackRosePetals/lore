@@ -2229,6 +2229,16 @@ struct FailingMutableStore {
 
 #[async_trait::async_trait]
 impl lore_storage::MutableStore for FailingMutableStore {
+    /// Joins the claim of the store this one wraps.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        lore_storage::MutableStore::hold_for_command(self.inner.clone()).await
+    }
+
     async fn load(
         self: Arc<Self>,
         partition: lore_storage::Partition,

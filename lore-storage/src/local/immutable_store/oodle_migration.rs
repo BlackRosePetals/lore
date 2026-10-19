@@ -258,7 +258,7 @@ async fn migrate_group(
 ) -> Result<(), LocalImmutableStoreError> {
     let group = &store.group[group_index];
 
-    let flush_guard = group.flush_lock.clone().lock_owned().await;
+    let flush_guard = crate::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
 
     let num_buckets = group.bucket_count.load(Ordering::Relaxed);
     let mut guards: Vec<OwnedRwLockWriteGuard<ImmutableStoreBucket>> =

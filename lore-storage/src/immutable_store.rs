@@ -27,6 +27,7 @@ use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
+use crate::local::store_lock::StoreGuard;
 use crate::store_types::PayloadRead;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
@@ -448,11 +449,67 @@ pub async fn query_one(
     Ok(result[0])
 }
 
+/// A claim on `store` for a task spawned to outlive the operation spawning it, which the span
+/// covering that operation no longer covers once it ends.
+///
+/// `joined` is what [`ImmutableStore::try_join_claim`] returned to the operation before it
+/// spawned the task: a guard on the span's flock, which holds it without a gap from the
+/// operation to the end of the work it spawned. Where the operation could not join, the task
+/// claims `store` here as its first step. Held until the task ends. `None` for a store with
+/// nothing on disk to claim, or where the claim cannot be taken, which leaves the task's
+/// operations to claim for themselves and fail as they would have.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn claim_for_task(
+    store: &Arc<dyn ImmutableStore>,
+    joined: Option<StoreGuard>,
+) -> impl Future<Output = Option<StoreGuard>> + '_ {
+    async move {
+        if joined.is_some() {
+            return joined;
+        }
+        store.clone().hold_for_command().await.ok().flatten()
+    }
+}
+
 #[async_trait]
 pub trait ImmutableStore: Any + Send + Sync {
     /// Check if this store is backed by local disk
     fn is_local(&self) -> bool {
         false
+    }
+
+    /// Claims this store for the span it is about to be used — a storage handle from
+    /// open to close, one repository command, or work spawned to outlive the operation
+    /// that started it.
+    ///
+    /// The claim is what tells other processes this one is using the store, so it
+    /// belongs to the span rather than to each call within it. It is also the pair a
+    /// repository lock is contained within: store locks are the outer ones, because
+    /// they are the pair the storage API can also take, and two orders over one pair
+    /// would be a cycle.
+    ///
+    /// `None` means this store has nothing on disk to claim — a remote store, or an
+    /// in-memory one. There is no default answer: every store decides for itself, so a
+    /// wrapper around a store with files on disk delegates to it rather than answering
+    /// `None`, which would open a handle holding nothing that then reads and writes a
+    /// store no process has claimed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the lock cannot be taken, or if the reload a stale
+    /// acquisition demands fails.
+    async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError>;
+
+    /// Joins the claim this process holds on this store, without waiting: a counted guard when
+    /// the store's flock is held and this store is current, `None` otherwise and for a store
+    /// with nothing on disk to claim.
+    ///
+    /// Taken by an operation for work it spawns to outlive it: see [`claim_for_task`]. A wrapper
+    /// delegates it as it delegates [`Self::hold_for_command`].
+    fn try_join_claim(&self) -> Option<StoreGuard> {
+        None
     }
 
     /// Whether this store refuses to serve a payload it only found under another partition.

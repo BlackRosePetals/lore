@@ -554,6 +554,7 @@ mod defragment_integration {
             DefragmentSink::Stream { sender },
             options,
             None,
+            None,
         );
         let consumer = async move {
             receiver
@@ -594,6 +595,7 @@ mod defragment_integration {
             leaf_rx,
             data_tx,
             ReadOptions::default(),
+            None,
             None,
         ));
 
@@ -690,6 +692,7 @@ mod defragment_integration {
             leaf_rx,
             data_tx,
             ReadOptions::default(),
+            None,
             None,
         ));
 
@@ -850,6 +853,7 @@ mod defragment_integration {
             },
             options,
             None,
+            None,
         )
         .await
         .expect_err("a write past the end of the sink fails the read");
@@ -871,6 +875,16 @@ mod defragment_integration {
 
     #[async_trait::async_trait]
     impl ImmutableStore for CountingGetStore {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         async fn get(
             self: Arc<Self>,
             partition: Partition,
@@ -1069,6 +1083,7 @@ mod defragment_integration {
             leaf_tx,
             options,
             None,
+            None,
         )
         .await
         .expect("an abandoned walk is not a failure");
@@ -1125,6 +1140,7 @@ mod defragment_integration {
             0..total,
             leaf_tx,
             options,
+            None,
             None,
         ));
 
@@ -1868,6 +1884,7 @@ mod defragment_integration {
             data_tx,
             ReadOptions::default(),
             None,
+            None,
         ));
 
         // Wait for the pipeline to reach the budget, rather than assuming it got there.
@@ -2006,6 +2023,7 @@ mod defragment_integration {
                 tx,
                 options,
                 None,
+                None,
             )
             .await
             .expect("leaf pipeline");
@@ -2048,6 +2066,7 @@ mod defragment_integration {
             list,
             tx,
             ReadOptions::default().no_decompress(),
+            None,
             None,
         )
         .await;

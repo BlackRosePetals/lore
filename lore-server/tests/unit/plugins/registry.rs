@@ -59,6 +59,16 @@ struct MockImmutableStore;
 
 #[async_trait]
 impl ImmutableStore for MockImmutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn query(
         self: Arc<Self>,
         _partition: Partition,
@@ -156,6 +166,16 @@ struct MockMutableStore;
 
 #[async_trait]
 impl MutableStore for MockMutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn load(
         self: Arc<Self>,
         _partition: Partition,

@@ -14,6 +14,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -25,6 +26,9 @@ use pin_project::pin_project;
 use tokio::sync::Notify;
 
 use crate::error::StorageError;
+use crate::immutable_store::ImmutableStore;
+use crate::immutable_store::claim_for_task;
+use crate::local::store_lock::StoreGuard;
 use crate::types::Fragment;
 use crate::write_stats::FragmentWriteStats;
 
@@ -62,6 +66,10 @@ struct SharedState {
     first_error: Mutex<Option<StorageError>>,
     /// Notified when `in_flight` transitions to 0 so `await_all` can proceed.
     idle: Notify,
+    /// A claim on the store the tasks write to, taken at the first dispatch and held until the
+    /// tracker and every task it spawned have ended. The tasks run on when the operation that
+    /// dispatched them is dropped before it awaits them, past the span that covered it.
+    claim: OnceLock<Option<StoreGuard>>,
 }
 
 impl SharedState {
@@ -122,8 +130,20 @@ impl WriteTracker {
                 in_flight: AtomicUsize::new(0),
                 first_error: Mutex::new(None),
                 idle: Notify::new(),
+                claim: OnceLock::new(),
             }),
             on_fragment: None,
+        }
+    }
+
+    /// Claims `store` for the tasks this tracker spawns, at the first dispatch: see
+    /// [`SharedState::claim`]. Later dispatches find the claim taken and do nothing.
+    pub async fn claim(&self, store: &Arc<dyn ImmutableStore>) {
+        if self.state.claim.get().is_none() {
+            let _ = self
+                .state
+                .claim
+                .set(claim_for_task(store, store.try_join_claim()).await);
         }
     }
 

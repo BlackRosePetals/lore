@@ -26,6 +26,7 @@ use crate::concurrency::fragment_permit_count;
 use crate::error::StorageError;
 use crate::fragment_flags::FragmentFlags;
 use crate::immutable_store::ImmutableStore;
+use crate::local::store_lock::StoreGuard;
 use crate::options::ReadOptions;
 use crate::read::load_fragment;
 use crate::typed_bytes::TypedBytes;
@@ -109,9 +110,14 @@ pub const MAX_FRAGMENT_TREE_DEPTH: usize = 8;
 /// already clamped to it. Offsets inside a fragment tree are absolute within the content,
 /// so the range is rebased onto the root list's own first offset once here and every level
 /// below compares against it directly.
+///
+/// Holds `claim`, the pipeline's claim on `store`, for as long as it walks: it runs as a task of
+/// its own, which a dropped pipeline leaves running past the span that covered the pipeline.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
 #[lore_macro::test_pub]
-#[allow(clippy::too_many_arguments)]
-async fn walk_fragment_tree(
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+fn walk_fragment_tree(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
@@ -121,46 +127,50 @@ async fn walk_fragment_tree(
     leaf_tx: Sender<LeafReference>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<(), StorageError> {
-    debug_assert!(
-        (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented
-    );
+    claim: Option<Arc<StoreGuard>>,
+) -> impl Future<Output = Result<(), StorageError>> {
+    async move {
+        debug_assert!(
+            (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented
+        );
 
-    let payload_size = fragment.size_payload as usize;
-    if source_buffer.len() < payload_size {
-        return Err(StorageError::internal("insufficient buffer"));
+        let payload_size = fragment.size_payload as usize;
+        if source_buffer.len() < payload_size {
+            return Err(StorageError::internal("insufficient buffer"));
+        }
+
+        let source_buffer = source_buffer.to_aligned::<FragmentReference>();
+        let fragment_list = source_buffer.as_type_slice::<FragmentReference>();
+        let total_content_size = fragment.size_content as usize;
+
+        if fragment_list.is_empty() {
+            return Err(StorageError::internal(format!(
+                "fragment list is empty, claiming {total_content_size} bytes of content"
+            )));
+        }
+
+        let base_offset = fragment_list[0].offset_content;
+        let window = base_offset
+            .checked_add(range.start)
+            .zip(base_offset.checked_add(range.end))
+            .map(|(start, end)| start..end)
+            .ok_or_else(|| StorageError::internal("content range offset overflow"))?;
+
+        walk_fragment_level(
+            store,
+            partition,
+            address.context,
+            fragment_list,
+            total_content_size,
+            &window,
+            &leaf_tx,
+            options,
+            remote_session,
+            &claim,
+            0,
+        )
+        .await
     }
-
-    let source_buffer = source_buffer.to_aligned::<FragmentReference>();
-    let fragment_list = source_buffer.as_type_slice::<FragmentReference>();
-    let total_content_size = fragment.size_content as usize;
-
-    if fragment_list.is_empty() {
-        return Err(StorageError::internal(format!(
-            "fragment list is empty, claiming {total_content_size} bytes of content"
-        )));
-    }
-
-    let base_offset = fragment_list[0].offset_content;
-    let window = base_offset
-        .checked_add(range.start)
-        .zip(base_offset.checked_add(range.end))
-        .map(|(start, end)| start..end)
-        .ok_or_else(|| StorageError::internal("content range offset overflow"))?;
-
-    walk_fragment_level(
-        store,
-        partition,
-        address.context,
-        fragment_list,
-        total_content_size,
-        &window,
-        &leaf_tx,
-        options,
-        remote_session,
-        0,
-    )
-    .await
 }
 
 /// The absolute content window one entry of a fragment list stands for: from its own offset
@@ -280,6 +290,7 @@ async fn walk_fragment_level(
     leaf_tx: &Sender<LeafReference>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
+    claim: &Option<Arc<StoreGuard>>,
     depth: usize,
 ) -> Result<(), StorageError> {
     if walk_abandoned(leaf_tx) {
@@ -337,6 +348,7 @@ async fn walk_fragment_level(
             leaf_tx,
             options,
             remote_session,
+            claim,
             depth,
         )
         .await
@@ -471,6 +483,9 @@ pub fn sublist_coverage(
 /// on a large tree: an entry's window comes from its parent's list, so the walk can rule out a
 /// subtree — and everything under it — without a single fetch. `wanted` is the index range the
 /// window reaches, whose first entry the caller's tier peek has already loaded.
+///
+/// The launcher and every load it spawns hold `claim`: an abandoned walk detaches the loads
+/// queued, which then finish past the walk.
 #[allow(clippy::too_many_arguments)]
 async fn walk_intermediate_level(
     store: Arc<dyn ImmutableStore>,
@@ -485,6 +500,7 @@ async fn walk_intermediate_level(
     leaf_tx: &Sender<LeafReference>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
+    claim: &Option<Arc<StoreGuard>>,
     depth: usize,
 ) -> Result<(), StorageError> {
     let first_index = wanted.start;
@@ -550,6 +566,7 @@ async fn walk_intermediate_level(
             leaf_tx,
             options,
             remote_session.clone(),
+            claim,
             depth + 1,
         ))
         .await
@@ -570,6 +587,7 @@ async fn walk_intermediate_level(
     let launcher: JoinHandle<Result<(), StorageError>> = {
         let store = store.clone();
         let remote_session = remote_session.clone();
+        let claim = claim.clone();
         let base_index = first_index + 1;
         lore_base::lore_spawn!(async move {
             for (offset, hash) in hashes.into_iter().enumerate() {
@@ -577,8 +595,10 @@ async fn walk_intermediate_level(
                 let subaddress = Address { context, hash };
                 let store = store.clone();
                 let remote_session = remote_session.clone();
+                let claim = claim.clone();
                 let handle: JoinHandle<Result<(Fragment, Bytes), StorageError>> =
                     lore_base::lore_spawn!(async move {
+                        let _claim = claim;
                         load_fragment(store, partition, subaddress, options, remote_session).await
                     });
 
@@ -657,6 +677,7 @@ async fn walk_intermediate_level(
                 leaf_tx,
                 options,
                 remote_session.clone(),
+                claim,
                 depth + 1,
             ))
             .await
@@ -668,6 +689,9 @@ async fn walk_intermediate_level(
 }
 
 /// Unordered fetch pool for file targets.
+///
+/// Holds `claim` for as long as it fetches, for the reason [`walk_fragment_tree`] gives. Its
+/// fetches end before it does.
 #[lore_macro::test_pub]
 async fn fetch_unordered(
     store: Arc<dyn ImmutableStore>,
@@ -676,6 +700,7 @@ async fn fetch_unordered(
     data_tx: DataSender,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
+    _claim: Option<Arc<StoreGuard>>,
 ) -> Result<(), StorageError> {
     // Leaves must be decompressed here — their content is written at the
     // uncompressed `offset_content` position in the output buffer, and the
@@ -856,6 +881,7 @@ fn fetch_ordered_and_stream(
     sender: Sender<Result<Bytes, StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
+    claim: Option<Arc<StoreGuard>>,
 ) -> impl Future<Output = Result<(), StorageError>> {
     fetch_ordered_and_stream_from(
         fragment_limiter(),
@@ -865,11 +891,13 @@ fn fetch_ordered_and_stream(
         sender,
         options,
         remote_session,
+        claim,
     )
 }
 
 /// [`fetch_ordered_and_stream`] with the fragment budget taken from `semaphore`.
 #[lore_macro::test_pub]
+#[allow(clippy::too_many_arguments)]
 fn fetch_ordered_and_stream_from(
     semaphore: &'static Semaphore,
     store: Arc<dyn ImmutableStore>,
@@ -878,6 +906,7 @@ fn fetch_ordered_and_stream_from(
     sender: Sender<Result<Bytes, StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
+    claim: Option<Arc<StoreGuard>>,
 ) -> impl Future<Output = Result<(), StorageError>> {
     // See fetch_unordered: defragmentation leaves are always decompressed.
     fetch_ordered_from(
@@ -888,6 +917,7 @@ fn fetch_ordered_and_stream_from(
         sender,
         options.with_decompress(),
         remote_session,
+        claim,
         content_leaf,
     )
 }
@@ -901,6 +931,7 @@ fn fetch_ordered_leaves(
     sender: Sender<Result<(Fragment, Bytes), StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
+    claim: Option<Arc<StoreGuard>>,
 ) -> impl Future<Output = Result<(), StorageError>> {
     fetch_ordered_from(
         fragment_limiter(),
@@ -910,6 +941,7 @@ fn fetch_ordered_leaves(
         sender,
         options,
         remote_session,
+        claim,
         whole_leaf,
     )
 }
@@ -967,6 +999,9 @@ fn whole_leaf(
 /// The ordered fetch pool behind [`fetch_ordered_and_stream`]. Each leaf is loaded under
 /// `options` and handed to `make_leaf` with the content size its parent list states and the part
 /// of it that was asked for; what that returns is what the caller receives.
+///
+/// The launcher and every fetch it spawns hold `claim`, for the reason [`walk_intermediate_level`]
+/// gives for its loads.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_ordered_from<T, F>(
     semaphore: &'static Semaphore,
@@ -976,6 +1011,7 @@ async fn fetch_ordered_from<T, F>(
     sender: Sender<Result<T, StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
+    claim: Option<Arc<StoreGuard>>,
     make_leaf: F,
 ) -> Result<(), StorageError>
 where
@@ -1006,8 +1042,10 @@ where
                 let remote_session = remote_session.clone();
                 let expected_size = leaf.expected_size;
                 let clip = leaf.clip.clone();
+                let claim = claim.clone();
 
                 let handle: JoinHandle<FetchResult<T>> = lore_base::lore_spawn!(async move {
+                    let _claim = claim;
                     let (loaded_fragment, buffer) =
                         load_fragment(store, partition, subaddress, options, remote_session)
                             .await?;
@@ -1163,6 +1201,10 @@ async fn write_to_file(
 /// proportional to the range rather than to the content. Everything delivered is positioned
 /// relative to `range.start`, which for a whole-content read leaves offsets exactly where
 /// they were.
+///
+/// `claim` is the caller's claim on `store`, from
+/// [`claim_for_task`](crate::immutable_store::claim_for_task), which every task the pipeline
+/// spawns holds until it ends.
 #[allow(clippy::too_many_arguments)]
 pub async fn defragment_pipeline(
     store: Arc<dyn ImmutableStore>,
@@ -1174,6 +1216,7 @@ pub async fn defragment_pipeline(
     sink: DefragmentSink,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
+    claim: Option<Arc<StoreGuard>>,
 ) -> Result<(), StorageError> {
     let (leaf_tx, leaf_rx) = channel::<LeafReference>(PIPELINE_LEAF_CHANNEL_SIZE);
 
@@ -1190,6 +1233,7 @@ pub async fn defragment_pipeline(
         leaf_tx,
         options,
         session_walker,
+        claim.clone(),
     ));
 
     match sink {
@@ -1203,6 +1247,7 @@ pub async fn defragment_pipeline(
                 sender,
                 options,
                 session_fetch,
+                claim,
             ));
 
             let (walk_result, fetch_result) = tokio::join!(walker, fetcher);
@@ -1220,6 +1265,7 @@ pub async fn defragment_pipeline(
                 data_tx,
                 options,
                 session_fetch,
+                claim,
             ));
 
             let writer = lore_base::lore_spawn!(write_to_file(file, size, data_rx));
@@ -1235,7 +1281,8 @@ pub async fn defragment_pipeline(
 /// [`defragment_pipeline`] delivering a whole content's leaves in content order on `sender`, each
 /// with its fragment and loaded as `options` asks.
 ///
-/// Not a [`DefragmentSink`] variant, which would grow every future holding a sink.
+/// Not a [`DefragmentSink`] variant, which would grow every future holding a sink. `claim` as
+/// [`defragment_pipeline`] takes it.
 #[allow(clippy::too_many_arguments)]
 pub async fn defragment_pipeline_leaves(
     store: Arc<dyn ImmutableStore>,
@@ -1246,6 +1293,7 @@ pub async fn defragment_pipeline_leaves(
     sender: Sender<Result<(Fragment, Bytes), StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
+    claim: Option<Arc<StoreGuard>>,
 ) -> Result<(), StorageError> {
     let (leaf_tx, leaf_rx) = channel::<LeafReference>(PIPELINE_LEAF_CHANNEL_SIZE);
 
@@ -1261,6 +1309,7 @@ pub async fn defragment_pipeline_leaves(
         leaf_tx,
         options,
         session_walker,
+        claim.clone(),
     ));
     let fetcher = lore_base::lore_spawn!(fetch_ordered_leaves(
         store,
@@ -1269,6 +1318,7 @@ pub async fn defragment_pipeline_leaves(
         sender,
         options,
         remote_session,
+        claim,
     ));
 
     let (walk_result, fetch_result) = tokio::join!(walker, fetcher);
@@ -1534,6 +1584,6 @@ pub async fn open_file_write(
             &OpenOptions::new().read(true).write(true).create(true),
         )
         .await?;
-    file.set_len(size as u64).await?;
+    file.set_len(size as u64, ()).await?;
     Ok(file)
 }

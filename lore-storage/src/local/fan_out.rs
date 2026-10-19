@@ -19,6 +19,8 @@ use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
 use crate::Hash;
+use crate::local::store_lock::LockAnchor;
+use crate::local::store_lock::StoreLock;
 
 /// The set of valid bucket counts a group can be at. Fan-out only ever moves a
 /// group to the next-higher value in this list.
@@ -215,8 +217,9 @@ pub async fn write_level_marker(
     group_path: &Path,
     level: usize,
     sync_data: bool,
+    writes: Option<&Arc<GroupWrites>>,
 ) -> std::io::Result<()> {
-    write_level_header_file(&group_path.join(MARKER_FILENAME), level, sync_data).await
+    write_level_header_file(&group_path.join(MARKER_FILENAME), level, sync_data, writes).await
 }
 
 /// Number of bytes a bucket file name occupies: the prefix plus two hex digits.
@@ -382,8 +385,10 @@ pub async fn read_group_level(group_path: &Path) -> std::io::Result<GroupLevel> 
 /// * `Ok(())` when the group's level is recorded, now or before, is left to a pending commit, or
 ///   needs no marker.
 /// * `Err(io::Error)` when writing the marker failed, leaving `committed_level` at 0.
+#[allow(clippy::too_many_arguments)]
 pub async fn commit_if_initial_level(
     _flush_guard: &OwnedMutexGuard<()>,
+    writes: &Arc<GroupWrites>,
     committed_level: &AtomicUsize,
     pending_level: &AtomicUsize,
     bucket_count: &AtomicUsize,
@@ -406,7 +411,7 @@ pub async fn commit_if_initial_level(
         .create_dir_all(&marker_path)
         .await?;
     marker_path.push(MARKER_FILENAME);
-    write_level_header_file(&marker_path, active_buckets, sync_data).await?;
+    write_level_header_file(&marker_path, active_buckets, sync_data, Some(writes)).await?;
     committed_level.store(active_buckets, Ordering::Relaxed);
     Ok(())
 }
@@ -477,13 +482,20 @@ pub async fn read_level_pending(group_path: &Path) -> std::io::Result<Option<usi
 }
 
 /// Write the `level.pending` sentinel in `group_path` with the recorded target bucket count.
-/// Same binary layout as the level marker.
+/// Same binary layout as the level marker. `writes` as [`write_level_header_file`] takes it.
 pub async fn write_level_pending(
     group_path: &Path,
     level: usize,
     sync_data: bool,
+    writes: Option<&Arc<GroupWrites>>,
 ) -> std::io::Result<()> {
-    write_level_header_file(&group_path.join(LEVEL_PENDING_FILENAME), level, sync_data).await?;
+    write_level_header_file(
+        &group_path.join(LEVEL_PENDING_FILENAME),
+        level,
+        sync_data,
+        writes,
+    )
+    .await?;
     #[cfg(feature = "test-util")]
     crate::test_util::pause_point(crate::test_util::PausePoint::Committing).await;
     Ok(())
@@ -627,11 +639,14 @@ impl lore_io::StableBufList for LevelHeaderSegment {
 /// Write a level-header file (marker or pending) to a temporary file renamed over `path`, so that
 /// a process stopped during the write leaves the file it last wrote, or none. With `sync_data`,
 /// the file is synced before the rename and its directory after. A write that fails removes its
-/// temporary file, which on a full disk holds space the store needs.
+/// temporary file, which on a full disk holds space the store needs. `writes` are the writes in
+/// flight of the store group the file is in, if it is in one, a share of which the write holds
+/// until it has landed.
 async fn write_level_header_file(
     path: &Path,
     level: usize,
     sync_data: bool,
+    writes: Option<&Arc<GroupWrites>>,
 ) -> std::io::Result<()> {
     let header = LevelMarkerHeader {
         magic: MARKER_MAGIC,
@@ -651,6 +666,7 @@ async fn write_level_header_file(
                 .truncate(true),
             LevelHeaderSegment(segment),
             sync_data,
+            writes.and_then(write_share),
         )
         .await
 }
@@ -664,6 +680,73 @@ pub(crate) fn temporary_path(path: &Path) -> PathBuf {
     temporary.push(path.as_os_str());
     temporary.push(TEMPORARY_SUFFIX);
     PathBuf::from(temporary)
+}
+
+/// Wait for a bucket write that holds `flush_lock`, as one another flush claimed before this one
+/// read the group clean, or that a dropped flush left in flight, so that a flush finding nothing
+/// flagged does not return before that write has landed.
+pub(crate) async fn await_bucket_write(
+    flush_lock: &Arc<tokio::sync::Mutex<()>>,
+    writes: &GroupWrites,
+) {
+    if flush_lock.try_lock().is_err() || writes.try_write().is_err() {
+        // Boxed: a write in flight is rare, and carried inline the wait would be part of every
+        // flush's future.
+        drop(Box::pin(lock_flush(flush_lock, writes)).await);
+    }
+}
+
+/// The writes in flight in a store's group. Each bucket and level file write in the group holds a
+/// share as its completion, which lore-io drops once the write has landed, whether or not the
+/// flush that dispatched it still awaits it. [`lock_flush`] waits for them, and the store lock
+/// counts them as files in use, through the anchor this holds, see [`anchor_writes`].
+pub type GroupWrites = RwLock<Option<LockAnchor>>;
+
+/// Registers `writes` with `lock` as files in use, and keeps the anchor in it, so that a write in
+/// flight keeps the flock, and the lock itself past the store's own life. For a store being built,
+/// whose `writes` nothing else holds yet.
+pub(crate) fn anchor_writes(writes: &Arc<GroupWrites>, lock: &StoreLock) {
+    let anchor = lock.anchor(Arc::downgrade(writes) as _);
+    let held = writes.try_write();
+    debug_assert!(held.is_ok(), "a store being built shares no writes");
+    if let Ok(mut held) = held {
+        *held = Some(anchor);
+    }
+}
+
+/// Take a group's flush lock, once every write its earlier holders dispatched has landed.
+///
+/// A flush dropped part way releases the lock and leaves the writes it dispatched running. Written
+/// under the next holder, a bucket file could take an abandoned write's older contents after the
+/// newer ones, or a torn file from two writes sharing its temporary file.
+#[lore_macro::test_pub]
+pub(crate) async fn lock_flush(
+    flush_lock: &Arc<tokio::sync::Mutex<()>>,
+    writes: &GroupWrites,
+) -> OwnedMutexGuard<()> {
+    let guard = Arc::clone(flush_lock).lock_owned().await;
+    if writes.try_write().is_err() {
+        // Boxed: writes left in flight are rare, and carried inline the wait would be part of
+        // every flush's future.
+        drop(Box::pin(writes.write()).await);
+    }
+    guard
+}
+
+/// A share of `writes`, for a write in the group to hold as its completion until it has landed.
+///
+/// Taken under the group's flush lock, which no holder takes while writes are in flight, so no
+/// holder waits to write-lock `writes` meanwhile and the share is never refused. `None` if it were,
+/// which leaves that write untracked rather than waiting for it here.
+pub(crate) fn write_share(
+    writes: &Arc<GroupWrites>,
+) -> Option<tokio::sync::OwnedRwLockReadGuard<Option<LockAnchor>>> {
+    let share = Arc::clone(writes).try_read_owned().ok();
+    debug_assert!(
+        share.is_some(),
+        "a write share is taken under the flush lock"
+    );
+    share
 }
 
 /// The buckets a fan-out commit has written `.new` files for, whose dirty marks writing them
@@ -716,6 +799,7 @@ impl Drop for UnfinishedCommit<'_> {
 pub async fn recover_level_transition(
     group_path: &Path,
     sync_data: bool,
+    writes: Option<&Arc<GroupWrites>>,
 ) -> std::io::Result<Option<usize>> {
     let target = match read_level_pending(group_path).await? {
         Some(level) => level,
@@ -745,7 +829,7 @@ pub async fn recover_level_transition(
         }
     }
 
-    write_level_marker(group_path, target, sync_data).await?;
+    write_level_marker(group_path, target, sync_data, writes).await?;
     delete_level_pending(group_path).await?;
     Ok(Some(target))
 }
@@ -755,6 +839,7 @@ pub async fn recover_level_transition(
 /// committed. Does nothing when `pending_level` is `0`. `store_path` is the store root; the group
 /// directory is `<store_path>/index/<gg>`. Run under the group's flush lock.
 pub(crate) async fn roll_pending_commit_forward(
+    writes: &Arc<GroupWrites>,
     committed_level: &AtomicUsize,
     pending_level: &AtomicUsize,
     store_path: &Path,
@@ -767,7 +852,7 @@ pub(crate) async fn roll_pending_commit_forward(
     }
     let mut group_path = store_path.join("index");
     push_group_dir(&mut group_path, group_index);
-    recover_level_transition(&group_path, sync_data).await?;
+    recover_level_transition(&group_path, sync_data, Some(writes)).await?;
     committed_level.store(pending, Ordering::Relaxed);
     pending_level.store(0, Ordering::Relaxed);
     Ok(())

@@ -208,6 +208,16 @@ impl<ClientType> ImmutableStore for Replica<ClientType>
 where
     ClientType: StoreClient,
 {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     /// The peer answers exact addresses only, so nothing it returns can have come from another
     /// partition.
     fn isolates_partitions(&self) -> bool {

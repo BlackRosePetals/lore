@@ -27,6 +27,7 @@ use crate::fragment_flags::FragmentFlags;
 use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
+use crate::immutable_store::claim_for_task;
 use crate::mutable_store::MutableStore;
 use crate::options::ReadOptions;
 use crate::store_types::PayloadRead;
@@ -1315,7 +1316,9 @@ pub fn read_stream(
             let store = store.clone();
             let pipeline_range = streamed.clone();
             let report = sender.clone();
+            let joined = store.try_join_claim();
             lore_base::lore_spawn!(async move {
+                let claim = claim_for_task(&store, joined).await.map(Arc::new);
                 let result = defragment_pipeline(
                     store,
                     partition,
@@ -1326,6 +1329,7 @@ pub fn read_stream(
                     DefragmentSink::Stream { sender },
                     options.with_decompress(),
                     remote_session,
+                    claim,
                 )
                 .await;
 
@@ -1522,6 +1526,9 @@ fn write_root_to_file(
                 range.len()
             );
 
+            let claim = claim_for_task(&store, store.try_join_claim())
+                .await
+                .map(Arc::new);
             defragment_pipeline(
                 store,
                 partition,
@@ -1532,6 +1539,7 @@ fn write_root_to_file(
                 defrag_target,
                 options,
                 remote_session,
+                claim,
             )
             .await?;
 
@@ -1929,7 +1937,9 @@ pub fn read_resolved_stream(
             let buffer = root.buffer;
             let remote_session = root.session;
             let report = sender.clone();
+            let joined = store.try_join_claim();
             lore_base::lore_spawn!(async move {
+                let claim = claim_for_task(&store, joined).await.map(Arc::new);
                 let result = defragment_pipeline_leaves(
                     store,
                     partition,
@@ -1939,6 +1949,7 @@ pub fn read_resolved_stream(
                     sender,
                     options,
                     remote_session,
+                    claim,
                 )
                 .await;
 

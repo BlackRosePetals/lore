@@ -4114,9 +4114,13 @@ typedef struct lore_global_args_t {
   uint64_t compress_task_limit;
   // Keep store references alive after a repository call completes to avoid
   // repeated store open/close cycles for consecutive API calls in the same process.
+  // The stores stay locked meanwhile, so another process using them waits. With
+  // `LORE_STORE_RETAIN` set to `1` or `true` in the environment of the process running
+  // the call, the stores are kept after every call whether or not this is set,
+  // unlocked, and the next call reloads them only if another process changed them.
   uint8_t store_keep_alive;
-  // Duration in seconds to keep store references alive. Only used when
-  // `store_keep_alive` is set. 0 means use the default (10 seconds).
+  // Duration in seconds to keep store references alive, when `store_keep_alive` or
+  // `LORE_STORE_RETAIN` is set. 0 means use the default (10 seconds).
   uint64_t store_keep_alive_seconds;
   // Force sync data to storage media during store flush
   uint8_t sync_data;
@@ -9764,9 +9768,10 @@ void lore_repository_gc_async(const struct lore_global_args_t *globals,
 
 // Release all cached store references for the given repository path.
 //
-// Frees in-memory store data and releases file-backed store cache entries.
-// Any active repository contexts for this path remain valid, but once they
-// are dropped the stores will be freed. Subsequent opens will create fresh stores.
+// Frees cached in-memory store data. Disk-backed stores are not forced closed:
+// each is released once nothing uses it, and a later open reuses one that is still
+// alive, which the store epoch keeps current with what other processes wrote.
+// Any active repository contexts for this path remain valid.
 //
 // # Events
 //
@@ -11609,6 +11614,11 @@ void lore_shared_store_set_use_automatically_async(const struct lore_global_args
 
 // Open a content-addressed storage handle.
 //
+// A disk-backed handle claims its stores for this process until it is released, so
+// another process using the same stores waits until then. The claim ends once the
+// flush `lore_storage_close` starts has finished and every revision tree loaded
+// against the handle has been closed.
+//
 // # Events
 //
 // | Tag | Data Type | Description |
@@ -11755,7 +11765,12 @@ void lore_storage_put_resolved_async(const struct lore_global_args_t *globals,
 //
 // Subsequent calls against the same handle return `InvalidArguments`.
 // Close does not block on the flush it spawns — `Complete` fires after
-// the in-flight counter drains, not after the flush finishes.
+// the in-flight counter drains, not after the flush finishes. The handle's
+// claim on its stores ends once that flush has finished and every revision
+// tree loaded against the handle has been closed. With `LORE_STORE_RETAIN`
+// set to `1` or `true`, a disk-backed handle's stores stay in memory without
+// the claim for the window `store_keep_alive_seconds` gives, so a
+// `lore_storage_open` of the same repository in that window reuses them.
 int32_t lore_storage_close(const struct lore_global_args_t *globals,
                            const struct lore_storage_close_args_t *args,
                            struct lore_event_callback_config_t callback);
@@ -12551,6 +12566,9 @@ void lore_repository_config_get_async(const struct lore_global_args_t *globals,
 // `(store, repository, revision_hash)` tuple. `revision_hash == 0` opens an
 // empty tree suitable for committing an initial revision.
 //
+// The tree keeps the storage handle's claim on its stores for as long as it is
+// open, past `lore_storage_close` on that handle.
+//
 // | Terminal event                       | Payload                                | Notes                                              |
 // |--------------------------------------|----------------------------------------|----------------------------------------------------|
 // | `LORE_EVENT_REVISION_TREE_LOADED`    | `lore_revision_tree_loaded_event_data_t` | Emitted on success carrying the opened handle id |
@@ -12567,7 +12585,9 @@ void lore_revision_tree_load_async(const struct lore_global_args_t *globals,
 //
 // Subsequent calls against the same handle return `InvalidArguments`. The
 // call blocks until every in-flight op on the handle has paired its
-// decrement.
+// decrement. Closing a tree on a storage handle that is already closed
+// flushes what the tree wrote since, and closing the last one releases
+// what was keeping that handle's claim on its stores.
 //
 // | Terminal event                              | Payload                                       | Notes                                              |
 // |---------------------------------------------|-----------------------------------------------|----------------------------------------------------|

@@ -4,8 +4,6 @@ use std::sync::Arc;
 
 use lore_error_set::ForwardStrict;
 use lore_error_set::error_set;
-use lore_storage::ImmutableStore;
-use lore_storage::MutableStore;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 use serde::Deserialize;
 use serde::Serialize;
@@ -13,6 +11,7 @@ use serde::Serialize;
 use crate::global::get_global_data_dir;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryError;
+use crate::repository::claim_opened_stores;
 use crate::repository::create_immutable_store_at_path;
 use crate::repository::create_mutable_store_at_path;
 use crate::shared_store::SHARED_STORE_DIR;
@@ -68,28 +67,31 @@ impl SharedStoreRegistryEntry {
         &self.path
     }
 
-    pub async fn create_stores(
+    /// A context on the zero repository over this shared store's stores, which it claims for
+    /// its lifetime as a command does.
+    ///
+    /// # Errors
+    ///
+    /// [`RepositoryError`] if the stores cannot be opened or claimed.
+    pub async fn create_null_repository_context(
         &self,
-    ) -> Result<(Arc<dyn ImmutableStore>, Arc<dyn MutableStore>), RepositoryError> {
+    ) -> Result<Arc<RepositoryContext>, RepositoryError> {
         let path_buf = PathBuf::from(&self.path).join(SHARED_STORE_DIR);
-        let immutable_store = create_immutable_store_at_path(
+        let (immutable_store, opening) = create_immutable_store_at_path(
             path_buf.clone(),
             ImmutableStoreCreateOptions::none(),
             false,
         )
         .await?;
-        let mutable_store = create_mutable_store_at_path(path_buf, immutable_store.clone()).await?;
-        Ok((immutable_store, mutable_store))
-    }
-
-    pub async fn create_null_repository_context(
-        &self,
-    ) -> Result<Arc<RepositoryContext>, RepositoryError> {
-        let (immutable_store, mutable_store) = self.create_stores().await?;
-        Ok(Arc::new(RepositoryContext::new_null_context(
-            immutable_store,
-            mutable_store,
-        )))
+        let (immutable_store, mutable_store, stores) =
+            claim_opened_stores(immutable_store, opening, |immutable_store| {
+                create_mutable_store_at_path(path_buf, immutable_store)
+            })
+            .await?;
+        Ok(Arc::new(
+            RepositoryContext::new_null_context(immutable_store, mutable_store)
+                .with_store_hold(stores),
+        ))
     }
 }
 

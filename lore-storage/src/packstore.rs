@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::ops::Deref;
+use std::ops::DerefMut;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
@@ -22,6 +25,8 @@ use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
 use crate::caller_buffer::CallerBuffer;
+use crate::local::store_lock::LockAnchor;
+use crate::local::store_lock::StoreLock;
 
 #[error_set]
 pub enum PackfileError {}
@@ -51,7 +56,8 @@ struct PackFile {
     dirty: AtomicBool,
     /// Set once the packfile takes no more writes and a sync covers every write to it, so that a
     /// crash cannot leave it shorter than an entry pointing into it. A packfile opened at the
-    /// size limit is taken to be settled, by the sync that followed its last write.
+    /// size limit is taken to be settled, by the sync that followed its last write, unless it was
+    /// closed holding writes no sync covered, see [`PackStore::released`].
     settled: AtomicBool,
     /// Set by a failed sync. A later sync could report success without the writes the failed one
     /// dropped, so every later sync fails, see [`PackStore::sync_packfile`].
@@ -66,6 +72,28 @@ struct Contents {
     size: usize,
     /// The bytes of a packfile held in memory, which has no file.
     buffer: Vec<u8>,
+}
+
+/// The packfiles of a packstore, and the anchor of the store directory's lock they keep alive
+/// while any I/O holds them, see [`crate::local::store_lock::FilesInUse`].
+#[derive(Default)]
+struct Packfiles {
+    files: Vec<PackFile>,
+    anchor: Option<LockAnchor>,
+}
+
+impl Deref for Packfiles {
+    type Target = Vec<PackFile>;
+
+    fn deref(&self) -> &Vec<PackFile> {
+        &self.files
+    }
+}
+
+impl DerefMut for Packfiles {
+    fn deref_mut(&mut self) -> &mut Vec<PackFile> {
+        &mut self.files
+    }
 }
 
 impl PackFile {
@@ -121,12 +149,12 @@ struct PackfileWrite(Arc<HeldWrite>);
 
 struct HeldWrite {
     payload: Bytes,
-    packfiles: OwnedRwLockReadGuard<Vec<PackFile>>,
+    packfiles: OwnedRwLockReadGuard<Packfiles>,
     index: usize,
 }
 
 impl PackfileWrite {
-    fn new(payload: Bytes, packfiles: OwnedRwLockReadGuard<Vec<PackFile>>, index: usize) -> Self {
+    fn new(payload: Bytes, packfiles: OwnedRwLockReadGuard<Packfiles>, index: usize) -> Self {
         PackfileWrite(Arc::new(HeldWrite {
             payload,
             packfiles,
@@ -185,13 +213,21 @@ pub struct PackStore {
     path: Option<PathBuf>,
     min_count: usize,
     /// Shared with the writes in flight, see `PackfileWrite`.
-    packfile: Arc<RwLock<Vec<PackFile>>>,
+    packfile: Arc<RwLock<Packfiles>>,
     /// Ids of the packfiles that take writes, ascending.
     writeable: RwLock<Vec<u32>>,
     /// Shared per-store GC counters; `resume()` feeds loaded packfile sizes into them
     /// so an over-cap store fires compaction without a startup scan. `None` for stores
     /// that don't participate in automatic GC (e.g. migration/scratch packstores).
     gc_counters: Option<Arc<crate::maintenance::GcCounters>>,
+    /// What [`Self::resume`] last added to the GC counters, taken out again when the
+    /// packfiles are closed so that the next `resume` does not count them twice.
+    accounted: AtomicU64,
+    /// The packfiles [`Self::release_files`] closed holding writes no sync covered, with the bytes
+    /// reserved in them, until they are loaded again. [`Self::unsettled_sizes`] reports them while
+    /// they are closed, and a load marks them dirty and not settled, so that closing a packfile
+    /// loses neither the size a bucket file records for it nor the sync a later flush owes it.
+    released: parking_lot::Mutex<smallvec::SmallVec<[PackfileSize; 2]>>,
 }
 
 impl PackStore {
@@ -210,7 +246,84 @@ impl PackStore {
             packfile: Arc::default(),
             writeable: RwLock::default(),
             gc_counters,
+            accounted: AtomicU64::new(0),
+            released: parking_lot::Mutex::default(),
         }
+    }
+
+    /// Drop the cached packfile set so the next [`Self::resume`] re-reads the
+    /// directory.
+    ///
+    /// For a store that has discovered another process changed it underneath. The
+    /// open files go with the vector, which is the point: they may name packfiles
+    /// that have since been compacted away.
+    ///
+    /// Cannot fail and does no I/O, which is what lets a caller invalidate all 256
+    /// groups without the possibility of stopping half way. Reloading is left to
+    /// `resume()`, which every read and write path already calls, so nothing is read
+    /// back until something actually wants it.
+    ///
+    /// The GC counters are not adjusted here: a reload resets them as a whole before any
+    /// group is forgotten, so what this packstore had added is already gone.
+    pub async fn forget(&self) {
+        let mut packfile = self.packfile.write().await;
+        let mut writeable = self.writeable.write().await;
+        packfile.clear();
+        writeable.clear();
+        self.accounted.store(0, Ordering::Relaxed);
+        self.released.lock().clear();
+    }
+
+    /// Closes the packfiles, so that none is held open while the store's lock is not.
+    ///
+    /// Both vectors are cleared, as [`Self::forget`] does, which re-arms
+    /// [`Self::resume`] for the next operation; what `resume` added to the GC counters
+    /// is taken out again, so the reopen is not counted on top of it. The packfiles holding
+    /// writes no sync covered are kept in [`Self::released`].
+    ///
+    /// Called as the last guard on the store's directory goes, under the lock's state
+    /// mutex, so it does not wait: packfiles an operation or its I/O still holds are left open,
+    /// and the answer `false` keeps the flock until they are not.
+    pub fn release_files(&self) -> bool {
+        if self.path.is_none() {
+            return true;
+        }
+        let (Ok(mut packfile), Ok(mut writeable)) =
+            (self.packfile.try_write(), self.writeable.try_write())
+        else {
+            return false;
+        };
+        if packfile.is_empty() {
+            return true;
+        }
+        self.released
+            .lock()
+            .extend(packfile.iter_mut().filter_map(|closed| {
+                (!*closed.settled.get_mut() && *closed.dirty.get_mut()).then(|| PackfileSize {
+                    id: closed.id,
+                    size: u32::try_from(closed.contents.get_mut().size).unwrap_or(u32::MAX),
+                })
+            }));
+        packfile.clear();
+        writeable.clear();
+        let accounted = self.accounted.swap(0, Ordering::Relaxed);
+        if let Some(gc) = &self.gc_counters {
+            gc.remove_loaded_size(accounted);
+        }
+        true
+    }
+
+    /// Registers the packfiles with the lock of the directory they are in, so that I/O on them
+    /// keeps the flock, past the store's own life included, see [`crate::local::store_lock::FilesInUse`].
+    pub async fn anchor(&self, lock: &StoreLock) {
+        let anchor = lock.anchor(Arc::downgrade(&self.packfile) as _);
+        self.packfile.write().await.anchor = Some(anchor);
+    }
+
+    /// How many packfiles are open, without opening any. Test builds only.
+    #[cfg(feature = "test-util")]
+    pub async fn open_packfiles(&self) -> usize {
+        self.packfile.read().await.len()
     }
 
     /// Load the packfiles from disk unless they are loaded, and open packfiles to writes up to
@@ -224,9 +337,19 @@ impl PackStore {
             && let Some(path) = self.path.as_ref()
         {
             let (loaded, loaded_writeable, loaded_size) = Self::load_packfiles(path).await?;
-            *packfile = loaded;
+            packfile.files = loaded;
             *writeable = loaded_writeable;
+            for closed in self.released.lock().drain(..) {
+                if let Some(reopened) = (closed.id as usize)
+                    .checked_sub(1)
+                    .and_then(|index| packfile.get_mut(index))
+                {
+                    *reopened.dirty.get_mut() = true;
+                    *reopened.settled.get_mut() = false;
+                }
+            }
             lore_base::lore_trace!("{} writable packfiles", writeable.len());
+            self.accounted.store(loaded_size, Ordering::Relaxed);
             if let Some(gc) = &self.gc_counters {
                 gc.add_loaded_size(loaded_size);
             }
@@ -304,8 +427,9 @@ impl PackStore {
 
     /// Open packfile `id` in `path` with its size, creating it empty when there is no file. An
     /// existing file is opened as it is, never truncated, since an entry may point into it. A
-    /// packfile is the store's own: on Windows nothing outside this process may write it while it
-    /// is open, where the driver shares the files it opens by default.
+    /// packfile is the store's own, and is open only while this process holds the store's flock:
+    /// on Windows nothing outside this process may write it while it is open, where the driver
+    /// shares the files it opens by default.
     async fn open_packfile(path: &Path, id: u32) -> Result<PackFile, PackfileError> {
         #[cfg(feature = "test-util")]
         if crate::test_util::take_packfile_open_failure() {
@@ -368,7 +492,7 @@ impl PackStore {
     /// path of a new packfile is kept and appended to, see [`PackStore::open_packfile`].
     async fn fill_writeable<'a>(
         &'a self,
-        mut packfile: RwLockWriteGuard<'a, Vec<PackFile>>,
+        mut packfile: RwLockWriteGuard<'a, Packfiles>,
         mut writeable: RwLockWriteGuard<'a, Vec<u32>>,
     ) -> Result<(), PackfileError> {
         while writeable.len() < self.min_count {
@@ -389,7 +513,7 @@ impl PackStore {
     }
 
     /// The packfile list, loaded from disk first if it is not yet.
-    async fn loaded_packfiles(&self) -> Result<RwLockReadGuard<'_, Vec<PackFile>>, PackfileError> {
+    async fn loaded_packfiles(&self) -> Result<RwLockReadGuard<'_, Packfiles>, PackfileError> {
         let packfiles = self.packfile.read().await;
         if !packfiles.is_empty() {
             return Ok(packfiles);
@@ -402,7 +526,7 @@ impl PackStore {
     /// As [`PackStore::loaded_packfiles`], with a guard that owns its hold on the list.
     async fn loaded_packfiles_owned(
         &self,
-    ) -> Result<OwnedRwLockReadGuard<Vec<PackFile>>, PackfileError> {
+    ) -> Result<OwnedRwLockReadGuard<Packfiles>, PackfileError> {
         let packfiles = self.packfile.clone().read_owned().await;
         if !packfiles.is_empty() {
             return Ok(packfiles);
@@ -435,9 +559,16 @@ impl PackStore {
     /// packfile, which a crash cannot leave shorter than the entry. Packfiles not yet loaded are
     /// left out, and not loaded: no write in this process went to them, since a write loads them
     /// first, and no entry that points into them was loaded from a file recording sizes, since
-    /// loading one compares the sizes with them, see [`PackStore::short_of`].
+    /// loading one compares the sizes with them, see [`PackStore::short_of`]. Packfiles closed
+    /// holding writes no sync covered are written with the sizes they were closed at, see
+    /// [`PackStore::released`].
     pub async fn unsettled_sizes(&self, sizes: &mut [PackfileSize]) -> Option<usize> {
         let packfiles = self.packfile.read().await;
+        if packfiles.is_empty() {
+            let released = self.released.lock();
+            sizes.get_mut(..released.len())?.copy_from_slice(&released);
+            return Some(released.len());
+        }
         let mut count = 0;
         for packfile in packfiles
             .iter()
@@ -509,8 +640,15 @@ impl PackStore {
     /// again, after discarding the empty packfiles at the end, see
     /// [`PackStore::discard_empty_tail`]. A packfile that is itself discarded is removed once
     /// truncated. A failed truncate or sync is reported and leaves the packfile out of writes, see
-    /// [`PackStore::empty_packfile`].
-    pub async fn truncate(&self, id: u32) -> Result<(), PackfileError> {
+    /// [`PackStore::empty_packfile`]. `completion` is dropped once the truncate has landed, whether
+    /// or not the call is still awaited, see [`lore_io::IoFile::set_len`]: a store passes a share
+    /// of the group's writes in flight, which keeps the flock and the group's next flush waiting
+    /// for a truncate left in flight.
+    pub async fn truncate<C: Send + 'static>(
+        &self,
+        id: u32,
+        completion: C,
+    ) -> Result<(), PackfileError> {
         if self.path.is_none() {
             return Err(PackfileError::internal(
                 "Truncating a packfile needs a packstore on disk",
@@ -536,7 +674,7 @@ impl PackStore {
             return Err(PackfileError::internal("Invalid packfile"));
         }
 
-        Self::empty_packfile(&mut packfile[index]).await?;
+        Self::empty_packfile(&mut packfile[index], completion).await?;
         self.discard_empty_tail(&mut packfile, &mut writeable).await;
         if index < packfile.len() {
             lore_base::lore_debug!("Truncated compacted packfile {id} to zero");
@@ -553,10 +691,15 @@ impl PackStore {
     /// settled. A failed truncate leaves the packfile as it was. A failed sync after it records the
     /// packfile empty, as its file now is, and is reported, and fails later syncs of it, see
     /// [`PackFile::sync_failed`].
-    async fn empty_packfile(packfile: &mut PackFile) -> Result<(), PackfileError> {
+    async fn empty_packfile<C: Send + 'static>(
+        packfile: &mut PackFile,
+        completion: C,
+    ) -> Result<(), PackfileError> {
         let synced = match packfile.file.as_ref() {
             Some(file) => {
-                file.set_len(0)
+                #[cfg(feature = "test-util")]
+                let completion = crate::test_util::park_store_write(completion).await;
+                file.set_len(0, completion)
                     .await
                     .internal("Failed truncating packstore file")?;
                 file.sync_all().await
@@ -896,14 +1039,19 @@ impl PackStore {
     }
 
     /// With `sync_data`, sync every packfile holding writes not yet synced, see
-    /// [`PackStore::sync_packfile`]. Returns the first error. A failed sync takes its packfile off
-    /// the writeable list, see [`PackStore::stop_writes_after_failed_sync`].
+    /// [`PackStore::sync_packfile`], loading those closed holding them first, see
+    /// [`PackStore::released`], in a call boxed as it runs only after a release. Returns the first
+    /// error. A failed sync takes its packfile off the writeable list, see
+    /// [`PackStore::stop_writes_after_failed_sync`].
     pub async fn flush_all(&self, sync_data: bool) -> Result<(), PackfileError> {
         if !sync_data {
             return Ok(());
         }
         #[cfg(feature = "test-util")]
         crate::test_util::pause_point(crate::test_util::PausePoint::Syncing).await;
+        if !self.released.lock().is_empty() {
+            Box::pin(self.resume()).await?;
+        }
         let packfiles = self.packfile.read().await;
         let synced = futures::future::join_all(packfiles.iter().map(Self::sync_packfile)).await;
         let failed: Vec<u32> = packfiles
@@ -980,11 +1128,13 @@ pub mod test_util {
     use super::PackStore;
 
     impl PackStore {
-        /// Whether packfile `id` holds a write that no sync has claimed.
+        /// Whether packfile `id` holds a write that no sync has claimed, open or closed, see
+        /// `PackStore::released`.
         pub async fn is_dirty(&self, id: u32) -> bool {
-            self.packfile.read().await[(id - 1) as usize]
-                .dirty
-                .load(Ordering::Acquire)
+            match self.packfile.read().await.get((id - 1) as usize) {
+                Some(packfile) => packfile.dirty.load(Ordering::Acquire),
+                None => self.released.lock().iter().any(|closed| closed.id == id),
+            }
         }
 
         /// Whether packfile `id` is settled, see `PackFile::settled`.

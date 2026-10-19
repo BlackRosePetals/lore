@@ -10,6 +10,7 @@ use lore_storage::Partition;
 use lore_storage::immutable_store::ImmutableStore;
 use lore_storage::local::immutable_store::format_bucket_path;
 use lore_storage::local::mutable_store::*;
+use lore_storage::local::store_lock::Intent;
 use lore_storage::store_types::KeyType;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
@@ -142,10 +143,13 @@ async fn deserialize_authoritative_errors_and_preserves_corrupt_bucket() {
     );
 }
 
-/// Client-shaped settings: groups start at level 1.
+/// Client-shaped settings: groups start at level 1, and the store keeps its state across holds,
+/// as one does in a process that retains stores. A test builds a store's state under one claim
+/// and examines it under the next.
 fn client_settings() -> MutableStoreSettings {
     MutableStoreSettings {
         initial_fan_out_level: 1,
+        reuse_state_across_holds: true,
         ..Default::default()
     }
 }
@@ -181,9 +185,8 @@ async fn store_keys(store: &Arc<LocalMutableStore>, partition: Partition, count:
 async fn run_delayed_flush(store: &Arc<LocalMutableStore>) {
     let weak = Arc::downgrade(store);
     for group_index in 0..GROUP_COUNT {
-        LocalMutableStore::flush_delayed(weak.clone(), group_index, 0, 0)
-            .await
-            .expect("delayed flush joins");
+        // Sweeps every dirty bucket in the group, so no bucket index is named.
+        LocalMutableStore::flush_delayed(weak.clone(), group_index, 0).await;
     }
 }
 
@@ -264,29 +267,36 @@ async fn a_store_after_a_failed_delayed_flush_starts_another() {
     let group_path = dir.path().join("mutable").join("index").join("07");
     let marker = group_path.join(lore_storage::local::fan_out::MARKER_FILENAME);
     let bucket_file = lore_storage::local::fan_out::bucket_path(&group_path, 0);
-    let bucket = store.group[7].bucket(0).clone();
+    let group = store.group[7].clone();
     std::fs::create_dir_all(marker.join("blocker")).expect("block the level marker");
 
     store_key(0).await;
-    wait_for_delayed_flush(&bucket).await;
+    wait_for_delayed_flush(&group).await;
     assert!(store.group[7].dirty[0].load(atomic::Ordering::Relaxed));
     assert!(!bucket_file.exists());
 
     std::fs::remove_dir_all(&marker).expect("unblock the level marker");
     store_key(1).await;
     assert!(
-        bucket.read().await.flush_pending(),
+        sweep_pending(&group).await,
         "the store into a bucket a failed delayed flush left dirty started no delayed flush"
     );
-    wait_for_delayed_flush(&bucket).await;
+    wait_for_delayed_flush(&group).await;
     assert!(!store.group[7].dirty[0].load(atomic::Ordering::Relaxed));
     assert!(bucket_file.exists() && marker.exists());
 }
 
-/// Wait until no delayed flush of `bucket` is pending, for at most 10 s.
-async fn wait_for_delayed_flush(bucket: &tokio::sync::RwLock<MutableStoreBucket>) {
+/// Whether a delayed flush of `group` is scheduled or running.
+async fn sweep_pending(group: &lore_storage::local::mutable_store::MutableStoreGroup) -> bool {
+    let mut flush = group.flush.lock().await;
+    while flush.try_join_next().is_some() {}
+    group.scheduled.load(atomic::Ordering::Relaxed) || !flush.is_empty()
+}
+
+/// Wait until no delayed flush of `group` is pending, for at most 10 s.
+async fn wait_for_delayed_flush(group: &lore_storage::local::mutable_store::MutableStoreGroup) {
     for _ in 0..1000 {
-        if !bucket.read().await.flush_pending() {
+        if !sweep_pending(group).await {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -358,9 +368,7 @@ async fn a_commit_failing_after_its_pending_marker_is_rolled_forward_before_any_
             )
             .await
             .expect("store the newer value");
-        LocalMutableStore::flush_delayed(Arc::downgrade(&store), 7, bucket, 0)
-            .await
-            .expect("delayed flush joins");
+        LocalMutableStore::flush_delayed(Arc::downgrade(&store), 7, 0).await;
         dyn_store.clone().flush(false).await.expect("flush");
     }
 
@@ -608,9 +616,7 @@ async fn a_flush_dropped_while_its_commit_writes_level_pending_runs_the_commit_t
             )
             .await
             .expect("store the newer value");
-        LocalMutableStore::flush_delayed(Arc::downgrade(&store), 7, 0, 0)
-            .await
-            .expect("delayed flush joins");
+        LocalMutableStore::flush_delayed(Arc::downgrade(&store), 7, 0).await;
         dyn_store.clone().flush(false).await.expect("flush");
     }
 
@@ -762,11 +768,7 @@ async fn a_delayed_flush_rolls_a_pending_commit_forward_before_it_writes_a_bucke
         let blocked = format_bucket_path(&dir.path().join("mutable"), 7, 0);
         super::fail_commit_at_rename(&blocked, || dyn_store.clone().flush(false)).await;
 
-        for bucket in 0..32 {
-            LocalMutableStore::flush_delayed(Arc::downgrade(&store), 7, bucket, 0)
-                .await
-                .expect("delayed flush joins");
-        }
+        LocalMutableStore::flush_delayed(Arc::downgrade(&store), 7, 0).await;
 
         let group = &store.group[7];
         assert_eq!(group.pending_level.load(atomic::Ordering::Relaxed), 0);
@@ -901,7 +903,7 @@ fn level_markers(index_root: &Path) -> Vec<PathBuf> {
 /// out of reach — here that is branch heads and revision metadata.
 ///
 /// Reachable when a sub-256 store is given a non-zero flush delay. The client's level-1
-/// default sets the delay to 0, which stops `mark_dirty` spawning the task, and the server
+/// default sets the delay to 0, which stops a write scheduling the sweep, and the server
 /// runs the delayed flush with groups at 256, where a missing marker reads back correctly;
 /// this pins the invariant rather than leaving it to those defaults.
 #[tokio::test]
@@ -1025,12 +1027,9 @@ async fn a_flat_layout_store_gains_no_level_markers() {
         );
 
         let keys = store_keys(&store, partition, 32).await;
-        // Bucket 0xAB is where these keys live at 256, so flush that one.
         let weak = Arc::downgrade(&store);
         for group_index in 0..GROUP_COUNT {
-            LocalMutableStore::flush_delayed(weak.clone(), group_index, 0xAB, 0)
-                .await
-                .expect("delayed flush joins");
+            LocalMutableStore::flush_delayed(weak.clone(), group_index, 0).await;
         }
         keys
     };
@@ -1336,7 +1335,7 @@ async fn store_initializes_group_bucket_count_from_settings_level_1() {
     )
     .await
     .unwrap();
-    for group in &store.group {
+    for group in store.group.iter() {
         assert_eq!(group.bucket_count.load(Ordering::Relaxed), 1);
     }
 }
@@ -1354,12 +1353,910 @@ async fn store_initializes_group_bucket_count_from_settings_level_256() {
     )
     .await
     .unwrap();
-    for group in &store.group {
+    for group in store.group.iter() {
         assert_eq!(
             group.bucket_count.load(Ordering::Relaxed),
             lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX
         );
     }
+}
+
+/// **A migration store takes no claim of its own, so its caller must hold one.**
+///
+/// `for_migration` builds a view over an old on-disk layout with `lock: None`,
+/// which means `hold` returns nothing and no epoch is advanced however much the
+/// migration rewrites. Every other process on the directory would read the same
+/// epoch before and after, serve the state it had, and flush that back over the
+/// migrated files.
+///
+/// This pins the property the caller's obligation rests on: the migration store is
+/// silent, so silence has to be made impossible some other way.
+#[tokio::test]
+async fn a_migration_store_holds_nothing_and_announces_nothing() {
+    let dir = lore_base::test_util::TempDir::new("ms_migration_claim_");
+    let path = dir.to_path_buf().join("mutable");
+    std::fs::create_dir_all(&path).expect("store directory");
+
+    let migrating = Arc::new(LocalMutableStore::for_migration(path.clone(), Vec::new()));
+    assert!(
+        migrating
+            .hold(Intent::Write)
+            .await
+            .expect("holds")
+            .is_none(),
+        "a migration view has no lock, so it can claim nothing"
+    );
+    assert!(
+        !path.join("epoch").exists(),
+        "and announces nothing, however much it rewrites — which is why the caller \
+         has to hold the claim across the whole migration"
+    );
+}
+
+/// **A claim outlives the store object that took it.**
+///
+/// What the migration rests on. It takes a claim from the live store, drops that
+/// store so the rewrite has sole ownership of the files, and re-creates one
+/// afterwards to read the migrated data back — so the claim has to survive the
+/// object. It does because the flock belongs to the directory, not to a store: the
+/// store built afterwards joins the same one rather than contending with it, which
+/// before that was a process blocking against itself with an unbounded wait.
+#[tokio::test]
+async fn a_claim_outlives_the_store_that_took_it() {
+    let dir = lore_base::test_util::TempDir::new("ms_claim_outlives_");
+    let settings = MutableStoreSettings::default;
+
+    let first = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let claim = first
+        .hold(Intent::Read)
+        .await
+        .expect("claims")
+        .expect("a disk-backed store claims something");
+    drop(first);
+
+    let immutable = make_in_memory_immutable().await;
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        LocalMutableStore::new(Some(dir.to_path_buf()), settings(), immutable),
+    )
+    .await
+    .expect("a store built while the claim is held joins it rather than waiting on it")
+    .unwrap();
+    let lock = second.lock.clone().expect("a disk-backed store has a lock");
+    assert!(
+        lock.is_held(),
+        "the claim taken by the dropped store must still hold the directory"
+    );
+
+    drop(claim);
+    assert!(!lock.is_held(), "and releasing it releases the directory");
+}
+
+/// **A store joins only a claim this process already holds, and without waiting.** Outside a
+/// span, and for a store with nothing on disk, there is nothing to join; inside a span the join
+/// is a counted guard, which keeps the flock past the span until it is dropped.
+#[tokio::test]
+async fn a_store_joins_only_a_claim_it_already_holds() {
+    use lore_storage::mutable_store::MutableStore;
+
+    let in_memory = LocalMutableStore::new(
+        None::<&Path>,
+        MutableStoreSettings::default(),
+        make_in_memory_immutable().await,
+    )
+    .await
+    .unwrap();
+    assert!(in_memory.try_join_claim().is_none());
+
+    let dir = lore_base::test_util::TempDir::new("ms_try_join_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            MutableStoreSettings::default(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    assert!(
+        store.try_join_claim().is_none(),
+        "nothing to join outside a span"
+    );
+
+    let span = store.clone().hold_for_command().await.unwrap();
+    let joined = store.try_join_claim().expect("the span's claim to join");
+    drop(span);
+    assert!(
+        lock.is_held(),
+        "the joined claim keeps the flock past the span"
+    );
+    drop(joined);
+    assert!(!lock.is_held());
+}
+
+/// **A store reloads at its first claim after its flock was released, although the epoch is
+/// unchanged, unless it reuses its state across holds.** The claim records whether it reloaded.
+#[tokio::test]
+async fn a_released_store_reloads_at_its_next_claim_unless_it_reuses_state_across_holds() {
+    for reuse_state_across_holds in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("ms_reuse_across_holds_");
+        let store = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.to_path_buf()),
+                MutableStoreSettings {
+                    reuse_state_across_holds,
+                    ..Default::default()
+                },
+                make_in_memory_immutable().await,
+            )
+            .await
+            .unwrap(),
+        );
+        let claim = store
+            .hold(Intent::Read)
+            .await
+            .expect("claims")
+            .expect("a disk-backed store claims something");
+        assert_eq!(
+            claim.is_stale(),
+            !reuse_state_across_holds,
+            "the store opened under a hold of its own, released since, and reloads only if it \
+             does not reuse its state across holds"
+        );
+    }
+}
+
+/// **Stamping the version claims the store; recognising it costs nothing.**
+///
+/// The probe, the version read and the stamp are all decisions about on-disk state,
+/// and the stamp is a write — so another process must not be rewriting it
+/// underneath them. The case that recurs is a `version` file holding a value this
+/// client does not recognise, which is what a newer client writes: it leaves the
+/// version at `Initial`, so an older client re-stamps on every open.
+///
+/// The epoch is the observable. A stamp takes a write claim and advances it; an
+/// open that reads a version it recognises writes nothing and must leave it alone.
+#[tokio::test]
+async fn stamping_the_version_claims_the_store() {
+    let dir = lore_base::test_util::TempDir::new("ms_version_claim_");
+    let epoch = dir.to_path_buf().join("mutable").join("epoch");
+
+    let store = LocalMutableStore::new(
+        Some(dir.to_path_buf()),
+        MutableStoreSettings::default(),
+        make_in_memory_immutable().await,
+    )
+    .await
+    .unwrap();
+    drop(store);
+
+    let after_stamp = std::fs::read(&epoch).ok();
+    assert!(
+        after_stamp.is_some(),
+        "creating the store stamped its version, which must be claimed and announced"
+    );
+
+    // Reopening reads a version it recognises, so there is nothing to stamp.
+    let store = LocalMutableStore::new(
+        Some(dir.to_path_buf()),
+        MutableStoreSettings::default(),
+        make_in_memory_immutable().await,
+    )
+    .await
+    .unwrap();
+    drop(store);
+
+    assert_eq!(
+        std::fs::read(&epoch).ok(),
+        after_stamp,
+        "an open that writes nothing must not invalidate every other process's state"
+    );
+}
+
+/// **A store serves what another process wrote, not what it had cached.**
+///
+/// Two stores over one directory, which is what two processes are. The first
+/// caches an empty bucket with a miss; the second stores the key and flushes. The
+/// first must find it on its next operation, which it can only do by noticing the
+/// epoch moved and dropping the bucket it held.
+///
+/// The only end-to-end exercise of [`MutableStoreGroup::invalidate`]: the
+/// lock-interleave probe drives reads alone, so nothing there advances an epoch.
+#[tokio::test]
+async fn a_store_drops_what_another_one_changed_underneath_it() {
+    use lore_storage::mutable_store::MutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("ms_refresh_");
+    let partition = Partition::default();
+    let key = Hash::from_u64(0x5eed);
+    let value = Hash::from_u64(0x1234);
+
+    let reader: Arc<dyn MutableStore> = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            MutableStoreSettings::default(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(
+        reader
+            .clone()
+            .load(partition, key, KeyType::BranchMetadata)
+            .await
+            .is_err(),
+        "nothing has been written yet, and the miss is what caches the bucket"
+    );
+
+    {
+        let writer: Arc<dyn MutableStore> = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.to_path_buf()),
+                MutableStoreSettings::default(),
+                make_in_memory_immutable().await,
+            )
+            .await
+            .unwrap(),
+        );
+        writer
+            .clone()
+            .store(partition, key, value, KeyType::BranchMetadata)
+            .await
+            .unwrap();
+        writer.clone().flush(true).await.unwrap();
+    }
+
+    assert_eq!(
+        reader
+            .clone()
+            .load(partition, key, KeyType::BranchMetadata)
+            .await
+            .unwrap(),
+        value,
+        "the cached empty bucket must have been dropped and re-read"
+    );
+}
+
+/// **A delayed flush releases the store once it has written.** Its own write claim
+/// counts as a writer in flight, so declaring the store clean while that claim is
+/// alive is refused, and the flock would stay held until some later flush.
+#[tokio::test]
+async fn a_delayed_flush_releases_the_store() {
+    let dir = lore_base::test_util::TempDir::new("ms_delayed_release_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            client_settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    store_keys(&store, Partition::default(), 2).await;
+    assert!(lock.is_held(), "unflushed writes hold the store");
+
+    run_delayed_flush(&store).await;
+    assert!(!lock.is_held(), "and the sweeps that wrote them release it");
+}
+
+/// **A write keeps the store claimed until it is flushed, and a flush with nothing
+/// to write announces nothing.**
+#[tokio::test]
+async fn a_write_holds_the_store_until_flushed_and_an_idle_flush_is_silent() {
+    use lore_storage::mutable_store::MutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("ms_flush_claim_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            MutableStoreSettings::default(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    store_keys(&store, Partition::default(), 1).await;
+    assert!(lock.is_held(), "an unflushed write holds the store");
+    store.clone().flush(true).await.unwrap();
+    assert!(!lock.is_held(), "and the flush that settles it releases it");
+
+    let epoch = dir.to_path_buf().join("mutable").join("epoch");
+    let before = std::fs::read(&epoch).ok();
+    store.clone().flush(true).await.unwrap();
+    assert_eq!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "nothing to write, nothing said"
+    );
+    assert!(!lock.is_held());
+}
+
+/// **A listing keeps its claim while its producers are still reading.** They go on
+/// after the stream is handed back, so a claim released when `list` returns would
+/// leave them reading bucket files no claim covers.
+#[tokio::test]
+async fn a_listing_keeps_the_store_claimed_while_it_reads() {
+    use lore_storage::mutable_store::MutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("ms_list_claim_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            client_settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    store_keys(&store, Partition::default(), 1).await;
+    store.clone().flush(true).await.unwrap();
+    assert!(!lock.is_held());
+
+    // Holds the first bucket the group-0 producer reads, so it is still at work.
+    let blocker = store.group[0].bucket(0).clone().write_owned().await;
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store
+            .clone()
+            .list(Partition::default(), KeyType::BranchMetadata),
+    )
+    .await
+    .expect("a listing hands its stream back while its producers wait")
+    .unwrap();
+    assert!(lock.is_held(), "a listing still reading holds its claim");
+
+    drop(blocker);
+    drop(stream);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while lock.is_held() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the producers finished and released the claim"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// **A listing started inside a span keeps the store claimed past the span** while its
+/// producers read. A listing that relied on the span would leave them reading bucket files with
+/// no flock once the span ends.
+#[tokio::test]
+async fn a_listing_keeps_the_store_claimed_past_the_span_it_started_in() {
+    use lore_storage::mutable_store::MutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("ms_list_span_claim_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            MutableStoreSettings::default(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    store_keys(&store, Partition::default(), 1).await;
+    store.clone().flush(true).await.unwrap();
+    assert!(!lock.is_held());
+
+    let span = store.clone().hold_for_command().await.unwrap();
+    // Holds the first bucket the group-0 producer reads, so it is still at work.
+    let blocker = store.group[0].bucket(0).clone().write_owned().await;
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store
+            .clone()
+            .list(Partition::default(), KeyType::BranchMetadata),
+    )
+    .await
+    .expect("a listing hands its stream back while its producers wait")
+    .unwrap();
+    drop(span);
+    assert!(
+        lock.is_held(),
+        "a listing still reading holds the store past the span"
+    );
+
+    drop(blocker);
+    drop(stream);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while lock.is_held() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the producers stopped once the stream was dropped, and released the store"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// **A load claims to read and a compare-and-swap claims to write.** A load changes
+/// nothing, so it announces nothing and keeps nothing claimed; a compare-and-swap
+/// changes the store, so it announces the change and keeps the store claimed until
+/// it is flushed.
+#[tokio::test]
+async fn a_load_announces_nothing_and_a_compare_and_swap_holds_the_store() {
+    use lore_storage::mutable_store::MutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("ms_load_swap_claims_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            MutableStoreSettings::default(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    store.clone().flush(true).await.unwrap();
+    assert!(!lock.is_held());
+    let epoch = dir.to_path_buf().join("mutable").join("epoch");
+    let before = std::fs::read(&epoch).ok();
+
+    let key = Hash::from([0x5au8; 32]);
+    let _ = store
+        .clone()
+        .load(Partition::default(), key, KeyType::BranchMetadata)
+        .await;
+    assert_eq!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "a load announces nothing"
+    );
+    assert!(!lock.is_held(), "and keeps nothing claimed");
+
+    store
+        .clone()
+        .compare_and_swap(
+            Partition::default(),
+            key,
+            Hash::default(),
+            Hash::from([0xa5u8; 32]),
+            KeyType::BranchMetadata,
+        )
+        .await
+        .expect("swaps");
+    assert_ne!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "a compare-and-swap announces its change"
+    );
+    assert!(
+        lock.is_held(),
+        "and keeps the store claimed until it is flushed"
+    );
+
+    store.clone().flush(true).await.unwrap();
+    assert!(!lock.is_held(), "which releases it");
+}
+
+/// **A compare-and-swap to the value already stored flags nothing.** It succeeds, and
+/// leaves the bucket unflagged: a flagged bucket is rewritten by the next flush and keeps
+/// the store claimed until then, over a value that did not change — which is what
+/// recording a branch tip that has not moved does.
+#[tokio::test]
+async fn a_compare_and_swap_to_the_stored_value_flags_nothing() {
+    use lore_storage::mutable_store::MutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("ms_cas_unchanged_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            MutableStoreSettings::default(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let key = Hash::from([0x5au8; 32]);
+    let value = Hash::from([0xa5u8; 32]);
+    store
+        .clone()
+        .store(Partition::default(), key, value, KeyType::BranchMetadata)
+        .await
+        .unwrap();
+    store.clone().flush(true).await.unwrap();
+    let (group_index, bucket_index) = populated_bucket(&store).await;
+    let flagged = || store.group[group_index].dirty[bucket_index].load(atomic::Ordering::Relaxed);
+    assert!(!flagged(), "the flush wrote the stored value");
+
+    let previous = store
+        .clone()
+        .compare_and_swap(
+            Partition::default(),
+            key,
+            value,
+            value,
+            KeyType::BranchMetadata,
+        )
+        .await
+        .expect("swaps");
+    assert_eq!(previous, value, "the swap succeeds");
+    assert!(
+        !flagged(),
+        "and flags nothing for a value that did not change"
+    );
+}
+
+/// **A claim to rewrite announces the rewrite and keeps nothing claimed.** The version
+/// migration rewrites the store's files wholesale, so the epoch has to move before it
+/// does; but nothing it writes goes through a bucket a flush would clear, so a dirty
+/// mark would keep the store claimed for good.
+#[tokio::test]
+async fn a_claim_to_rewrite_announces_it_and_keeps_nothing_claimed() {
+    let dir = lore_base::test_util::TempDir::new("ms_rewrite_claim_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            MutableStoreSettings::default(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    assert!(!lock.is_held());
+    let epoch = dir.to_path_buf().join("mutable").join("epoch");
+    let before = std::fs::read(&epoch).ok();
+
+    let claim = store
+        .hold_to_rewrite()
+        .await
+        .expect("claims")
+        .expect("a disk-backed store claims something");
+    assert_ne!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "the rewrite is announced before it happens"
+    );
+    drop(claim);
+    assert!(!lock.is_held(), "and nothing is left for a flush to clear");
+}
+
+/// **A bucket flagged again after a sweep began schedules the next sweep.** The running
+/// sweep may already have written that bucket, so leaving it to that sweep would leave
+/// it flagged, keeping the store claimed with nothing coming to write it.
+#[tokio::test]
+async fn a_bucket_flagged_while_a_sweep_runs_schedules_the_next() {
+    use lore_storage::mutable_store::MutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("ms_sweep_schedule_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            MutableStoreSettings {
+                flush_delay_seconds: 60 * 60,
+                ..Default::default()
+            },
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let key = Hash::from([0x5au8; 32]);
+    store
+        .clone()
+        .store(
+            Partition::default(),
+            key,
+            Hash::from([0xa5u8; 32]),
+            KeyType::BranchMetadata,
+        )
+        .await
+        .unwrap();
+    let (group_index, bucket_index) = populated_bucket(&store).await;
+    let group = store.group[group_index].clone();
+    assert!(
+        group.scheduled.load(atomic::Ordering::Relaxed),
+        "the write scheduled a sweep"
+    );
+
+    // That sweep has woken and written the bucket, and is still running.
+    group.scheduled.store(false, atomic::Ordering::Relaxed);
+    group.dirty[bucket_index].store(false, atomic::Ordering::Relaxed);
+    let running = group.flush.lock().await.len();
+
+    store
+        .clone()
+        .store(
+            Partition::default(),
+            key,
+            Hash::from([0xb6u8; 32]),
+            KeyType::BranchMetadata,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        group.flush.lock().await.len(),
+        running + 1,
+        "a write during a running sweep schedules another"
+    );
+}
+
+/// **An untyped listing takes no claim.** It lists nothing, so it has nothing to hold
+/// the store for, and must not wait for another process using it.
+#[tokio::test]
+async fn an_untyped_listing_takes_no_claim() {
+    use lore_storage::mutable_store::MutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("ms_list_untyped_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            MutableStoreSettings::default(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    // Another process's claim: a second description of the lock file excludes this
+    // process's own.
+    let elsewhere = lore_base::fs::lock::FSLock::acquire_exact_path(
+        &dir.to_path_buf().join("mutable").join("lock"),
+    )
+    .await
+    .expect("takes the store's lock");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.clone().list(Partition::default(), KeyType::Untyped),
+    )
+    .await
+    .expect("an untyped listing does not wait for the store")
+    .unwrap();
+    drop(elsewhere);
+}
+
+/// **A change that fails to reach disk keeps its flag and the store's claim**, whether
+/// the write was synced or not. The flag is cleared as the write begins, so a failure
+/// that left it clear would never write the change, and a flush scan would find the
+/// store clean and release its flock over state that is only in memory.
+#[tokio::test]
+async fn a_change_that_fails_to_reach_disk_keeps_its_flag_and_the_claim() {
+    use lore_storage::mutable_store::MutableStore;
+
+    for sync_data in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("ms_failed_change_");
+        let store = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.to_path_buf()),
+                client_settings(),
+                make_in_memory_immutable().await,
+            )
+            .await
+            .unwrap(),
+        );
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+        let key = Hash::from([0x5au8; 32]);
+        // Written once, so the group's level is committed and the write below takes the
+        // regular path to the bucket's own file.
+        store
+            .clone()
+            .store(
+                Partition::default(),
+                key,
+                Hash::from([0xa5u8; 32]),
+                KeyType::BranchMetadata,
+            )
+            .await
+            .unwrap();
+        store.clone().flush(true).await.unwrap();
+        assert!(!lock.is_held());
+
+        let (group_index, bucket_index) = populated_bucket(&store).await;
+        let root = store.path.clone().expect("a disk-backed store has a path");
+        let file = format_bucket_path(&root, group_index, bucket_index);
+        std::fs::remove_file(&file).expect("the bucket was written");
+        std::fs::create_dir_all(file.join("occupied"))
+            .expect("a directory where the bucket file goes");
+
+        // A change, made the way every change is: under a write claim.
+        drop(store.hold(Intent::Write).await.unwrap());
+        let group = store.group[group_index].clone();
+        group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+
+        assert!(
+            store.clone().flush(sync_data).await.is_err(),
+            "sync_data {sync_data}: the bucket cannot be written"
+        );
+        assert!(
+            group.dirty[bucket_index].load(atomic::Ordering::Relaxed),
+            "sync_data {sync_data}: the change keeps its flag, to be written again"
+        );
+        assert!(
+            lock.is_held(),
+            "sync_data {sync_data}: and the store stays claimed while it is not on disk"
+        );
+    }
+}
+
+/// **A write inside a span keeps the flock past the span until it is flushed**, for the
+/// reason the immutable store's test gives, and the flock of the immutable store beside it,
+/// which a command claims first: a process keeping only this store's would claim the immutable
+/// store after it at its next command, and deadlock against a process opening both. Released
+/// by an immediate flush and by a delayed one alike.
+#[tokio::test]
+async fn a_write_inside_a_span_keeps_both_flocks_past_the_span_until_flushed() {
+    use lore_storage::local::immutable_store::ImmutableStoreSettings;
+    use lore_storage::local::immutable_store::LocalImmutableStore;
+    use lore_storage::mutable_store::MutableStore;
+
+    for delayed in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("ms_span_write_");
+        let immutable = LocalImmutableStore::new(
+            Some(dir.path().join("immutable")),
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.to_path_buf()),
+                client_settings(),
+                immutable.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let locks = [&immutable.lock, &store.lock]
+            .map(|lock| lock.clone().expect("a disk-backed store has a lock"));
+
+        // In the order a command claims them, and drops them.
+        let span = (
+            immutable.clone().hold_for_command().await.unwrap(),
+            store.clone().hold_for_command().await.unwrap(),
+        );
+        store
+            .clone()
+            .store(
+                Partition::default(),
+                Hash::from([0x5au8; 32]),
+                Hash::from([0xa5u8; 32]),
+                KeyType::BranchMetadata,
+            )
+            .await
+            .unwrap();
+        drop(span);
+        assert_eq!(
+            locks.each_ref().map(|lock| lock.is_held()),
+            [true, true],
+            "delayed {delayed}: the bucket the write flagged keeps both flocks past the span"
+        );
+
+        if delayed {
+            run_delayed_flush(&store).await;
+        } else {
+            store.clone().flush(true).await.unwrap();
+        }
+        assert_eq!(
+            locks.each_ref().map(|lock| lock.is_held()),
+            [false, false],
+            "delayed {delayed}: and the flush that writes it releases both"
+        );
+    }
+}
+
+/// **A bucket write abandoned in flight keeps its group's writes in flight until it lands**, for
+/// the reason the immutable store's test gives.
+#[tokio::test]
+async fn a_bucket_write_abandoned_in_flight_holds_its_group_until_it_lands() {
+    use lore_storage::mutable_store::MutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("ms_abandoned_write_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            client_settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    store_keys(&store, Partition::default(), 1).await;
+
+    let in_flight = lore_storage::test_util::hold_store_write();
+    let flush = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { store.flush(false).await })
+    };
+    in_flight.issued.notified().await;
+    flush.abort();
+    assert!(flush.await.unwrap_err().is_cancelled());
+    assert!(
+        store
+            .group
+            .iter()
+            .any(|group| group.writes.try_write().is_err()),
+        "the abandoned write keeps its group's writes in flight"
+    );
+
+    in_flight.complete();
+    assert!(
+        store
+            .group
+            .iter()
+            .all(|group| group.writes.try_write().is_ok()),
+        "until it lands"
+    );
+}
+
+/// The group and bucket index of the first bucket in `store` holding an entry.
+async fn populated_bucket(store: &LocalMutableStore) -> (usize, usize) {
+    for (group_index, group) in store.group.iter().enumerate() {
+        for bucket_index in 0..group.bucket_count.load(atomic::Ordering::Relaxed) {
+            if !group.bucket(bucket_index).read().await.entry.is_empty() {
+                return (group_index, bucket_index);
+            }
+        }
+    }
+    panic!("a store populates a bucket");
+}
+
+/// **A flush settles a bucket it has nothing to write for**, so an emptied bucket
+/// above the committed level does not keep the store claimed.
+#[tokio::test]
+async fn a_flush_settles_an_emptied_bucket_it_has_nothing_to_write_for() {
+    use lore_storage::mutable_store::MutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("ms_empty_settle_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.to_path_buf()),
+            client_settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let _ = store.group[0].bucket(0);
+    store.group[0].dirty[0].store(true, atomic::Ordering::Relaxed);
+
+    store.clone().flush(true).await.unwrap();
+    assert!(
+        !store.group[0].dirty[0].load(atomic::Ordering::Relaxed),
+        "the flag was settled"
+    );
+    assert!(!lock.is_held(), "so nothing keeps the store claimed");
+}
+
+/// **A reload takes the levels a fresh survey read and drops every flag**, for the
+/// reason the immutable store's test gives.
+#[tokio::test]
+async fn invalidating_a_group_takes_the_surveyed_levels_and_clears_its_flags() {
+    let store = LocalMutableStore::new(
+        None::<std::path::PathBuf>,
+        MutableStoreSettings::default(),
+        make_in_memory_immutable().await,
+    )
+    .await
+    .unwrap();
+    let group = store.group[0].clone();
+    let _ = group.bucket(3);
+    group.dirty[3].store(true, atomic::Ordering::Relaxed);
+
+    group.invalidate(64, 32, 7).await;
+
+    assert!(
+        !group.dirty[3].load(atomic::Ordering::Relaxed),
+        "no flag survives a reload"
+    );
+    assert_eq!(group.bucket_count.load(atomic::Ordering::Relaxed), 64);
+    assert_eq!(group.committed_level.load(atomic::Ordering::Relaxed), 32);
+    assert_eq!(group.serialize_version.load(atomic::Ordering::Relaxed), 7);
 }
 
 #[tokio::test]
@@ -1621,7 +2518,7 @@ async fn list_finds_typed_entries_at_each_fan_out_level() {
                 found_phase4,
                 expected,
                 "level {level} phase 4: expected {} Instance entries across multiple \
-                     buckets, got {found_phase4:?}",
+                 buckets, got {found_phase4:?}",
                 expected.len()
             );
         }

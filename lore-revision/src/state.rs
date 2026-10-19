@@ -7437,11 +7437,14 @@ impl RecordedModifiedTimes {
             if items.is_empty() {
                 continue;
             }
+            // Each task holds the context, and with it the command's claims on the store, so
+            // that none outlives them when this is dropped part way and its tasks run on to
+            // their next await.
             lore_spawn!(tasks, {
                 let store = store.clone();
-                let partition = repository.root_id();
+                let repository = repository.clone();
                 async move {
-                    file_modified_time_store_group(store, partition, items).await;
+                    file_modified_time_store_group(store, repository.root_id(), items).await;
                 }
             });
         }

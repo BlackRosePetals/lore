@@ -45,6 +45,15 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   payload, such as store-managed obliteration flags, two compressors, or a fragment list that is not a whole number of
   references, and stores a flag bit it does not know. A put without its payload to an obliterated association is refused
   as `PayloadNotFound`; one with its payload replaces the obliteration
+- `lore-storage`: `ImmutableStoreSettings` and `MutableStoreSettings` gain `reuse_state_across_holds`, so a struct
+  literal names it, and `StoreLock::new` takes it. A store with it unset, the default, reloads at the first use after
+  its lock was released. `MutableStore` gains `try_join_claim`, as `ImmutableStore` has. `LocalImmutableStore` and
+  `LocalMutableStore` gain `new_claimed`, and their modules `create_claimed`, which return the store with the claim it
+  was opened under. `lore-revision`: `create_client_immutable_store`, `create_immutable_store_at_path`,
+  `create_client_mutable_store` and `create_mutable_store_at_path` return the store with that claim, `None` for a store
+  from the cache, for the caller to keep until its own claim on the store has joined it; `claim_opened_stores` opens the
+  mutable store beside an opened immutable store and claims both that way. `SharedStoreRegistryEntry::create_stores` is
+  removed, and `create_null_repository_context` claims the stores for the context's lifetime
 
 ### Features
 
@@ -111,6 +120,14 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   and scheduler whose action cache and content-addressable storage are Lore partitions, executors that move content
   between their input roots and a shared loreserver by path, and a script that builds, runs and stops them. A
   standalone workspace, built from within `contrib/bazel`
+- Opt in to keeping stores in memory between calls with the environment variable `LORE_STORE_RETAIN=1` (or `true`). A
+  process then keeps its stores after every repository call, and after `lore_storage_close`, for the keep-alive window,
+  `store_keep_alive_seconds` (10 seconds by default), without their locks, whether or not the call sets
+  `store_keep_alive`. A call in the window reuses them, and a store reloads only if its `epoch` file shows another
+  process changed it. A process with it set cannot safely share a store directory with a process of an earlier build,
+  which writes without advancing the epoch, so the retained state is served stale. Unset, the default, a store reloads
+  at its first use after its lock was released, and `store_keep_alive` keeps the stores locked for the window. Either
+  way a call loads each store at most once
 
 ### Fixes & Improvements
 
@@ -421,6 +438,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   directory it deletes. A delete that succeeded sent none, so a caller tracking the working tree through those events,
   such as an editor updating its asset registry, kept every deleted path. The progress totals counted the deletes all
   along
+- Fix a deadlock between processes using one repository: a storage handle or the store keep-alive held a store's lock
+  without the repository lock, while a repository command took the two in the opposite order. A store's lock is now held
+  only while the store is in use, and the repository lock is taken inside it. Store directories gain an `epoch` file,
+  which a process that retains stores compares (`LORE_STORE_RETAIN`). A store closes its packfiles when its lock is
+  released and reopens them at its next use
 
 ## v0.10.1 (Oct 5th 2026) [#1475]
 

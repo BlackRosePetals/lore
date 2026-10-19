@@ -8,11 +8,42 @@ use async_trait::async_trait;
 use crate::Hash;
 use crate::Partition;
 use crate::immutable_store::StoreError;
+use crate::local::store_lock::StoreGuard;
 use crate::store_types::KeyType;
 use crate::store_types::KeyValueStream;
 
 #[async_trait]
 pub trait MutableStore: Send + Sync {
+    /// Claims this store for the span it is about to be used — a storage handle from
+    /// open to close, one repository command, or work spawned to outlive the operation
+    /// that started it.
+    ///
+    /// The claim is what tells other processes this one is using the store, so it
+    /// belongs to the span rather than to each call within it. It is also the pair a
+    /// repository lock is contained within: store locks are the outer ones, because
+    /// they are the pair the storage API can also take, and two orders over one pair
+    /// would be a cycle.
+    ///
+    /// `None` means this store has nothing on disk to claim — a remote store, or an
+    /// in-memory one. There is no default answer: every store decides for itself, so a
+    /// wrapper around a store with files on disk delegates to it rather than answering
+    /// `None`, which would open a handle holding nothing that then reads and writes a
+    /// store no process has claimed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the lock cannot be taken, or if the reload a stale
+    /// acquisition demands fails.
+    async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError>;
+
+    /// Joins the claim this process holds on this store, without waiting: a counted guard when
+    /// the store's flock is held and this store is current, `None` otherwise and for a store
+    /// with nothing on disk to claim. A wrapper delegates it as it delegates
+    /// [`Self::hold_for_command`].
+    fn try_join_claim(&self) -> Option<StoreGuard> {
+        None
+    }
+
     /// Returns the mutable value stored for `key` with the type `key_type` within `partition`.
     ///
     /// Returns `StoreError::AddressNotFound` if no value of the given type is stored for the given key.

@@ -913,6 +913,7 @@ async fn store_fragment_dispatched(
     writes: &WriteContext,
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<StoreResult, StorageError> {
+    tracker.claim(&store).await;
     let guard = match try_acquire_in_flight(partition, address) {
         Ok(guard) => guard,
         Err(token) => {

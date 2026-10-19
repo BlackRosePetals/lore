@@ -10,6 +10,7 @@ mod get_resolved;
 mod handle;
 mod held;
 mod lent;
+mod lock_interleave;
 mod open;
 mod store;
 
@@ -283,6 +284,7 @@ async fn build_connection_store(identity: &str, connection_id: u64) -> Arc<Store
             None,
             lore::storage::store::BoundFlags::default(),
             false,
+            lore_storage::local::store_lock::StoreHold::default(),
         )
         .with_connection_id(connection_id),
     )

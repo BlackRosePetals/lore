@@ -81,6 +81,7 @@ pub(super) fn holding_handle(
         None,
         BoundFlags::default(),
         false,
+        lore_storage::local::store_lock::StoreHold::default(),
     );
     (handle::register(Arc::new(store)), holds)
 }

@@ -167,6 +167,7 @@ async fn a_batch_reuses_the_session_of_each_partition_it_returns_to() {
         ))),
         BoundFlags::default(),
         false,
+        lore_storage::local::store_lock::StoreHold::default(),
     );
     let (first, second) = (
         lore_base::types::Partition::from([0xa1u8; 16]),

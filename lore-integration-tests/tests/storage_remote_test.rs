@@ -147,6 +147,16 @@ mod storage_remote_tests {
 
     #[async_trait::async_trait]
     impl lore_storage::ImmutableStore for InterceptPutStore {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         fn is_local(&self) -> bool {
             self.inner.clone().is_local()
         }
@@ -7809,6 +7819,16 @@ mod storage_remote_tests {
 
     #[async_trait::async_trait]
     impl lore_storage::ImmutableStore for SlowDownOnce {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         // Answered from the wrapped store rather than the trait defaults: these describe how widely
         // the store behind this one reads and reports, and the `query` contract is written against
         // them. A decorator that let them default would misdescribe whatever it wraps.

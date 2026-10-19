@@ -21,11 +21,13 @@ async fn create_test_store(path: Option<PathBuf>) -> Arc<dyn ImmutableStore> {
     // These GC-mechanics tests put non-durable fragments and then expect
     // eviction/compaction to act on them, so they run with local-fragment
     // protection disabled (server behavior). Protection itself is covered by
-    // the `evict_bucket_*` unit tests.
+    // the `evict_bucket_*` unit tests. The passes act on what earlier claims
+    // loaded, so the store keeps its state across holds.
     LocalImmutableStore::new(
         path,
         ImmutableStoreSettings {
             protect_local_fragment: false,
+            reuse_state_across_holds: true,
             ..Default::default()
         },
     )
@@ -297,6 +299,15 @@ impl ImmutableStore for FailingCompactStore {
         address: lore_storage::Address,
     ) -> Result<lore_storage::StoreGetData, lore_storage::immutable_store::StoreError> {
         self.inner.clone().get(partition, address).await
+    }
+
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::immutable_store::StoreError,
+    > {
+        self.inner.clone().hold_for_command().await
     }
 
     async fn put(
@@ -709,6 +720,7 @@ fn test_group(dir: &TempDir) -> Arc<lore_storage::local::immutable_store::Immuta
     Arc::new(ImmutableStoreGroup {
         bucket: [const { OnceLock::new() }; BUCKET_COUNT],
         dirty: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
+        soft_dirty: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
         bucket_count: std::sync::atomic::AtomicUsize::new(
             lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
         ),
@@ -721,8 +733,10 @@ fn test_group(dir: &TempDir) -> Arc<lore_storage::local::immutable_store::Immuta
         ),
         pending_level: std::sync::atomic::AtomicUsize::new(0),
         flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        writes: Arc::default(),
         packstore: PackStore::new(Some(dir.to_path_buf()), 1, None),
         flush: tokio::sync::Mutex::new(JoinSet::new()),
+        scheduled: std::sync::atomic::AtomicBool::new(false),
         payload_gate: Default::default(),
     })
 }

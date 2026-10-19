@@ -325,6 +325,16 @@ impl CountingReadStore {
 
 #[async_trait::async_trait]
 impl ImmutableStore for CountingReadStore {
+    /// Joins the claim of the store this one wraps.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+    }
+
     async fn get(
         self: Arc<Self>,
         partition: Partition,
@@ -2582,6 +2592,63 @@ async fn a_ranged_stream_delivers_exactly_the_range() {
         delivered.extend_from_slice(chunk.as_ref());
     }
     assert_eq!(delivered, content[120..330]);
+}
+
+/// **A stream read keeps its store claimed past the span it ran in, until the stream ends.** The
+/// read returns once it has spawned the task that delivers the stream, so it claims the store
+/// before the spawn: the span's end then leaves the flock held rather than releasing it before
+/// the task first runs, which on a single-threaded runtime is after the span has ended.
+#[tokio::test]
+async fn a_stream_read_keeps_the_flock_past_its_span_until_the_stream_ends() {
+    let dir = TempDir::new("lore-storage-read-claim-");
+    let local = LocalImmutableStore::new(
+        Some(PathBuf::from(dir.as_ref())),
+        ImmutableStoreSettings::default(),
+    )
+    .await
+    .expect("create test store");
+    let lock = local.lock.clone().expect("a disk-backed store has a lock");
+    let store: Arc<dyn ImmutableStore> = local;
+    let partition = Partition::from([0x3a; 16]);
+    let context = Context::from([0x3a; 16]);
+    let (root, content) = tree::build(&store, partition, context, true).await;
+    store.clone().flush(true).await.expect("flush");
+    assert!(!lock.is_held(), "nothing holds the flock before the read");
+
+    let span = store.clone().hold_for_command().await.expect("span");
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<Bytes, StorageError>>(1);
+    read_stream(
+        store,
+        partition,
+        Address {
+            hash: root.hash,
+            context,
+        },
+        None,
+        no_remote(),
+        sender,
+        None,
+    )
+    .await
+    .expect("stream");
+    drop(span);
+    assert!(
+        lock.is_held(),
+        "the task delivering the stream keeps the flock past the span"
+    );
+
+    let mut delivered = Vec::new();
+    while let Some(chunk) = receiver.recv().await {
+        delivered.extend_from_slice(chunk.expect("stream chunk").as_ref());
+    }
+    assert_eq!(delivered, content);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while lock.is_held() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the flock goes once the stream has ended");
 }
 
 /// The streaming path prunes the same way the buffered one does — it is a different sink

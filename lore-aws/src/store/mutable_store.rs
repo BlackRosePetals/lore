@@ -511,6 +511,16 @@ impl AwsMutableStore {
 
 #[async_trait]
 impl MutableStoreTrait for AwsMutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     #[lore_macro::lore_instrument]
     #[tracing::instrument(name= "AwsMutableStore::list" skip(self))]
     async fn list(

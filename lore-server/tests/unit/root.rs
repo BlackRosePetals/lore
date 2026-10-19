@@ -22,6 +22,16 @@ struct SlowDownImmutableStore;
 
 #[async_trait]
 impl ImmutableStore for SlowDownImmutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn query(
         self: Arc<Self>,
         _partition: Partition,

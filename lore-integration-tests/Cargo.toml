@@ -24,6 +24,13 @@ required-features = ["integration_tests"]
 name = "store_gc_trigger"
 path = "tests/store_gc_trigger_test.rs"
 
+# Its own target: whether a process retains its stores is read once per process, so each test
+# runs in a copy of this binary started with `LORE_STORE_RETAIN` set or removed. Needs no service
+# from compose.yaml, so it is not behind `integration_tests`.
+[[test]]
+name = "store_retention"
+path = "tests/store_retention_test.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -61,6 +68,7 @@ lore-server = { workspace = true }
 lore-storage = { workspace = true, features = ["test-util"] }
 lore-transport = { workspace = true, features = ["test-util"] }
 rcgen = { workspace = true }
+serde = { workspace = true }
 
 [features]
 integration_tests = ["lore-server/integration_tests"]
