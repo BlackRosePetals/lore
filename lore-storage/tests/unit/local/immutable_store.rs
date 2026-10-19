@@ -738,6 +738,54 @@ async fn a_store_opened_while_a_dropped_flush_commits_waits_for_the_commit() {
     );
 }
 
+/// A flush dropped before its group flush claims the last flag it writes leaves the flock to the
+/// flags, and the group flush releases it once it has written them and ended: the flush's claim is
+/// gone, nothing is left unflushed, and no other release follows.
+#[tokio::test]
+async fn a_group_flush_left_by_a_dropped_flush_releases_the_flock_once_it_ends() {
+    let dir = lore_base::test_util::TempDir::new("is_release_after_dropped_flush_");
+    let store = LocalImmutableStore::new(
+        Some(dir.path().to_path_buf()),
+        ImmutableStoreSettings {
+            fan_out_threshold: 4,
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        },
+    )
+    .await
+    .expect("store opens");
+    let (_, payloads) = payloads_in_one_group(12);
+    for payload in &payloads {
+        put_payload(
+            &store,
+            Partition::from([9u8; 16]),
+            Context::default(),
+            payload,
+            false,
+        )
+        .await;
+    }
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+    let serializing = pause_at(PausePoint::Serializing);
+    let flushing: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+    let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    serializing.reached.notified().await;
+    flush.abort();
+    assert!(flush.await.unwrap_err().is_cancelled());
+    assert!(
+        lock.is_held(),
+        "the flags the group flush has yet to claim keep the flock"
+    );
+
+    serializing.resume.notify_one();
+    wait_for(
+        async || !lock.is_held(),
+        "the group flush releases the flock once it ends",
+    )
+    .await;
+}
+
 /// Copy the tree at `source` to `destination`: a copy of a store directory with no write in
 /// flight is what a process killed then leaves on disk.
 fn copy_tree(source: &Path, destination: &Path) {
@@ -6715,6 +6763,50 @@ mod obliteration {
         wait_for(
             async || !lock.is_held(),
             "the flock goes once the tombstone write ends",
+        )
+        .await;
+    }
+
+    /// An obliterate dropped before its tombstone's bucket write claims the bucket's flag leaves the
+    /// flock to the flag, and the write releases it once it has written the bucket and ended.
+    #[tokio::test]
+    async fn a_bucket_write_left_by_a_dropped_obliterate_releases_the_flock_once_it_ends() {
+        let dir = lore_base::test_util::TempDir::new("is_release_after_dropped_obliterate_");
+        let (store, dyn_store) = store_over(dir.path()).await;
+        let partition = Partition::from([0x78u8; 16]);
+        let address = put(
+            &dyn_store,
+            partition,
+            &b"content to be obliterated".repeat(16),
+        )
+        .await;
+        dyn_store.clone().flush(false).await.expect("flush");
+        let group = &store.group[address.hash.data()[0] as usize];
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+        let flushing = group.flush_lock.clone().lock_owned().await;
+        let obliterating = dyn_store.clone();
+        let obliterate_task = lore_base::lore_spawn!(async move {
+            obliterate(&obliterating, partition, address).await;
+        });
+        wait_until(
+            || {
+                group
+                    .dirty
+                    .iter()
+                    .any(|flag| flag.load(atomic::Ordering::Relaxed))
+            },
+            &obliterate_task,
+        )
+        .await;
+        obliterate_task.abort();
+        assert!(obliterate_task.await.unwrap_err().is_cancelled());
+        assert!(lock.is_held(), "the tombstone's flag keeps the flock");
+
+        drop(flushing);
+        wait_for(
+            async || !lock.is_held(),
+            "the bucket write releases the flock once it ends",
         )
         .await;
     }

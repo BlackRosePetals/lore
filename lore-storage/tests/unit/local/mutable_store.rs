@@ -824,6 +824,69 @@ async fn a_store_opened_while_a_dropped_flush_commits_waits_for_the_commit() {
     );
 }
 
+/// A flush dropped before its group flush claims the last flag it writes leaves the flocks to the
+/// flags, this store's and the immutable store's, which the flags keep as well, and the group
+/// flush releases both once it has written them and ended, as in the immutable store's test of
+/// this name.
+#[tokio::test]
+async fn a_group_flush_left_by_a_dropped_flush_releases_the_flock_once_it_ends() {
+    use lore_storage::local::immutable_store::ImmutableStoreSettings;
+    use lore_storage::local::immutable_store::LocalImmutableStore;
+    use lore_storage::mutable_store::MutableStore;
+    use lore_storage::test_util::PausePoint;
+    let dir = lore_base::test_util::TempDir::new("ms_release_after_dropped_flush_");
+    let immutable = LocalImmutableStore::new(
+        Some(dir.path().join("immutable")),
+        ImmutableStoreSettings {
+            flush_delay_seconds: 3600,
+            ..ImmutableStoreSettings::default()
+        },
+    )
+    .await
+    .expect("immutable store opens");
+    let local = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            MutableStoreSettings {
+                fan_out_threshold: 2,
+                flush_delay_seconds: 3600,
+                ..client_settings()
+            },
+            immutable.clone(),
+        )
+        .await
+        .expect("store opens"),
+    );
+    let store: Arc<dyn MutableStore> = local.clone();
+    let locks = [&immutable.lock, &local.lock]
+        .map(|lock| lock.clone().expect("a disk-backed store has a lock"));
+    let span = (
+        immutable.clone().hold_for_command().await.unwrap(),
+        store.clone().hold_for_command().await.unwrap(),
+    );
+    store_spread_keys(&store, 0..6).await;
+    drop(span);
+
+    let serializing = lore_storage::test_util::pause_at(PausePoint::Serializing);
+    let flushing = store.clone();
+    let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    serializing.reached.notified().await;
+    flush.abort();
+    assert!(flush.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        locks.each_ref().map(|lock| lock.is_held()),
+        [true, true],
+        "the flags the group flush has yet to claim keep both flocks"
+    );
+
+    serializing.resume.notify_one();
+    wait_for(
+        async || locks.iter().all(|lock| !lock.is_held()),
+        "the group flush releases both flocks once it ends",
+    )
+    .await;
+}
+
 /// After a group's second fan-out commit fails once its `level.pending` is on disk and the group is
 /// flushed again, every entry reads back once the store reopens, and each bucket file of the group
 /// holds only the entries of its own bucket at the committed level. The commit fails at the rename

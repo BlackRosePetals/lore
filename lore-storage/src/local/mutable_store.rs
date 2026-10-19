@@ -1517,6 +1517,9 @@ impl LocalMutableStore {
     /// group's flush lock, so that no write it started lands after the lock is released, and a
     /// share of the group's writes, so that the store stays claimed while it runs: the flush's
     /// claim goes with the flush, and a group flush has no write in flight between its writes.
+    /// Once it ends, it releases this store's flock, then the immutable store's, which this store's
+    /// changes keep as well, each if nothing keeps it, as [`Self::note_flushed`] does, see
+    /// [`crate::local::fan_out::releasing_once_done`].
     async fn flush_all(
         self: Arc<Self>,
         path: Option<Arc<PathBuf>>,
@@ -1543,7 +1546,7 @@ impl LocalMutableStore {
 
             let group = group.clone();
             let path = path.clone();
-            lore_base::lore_spawn!(tasks, async move {
+            let work = async move {
                 let mut first_err: Option<LocalMutableStoreError> = None;
 
                 // One flusher per group at a time. Held for the whole group flush so
@@ -1819,7 +1822,14 @@ impl LocalMutableStore {
                     Some(err) => Err(err),
                     None => Ok(()),
                 }
-            });
+            };
+            lore_base::lore_spawn!(
+                tasks,
+                crate::local::fan_out::releasing_once_done(
+                    self.immutable_lock.clone(),
+                    crate::local::fan_out::releasing_once_done(self.lock.clone(), work)
+                )
+            );
         }
 
         let mut result = Ok(());

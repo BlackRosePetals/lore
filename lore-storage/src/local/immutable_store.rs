@@ -3467,7 +3467,8 @@ impl LocalImmutableStore {
     /// [`crate::local::fan_out::commit_if_initial_level`]. The write runs in a task of its own, so
     /// that one whose caller is dropped still runs to its end, holding the group's flush lock, so
     /// that none of it lands after the lock is released, and a share of the group's writes, so that
-    /// the store stays claimed while it runs: the caller's claim goes with the caller.
+    /// the store stays claimed while it runs: the caller's claim goes with the caller. Once it ends,
+    /// it releases the flock if nothing keeps it, see [`crate::local::fan_out::releasing_once_done`].
     async fn write_bucket_of(
         &self,
         group_index: usize,
@@ -3477,7 +3478,7 @@ impl LocalImmutableStore {
         let group = self.group[group_index].clone();
         let hash = *hash;
         let path = path.clone();
-        lore_base::lore_spawn!(async move {
+        let work = async move {
             let flush_guard =
                 crate::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
             let _in_flight = crate::local::fan_out::write_share(&group.writes);
@@ -3514,7 +3515,11 @@ impl LocalImmutableStore {
             )
             .await
             .forward::<StoreError>("writing the bucket of an obliterated entry")
-        })
+        };
+        lore_base::lore_spawn!(crate::local::fan_out::releasing_once_done(
+            self.lock.clone(),
+            work
+        ))
         .await
         .internal("writing the bucket of an obliterated entry")?
     }
@@ -4951,6 +4956,8 @@ impl LocalImmutableStore {
     /// group's flush lock, so that no write it started lands after the lock is released, and a
     /// share of the group's writes, so that the store stays claimed while it runs: the flush's
     /// claim goes with the flush, and a group flush has no write in flight between its writes.
+    /// Once it ends, it releases the flock if nothing keeps it, see
+    /// [`crate::local::fan_out::releasing_once_done`].
     async fn flush_all(
         self: Arc<Self>,
         path: Option<Arc<PathBuf>>,
@@ -4980,7 +4987,7 @@ impl LocalImmutableStore {
             }
 
             let path = path.clone();
-            lore_base::lore_spawn!(tasks, async move {
+            let work = async move {
                 // One flusher per group at a time, held for the whole group flush so an
                 // overlapping flush cannot observe a half-finished level transition and
                 // take the other commit path. See `ImmutableStoreGroup::flush_lock`.
@@ -4989,7 +4996,11 @@ impl LocalImmutableStore {
                 let _in_flight = crate::local::fan_out::write_share(&group.writes);
 
                 flush_locked_group(group, group_index, path, sync_data).await
-            });
+            };
+            lore_base::lore_spawn!(
+                tasks,
+                crate::local::fan_out::releasing_once_done(self.lock.clone(), work)
+            );
         }
 
         let mut result = Ok(());

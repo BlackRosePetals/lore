@@ -153,6 +153,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   files it wrote at that level then sat under the marker the commit recorded, where lookups missed their entries and
   the next fan-out listed a key once per copy. The writes now keep the store claimed until they end, and a store opened
   meanwhile waits for them
+- `lore-storage`: a flush or an obliterate of a local store dropped before its bucket writes had claimed every bucket
+  they write left the store's lock held once they had written them, until the next use or flush of the store in that
+  process, and another process waited for it meanwhile. Each such write now releases the lock as it ends if nothing
+  else keeps it
 - On a server with `[server.auth] resource_claim` set, a repository lookup by name or id answers any verified caller
   with the repository's id, name and metadata hash, so a client can learn the id it exchanges a token for. Without a
   grant on the partition the lookup answered not found, so `lore repository clone`, `lore link add`, `lore layer add`,

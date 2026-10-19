@@ -737,8 +737,47 @@ pub(crate) async fn lock_flush(
     guard
 }
 
+/// The body of a task that writes a group under its flush lock and a share of its writes, `F`,
+/// which drops both as it completes, after which this releases the flock of `lock` if nothing keeps
+/// it. Such a task runs to its end when the flush or obliterate that spawned it is dropped, and one
+/// dropped before the task claimed the last flag it writes leaves the flock to the flags: once the
+/// task has written them, nothing else releases it.
+///
+/// Polled through in place, so it is no larger than `F` and the lock. An `async fn` awaiting `F`
+/// would hold its arguments for its whole life beside `F`.
+#[pin_project::pin_project]
+pub(crate) struct ReleasingOnceDone<F> {
+    #[pin]
+    work: F,
+    lock: Option<Arc<StoreLock>>,
+}
+
+/// Runs `work`, then releases the flock of `lock` if nothing keeps it, see [`ReleasingOnceDone`].
+pub(crate) fn releasing_once_done<F: Future>(
+    lock: Option<Arc<StoreLock>>,
+    work: F,
+) -> ReleasingOnceDone<F> {
+    ReleasingOnceDone { work, lock }
+}
+
+impl<F: Future> Future for ReleasingOnceDone<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let this = self.project();
+        let done = std::task::ready!(this.work.poll(cx));
+        if let Some(lock) = this.lock.take() {
+            lock.release_if_clean();
+        }
+        std::task::Poll::Ready(done)
+    }
+}
+
 /// A share of `writes`, for a write in the group to hold as its completion until it has landed, or
-/// for a whole-group flush to hold while it runs.
+/// for a task that writes the group to hold while it runs.
 ///
 /// Taken under the group's flush lock, which no holder takes while writes are in flight, so no
 /// holder waits to write-lock `writes` meanwhile and the share is never refused. `None` if it were,
