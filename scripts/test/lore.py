@@ -2566,7 +2566,9 @@ class Lore:
         )
 
     def write_files(
-        self, files_and_contents: TypedDict[str | Path, bytes | str | Iterable[str]]
+        self,
+        files_and_contents: TypedDict[str | Path, bytes | str | Iterable[str]],
+        flush_writes: bool = False,
     ):
         for file_name, contents in files_and_contents.items():
             self.make_dirs(os.path.dirname(file_name))
@@ -2576,6 +2578,12 @@ class Lore:
                     output_file.write(contents)
                 else:
                     output_file.writelines(contents)
+                if flush_writes:
+                    # Closing leaves the bytes in the OS file cache, which hands them to the
+                    # filesystem later. Lore operations that use SWFS need to have the OS write
+                    # flushed before they see it.
+                    output_file.flush()
+                    os.fsync(output_file.fileno())
 
     def write_commit_push(
         self,

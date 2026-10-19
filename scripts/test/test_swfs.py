@@ -283,7 +283,9 @@ def test_swfs_sync_removes_file_with_no_other_changes(
         kept_contents
         | {removed_file: "to be removed", nested_removed_file: "nested to be removed"},
     )
-    _remove_commit_push(original_repo, "remove only", [removed_file, nested_removed_file])
+    _remove_commit_push(
+        original_repo, "remove only", [removed_file, nested_removed_file]
+    )
 
     swfs_repo = _swfs_clone(original_repo)
     assert not swfs_repo.file_exists(removed_file)
@@ -299,13 +301,6 @@ def test_swfs_sync_removes_file_with_no_other_changes(
     _repositories_match_files(original_repo, swfs_repo, kept_contents)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A forced sync does not yet clear SWFS's local writes to a file the sync changes: "
-        "the mount keeps showing the locally written contents."
-    ),
-)
 @pytest.mark.smoke
 @pytest.mark.skipif(
     "not config.getoption('--swfs')", reason="Test requires --swfs flag"
@@ -319,7 +314,10 @@ def test_swfs_sync_force_clears_local_writes(new_lore_repo, background_lore_serv
     original_repo.write_commit_push(
         "first",
         unchanged_contents
-        | {"changed.txt": "first changed", "nested/changed.txt": "first nested changed"},
+        | {
+            "changed.txt": "first changed",
+            "nested/changed.txt": "first nested changed",
+        },
     )
     changed_contents = {
         "changed.txt": "second changed",
@@ -339,7 +337,7 @@ def test_swfs_sync_force_clears_local_writes(new_lore_repo, background_lore_serv
         "unchanged.txt": "locally written unchanged, longer than the original",
         "nested/unchanged.txt": "local",
     }
-    swfs_repo.write_files(local_contents)
+    swfs_repo.write_files(local_contents, flush_writes=True)
     for file_name in local_contents:
         assert not original_repo.compare_file(
             swfs_repo, file_name, only_file_contents=True
@@ -372,7 +370,9 @@ def test_swfs_sync_force_removes_locally_written_file(
         kept_contents
         | {removed_file: "to be removed", nested_removed_file: "nested to be removed"},
     )
-    _remove_commit_push(original_repo, "remove only", [removed_file, nested_removed_file])
+    _remove_commit_push(
+        original_repo, "remove only", [removed_file, nested_removed_file]
+    )
 
     swfs_repo = _swfs_clone(original_repo)
     swfs_repo.sync("main@1", force=True)
