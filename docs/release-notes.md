@@ -137,6 +137,13 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- Opening a mutable store whose `version` file cannot be read fails rather than taking the store for one without a
+  version. Taken for one, the open stamped the store `Initial` under a write claim, and every later open stamped it
+  again and advanced the epoch, so every other process retaining the store reloaded it at each use. A store already
+  stamped that way recovers at its next command with a connection to the remote: the migration that `Initial` asks
+  for skips bucket files already in the current layout and writes a version later opens recognise. Until then, a
+  command without a connection fails with "Unable to upgrade local store to current client, need a connection to
+  server"
 - `lore-storage`: a flush of a local store no longer reports success while a bucket write it overlapped, which failed
   or was dropped part way, left entries unwritten
 - `lore-storage`: a flush or an obliterate of a local store dropped part way, as a command that stops waiting for it

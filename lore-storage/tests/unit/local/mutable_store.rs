@@ -300,6 +300,37 @@ async fn assert_bucket_file_holds(dir: &Path, group_index: usize, key: &Hash) {
     );
 }
 
+/// A `version` file that cannot be read fails the open and is left as it is.
+#[tokio::test]
+async fn an_unreadable_version_file_fails_the_open_and_is_kept() {
+    let dir = lore_base::test_util::TempDir::new("ms_version_unreadable_");
+    let mutable = dir.path().join("mutable");
+    std::fs::create_dir_all(mutable.join("index")).expect("index directory");
+    // Over the whole-file read limit, which fails the read and not a stamp's write.
+    let version = mutable.join("version");
+    let length = lore_io::WHOLE_FILE_LIMIT as u64 + 1;
+    std::fs::File::create(&version)
+        .and_then(|file| file.set_len(length))
+        .expect("version file");
+
+    let opened = LocalMutableStore::new(
+        Some(dir.path()),
+        client_settings(),
+        make_in_memory_immutable().await,
+    )
+    .await;
+
+    assert!(
+        opened.is_err(),
+        "the open fails rather than stamping the version"
+    );
+    assert_eq!(
+        std::fs::metadata(&version).expect("version file").len(),
+        length,
+        "the version file is left as it is"
+    );
+}
+
 /// A delayed flush that cannot write its group's level marker finishes and leaves the bucket
 /// dirty. The next store into the bucket starts another, which writes it once the marker can be
 /// written.

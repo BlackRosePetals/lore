@@ -1137,29 +1137,39 @@ impl LocalMutableStore {
 
             let index_existed = std::fs::exists(path.join("index")).unwrap_or_default();
 
-            // Check store version
             let version_path = path.join("version");
-            if let Ok(bytes) = lore_io::IoDriver::global()
+            match lore_io::IoDriver::global()
                 .read_file_bytes(&version_path)
                 .await
             {
-                let stored = bytes
-                    .as_ref()
-                    .get(..4)
-                    .map(|value| u32::from_ne_bytes(value.try_into().expect("4 bytes")))
-                    .unwrap_or_default();
-                match stored {
-                    x if x == MutableStoreVersion::LazyFanOut as u32 => {
-                        version = MutableStoreVersion::LazyFanOut;
-                    }
-                    x if x == MutableStoreVersion::TypedItems as u32 => {
-                        version = MutableStoreVersion::TypedItems;
-                    }
-                    _ => {
-                        lore_base::lore_debug!("Mutable store NOT at latest version: {version:?}");
+                Ok(bytes) => {
+                    let stored = bytes
+                        .as_ref()
+                        .first_chunk::<4>()
+                        .map(|value| u32::from_ne_bytes(*value))
+                        .unwrap_or_default();
+                    match stored {
+                        x if x == MutableStoreVersion::LazyFanOut as u32 => {
+                            version = MutableStoreVersion::LazyFanOut;
+                        }
+                        x if x == MutableStoreVersion::TypedItems as u32 => {
+                            version = MutableStoreVersion::TypedItems;
+                        }
+                        _ => {
+                            lore_base::lore_debug!(
+                                "Mutable store NOT at latest version: {version:?}"
+                            );
+                        }
                     }
                 }
-            };
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(LocalMutableStoreError::internal_with_context(
+                        err,
+                        "reading the mutable store's version",
+                    ));
+                }
+            }
 
             if version == MutableStoreVersion::Initial {
                 // A write claim, taken only on the branch that writes. It joins the flock
