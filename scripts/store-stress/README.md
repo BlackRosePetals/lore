@@ -43,7 +43,8 @@ a durability gap only such a failure would expose is reported, not tested for.
 ## Parts
 
 - `lore-storage/examples/store_stress/` is the harness, built against the store's `test-util`
-  feature:
+  feature. It builds only with lore-storage's `store-stress` feature, which `stress.py build`
+  enables, so `cargo test` never builds it:
   - `work <dir>` runs a randomized concurrent workload. With `--lists`, every sixteenth key is a
     fragment list over other keys, stored after its children; obliterating a live list obliterates
     them, and one already obliterated leaves them as they are. Every operation it starts and every

@@ -915,9 +915,9 @@ def shared_round(campaign, store, run_dir):
 def build(args):
     shim = Path(args.shim)
     subprocess.run(["cc", "-O2", "-shared", "-fPIC", "-o", str(shim), str(HERE / "crashpoint.c"), "-ldl"], check=True)
-    subprocess.run(["cargo", "build", "--release", "--example", "store_stress", "-p", "lore-storage"], cwd=REPO, check=True)
+    subprocess.run(["cargo", "build", "--release", "--example", "store_stress", "-p", "lore-storage", "--features", "store-stress"], cwd=REPO, check=True)
     env = dict(os.environ, CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS="false")
-    subprocess.run(["cargo", "build", "--release", "--example", "store_stress", "-p", "lore-storage",
+    subprocess.run(["cargo", "build", "--release", "--example", "store_stress", "-p", "lore-storage", "--features", "store-stress",
                     "--target-dir", str(REPO / "target" / "stress-production")], cwd=REPO, check=True, env=env)
 
 

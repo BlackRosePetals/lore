@@ -46,8 +46,17 @@ zerocopy = { workspace = true }
 default = []
 failure_generator = []
 oodle = []
+store-stress = []
 test-util = []
 trace_log = []
+
+# The stress harness, run by hand through `scripts/store-stress/stress.py`, which enables
+# `store-stress`. Naming the feature here keeps `cargo test` and builds of all targets from
+# building it at all: it builds on Unix only, and is not part of any test run.
+[[example]]
+name = "store_stress"
+path = "examples/store_stress/main.rs"
+required-features = ["store-stress"]
 
 [dev-dependencies]
 # The shared test temp-directory helper.
