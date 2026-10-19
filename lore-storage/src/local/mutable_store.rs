@@ -1493,7 +1493,9 @@ impl LocalMutableStore {
 
     /// Immediate flush of all dirty buckets. Parallel across groups, sequential within a group. A
     /// flush dropped part way leaves each group flush it started running to its end, holding the
-    /// group's flush lock, so that no write it started lands after the lock is released.
+    /// group's flush lock, so that no write it started lands after the lock is released, and a
+    /// share of the group's writes, so that the store stays claimed while it runs: the flush's
+    /// claim goes with the flush, and a group flush has no write in flight between its writes.
     async fn flush_all(
         self: Arc<Self>,
         path: Option<Arc<PathBuf>>,
@@ -1531,6 +1533,7 @@ impl LocalMutableStore {
                 // and take the other path. See `MutableStoreGroup::flush_lock`.
                 let _flush_guard =
                     crate::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
+                let _in_flight = crate::local::fan_out::write_share(&group.writes);
 
                 crate::local::fan_out::roll_pending_commit_forward(
                     &group.writes,

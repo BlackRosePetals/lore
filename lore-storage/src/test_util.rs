@@ -220,27 +220,70 @@ pub(crate) fn packfile_size_limit() -> Option<u64> {
     PACKFILE_SIZE_LIMIT.with(|size| Some(size.get()).filter(|limit| *limit != 0))
 }
 
-/// A write [`hold_packfile_write`] or [`hold_store_write`] keeps in flight: it never completes,
-/// and what it was issued with, a packfile write's buffer or another write's completion, is kept
-/// until [`InFlight::complete`], as a driver keeps it until the kernel is done with the write.
-/// `issued` is notified once the write is issued.
+/// A write [`hold_packfile_write`] or [`hold_store_write`] keeps in flight: it lands only at
+/// [`InFlight::complete`], and until then what it was issued with, a packfile write's buffer or
+/// another write's completion, is kept, as a driver keeps it until the kernel is done with the
+/// write. A task still awaiting the write then goes on with it, as it would once the driver answers;
+/// one dropped before it goes on leaves what was kept to be dropped once the write has landed, as
+/// the driver drops it. `issued` is notified once the write is issued.
 #[derive(Default)]
 pub struct InFlight {
     pub issued: Notify,
-    kept: parking_lot::Mutex<Option<Box<dyn std::any::Any + Send>>>,
+    landed: Notify,
+    parked: parking_lot::Mutex<Parked>,
+}
+
+/// What an [`InFlight`] write was issued with, and whether it has landed and is awaited, under one
+/// lock, so that whichever of its landing and the drop of the task awaiting it comes second drops
+/// what was kept.
+#[derive(Default)]
+struct Parked {
+    kept: Option<Box<dyn std::any::Any + Send>>,
+    landed: bool,
+    awaited: bool,
 }
 
 impl InFlight {
-    /// Drops what the write was issued with, as the driver does once the write completes.
+    /// Lands the write: a task awaiting it goes on with what it was issued with, and with none,
+    /// that is dropped as the driver drops it once the write completes.
     pub fn complete(&self) {
-        drop(self.kept.lock().take());
+        let mut parked = self.parked.lock();
+        parked.landed = true;
+        if parked.awaited {
+            self.landed.notify_one();
+        } else {
+            let kept = parked.kept.take();
+            drop(parked);
+            drop(kept);
+        }
     }
 
-    /// Keeps `kept` and parks the write for good.
-    async fn park<T>(&self, kept: Box<dyn std::any::Any + Send>) -> T {
-        *self.kept.lock() = Some(kept);
+    /// Keeps `kept` and parks the write until it lands, handing `kept` back if it is a `T`.
+    async fn park<T: 'static>(&self, kept: Box<dyn std::any::Any + Send>) -> Option<T> {
+        struct Awaiting<'a>(&'a parking_lot::Mutex<Parked>);
+        impl Drop for Awaiting<'_> {
+            fn drop(&mut self) {
+                let mut parked = self.0.lock();
+                parked.awaited = false;
+                let kept = if parked.landed {
+                    parked.kept.take()
+                } else {
+                    None
+                };
+                drop(parked);
+                drop(kept);
+            }
+        }
+        {
+            let mut parked = self.parked.lock();
+            parked.kept = Some(kept);
+            parked.awaited = true;
+        }
+        let _awaiting = Awaiting(&self.parked);
         self.issued.notify_one();
-        std::future::pending().await
+        self.landed.notified().await;
+        let kept = self.parked.lock().kept.take()?;
+        kept.downcast().ok().map(|kept| *kept)
     }
 }
 
@@ -264,7 +307,7 @@ fn hold_write(
     in_flight
 }
 
-/// Parks this packfile write for good, keeping a copy of `buffer` in the [`InFlight`] that
+/// Parks this packfile write until it lands, keeping a copy of `buffer` in the [`InFlight`] that
 /// [`hold_packfile_write`] armed on this thread, if any.
 pub(crate) async fn park_packfile_write<B: Clone + Send + 'static>(buffer: &B) {
     if let Some(in_flight) = PACKFILE_IN_FLIGHT.with(|held| held.borrow_mut().take()) {
@@ -272,11 +315,14 @@ pub(crate) async fn park_packfile_write<B: Clone + Send + 'static>(buffer: &B) {
     }
 }
 
-/// Parks this write for good, keeping `completion` in the [`InFlight`] that [`hold_store_write`]
-/// armed on this thread, if any, and otherwise hands it back.
+/// Parks this write until it lands, keeping `completion` in the [`InFlight`] that
+/// [`hold_store_write`] armed on this thread, if any, and hands it back.
 pub(crate) async fn park_store_write<C: Send + 'static>(completion: C) -> C {
     match STORE_WRITE_IN_FLIGHT.with(|held| held.borrow_mut().take()) {
-        Some(in_flight) => in_flight.park(Box::new(completion)).await,
+        Some(in_flight) => in_flight
+            .park(Box::new(completion))
+            .await
+            .expect("a landed write's completion is handed back"),
         None => completion,
     }
 }

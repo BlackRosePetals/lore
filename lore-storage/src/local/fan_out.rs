@@ -698,8 +698,9 @@ pub(crate) async fn await_bucket_write(
 
 /// The writes in flight in a store's group. Each bucket and level file write in the group holds a
 /// share as its completion, which lore-io drops once the write has landed, whether or not the
-/// flush that dispatched it still awaits it. [`lock_flush`] waits for them, and the store lock
-/// counts them as files in use, through the anchor this holds, see [`anchor_writes`].
+/// flush that dispatched it still awaits it, and a group flush or an obliterate's bucket write
+/// holds one for as long as it runs. [`lock_flush`] waits for them, and the store lock counts them as files in use,
+/// through the anchor this holds, see [`anchor_writes`].
 pub type GroupWrites = RwLock<Option<LockAnchor>>;
 
 /// Registers `writes` with `lock` as files in use, and keeps the anchor in it, so that a write in
@@ -733,7 +734,8 @@ pub(crate) async fn lock_flush(
     guard
 }
 
-/// A share of `writes`, for a write in the group to hold as its completion until it has landed.
+/// A share of `writes`, for a write in the group to hold as its completion until it has landed, or
+/// for a whole-group flush to hold while it runs.
 ///
 /// Taken under the group's flush lock, which no holder takes while writes are in flight, so no
 /// holder waits to write-lock `writes` meanwhile and the share is never refused. `None` if it were,

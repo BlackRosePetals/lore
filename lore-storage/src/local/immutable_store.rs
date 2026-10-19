@@ -3457,9 +3457,10 @@ impl LocalImmutableStore {
     /// fan-out is not committed, a bucket is only written with the commit, so the group is flushed.
     /// A group below [`crate::local::fan_out::FAN_OUT_LEVEL_MAX`] with no level marker yet is given
     /// one, and the write fails if it cannot be, see
-    /// [`crate::local::fan_out::commit_if_initial_level`]. The write runs in a task of its own
-    /// holding the group's flush lock, so that one whose caller is dropped still runs to its end,
-    /// and none of it lands after the lock is released.
+    /// [`crate::local::fan_out::commit_if_initial_level`]. The write runs in a task of its own, so
+    /// that one whose caller is dropped still runs to its end, holding the group's flush lock, so
+    /// that none of it lands after the lock is released, and a share of the group's writes, so that
+    /// the store stays claimed while it runs: the caller's claim goes with the caller.
     async fn write_bucket_of(
         &self,
         group_index: usize,
@@ -3472,6 +3473,7 @@ impl LocalImmutableStore {
         lore_base::lore_spawn!(async move {
             let flush_guard =
                 crate::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
+            let _in_flight = crate::local::fan_out::write_share(&group.writes);
             let bucket_index = crate::local::fan_out::bucket_index_for(
                 &hash,
                 group.bucket_count.load(atomic::Ordering::Relaxed),
@@ -4939,7 +4941,9 @@ impl LocalImmutableStore {
 
     /// Immediate flush of all dirty buckets. Parallel across groups, sequential within a group. A
     /// flush dropped part way leaves each group flush it started running to its end, holding the
-    /// group's flush lock, so that no write it started lands after the lock is released.
+    /// group's flush lock, so that no write it started lands after the lock is released, and a
+    /// share of the group's writes, so that the store stays claimed while it runs: the flush's
+    /// claim goes with the flush, and a group flush has no write in flight between its writes.
     async fn flush_all(
         self: Arc<Self>,
         path: Option<Arc<PathBuf>>,
@@ -4976,6 +4980,7 @@ impl LocalImmutableStore {
                 // take the other commit path. See `ImmutableStoreGroup::flush_lock`.
                 let _flush_guard =
                     crate::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
+                let _in_flight = crate::local::fan_out::write_share(&group.writes);
 
                 flush_locked_group(group, group_index, path, sync_data).await
             });

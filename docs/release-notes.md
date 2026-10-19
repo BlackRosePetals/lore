@@ -137,6 +137,13 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore-storage`: a flush or an obliterate of a local store dropped part way, as a command that stops waiting for it
+  drops it, left the bucket writes it had started running with nothing keeping the store claimed, so another process,
+  or a store opened on the directory in the same process, could write the same bucket files meanwhile. Once a fan-out
+  commit had claimed every bucket it writes, such a store read the group at the level the commit was replacing; bucket
+  files it wrote at that level then sat under the marker the commit recorded, where lookups missed their entries and
+  the next fan-out listed a key once per copy. The writes now keep the store claimed until they end, and a store opened
+  meanwhile waits for them
 - On a server with `[server.auth] resource_claim` set, a repository lookup by name or id answers any verified caller
   with the repository's id, name and metadata hash, so a client can learn the id it exchanges a token for. Without a
   grant on the partition the lookup answered not found, so `lore repository clone`, `lore link add`, `lore layer add`,

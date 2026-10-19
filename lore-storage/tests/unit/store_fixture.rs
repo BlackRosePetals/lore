@@ -137,6 +137,17 @@ pub(crate) async fn wait_until<T>(condition: impl Fn() -> bool, task: &tokio::ta
     panic!("the condition never held");
 }
 
+/// Wait until `condition` holds, failing with `failure` after 10 s.
+pub(crate) async fn wait_for(condition: impl AsyncFn() -> bool, failure: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !condition().await {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect(failure);
+}
+
 /// Assert that each of `payloads`, an address and the bytes stored under it, reads back from
 /// `store`.
 pub(crate) async fn assert_payloads_read_back(

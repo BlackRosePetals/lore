@@ -45,6 +45,7 @@ use crate::store_fixture::payloads_of_size_in_one_group;
 use crate::store_fixture::put_payload;
 use crate::store_fixture::try_compact_group_toward;
 use crate::store_fixture::try_put_payload;
+use crate::store_fixture::wait_for;
 use crate::store_fixture::wait_until;
 
 fn write_bucket_file(path: &Path, version: u32) {
@@ -556,6 +557,77 @@ async fn a_flush_dropped_while_its_commit_writes_level_pending_runs_the_commit_t
         .await
         .expect("store reopens");
     assert_payloads_read_back(&store, partition, stored).await;
+}
+
+/// A flush dropped part way through a fan-out commit leaves the commit running, and until it has
+/// run to its end the store stays claimed and a store opened on the directory waits for it. Read
+/// before the commit ends, the group is at the level the commit replaces, and what a store writes
+/// at that level then sits under the marker the commit records, where no lookup finds it and the
+/// next fan-out gathers it beside the key's current entry. The commit here is the group's first,
+/// dropped as it takes the contents of its last `.new` file: every bucket's flag is claimed and no
+/// write is in flight, so nothing but the commit itself keeps the store.
+#[tokio::test]
+async fn a_store_opened_while_a_dropped_flush_commits_waits_for_the_commit() {
+    let dir = lore_base::test_util::TempDir::new("is_open_during_commit_");
+    let settings = || ImmutableStoreSettings {
+        fan_out_threshold: 4,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    let partition = Partition::from([9u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(12);
+    let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), settings())
+        .await
+        .expect("store opens");
+    let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+    for payload in &payloads {
+        put_payload(&store, partition, Context::default(), payload, false).await;
+    }
+    let level = lore_storage::local::fan_out::level_for(1, payloads.len(), 4);
+    let written: std::collections::HashSet<usize> = payloads
+        .iter()
+        .map(|payload| {
+            lore_storage::local::fan_out::bucket_index_for(&hash::hash_slice(payload), level)
+        })
+        .collect();
+
+    let mut serializing = pause_at(PausePoint::Serializing);
+    let flushing = dyn_store.clone();
+    let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    for _ in 1..written.len() {
+        serializing.reached.notified().await;
+        let next = pause_at(PausePoint::Serializing);
+        serializing.resume.notify_one();
+        serializing = next;
+    }
+    serializing.reached.notified().await;
+    flush.abort();
+    assert!(flush.await.is_err(), "the flush was dropped");
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    assert!(
+        lock.is_held(),
+        "the commit a dropped flush left running keeps the store claimed"
+    );
+
+    let mut opening = {
+        let dir = dir.path().to_path_buf();
+        lore_base::lore_spawn!(async move { LocalImmutableStore::new(Some(dir), settings()).await })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut opening)
+            .await
+            .is_err(),
+        "a store opened on the directory while the commit ran"
+    );
+    serializing.resume.notify_one();
+    let opened = opening.await.expect("open task").expect("store opens");
+    assert_eq!(
+        opened.group[group_index]
+            .bucket_count
+            .load(atomic::Ordering::Relaxed),
+        level,
+        "the store opened during the commit read the group at the level the commit replaced"
+    );
 }
 
 /// Copy the tree at `source` to `destination`: a copy of a store directory with no write in
@@ -4666,17 +4738,6 @@ async fn flock_free(dir: &Path) -> bool {
         .is_some()
 }
 
-/// Waits until `released` reports the flock gone, failing after ten seconds.
-async fn until_released(released: impl AsyncFn() -> bool) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !released().await {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .expect("the flock goes once the write lands");
-}
-
 /// Puts a payload in a task of its own, held in flight at its packfile write, and drops the put
 /// there, leaving the write to the driver as a dropped put does.
 async fn abandon_a_packfile_write(
@@ -4729,7 +4790,47 @@ async fn an_abandoned_packfile_write_keeps_the_flock_past_its_store_until_it_lan
     );
 
     in_flight.complete();
-    until_released(async || flock_free(dir.path()).await).await;
+    wait_for(
+        async || flock_free(dir.path()).await,
+        "the flock goes once the write lands",
+    )
+    .await;
+}
+
+/// **A packfile write that lands between its put's abort and the put's drop lets the flock go once
+/// the put is dropped.** An abort drops the put's future only at the task's next poll, so the write
+/// lands while the put still awaits it, and what the write was issued with goes with the put.
+#[tokio::test]
+async fn a_packfile_write_landing_before_its_aborted_put_is_dropped_lets_the_flock_go() {
+    let dir = lore_base::test_util::TempDir::new("is_landed_before_drop_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let in_flight = lore_storage::test_util::hold_packfile_write();
+    let put = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move {
+            put_payload(
+                &store,
+                Partition::default(),
+                Context::default(),
+                &[0x6cu8; 64],
+                false,
+            )
+            .await
+        })
+    };
+    in_flight.issued.notified().await;
+    put.abort();
+    in_flight.complete();
+    assert!(put.await.unwrap_err().is_cancelled());
+    drop(store);
+
+    wait_for(
+        async || flock_free(dir.path()).await,
+        "the flock goes once the aborted put is dropped",
+    )
+    .await;
 }
 
 /// **A use that ends with a packfile write in flight keeps the flock until the write lands.**
@@ -4751,7 +4852,11 @@ async fn a_use_ending_with_a_packfile_write_in_flight_keeps_the_flock_until_it_l
     );
 
     in_flight.complete();
-    until_released(async || !lock.is_held()).await;
+    wait_for(
+        async || !lock.is_held(),
+        "the flock goes once the write lands",
+    )
+    .await;
 }
 
 /// **A store joins only a claim this process already holds, and without waiting.** Outside a
@@ -4787,14 +4892,14 @@ async fn a_store_joins_only_a_claim_it_already_holds() {
     assert!(!lock.is_held());
 }
 
-/// **A bucket write abandoned in flight keeps its group's writes in flight until it lands.** The
-/// driver finishes the write after the flush that dispatched it is dropped, so the group's next
-/// flush, and the release of the flock, wait for the write rather than for that flush.
+/// **A group flush left running by a dropped flush holds its group's writes until it ends**, which
+/// it does once the bucket write it awaits has landed. The group's next flush, and the release of
+/// the flock, wait for the group flush rather than for the flush that started it.
 #[tokio::test]
-async fn a_bucket_write_abandoned_in_flight_holds_its_group_until_it_lands() {
+async fn a_group_flush_left_by_a_dropped_flush_holds_its_group_until_it_ends() {
     use lore_storage::immutable_store::ImmutableStore;
 
-    let dir = lore_base::test_util::TempDir::new("is_abandoned_write_");
+    let dir = lore_base::test_util::TempDir::new("is_dropped_flush_group_");
     let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
         .await
         .unwrap();
@@ -4820,17 +4925,20 @@ async fn a_bucket_write_abandoned_in_flight_holds_its_group_until_it_lands() {
             .group
             .iter()
             .any(|group| group.writes.try_write().is_err()),
-        "the abandoned write keeps its group's writes in flight"
+        "the group flush keeps its group's writes in flight"
     );
 
     in_flight.complete();
-    assert!(
-        store
-            .group
-            .iter()
-            .all(|group| group.writes.try_write().is_ok()),
-        "until it lands"
-    );
+    wait_for(
+        async || {
+            store
+                .group
+                .iter()
+                .all(|group| group.writes.try_write().is_ok())
+        },
+        "the group's writes go once the group flush ends",
+    )
+    .await;
 }
 
 /// **A write in flight keeps the flock past the last guard, and the release follows it**, so that
@@ -6462,6 +6570,45 @@ mod obliteration {
             ),
             Err(err) => panic!("the obliterated address reads as {err}"),
         }
+    }
+
+    /// An obliterate dropped while it writes the tombstone leaves the write running, and the store
+    /// stays claimed until the write ends. The obliterate's claim goes with it, and the write has
+    /// claimed the bucket's flag and has no file write in flight yet, so nothing but the write
+    /// itself keeps the store.
+    #[tokio::test]
+    async fn a_dropped_obliterate_keeps_the_store_claimed_while_its_tombstone_is_written() {
+        let dir = lore_base::test_util::TempDir::new("is_obliterate_dropped_");
+        let (store, dyn_store) = store_over(dir.path()).await;
+        let partition = Partition::from([0x77u8; 16]);
+        let address = put(
+            &dyn_store,
+            partition,
+            &b"content to be obliterated".repeat(16),
+        )
+        .await;
+        dyn_store.clone().flush(false).await.expect("flush");
+
+        let pause = pause_at(PausePoint::Serializing);
+        let obliterating = dyn_store.clone();
+        let obliterate_task = lore_base::lore_spawn!(async move {
+            obliterate(&obliterating, partition, address).await;
+        });
+        pause.reached.notified().await;
+        obliterate_task.abort();
+        assert!(obliterate_task.await.unwrap_err().is_cancelled());
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+        assert!(
+            lock.is_held(),
+            "the tombstone write a dropped obliterate left running keeps the store claimed"
+        );
+
+        pause.resume.notify_one();
+        wait_for(
+            async || !lock.is_held(),
+            "the flock goes once the tombstone write ends",
+        )
+        .await;
     }
 
     /// A read that located a payload before an obliterate tombstoned its entry loads it whole: the

@@ -15,6 +15,8 @@ use lore_storage::store_types::KeyType;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
+use crate::store_fixture::wait_for;
+
 fn write_bucket_file(path: &Path, version: u32) {
     let entry = MutableStoreEntry::default();
     let mut header = MutableStoreHeader::new_zeroed();
@@ -649,6 +651,75 @@ async fn a_flush_dropped_while_its_commit_writes_level_pending_runs_the_commit_t
             "value in bucket {bucket} after reopening"
         );
     }
+}
+
+/// A flush dropped part way through a fan-out commit leaves the commit running, and until it has
+/// run to its end the store stays claimed and a store opened on the directory waits for it. Read
+/// before the commit ends, the group is at the level the commit replaces, and what a store writes
+/// at that level then sits under the marker the commit records, where no lookup finds it and the
+/// next fan-out gathers it beside the key's current entry. The commit here is the group's first,
+/// dropped as it takes the contents of its last `.new` file: every bucket's flag is claimed and no
+/// write is in flight, so nothing but the commit itself keeps the store.
+#[tokio::test]
+async fn a_store_opened_while_a_dropped_flush_commits_waits_for_the_commit() {
+    use lore_storage::mutable_store::MutableStore;
+    use lore_storage::test_util::PausePoint;
+    let dir = lore_base::test_util::TempDir::new("ms_open_during_commit_");
+    let settings = || MutableStoreSettings {
+        fan_out_threshold: 2,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    let local = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            settings(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store opens"),
+    );
+    let store: Arc<dyn MutableStore> = local.clone();
+    store_spread_keys(&store, 0..6).await;
+    let level = lore_storage::local::fan_out::level_for(1, 6, 2);
+
+    let mut serializing = lore_storage::test_util::pause_at(PausePoint::Serializing);
+    let flushing = store.clone();
+    let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    for _ in 1..6 {
+        serializing.reached.notified().await;
+        let next = lore_storage::test_util::pause_at(PausePoint::Serializing);
+        serializing.resume.notify_one();
+        serializing = next;
+    }
+    serializing.reached.notified().await;
+    flush.abort();
+    assert!(flush.await.is_err(), "the flush was dropped");
+    let lock = local.lock.clone().expect("a disk-backed store has a lock");
+    assert!(
+        lock.is_held(),
+        "the commit a dropped flush left running keeps the store claimed"
+    );
+
+    let mut opening = {
+        let dir = dir.path().to_path_buf();
+        lore_base::lore_spawn!(async move {
+            LocalMutableStore::new(Some(dir), settings(), make_in_memory_immutable().await).await
+        })
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut opening)
+            .await
+            .is_err(),
+        "a store opened on the directory while the commit ran"
+    );
+    serializing.resume.notify_one();
+    let opened = opening.await.expect("open task").expect("store opens");
+    assert_eq!(
+        opened.group[7].bucket_count.load(atomic::Ordering::Relaxed),
+        level,
+        "the store opened during the commit read the group at the level the commit replaced"
+    );
 }
 
 /// After a group's second fan-out commit fails once its `level.pending` is on disk and the group is
@@ -2149,13 +2220,13 @@ async fn a_write_inside_a_span_keeps_both_flocks_past_the_span_until_flushed() {
     }
 }
 
-/// **A bucket write abandoned in flight keeps its group's writes in flight until it lands**, for
-/// the reason the immutable store's test gives.
+/// **A group flush left running by a dropped flush holds its group's writes until it ends**, for
+/// the reason the immutable store's test of this name gives.
 #[tokio::test]
-async fn a_bucket_write_abandoned_in_flight_holds_its_group_until_it_lands() {
+async fn a_group_flush_left_by_a_dropped_flush_holds_its_group_until_it_ends() {
     use lore_storage::mutable_store::MutableStore;
 
-    let dir = lore_base::test_util::TempDir::new("ms_abandoned_write_");
+    let dir = lore_base::test_util::TempDir::new("ms_dropped_flush_group_");
     let store = Arc::new(
         LocalMutableStore::new(
             Some(dir.to_path_buf()),
@@ -2180,17 +2251,20 @@ async fn a_bucket_write_abandoned_in_flight_holds_its_group_until_it_lands() {
             .group
             .iter()
             .any(|group| group.writes.try_write().is_err()),
-        "the abandoned write keeps its group's writes in flight"
+        "the group flush keeps its group's writes in flight"
     );
 
     in_flight.complete();
-    assert!(
-        store
-            .group
-            .iter()
-            .all(|group| group.writes.try_write().is_ok()),
-        "until it lands"
-    );
+    wait_for(
+        async || {
+            store
+                .group
+                .iter()
+                .all(|group| group.writes.try_write().is_ok())
+        },
+        "the group's writes go once the group flush ends",
+    )
+    .await;
 }
 
 /// The group and bucket index of the first bucket in `store` holding an entry.
