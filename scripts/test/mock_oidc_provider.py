@@ -12,6 +12,10 @@ authorizes partitions with. It reads the partition from the `resource` or
 `scope` the request carries, under the template the test sets, and answers
 with a token whose `resources` claim grants what `grants` holds for that
 partition, or with `invalid_target` for a partition `grants` does not name.
+An exchange whose subject is an API key, under `API_KEY_TOKEN_TYPE` or its
+short name `api-key` as UCS Auth accepts, logs in the user `api_keys` binds
+the key to, answering as the device grant does, or answers `invalid_grant`
+for a key `api_keys` does not name.
 
 The token endpoint answers from a script the test sets: a list of RFC 8628
 §3.5 error codes answered in order, then the token. An empty script hands out
@@ -40,6 +44,7 @@ logger = logging.getLogger(__name__)
 DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
+API_KEY_TOKEN_TYPE = "urn:lore:params:oauth:token-type:api-key"
 DEFAULT_TOKEN_LIFETIME_SECONDS = 3600
 
 
@@ -59,6 +64,7 @@ class OidcUser:
 
 
 USER = OidcUser("oidc-user-1", "OIDC User One", "oidcuser1")
+KEY_USER = OidcUser("oidc-key-user", "OIDC Key User", "oidckeyuser")
 PAIRWISE_USER = OidcUser(
     "pairwise-sub-1", "Pairwise User", "pairwiseuser", identity="stable-oid-1"
 )
@@ -170,6 +176,8 @@ class MockOidcProvider:
         self.exchange_carrier = "resource"
         # Partition id to the actions an exchange for it grants.
         self.grants: dict[str, list[str]] = {}
+        # API key to the user an exchange of it logs in.
+        self.api_keys: dict[str, OidcUser] = {}
         self._minted: set[str] = set()
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
@@ -198,6 +206,7 @@ class MockOidcProvider:
             self._poll_script.clear()
             self.requests.clear()
             self.grants.clear()
+            self.api_keys.clear()
 
     def reset_requests(self) -> None:
         with self._lock:
@@ -279,6 +288,8 @@ class MockOidcProvider:
         the partition is read from the configured carrier."""
         if form.get("client_id") != self.client_id:
             return 400, {"error": "invalid_client"}
+        if form.get("subject_token_type") in (API_KEY_TOKEN_TYPE, "api-key"):
+            return self.api_key_exchange(form)
         with self._lock:
             minted = form.get("subject_token") in self._minted
         if not minted or form.get("subject_token_type") != ACCESS_TOKEN_TYPE:
@@ -293,6 +304,22 @@ class MockOidcProvider:
         ]
         return 200, {
             "access_token": self.mint_token(self.user, resources=resources),
+            "issued_token_type": ACCESS_TOKEN_TYPE,
+            "token_type": "Bearer",
+            "expires_in": DEFAULT_TOKEN_LIFETIME_SECONDS,
+        }
+
+    def api_key_exchange(self, form: dict[str, str]) -> tuple[int, dict]:
+        """A foreign credential exchange: the key alone names the user, and
+        the answer is the device grant's."""
+        if "resource" in form or "audience" in form:
+            return 400, {"error": "invalid_target"}
+        with self._lock:
+            user = self.api_keys.get(form.get("subject_token", ""))
+        if user is None:
+            return 400, {"error": "invalid_grant"}
+        return 200, {
+            "access_token": self.mint_token(user),
             "issued_token_type": ACCESS_TOKEN_TYPE,
             "token_type": "Bearer",
             "expires_in": DEFAULT_TOKEN_LIFETIME_SECONDS,

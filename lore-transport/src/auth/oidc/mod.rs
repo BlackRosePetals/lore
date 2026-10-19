@@ -208,9 +208,10 @@ pub fn issuer(endpoint: &str) -> &str {
 /// server names. Bound to that advertisement at selection, since the endpoint string alone
 /// names the issuer and not the client.
 ///
-/// The interactive login is the device authorization grant (RFC 8628), and authorization
-/// for a partition the token exchange (RFC 8693) when the server advertises a template. The
-/// other grants are not implemented yet, and fail with [`NotSupported`].
+/// The interactive login is the device authorization grant (RFC 8628), a login with an
+/// external credential the token exchange (RFC 8693), and authorization for a partition the
+/// token exchange when the server advertises a template. The refresh grant is not
+/// implemented yet, and fails with [`NotSupported`].
 pub struct OidcAuthentication {
     oidc: Oidc,
 }
@@ -306,11 +307,12 @@ impl Authentication for OidcAuthentication {
     async fn exchange_external_token(
         &self,
         auth_url: &str,
-        _token: &str,
-        _token_type: &str,
+        token: &str,
+        token_type: &str,
         _correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
-        Err(Self::not_implemented("token exchange", auth_url))
+        let document = self.discover(auth_url).await?;
+        exchange::login(&self.oidc, &document, token, token_type).await
     }
 
     async fn refresh_authentication(

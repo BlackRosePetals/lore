@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! The token exchange against a stub provider: the carrier each template puts on the wire,
-//! the send-check in front of a separate exchange host, and the mapping of refusals.
+//! the send-check in front of a separate exchange host, and the mapping of refusals; and the
+//! login exchange of an external credential.
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
@@ -411,4 +412,112 @@ async fn an_unusable_exchanged_token_is_an_error() {
 
         assert!(refused.is_internal(), "{answer}: {refused}");
     }
+}
+
+const API_KEY: &str = "key-id.secret";
+
+/// A login answer in the device grant's shape, for the user the API key is bound to.
+fn login_response(issuer: &str) -> Response {
+    json(&serde_json::json!({
+        "access_token": access_token(issuer, "key-user", "Key User"),
+        "issued_token_type": ACCESS_TOKEN_TYPE,
+        "token_type": "Bearer",
+        "expires_in": 300,
+        "refresh_token": "refresh-1",
+    }))
+}
+
+async fn login_with(
+    oidc: Oidc,
+    token_type: &str,
+) -> Result<lore_transport::types::AuthenticationToken, lore_transport::ProtocolError> {
+    let endpoint = oidc::endpoint(&oidc.issuer);
+    OidcAuthentication::new(oidc)
+        .exchange_external_token(&endpoint, API_KEY, token_type, "corr")
+        .await
+}
+
+/// RFC 8693 §2.1 with the key as an opaque `subject_token` and the type verbatim as
+/// `subject_token_type`, whatever its spelling, and no target. It goes to the login issuer
+/// even when the server names a separate exchange issuer.
+#[tokio::test]
+async fn an_external_token_login_sends_the_type_verbatim() {
+    for token_type in [
+        "api-key",
+        "urn:lore:params:oauth:token-type:api-key",
+        "urn:example:token-type:other",
+    ] {
+        let provider = provider_answering(login_response).await;
+        let oidc = Oidc {
+            token_exchange_issuer: Some("https://exchange.invalid".to_owned()),
+            ..with_resource_template(&provider.issuer)
+        };
+
+        let authn = login_with(oidc, token_type)
+            .await
+            .expect("the login succeeds");
+
+        let requests = provider.requests_to("/token");
+        assert_eq!(requests.len(), 1, "{token_type}");
+        let fields = fields(&requests[0]);
+        assert_eq!(
+            fields,
+            [
+                ("grant_type", GRANT_TYPE),
+                ("client_id", CLIENT_ID),
+                ("subject_token", API_KEY),
+                ("subject_token_type", token_type),
+                ("requested_token_type", ACCESS_TOKEN_TYPE),
+            ]
+            .map(|(name, value)| (name.to_owned(), value.to_owned())),
+            "{token_type}"
+        );
+        assert!(requests[0].header("authorization").is_none());
+
+        assert_eq!(
+            authn.token,
+            access_token(&provider.issuer, "key-user", "Key User")
+        );
+        assert_eq!(authn.user_id, "key-user");
+        assert_eq!(authn.user_name, "Key User");
+        assert_eq!(authn.refresh_token.as_deref(), Some("refresh-1"));
+    }
+}
+
+/// A refused credential means the caller is not authenticated; any other refusal, such as
+/// a type the issuer has not enabled, is an error carrying the provider's description.
+#[tokio::test]
+async fn login_refusals_map_to_the_state_they_describe() {
+    let provider = provider_answering(|_| refusal("invalid_grant")).await;
+    let refused = login_with(oidc(&provider.issuer), "api-key")
+        .await
+        .expect_err("the key is refused");
+    assert!(refused.is_not_authenticated(), "{refused}");
+
+    let provider = provider_answering(|_| refusal("invalid_request")).await;
+    let refused = login_with(oidc(&provider.issuer), "api-key")
+        .await
+        .expect_err("the type is refused");
+    let message = refused.to_string();
+    assert!(refused.is_internal(), "{message}");
+    assert!(
+        message.contains("invalid_request: as scripted"),
+        "{message}"
+    );
+    assert!(message.contains("api-key"), "{message}");
+}
+
+/// The login token must be a Bearer JWT naming someone, as the device grant's must.
+#[tokio::test]
+async fn an_unusable_login_token_is_an_error() {
+    let provider = provider_answering(|_| {
+        json(&serde_json::json!({"access_token": "opaque", "token_type": "Bearer"}))
+    })
+    .await;
+
+    let refused = login_with(oidc(&provider.issuer), "api-key")
+        .await
+        .expect_err("the token is refused");
+
+    assert!(refused.is_internal(), "{refused}");
 }

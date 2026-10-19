@@ -90,6 +90,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   the login token only if the token names that host: in its `root_domains` claim, or, without that claim, in its
   `aud`. Repository metadata set and get and repository delete send the partition's token as well. The refresh and
   client credentials grants are not implemented yet
+- `lore auth login --token-type <TYPE> --token <TOKEN>` against a server that advertises an OIDC issuer logs in
+  through the RFC 8693 token exchange at the issuer's token endpoint, with the token as `subject_token` and the type
+  passed verbatim as `subject_token_type`. The issuer decides which types it accepts and how they are spelled.
 - `lore branch merge` and `lore branch merge start` accept `--link-message <PATH> <MESSAGE>`, as `lore commit` does,
   giving the linked repository at `PATH` its own message on the revision a merge auto-commits. A path that is not a
   link fails the merge before it starts

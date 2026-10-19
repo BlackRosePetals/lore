@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! Token exchange (RFC 8693): the login token traded at the advertised exchange issuer for
-//! one scoped to a single resource, named as an RFC 8707 `resource` or as a scope value.
+//! one scoped to a single resource, named as an RFC 8707 `resource` or as a scope value, and
+//! an external credential such as an API key traded at the login issuer for a login token.
 
 use lore_base::error::NotAuthenticated;
 use lore_base::error::NotAuthorized;
@@ -18,6 +19,7 @@ use super::discovery;
 use super::token;
 use super::token::Outcome;
 use crate::error::ProtocolError;
+use crate::types::AuthenticationToken;
 use crate::types::AuthorizationToken;
 use crate::types::Oidc;
 
@@ -138,6 +140,43 @@ pub async fn exchange(
             Outcome::Refused(refusal) => return Err(refused(exchange_issuer, &target, &refusal)),
         };
     authorization_token(response)
+}
+
+/// Exchanges `subject_token`, an external credential of the type `subject_token_type` names,
+/// for the login token of the user it is bound to. The answer is the device grant's (RFC
+/// 6749 §5.1), and nothing but `subject_token` names the target.
+pub async fn login(
+    oidc: &Oidc,
+    document: &discovery::DiscoveryDocument,
+    subject_token: &str,
+    subject_token_type: &str,
+) -> Result<AuthenticationToken, ProtocolError> {
+    let form = vec![
+        ("grant_type", GRANT_TYPE.to_owned()),
+        ("client_id", oidc.client_id.clone()),
+        ("subject_token", subject_token.to_owned()),
+        ("subject_token_type", subject_token_type.to_owned()),
+        ("requested_token_type", ACCESS_TOKEN_TYPE.to_owned()),
+    ];
+    match token::request("token exchange", &document.token_endpoint, form).await? {
+        Outcome::Token(response) => token::authentication_token(response),
+        // A refusal of the credential itself: unknown, revoked, or bound to a user who may
+        // not log in, which the provider does not tell apart.
+        Outcome::Refused(refusal) if refusal.error == "invalid_grant" => {
+            lore_debug!(
+                "OIDC token exchange at {} refused the {subject_token_type} credential: {}",
+                oidc.issuer,
+                refusal.describe()
+            );
+            Err(NotAuthenticated.into())
+        }
+        Outcome::Refused(refusal) => Err(ProtocolError::internal(format!(
+            "OIDC token exchange at {} refused the {} credential: {}",
+            oidc.issuer,
+            body_excerpt(subject_token_type),
+            refusal.describe()
+        ))),
+    }
 }
 
 /// The hosts the login token may be sent to: those its claims name, and the login
