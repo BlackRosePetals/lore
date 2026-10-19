@@ -22,6 +22,7 @@ use crate::auth;
 use crate::auth::AuthEndpoint;
 use crate::auth::AuthMode;
 use crate::auth::exchange::auth_exchange;
+use crate::auth::user_directory::UserDirectory;
 use crate::error::ProtocolError;
 use crate::grpc;
 use crate::quic;
@@ -1048,17 +1049,8 @@ impl Connection {
         &self.auth_endpoint
     }
 
-    /// The user directory advertised by the server, or its gRPC auth
-    /// service when it advertises none. Independent of the authentication
-    /// path: an OIDC issuer serves no directory.
-    pub fn user_url(&self) -> &str {
-        let grpc_auth_url = self
-            .environment
-            .endpoint
-            .as_ref()
-            .and_then(|endpoint| endpoint.auth_url.as_deref())
-            .unwrap_or_default();
-        self.environment.user_url(grpc_auth_url)
+    pub fn user_directory(&self) -> UserDirectory {
+        UserDirectory::of(&self.environment)
     }
 
     pub fn identity(&self) -> &str {

@@ -3,8 +3,9 @@
 """Smoke tests for a user directory advertised apart from the auth service.
 
 `[environment.endpoint] user_url` defines where clients resolve user
-IDs to display names. Falls back to using `auth_url`, if a user service is
-not defined.
+IDs to display names over `lore.user.v1.UserService`. Without it the
+client speaks the `UrcAuthApi` directory RPCs to `auth_url`, covered by
+`test_auth_online.py`.
 """
 
 import logging
@@ -18,8 +19,14 @@ from lore_server import (
     generate_server_config,
     launch_lore_server,
 )
-from mock_auth_server import USER1, USER2, MockAuthServer, user_info_response
-from test_auth_online import authz_resources, provision_owner
+from mock_auth_server import (
+    USER1,
+    USER2,
+    MockAuthServer,
+    MockUser,
+    user_list_response,
+)
+from test_auth_online import authz_resources, commit_file, provision_owner
 
 logger = logging.getLogger(__name__)
 
@@ -153,26 +160,18 @@ def make_actor(new_lore_repo, scratch_dir):
 def test_names_are_asked_of_the_advertised_directory(
     service_env, make_actor, lore_library_path
 ):
-    """Another user's name is fetched from `user_url` with the token
-    exchanged at `auth_url`. The auth service is never asked for names, and
-    the directory is never asked for a token."""
+    """Another user's name is fetched from `user_url` with `UserGet`, the
+    repository id bytes as the partition."""
     owner = provision_owner(service_env, make_actor(service_env), "owner", USER1)
     directory = service_env.directory
-    directory.on(
-        "GetUserInfo", bearer=owner.authz_token, resource_id=owner.resource_id
-    ).respond(user_info_response(USER2))
+    directory.on("UserGet", bearer=owner.authz_token).respond(user_list_response(USER2))
 
     result = owner.repo.auth_user_info_capi(lore_library_path, USER2.user_id)
 
     assert result == 0, f"resolving through the directory failed with FFI code {result}"
-    assert directory.calls["GetUserInfo"] == 1
-    assert list(directory.requests_for("GetUserInfo")[0]["user_id"]) == [USER2.user_id]
-    assert service_env.mock.calls["GetUserInfo"] == 0, (
-        "names come from the directory, not the auth service"
-    )
-    assert directory.calls["ExchangeUserTokenForMultiresourceToken"] == 0, (
-        "tokens are exchanged at the auth service, not the directory"
-    )
+    [request] = directory.requests_for("UserGet")
+    assert list(request["id"]) == [USER2.user_id]
+    assert request["partition"].hex() == owner.resource_id.removeprefix("urc-")
 
 
 @pytest.mark.smoke
@@ -181,31 +180,23 @@ def test_a_directory_outside_the_tokens_domains_is_sent_nothing(
 ):
     """The exchanged token's `aud` does not cover `localhost`, so the client
     refuses to present it there, exactly as it would refuse a Lore server at
-    that host. The directory sees no request, and the lookup fails rather
-    than falling back to asking the auth service."""
+    that host."""
     env = foreign_service_env
     owner = provision_owner(env, make_actor(env), "owner", USER1)
-    directory = env.directory
-    # Would answer, were it asked.
-    directory.on("GetUserInfo", resource_id=owner.resource_id).respond(
-        user_info_response(USER2)
-    )
+    env.directory.on("UserGet").respond(user_list_response(USER2))
 
     result = owner.repo.auth_user_info_capi(lore_library_path, USER2.user_id)
 
     assert result != 0, "a token must not reach a host its claims do not name"
-    assert directory.calls["GetUserInfo"] == 0
-    assert env.mock.calls["GetUserInfo"] == 0
+    assert env.directory.calls["UserGet"] == 0
 
 
-def query_locks_by_owner(owner, supplied_token: str) -> str:
-    """`lore lock query --owner <name>` with a caller-supplied access token.
-    The owner name is resolved through the directory's `GetUserId`, and the
-    supplied token skips the exchange, so what reaches the directory is
-    exactly the token handed in. The login token rides along as the identity
+def query_locks_by_owner(owner, name: str, supplied_token: str) -> str:
+    """`lore lock query --owner <name>` with a caller-supplied access token,
+    which skips the exchange. The login token rides along as the identity
     token, since a supplied credential is never looked up in the store."""
     return owner.repo.run(
-        urc_args=["lock", "query", "--owner", USER2.display_name],
+        urc_args=["lock", "query", "--owner", name],
         identity_token=owner.login_token,
         access_token=supplied_token,
     )
@@ -218,20 +209,16 @@ def test_a_supplied_access_token_is_sent_to_a_directory_its_claims_name(
     """A caller-supplied `--access-token` bypasses the exchange and with it
     the exchange's recipient check, so the user service helper checks the token
     against the directory host itself. Inside the token's `aud` the token is
-    sent, as the bearer of the `GetUserId` call, with no exchange made."""
+    sent, with no exchange made."""
     env = service_env
     owner = provision_owner(env, make_actor(env), "owner", USER1)
     supplied = env.mock.mint_token(USER1, resources=authz_resources(owner.resource_id))
-    directory = env.directory
-    # A single `UserInfo` in field 1: the same bytes for `GetUserIdResponse`.
-    directory.on("GetUserId", bearer=supplied, resource_id=owner.resource_id).respond(
-        user_info_response(USER2)
-    )
+    env.directory.on("UserFind", bearer=supplied).respond(user_list_response(USER2))
     exchanges_before = env.mock.calls["ExchangeUserTokenForMultiresourceToken"]
 
-    query_locks_by_owner(owner, supplied)
+    query_locks_by_owner(owner, USER2.preferred_username, supplied)
 
-    assert directory.calls["GetUserId"] == 1
+    assert env.directory.calls["UserFind"] == 1
     assert (
         env.mock.calls["ExchangeUserTokenForMultiresourceToken"] == exchanges_before
     ), "a supplied access token is used as is, never exchanged"
@@ -242,19 +229,66 @@ def test_a_supplied_access_token_is_checked_against_the_directory_host(
     foreign_service_env, make_actor
 ):
     """The same supplied token against a directory advertised as `localhost`,
-    a host its `aud` does not name: refused before any request, exactly as
-    an exchanged token is. A rogue server cannot redirect a caller's own
-    token to a host of its choosing by advertising it as the directory."""
+    a host its `aud` does not name: refused before any request. A rogue server
+    cannot redirect a caller's own token to a host of its choosing by
+    advertising it as the directory."""
     env = foreign_service_env
     owner = provision_owner(env, make_actor(env), "owner", USER1)
     supplied = env.mock.mint_token(USER1, resources=authz_resources(owner.resource_id))
-    directory = env.directory
-    directory.on("GetUserId", resource_id=owner.resource_id).respond(
-        user_info_response(USER2)
-    )
+    env.directory.on("UserFind").respond(user_list_response(USER2))
 
     with pytest.raises(LoreException):
-        query_locks_by_owner(owner, supplied)
+        query_locks_by_owner(owner, USER2.preferred_username, supplied)
 
-    assert directory.calls["GetUserId"] == 0
-    assert env.mock.calls["GetUserId"] == 0
+    assert env.directory.calls["UserFind"] == 0
+
+
+def lock_query_by_owner_name(env, make_actor, name: str) -> str:
+    """USER1 locks a file, then queries the locks owned by `name`. The lock is
+    listed only when the directory resolves `name` to USER1. The raw output is
+    checked rather than parsed: on macOS the in-process gRPC stub's library
+    logs to the child's stderr after fork, and those lines land in the output."""
+    owner = provision_owner(env, make_actor(env), "owner", USER1)
+    commit_file(owner.repo, "locked.txt", "content")
+    owner.repo.lock_acquire("locked.txt")
+    return owner.repo.run(["lock", "query", "--owner", name])
+
+
+@pytest.mark.smoke
+def test_a_lock_owner_is_found_by_username(service_env, make_actor):
+    service_env.directory.on("UserFind", username=USER1.preferred_username).respond(
+        user_list_response(USER1)
+    )
+
+    output = lock_query_by_owner_name(service_env, make_actor, USER1.preferred_username)
+
+    assert "locked.txt" in output
+
+
+@pytest.mark.smoke
+def test_a_lock_owner_is_found_by_display_name(service_env, make_actor):
+    directory = service_env.directory
+    directory.on("UserFind", username=USER1.display_name).respond(user_list_response())
+    directory.on("UserFind", display_name=USER1.display_name).respond(
+        user_list_response(USER1)
+    )
+
+    output = lock_query_by_owner_name(service_env, make_actor, USER1.display_name)
+
+    assert "locked.txt" in output
+
+
+@pytest.mark.smoke
+def test_a_shared_display_name_finds_no_lock_owner(service_env, make_actor):
+    """Two users share USER1's display name: the name resolves to no one,
+    rather than to whichever user the directory listed first."""
+    namesake = MockUser("mock-user-3", USER1.display_name, "namesake")
+    directory = service_env.directory
+    directory.on("UserFind", username=USER1.display_name).respond(user_list_response())
+    directory.on("UserFind", display_name=USER1.display_name).respond(
+        user_list_response(USER1, namesake)
+    )
+
+    output = lock_query_by_owner_name(service_env, make_actor, USER1.display_name)
+
+    assert "locked.txt" not in output

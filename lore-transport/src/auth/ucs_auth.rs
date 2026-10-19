@@ -19,8 +19,7 @@ use crate::traits::Authentication;
 use crate::traits::UserService;
 use crate::types::*;
 
-/// The auth URL schemes [`UcsAuthentication`] is registered under, for
-/// authentication and the user service alike. `https` is the transition
+/// The auth URL schemes [`UcsAuthentication`] is registered under. `https` is the transition
 /// fallback. `http` serves local test auth services; The implementation only
 /// honours plaintext for loopback hosts and upgrades any other http URL to
 /// https (see [`grpc_endpoint`]).
@@ -67,6 +66,21 @@ fn resource_id(repository: RepositoryId) -> String {
     format!("urc-{repository}")
 }
 
+/// Connects a channel to a UCS Auth API endpoint.
+pub(super) async fn connect_channel(
+    auth_url: &str,
+) -> Result<tonic::transport::Channel, ProtocolError> {
+    let endpoint = grpc_endpoint(auth_url);
+    let endpoint = tonic::transport::Endpoint::new(endpoint)
+        .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?;
+    // Connect from a net-runtime task so the channel's driver tasks are
+    // bound to the net runtime.
+    lore_base::lore_spawn_net!(async move { endpoint.connect().await })
+        .await
+        .map_err(|e| ProtocolError::internal(format!("auth endpoint connect task: {e}")))?
+        .map_err(|e| ProtocolError::internal(format!("failed to connect to auth endpoint: {e}")))
+}
+
 /// Creates a gRPC client with correlation ID interceptor, connected to the
 /// auth endpoint.
 async fn connect_client(
@@ -77,23 +91,17 @@ async fn connect_client(
     >,
     ProtocolError,
 > {
-    let endpoint = grpc_endpoint(auth_url);
-    let endpoint = tonic::transport::Endpoint::new(endpoint)
-        .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?;
-    // Connect from a net-runtime task so the channel's driver tasks are
-    // bound to the net runtime.
-    let channel = lore_base::lore_spawn_net!(async move { endpoint.connect().await })
-        .await
-        .map_err(|e| ProtocolError::internal(format!("auth endpoint connect task: {e}")))?
-        .map_err(|e| ProtocolError::internal(format!("failed to connect to auth endpoint: {e}")))?;
     Ok(UrcAuthApiClient::with_interceptor(
-        channel,
+        connect_channel(auth_url).await?,
         CorrelationInterceptor,
     ))
 }
 
 /// Sets the authorization header on a gRPC request.
-fn set_auth_header<T>(request: &mut tonic::Request<T>, token: &str) -> Result<(), ProtocolError> {
+pub(super) fn set_auth_header<T>(
+    request: &mut tonic::Request<T>,
+    token: &str,
+) -> Result<(), ProtocolError> {
     let mut header: tonic::metadata::MetadataValue<_> = format!("Bearer {token}")
         .parse()
         .map_err(|e| ProtocolError::internal(format!("invalid metadata value: {e}")))?;
@@ -104,8 +112,7 @@ fn set_auth_header<T>(request: &mut tonic::Request<T>, token: &str) -> Result<()
 
 /// Authentication and user service over the UCS Auth API gRPC service.
 ///
-/// Registered under [`SCHEMES`] in both registries. All `lore_proto::auth`
-/// imports are confined to this module.
+/// All `lore_proto::auth` imports are confined to this module.
 ///
 /// The `correlation_id` parameter on trait methods is not used directly --
 /// correlation IDs are injected into gRPC requests by `CorrelationInterceptor`,

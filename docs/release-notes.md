@@ -7,6 +7,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+- `[environment.endpoint] user_url` now names a user directory serving `lore.user.v1.UserService`. Clients resolve
+  names there with `UserGet` and `UserFind`, and no longer send it the `UrcAuthApi` `GetUserInfo` and `GetUserId`
+  calls. A server that advertises no `user_url` is unchanged: clients ask `auth_url` over `UrcAuthApi` as before
 - A client and the Lore service it relays commands to must come from the same build. Commands, their events and their
   status cross as bitcode under message protocol version 2, where they crossed as JSON, and bitcode carries no field
   names to tell two builds apart. A client and a service on either side of this change refuse each other's messages, so

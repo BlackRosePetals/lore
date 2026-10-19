@@ -5,6 +5,8 @@ pub mod mode;
 pub mod oidc;
 pub mod token_only;
 pub mod ucs_auth;
+pub mod user_directory;
+pub mod user_service_v1;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,7 +20,6 @@ use parking_lot::Mutex;
 
 use crate::error::ProtocolError;
 use crate::traits::Authentication;
-use crate::traits::UserService;
 use crate::types::EnvironmentConfig;
 use crate::types::Oidc;
 
@@ -161,7 +162,6 @@ fn register_builtin() {
         let ucs_auth = Arc::new(ucs_auth::UcsAuthentication);
         for scheme in ucs_auth::SCHEMES {
             let _ = authentication::add(scheme, ucs_auth.clone());
-            let _ = user_service::add(scheme, ucs_auth.clone());
         }
     });
 }
@@ -329,43 +329,5 @@ pub mod authentication {
             Some(m) => m.keys().cloned().collect(),
             None => Vec::new(),
         }
-    }
-}
-
-/// Scheme-based registry for `UserService` implementations, keyed like
-/// [`authentication`] but on the service URL, which a server may advertise
-/// separately from its auth URL.
-///
-/// Unlike authentication, a service is optional: a scheme with none
-/// registered gets [`token_only::TokenOnlyUserService`], which names the
-/// bearer from their own token and echoes every other ID.
-pub mod user_service {
-    use super::*;
-
-    static USER_SERVICE_MAP: Mutex<Option<HashMap<String, Arc<dyn UserService>>>> =
-        Mutex::new(None);
-
-    /// The `UserService` for the given user service URL.
-    /// Registers builtin implementations on first call.
-    pub fn find(user_url: &str) -> Arc<dyn UserService> {
-        register_builtin();
-
-        let registered = parse_scheme(user_url).ok().and_then(|scheme| {
-            USER_SERVICE_MAP
-                .lock()
-                .as_ref()
-                .and_then(|m| m.get(scheme).cloned())
-        });
-        registered.unwrap_or_else(|| Arc::new(token_only::TokenOnlyUserService))
-    }
-
-    /// Registers a `UserService` implementation for the given scheme.
-    pub fn add(scheme: &str, service: Arc<dyn UserService>) -> Result<(), ProtocolError> {
-        let mut map = USER_SERVICE_MAP.lock();
-        if map.is_none() {
-            *map = Some(HashMap::new());
-        }
-        map.as_mut().unwrap().insert(scheme.to_string(), service);
-        Ok(())
     }
 }

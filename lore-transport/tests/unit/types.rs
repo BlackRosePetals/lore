@@ -69,28 +69,3 @@ fn per_service_overrides_are_independent() {
     assert_eq!(env.repository_url(FALLBACK), FALLBACK);
     assert_eq!(env.notification_url(FALLBACK), FALLBACK);
 }
-
-/// Uses `auth_url` as fallback user directory, unless
-/// `user_url` is defined
-#[test]
-fn user_url_follows_the_auth_url_until_advertised() {
-    const AUTH_URL: &str = "ucs-auth://auth.example.com";
-
-    assert_eq!(env_with(Endpoint::default()).user_url(AUTH_URL), AUTH_URL);
-    assert_eq!(
-        env_with(Endpoint {
-            user_url: Some(String::new()),
-            ..Default::default()
-        })
-        .user_url(AUTH_URL),
-        AUTH_URL
-    );
-    assert_eq!(
-        env_with(Endpoint {
-            user_url: Some("ucs-auth://directory.example.com".into()),
-            ..Default::default()
-        })
-        .user_url(AUTH_URL),
-        "ucs-auth://directory.example.com"
-    );
-}

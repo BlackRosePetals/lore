@@ -470,7 +470,7 @@ The rest of this proposal calls the first four fields
 | `identity_claim` | none | Reserved: a deprecated field the server leaves empty and the client ignores. The identity is read from the token itself, its `identity` claim or else `sub` (D7). |
 
 `Endpoint` gains `user_url`, from `[environment.endpoint]`: the user directory clients resolve
-names at, `auth_url` by default (D7). Independent of the auth path, so an OIDC deployment can
+names at, over `lore.user.v1.UserService` (D7). Independent of the auth path, so an OIDC deployment can
 advertise a directory without a gRPC auth service.
 
 The list of hosts a token may be sent to is deliberately *not* advertised here: it comes from the
@@ -836,15 +836,19 @@ OIDC does not supply one. Deployments with a directory can implement `UserServic
 `UserService` implementation show identifiers.
 
 The lookup runs on the client and bypasses the Lore server, which keeps personal information out
-of it. So the directory is discovered like the auth service: the server advertises
-`user_url` on the endpoint, `auth_url` when absent, and the client selects the
-`UserService` implementation from that URL. The directory's host must be under a domain that is
-found in one of the token's `aud` names.
+of it. So the server advertises the directory on the endpoint, and the client picks the
+`UserService` implementation from what is advertised:
 
-The directory operations outlive the auth service, so they get a gRPC API of their own:
-`lore.user.v1.UserService`, carrying `GetUserInfo`, `GetUserId` and `LookupUserPermissions` with
-their messages copied field for field from `auth_api.proto`. The copy is wire-identical for
-simple migration.
+- `user_url` set: `lore.user.v1.UserService` at `user_url`.
+- Otherwise `auth_url` set: the legacy `GetUserInfo` and `GetUserId` RPCs at `auth_url`.
+- Neither: the token-only default above.
+
+The directory's host must be under a domain that is found in one of the token's `aud` names.
+
+The directory operations outlive the auth service, so they get a gRPC API of their own,
+`lore.user.v1.UserService`. It has `UserGet` (IDs to users), `UserFind` (a username or a display
+name to users) and `PartitionList` (the partitions the caller holds permissions on), in the
+vocabulary of the other `lore.*.v1` APIs.
 
 **The user identity is read from the token.** Lore records a user as one string, in `created_by`
 and wherever else an identity is compared. Client and server take that string from the token's

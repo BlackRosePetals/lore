@@ -96,7 +96,7 @@ The `[server]` table and its sub-tables configure the network endpoints, gracefu
 | Field | Default | Description |
 | --- | --- | --- |
 | `auth_url` | none | The authentication service clients log in at and exchange tokens with. Setting it requires `[server.auth]`. If `auth_url` and `[server.auth]` are not set, starts the server unauthenticated. |
-| `user_url` | `auth_url` | The user directory that clients use to resolve user IDs to display names, and back. If not set, uses `auth_url` as the user service. If both are unset, falls back to an offline resolver that returns user IDs as names. |
+| `user_url` | none | A user directory served over `lore.user.v1.UserService`, which clients use to resolve user IDs to display names, and back. If not set, clients speak the `UrcAuthApi` `GetUserInfo` and `GetUserId` RPCs to `auth_url` instead. If neither is set, clients fall back to an offline resolver that returns user IDs as names. |
 
 ```toml
 [environment.endpoint]

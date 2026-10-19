@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: MIT
 """Declarative stub of the UCS auth service, for authenticated-path smoke tests.
 
-Serves the `epic_urc.UrcAuthApi` and `ucs.auth.RebacApi` gRPC services
-(lore-proto/proto/auth_api.proto, rebac_api.proto) plus an HTTP endpoint with
+Serves the `epic_urc.UrcAuthApi`, `ucs.auth.RebacApi` and
+`lore.user.v1.UserService` gRPC services (lore-proto/proto/auth_api.proto,
+rebac_api.proto, lore/user/v1/user.proto) plus an HTTP endpoint with
 the JWKS document the lore server validates tokens against. The stub holds
 **no behavior of its own**: each test registers the request/response pairs its
 scenario needs with `on(...)`, and anything unregistered is denied. A test
@@ -63,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 _AUTH_SERVICE = "epic_urc.UrcAuthApi"
 _REBAC_SERVICE = "ucs.auth.RebacApi"
+_USER_SERVICE = "lore.user.v1.UserService"
 
 
 def _identity_bytes(raw: bytes) -> bytes:
@@ -180,6 +182,20 @@ def user_info_response(*users: MockUser) -> bytes:
     return response
 
 
+def user_list_response(*users: MockUser) -> bytes:
+    """A `lore.user.v1` `UserGet` or `UserFind` answer: `repeated User`. No
+    users is an empty list, which `UserFind` answers for an unknown name."""
+    return b"".join(
+        encode_bytes_field(
+            1,
+            encode_string_field(1, user.user_id)
+            + encode_string_field(2, user.display_name)
+            + encode_string_field(3, user.preferred_username),
+        )
+        for user in users
+    )
+
+
 def empty_response() -> bytes:
     """An empty message: `CreateResource`/`DeleteResource` responses, or a
     `GetAuthSession`/`RefreshAuthSession` answer carrying no token yet."""
@@ -193,6 +209,7 @@ def empty_response() -> bytes:
 _STRING = "string"
 _STRINGS = "repeated string"
 _TARGET_USER = "target_user"
+_BYTES = "bytes"
 
 # method -> {field name: (field number, kind)}
 _REQUEST_FIELDS: dict[str, dict[str, tuple[int, str]]] = {
@@ -220,9 +237,18 @@ _REQUEST_FIELDS: dict[str, dict[str, tuple[int, str]]] = {
     "GetProviderUserId": {"user_id": (1, _STRING)},
     "CreateResource": {"resource_id": (1, _STRING), "resource_name": (2, _STRING)},
     "DeleteResource": {"resource_id": (1, _STRING)},
+    "UserGet": {"partition": (1, _BYTES), "id": (2, _STRINGS)},
+    # The `query` oneof, the arm not named decoding to the empty string.
+    "UserFind": {
+        "partition": (1, _BYTES),
+        "username": (2, _STRING),
+        "display_name": (3, _STRING),
+    },
 }
 
 _REBAC_METHODS = ("CreateResource", "DeleteResource")
+
+_USER_METHODS = ("UserGet", "UserFind")
 
 # The status an unmatched request is refused with. Chosen to mirror how the
 # real service refuses the corresponding case: a token endpoint answers "who
@@ -247,6 +273,8 @@ def _decode_request(method: str, request: bytes) -> dict:
             decoded[name] = field_string(fields, number)
         elif kind == _STRINGS:
             decoded[name] = tuple(field_strings(fields, number))
+        elif kind == _BYTES:
+            decoded[name] = field_bytes(fields, number)
         elif kind == _TARGET_USER:
             target_user = field_bytes(fields, number)
             decoded[name] = (
@@ -435,13 +463,15 @@ class MockAuthServer:
         auth_methods = {
             name: self._unary(name)
             for name in _REQUEST_FIELDS
-            if name not in _REBAC_METHODS
+            if name not in _REBAC_METHODS + _USER_METHODS
         }
+        user_methods = {name: self._unary(name) for name in _USER_METHODS}
         rebac_methods = {name: self._unary(name) for name in _REBAC_METHODS}
         self._grpc_server.add_generic_rpc_handlers(
             (
                 grpc.method_handlers_generic_handler(_AUTH_SERVICE, auth_methods),
                 grpc.method_handlers_generic_handler(_REBAC_SERVICE, rebac_methods),
+                grpc.method_handlers_generic_handler(_USER_SERVICE, user_methods),
             )
         )
         self.grpc_port = self._grpc_server.add_insecure_port("127.0.0.1:0")

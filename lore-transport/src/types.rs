@@ -77,15 +77,6 @@ impl EnvironmentConfig {
             fallback,
         )
     }
-
-    /// User directory endpoint: resolves user IDs to display names and back.
-    /// Falls back to `auth_url` if empty.
-    pub fn user_url<'a>(&'a self, fallback: &'a str) -> &'a str {
-        service_url_or(
-            self.endpoint.as_ref().and_then(|e| e.user_url.as_deref()),
-            fallback,
-        )
-    }
 }
 
 fn service_url_or<'a>(override_url: Option<&'a str>, fallback: &'a str) -> &'a str {

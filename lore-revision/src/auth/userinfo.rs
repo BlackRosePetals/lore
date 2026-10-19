@@ -9,7 +9,6 @@ use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
 use lore_transport::UserService;
-use lore_transport::auth::user_service;
 use serde::Serialize;
 
 use crate::errors::*;
@@ -85,14 +84,15 @@ struct UserServiceAccess {
 }
 
 /// Exchanges the caller's authentication token for a repository-scoped one
-/// and looks up the service behind the connection's `user_url`.
+/// and looks up the user directory the connection's server advertises.
 async fn open_user_service(
     remote: &Connection,
     repository: RepositoryId,
     identity: &str,
 ) -> Result<UserServiceAccess, UserInfoError> {
     let auth_endpoint = remote.auth_endpoint();
-    let user_url = remote.user_url().to_string();
+    let directory = remote.user_directory();
+    let user_url = directory.url().to_string();
     let execution = execution_context();
     let globals = execution.globals();
 
@@ -107,7 +107,7 @@ async fn open_user_service(
             globals.identity_token()
         };
         return Ok(UserServiceAccess {
-            service: user_service::find(&user_url),
+            service: directory.service(),
             user_url,
             token: supplied.to_string(),
         });
@@ -137,7 +137,7 @@ async fn open_user_service(
         .forward::<UserInfoError>("The token is not suitable for the user service")?;
 
     Ok(UserServiceAccess {
-        service: user_service::find(&user_url),
+        service: directory.service(),
         user_url,
         token,
     })
