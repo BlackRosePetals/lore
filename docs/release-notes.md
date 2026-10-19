@@ -203,6 +203,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - A server checks the sizes of every payload a replica serves it or a peer replicates to it, over QUIC or gRPC, against
   its fragment, as it does for every other payload, and refuses one whose sizes disagree. A replica's `get` or
   `get_metadata` response too short to hold its header is refused rather than ending the request in a panic
+- `lore-server`: a push to a protected branch needs the `push-protected` action on the repository to bypass the
+  protection. The `is_service_account` token claim no longer waives it, so a deployment that relied on the claim for
+  mirroring has to grant `push-protected` to those callers first
 - `lore commit` with changes staged in a layer commits the layer while the parent tree holds only changes marked dirty,
   and leaves those changes dirty. It failed with `Nothing staged for commit` before committing any layer
 - A merge of divergent branch history, such as the one a sync commits when the local and the remote latest have both

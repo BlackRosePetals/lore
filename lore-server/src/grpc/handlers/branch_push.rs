@@ -48,11 +48,11 @@ use tracing::instrument;
 use tracing::span;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::cache::revision::store_history_step;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
@@ -168,6 +168,7 @@ pub(crate) fn extract_client_ip<T>(request: &Request<T>) -> Option<IpAddr> {
 #[tracing::instrument(name = "BranchPush::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchPushRequest>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification: Arc<dyn NotificationSender>,
@@ -176,20 +177,14 @@ pub async fn handler(
     acceleration: crate::grpc::server::RevisionListAcceleration,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<BranchPushResponse>, Status> {
-    let user_info = get_authorization(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository = get_repository(request.metadata())?;
 
-    // TODO(mjansson): Once we have authz permission model with read/write/admin
-    // this should be upgraded to check for the correct permission rather than
-    // hardwired to service accounts. For now used to protect while allowing mirroring
-    let mut bypass_protection = false;
-    if let Ok(user_info) = user_info
-        && user_info.is_service_account.unwrap_or_default()
-    {
-        bypass_protection = true;
-    }
+    // The `push-protected` action waives branch protection, which is how mirroring pushes.
+    let bypass_protection = authorizer
+        .permits(request.extensions(), repository, "push-protected")
+        .await;
 
     let client_ip: Option<String> = extract_client_ip(&request).map(|ip_addr| ip_addr.to_string());
     let req = request.into_inner();

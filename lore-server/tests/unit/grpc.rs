@@ -7,6 +7,7 @@ mod forwarded_revision;
 mod handlers;
 mod lock_service;
 mod notification_service;
+mod push_protected;
 mod repository;
 mod revision;
 mod server;

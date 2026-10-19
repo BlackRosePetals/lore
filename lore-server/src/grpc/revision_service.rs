@@ -202,6 +202,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_push::handler(
                 request,
+                self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),

@@ -751,6 +751,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.mutable_store.clone(),
             self.0.notification_sender.clone(),
             self.0.hook_dispatcher.clone(),
+            repository_authorizer.clone(),
             history_step_size,
             acceleration,
             self.0.forwarded_requests.clone(),
