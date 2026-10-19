@@ -137,6 +137,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore-storage`: a write dropped while it advanced a local store's epoch no longer makes a kept store reload for
+  nothing or fails the next write with "No such file or directory"
 - `lore-storage`: a claim for work spawned to outlive an operation keeps the store's lock for that work and covers no
   other operation: the guard `try_join_claim` returns, the claim `claim_for_task` takes through the new
   `ImmutableStore::hold_for_task` where the operation could not join, and a closing handle's claims for its flush. As

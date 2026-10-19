@@ -361,6 +361,7 @@ async fn an_epoch_advance_dropped_part_way_keeps_the_flock_until_it_lands() {
     let dir = dir("epoch-in-flight");
     let lock = store_lock(dir.path());
     let in_flight = lore_storage::test_util::hold_store_write();
+    let landed = lore_storage::test_util::pause_at(lore_storage::test_util::PausePoint::Advanced);
     let advancing = {
         let lock = Arc::clone(&lock);
         lore_base::lore_spawn!(async move { lock.acquire(Intent::Write).await.map(drop) })
@@ -379,6 +380,9 @@ async fn an_epoch_advance_dropped_part_way_keeps_the_flock_until_it_lands() {
         "the epoch write in flight keeps the flock"
     );
     in_flight.complete();
+    tokio::time::timeout(Duration::from_secs(5), landed.reached.notified())
+        .await
+        .expect("the advance lands");
     assert!(
         FSLock::try_acquire_exact_path(&path)
             .await
@@ -386,6 +390,88 @@ async fn an_epoch_advance_dropped_part_way_keeps_the_flock_until_it_lands() {
             .is_some(),
         "until it lands"
     );
+    landed.resume.notify_one();
+}
+
+/// **An acquisition dropped once its advance has landed still records the advance.** The write
+/// runs to its end once dispatched, so a record that went with the acquisition's future would
+/// leave the store knowing nothing of the epoch it wrote, and reloading at its next claim for a
+/// write of its own.
+#[tokio::test]
+async fn an_acquisition_dropped_after_its_advance_landed_still_records_it() {
+    let dir = dir("dropped-advance");
+    let lock = store_lock(dir.path());
+    let mut opening = lock.acquire(Intent::Read).await.expect("acquires");
+    opening.note_refreshed();
+    drop(opening);
+
+    let landed = lore_storage::test_util::pause_at(lore_storage::test_util::PausePoint::Advanced);
+    let advancing = {
+        let lock = Arc::clone(&lock);
+        lore_base::lore_spawn!(async move { lock.acquire(Intent::Write).await.map(drop) })
+    };
+    tokio::time::timeout(Duration::from_secs(5), landed.reached.notified())
+        .await
+        .expect("the advance lands");
+    advancing.abort();
+    assert!(advancing.await.unwrap_err().is_cancelled());
+    assert_eq!(epoch_count(dir.path()).await, Some(1), "the advance landed");
+    landed.resume.notify_one();
+
+    let claim = lock.acquire(Intent::Read).await.expect("acquires");
+    assert!(
+        !claim.is_stale(),
+        "the store adopted the epoch it wrote, so a write of its own reloads nothing"
+    );
+}
+
+/// **A writer waits for an advance a dropped acquisition left unrecorded**, rather than advancing
+/// again alongside it: two advances in flight contend for the one staging file, and the one whose
+/// file the other removes or renames first fails its acquisition with the file not found.
+#[tokio::test]
+async fn a_writer_waits_for_an_advance_a_dropped_acquisition_left_in_flight() {
+    let dir = dir("advance-in-flight");
+    let lock = store_lock(dir.path());
+    let mut reader = lock.acquire(Intent::Read).await.expect("acquires");
+    reader.note_refreshed();
+
+    let landed = lore_storage::test_util::pause_at(lore_storage::test_util::PausePoint::Advanced);
+    let advancing = {
+        let lock = Arc::clone(&lock);
+        lore_base::lore_spawn!(async move { lock.acquire(Intent::Write).await.map(drop) })
+    };
+    tokio::time::timeout(Duration::from_secs(5), landed.reached.notified())
+        .await
+        .expect("the advance lands");
+    advancing.abort();
+    assert!(advancing.await.unwrap_err().is_cancelled());
+    let written = epoch(dir.path()).await;
+    assert!(matches!(written, Epoch::At(_)), "the advance landed");
+
+    let second = tokio::time::timeout(Duration::from_secs(5), lock.try_acquire(Intent::Write))
+        .await
+        .expect("does not wait for the gate")
+        .expect("attempts");
+    assert!(
+        second.is_none(),
+        "a writer is left for later until the advance is recorded"
+    );
+    landed.resume.notify_one();
+
+    let writer = tokio::time::timeout(Duration::from_secs(5), lock.acquire(Intent::Write))
+        .await
+        .expect("the advance is recorded")
+        .expect("acquires");
+    assert!(
+        !writer.is_stale(),
+        "the writer joins the epoch the advance recorded"
+    );
+    assert_eq!(
+        epoch(dir.path()).await,
+        written,
+        "and the one advance stands for it"
+    );
+    drop((writer, reader));
 }
 
 /// **Test builds fail a release of the flock under an operation a span covered.** The

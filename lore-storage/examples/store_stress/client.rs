@@ -80,6 +80,7 @@ fn pause_point(name: &str) -> Result<PausePoint, String> {
         ("syncing", PausePoint::Syncing),
         ("committing", PausePoint::Committing),
         ("evicting", PausePoint::Evicting),
+        ("advanced", PausePoint::Advanced),
         ("scanning", PausePoint::Scanning),
     ];
     POINTS

@@ -69,6 +69,9 @@ pub enum PausePoint {
     Committing,
     /// A size eviction is about to check for a stop or a fan-out and evict from its next bucket.
     Evicting,
+    /// An epoch advance has written the epoch and not yet recorded it as the directory's current
+    /// one.
+    Advanced,
     /// A flush is about to try a group's flush lock, under which it reads whether the group has
     /// anything to write.
     Scanning,

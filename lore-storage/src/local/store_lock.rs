@@ -379,7 +379,9 @@ struct PathLock {
     live: AtomicU64,
     /// Serialises the transitions that touch the filesystem — taking the flock,
     /// reading the epoch, advancing it — and is held across a caller's reload, so
-    /// only one task per process does any of them.
+    /// only one task per process does any of them. An advance keeps it until the epoch
+    /// it wrote is recorded, whether or not the acquisition that began it is still
+    /// awaited: see [`StoreLock::record_advance`].
     gate: Arc<tokio::sync::Mutex<()>>,
     /// Operations running with no guard of their own because a span covers them, each
     /// counted by a [`Claim::Covered`]. Zero whenever the flock is released: see
@@ -614,20 +616,9 @@ impl StoreLock {
             })
         };
         if let Some((stale, advance, known)) = joined {
-            // A stale guard keeps the gate until its caller has reloaded. A fresh one
-            // lets it go — but only once any advance below is committed and adopted.
-            // Released sooner, a second writer would pass the gate while `advanced` is
-            // still false and advance the same epoch again, and any other operation on
-            // this store would find it behind its own write and reload it underneath
-            // this one.
-            let (kept, pending) = if stale {
-                (Some(gate), None)
-            } else {
-                (None, Some(gate))
-            };
-            // Built before the write below, so the count it owns is released by its
-            // `Drop` if that write fails, rather than leaked by an early return.
-            let guard = self.counted_guard(kept);
+            // Built before the advance below, so the count it owns is released by its
+            // `Drop` if the advance fails, rather than leaked by an early return.
+            let mut guard = self.counted_guard();
             // A stale guard's caller reloads, sizing the packfiles from disk, and a write
             // that a store object dropped before this one left in flight would land past
             // the end it reads, at the offset its next write reserves. Files in use keep
@@ -637,25 +628,16 @@ impl StoreLock {
                 // every acquisition's future.
                 Box::pin(self.shared.await_files_idle()).await;
             }
-            if let Some(held) = advance {
+            let gate = match advance {
                 // The current epoch is authoritative while the flock is held, so this
                 // needs no read of its own — nothing outside this process can have
                 // written it since.
-                //
-                // Outside the state lock: this writes a file.
-                let stamp = self.shared.write_epoch(next_epoch(known), held).await?;
-                let mut state = self.shared.state.lock();
-                state.advanced = true;
-                state.set_current(Epoch::At(stamp));
-                // A store that has just announced its own write records the epoch it
-                // wrote rather than the one it replaced. A stale one adopts nothing
-                // until its caller has reloaded.
-                if !stale {
-                    self.adopt(&state);
-                }
-                state.publish(&self.shared.live);
+                Some(held) => self.advance(next_epoch(known), held, gate, stale).await?,
+                None => gate,
+            };
+            if stale {
+                guard.keep_gate(gate);
             }
-            drop(pending);
             return Ok(Some(guard));
         }
 
@@ -669,44 +651,92 @@ impl StoreLock {
         // so a generation decides nothing here.
         let stale = recreated || self.is_stale_against(on_disk);
         let advance = intent == Intent::Write || recreated;
-        let current = if advance {
-            Epoch::At(
-                self.shared
-                    .write_epoch(next_epoch(on_disk), Arc::clone(&held))
-                    .await?,
-            )
+        let gate = if advance {
+            self.advance(next_epoch(on_disk), Arc::clone(&held), gate, stale)
+                .await?
         } else {
-            on_disk
+            gate
         };
-        // Committed, adopted and counted in together, for the reasons the joined path
-        // gives above. Nothing can release a flock this call has just taken and not yet
-        // counted itself against, but keeping both paths atomic is what stops the
-        // shape recurring rather than this instance of it.
+        // A hold that did not advance records the epoch it read, and this store's adoption of
+        // it, as it counts itself in; an advance recorded both as it landed.
         {
             let mut state = self.shared.state.lock();
             state.held = Some(held);
             state.advanced = advance;
-            state.set_current(current);
-            state.count_in();
-            if !stale {
-                self.adopt(&state);
+            if !advance {
+                state.set_current(on_disk);
+                if !stale {
+                    self.adopt(&state);
+                }
             }
+            state.count_in();
             state.publish(&self.shared.live);
         }
-        Ok(Some(self.counted_guard(stale.then_some(gate))))
+        let mut guard = self.counted_guard();
+        if stale {
+            guard.keep_gate(gate);
+        }
+        Ok(Some(guard))
+    }
+
+    /// Advances the epoch to `stamp` in a task of its own, see [`Self::record_advance`], and
+    /// waits for it. Hands `gate` back once the advance is recorded.
+    ///
+    /// # Errors
+    ///
+    /// As [`PathLock::write_epoch`], or if the task does not complete.
+    async fn advance(
+        self: &Arc<Self>,
+        stamp: Stamp,
+        held: Arc<FSLock>,
+        gate: tokio::sync::OwnedMutexGuard<()>,
+        stale: bool,
+    ) -> std::io::Result<tokio::sync::OwnedMutexGuard<()>> {
+        lore_base::lore_spawn!(Arc::clone(self).record_advance(stamp, held, gate, stale))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
+    /// Writes `stamp` as the epoch and records it as the directory's current one, with this
+    /// store's adoption of it unless it is `stale` and reloads first, and `advanced` as whether
+    /// the directory's state holds the flock. On the joined path it does. The path that takes
+    /// the flock stores the flock and `advanced` itself once the advance returns, so an
+    /// acquisition dropped there leaves the next hold to begin unadvanced. Holds `gate`
+    /// throughout and hands it back.
+    ///
+    /// A task of its own rather than part of the acquisition's future: the write runs to its
+    /// end once dispatched, so an acquisition dropped at the await would leave the epoch
+    /// advanced on disk with nothing in this process recording it. The store would then
+    /// reload at its next claim after a release, for a write of its own, and a writer
+    /// passing the gate the dropped acquisition let go would advance alongside the write in
+    /// flight, the two contending for the one staging file.
+    ///
+    /// # Errors
+    ///
+    /// As [`PathLock::write_epoch`].
+    async fn record_advance(
+        self: Arc<Self>,
+        stamp: Stamp,
+        held: Arc<FSLock>,
+        gate: tokio::sync::OwnedMutexGuard<()>,
+        stale: bool,
+    ) -> std::io::Result<tokio::sync::OwnedMutexGuard<()>> {
+        let stamp = self.shared.write_epoch(stamp, held).await?;
+        #[cfg(feature = "test-util")]
+        crate::test_util::pause_point(crate::test_util::PausePoint::Advanced).await;
+        let mut state = self.shared.state.lock();
+        state.advanced = state.held.is_some();
+        state.set_current(Epoch::At(stamp));
+        if !stale {
+            self.adopt(&state);
+        }
+        state.publish(&self.shared.live);
+        Ok(gate)
     }
 
     /// Builds the guard for an operation this call has **already counted in**, with
-    /// [`LockState::count_in`].
-    ///
-    /// `gate` is the gate this guard keeps, and whether it keeps one is what makes it
-    /// stale: a stale guard holds the gate because its caller has not reloaded yet and
-    /// no other acquisition may join a store whose state is being dropped — see
-    /// [`StoreGuard::note_refreshed`]. A fresh guard is built with `None`.
-    fn counted_guard(
-        self: &Arc<Self>,
-        gate: Option<tokio::sync::OwnedMutexGuard<()>>,
-    ) -> StoreGuard {
+    /// [`LockState::count_in`]: a fresh one, until [`StoreGuard::keep_gate`] makes it stale.
+    fn counted_guard(self: &Arc<Self>) -> StoreGuard {
         // The invariant the counting exists to preserve, checked where it is supposed
         // to hold. A guard handed out over an unheld flock is invisible from outside —
         // by the time a caller could look, another acquisition has usually taken the
@@ -717,9 +747,9 @@ impl StoreLock {
         );
         StoreGuard {
             lock: Arc::clone(self),
-            stale: gate.is_some(),
+            stale: false,
             span: false,
-            gate,
+            gate: None,
         }
     }
 
@@ -1321,6 +1351,14 @@ impl StoreGuard {
     #[must_use]
     pub const fn is_stale(&self) -> bool {
         self.stale
+    }
+
+    /// Makes this the guard of a stale acquisition, keeping `gate` until its caller has
+    /// reloaded: no other acquisition may join a store whose state is being dropped, see
+    /// [`Self::note_refreshed`].
+    fn keep_gate(&mut self, gate: tokio::sync::OwnedMutexGuard<()>) {
+        self.stale = true;
+        self.gate = Some(gate);
     }
 
     /// Records that the caller has rebuilt this store's state from disk.
