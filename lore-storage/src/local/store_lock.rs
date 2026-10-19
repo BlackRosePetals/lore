@@ -419,8 +419,8 @@ pub struct StoreLock {
     /// [`NEVER_ADOPTED`].
     ///
     /// Written only under the directory's state lock. Read there by [`Self::is_current`],
-    /// and with no lock at all by [`Self::covers`], which is why it is an atomic beside
-    /// that mutex rather than a field inside it.
+    /// and with no lock at all by [`Self::covers`] and [`Self::still_covers`], which is why
+    /// it is an atomic beside that mutex rather than a field inside it.
     observed_generation: AtomicU64,
     /// Whether this store reuses its in-memory state across holds of the flock when the
     /// epoch it observed is unchanged. Without it, the store reloads at the first claim
@@ -444,6 +444,7 @@ fn is_stale(observed: Option<Epoch>, current: Epoch) -> bool {
 /// The generation after `generation`: below [`GENERATION_MASK`], so it fits beside
 /// [`ADVANCED`] in [`PathLock::live`] and never reads as [`NEVER_ADOPTED`] or
 /// [`NOT_HELD`].
+#[lore_macro::test_pub]
 fn next_generation(generation: u64) -> u64 {
     match generation.wrapping_add(1) & GENERATION_MASK {
         GENERATION_MASK => 0,
@@ -745,7 +746,7 @@ impl StoreLock {
     /// span ended between the check and the count, and a release that read the count before
     /// the operation counted itself would not have seen it. The release publishes the flock
     /// as not held before it reads the count, and a fence on each side orders the two, so one
-    /// of them sees the other.
+    /// of them sees the other. The re-check is [`Self::still_covers`].
     #[inline]
     #[must_use]
     pub fn covered(&self, intent: Intent) -> Option<Claim> {
@@ -757,7 +758,7 @@ impl StoreLock {
             });
             std::sync::atomic::fence(Ordering::SeqCst);
             assert!(
-                self.covers(intent),
+                self.still_covers(intent),
                 "an operation was counted as covered after the span it relied on ended"
             );
             Some(claim)
@@ -767,6 +768,24 @@ impl StoreLock {
             let _ = intent;
             None
         }
+    }
+
+    /// Whether the span that admitted an operation with `intent` through [`Self::covers`] still
+    /// covers it: as [`Self::covers`], except that this store may hold the generation after the
+    /// word's. A write's advance of the epoch in the span adopts the new generation before
+    /// [`LockState::publish`] carries it into the word, see [`Self::acquire_at_gate`]. Each is
+    /// loaded once: a word loaded before that publication pairs with either generation, and one
+    /// loaded after it with the adoption it follows. Test builds only.
+    #[cfg(feature = "test-util")]
+    fn still_covers(&self, intent: Intent) -> bool {
+        let live = self.shared.live.load(Ordering::Acquire);
+        if live == NOT_HELD {
+            return false;
+        }
+        let generation = live & GENERATION_MASK;
+        let observed = self.observed_generation.load(Ordering::Relaxed);
+        (observed == generation || observed == next_generation(generation))
+            && (intent == Intent::Read || live & ADVANCED != 0)
     }
 
     /// Registers the store this lock belongs to, so the directory can ask it whether

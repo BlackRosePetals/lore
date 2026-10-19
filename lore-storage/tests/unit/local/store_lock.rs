@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_base::fs::lock::FSLock;
@@ -420,6 +421,29 @@ async fn an_operation_counted_after_its_span_ended_fails_a_test_build() {
     assert!(lock.covers(Intent::Read), "the span covers a read");
     drop(span);
     let _operation = lock.covered(Intent::Read);
+}
+
+/// **A store that adopted an advance in its span before the word carries it is still covered.**
+/// The first write in a span advances the epoch: the writing store adopts the new generation
+/// before the word carries it, and an operation reading the two in between is counted, not failed.
+#[tokio::test]
+async fn an_operation_is_covered_while_its_store_adopts_an_advance_in_its_span() {
+    let dir = dir("covered-advance");
+    let lock = store_lock(dir.path());
+    let mut span = lock
+        .acquire(Intent::Read)
+        .await
+        .expect("acquires")
+        .into_span();
+    span.note_refreshed();
+    {
+        let _state = lock.shared.state.lock();
+        let adopted = lock.observed_generation.load(Ordering::Relaxed);
+        lock.observed_generation
+            .store(next_generation(adopted), Ordering::Relaxed);
+    }
+    drop(lock.covered(Intent::Read));
+    drop(span);
 }
 
 /// **A claim is no larger than the guard it may hold**, so no future holding one grows for the
