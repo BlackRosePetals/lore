@@ -21,7 +21,9 @@
 //! operation that started it is outside the span once the span ends, so the operation joins
 //! the span's claim for it before spawning it, without waiting, and the work holds that claim
 //! until it ends; where the operation cannot join, the work claims the store as its first
-//! step. Test builds check this: see [`Claim`].
+//! step. That claim keeps the flock and covers no operation, so once the span has ended each of
+//! the work's operations claims for itself, and no operation outside the work runs on a claim
+//! that ends with it. Test builds check this: see [`Claim`].
 //!
 //! A store kept in memory between uses is not in use. Its state is retained memory with
 //! no claim attached, which is why the epoch below exists.
@@ -1354,7 +1356,7 @@ impl StoreGuard {
 
     /// Makes this the guard of a span, which covers the operations of every store on the
     /// directory while it lives, see [`StoreLock::covers`]. For a use of the store: a command,
-    /// a handle, a server, an open, or work spawned from one.
+    /// a handle, a server or an open.
     #[must_use]
     #[lore_macro::test_pub]
     pub(crate) fn into_span(mut self) -> Self {

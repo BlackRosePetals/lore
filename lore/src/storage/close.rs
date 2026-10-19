@@ -46,15 +46,16 @@ use crate::storage::store::StoreInternal;
 /// ran, and another process writing in that gap would have the flush reload the stamps away. A
 /// claim that cannot be joined is left out, since the flush claims what it writes regardless.
 #[lore_macro::test_pub]
-pub(crate) async fn claims_for_flush(store: &StoreInternal) -> StoreHold {
-    let mut guards = Vec::new();
-    if let Ok(Some(guard)) = store.immutable.clone().hold_for_command().await {
-        guards.push(guard);
-    }
-    if let Ok(Some(guard)) = store.mutable.clone().hold_for_command().await {
-        guards.push(guard);
-    }
-    StoreHold::new(guards)
+pub(crate) fn claims_for_flush(store: &StoreInternal) -> StoreHold {
+    StoreHold::new(
+        [
+            store.immutable.try_join_claim(),
+            store.mutable.try_join_claim(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    )
 }
 
 /// Fire-and-forget flush of a closing handle's stores, holding `claims` until it is done — see
@@ -174,7 +175,7 @@ fn close_local(
 
         // Spawn flush after the drain so it sees a quiesced store.
         let sync_data = execution_context().globals().sync_data();
-        let claims = claims_for_flush(&store).await;
+        let claims = claims_for_flush(&store);
         retain_closed_stores(&store, &claims);
         spawn_flush_stores(
             store.immutable.clone(),

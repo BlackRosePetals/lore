@@ -1678,7 +1678,8 @@ async fn a_claim_outlives_the_store_that_took_it() {
 
 /// **A store joins only a claim this process already holds, and without waiting.** Outside a
 /// span, and for a store with nothing on disk, there is nothing to join; inside a span the join
-/// is a counted guard, which keeps the flock past the span until it is dropped.
+/// is a counted guard, which keeps the flock past the span until it is dropped and covers no
+/// operation.
 #[tokio::test]
 async fn a_store_joins_only_a_claim_it_already_holds() {
     use lore_storage::mutable_store::MutableStore;
@@ -1714,6 +1715,10 @@ async fn a_store_joins_only_a_claim_it_already_holds() {
     assert!(
         lock.is_held(),
         "the joined claim keeps the flock past the span"
+    );
+    assert!(
+        !lock.covers(Intent::Read),
+        "the joined claim covers no operation"
     );
     drop(joined);
     assert!(!lock.is_held());

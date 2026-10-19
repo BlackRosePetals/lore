@@ -15,8 +15,7 @@ use crate::store_types::KeyValueStream;
 #[async_trait]
 pub trait MutableStore: Send + Sync {
     /// Claims this store for the span it is about to be used — a storage handle from
-    /// open to close, one repository command, or work spawned to outlive the operation
-    /// that started it.
+    /// open to close, or one repository command.
     ///
     /// The claim is what tells other processes this one is using the store, so it
     /// belongs to the span rather than to each call within it. It is also the pair a
@@ -38,8 +37,10 @@ pub trait MutableStore: Send + Sync {
 
     /// Joins the claim this process holds on this store, without waiting: a counted guard when
     /// the store's flock is held and this store is current, `None` otherwise and for a store
-    /// with nothing on disk to claim. A wrapper delegates it as it delegates
-    /// [`Self::hold_for_command`].
+    /// with nothing on disk to claim. The guard keeps the flock for work spawned to outlive the
+    /// caller and covers no operation, as
+    /// [`crate::immutable_store::claim_for_task`] describes. A wrapper delegates it as it
+    /// delegates [`Self::hold_for_command`].
     fn try_join_claim(&self) -> Option<StoreGuard> {
         None
     }

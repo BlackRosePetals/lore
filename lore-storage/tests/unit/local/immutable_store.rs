@@ -5017,7 +5017,8 @@ async fn a_use_ending_with_a_packfile_write_in_flight_keeps_the_flock_until_it_l
 
 /// **A store joins only a claim this process already holds, and without waiting.** Outside a
 /// span, and for a store with nothing on disk, there is nothing to join; inside a span the join
-/// is a counted guard, which keeps the flock past the span until it is dropped.
+/// is a counted guard, which keeps the flock past the span until it is dropped and covers no
+/// operation.
 #[tokio::test]
 async fn a_store_joins_only_a_claim_it_already_holds() {
     use lore_storage::immutable_store::ImmutableStore;
@@ -5044,7 +5045,35 @@ async fn a_store_joins_only_a_claim_it_already_holds() {
         lock.is_held(),
         "the joined claim keeps the flock past the span"
     );
+    assert!(
+        !lock.covers(Intent::Read),
+        "the joined claim covers no operation"
+    );
     drop(joined);
+    assert!(!lock.is_held());
+}
+
+/// **A task that could not join a claim takes one that keeps the flock and covers no operation**,
+/// as a joined claim does: an operation outside the task that ran on it would lose the flock as
+/// the task ends.
+#[tokio::test]
+async fn a_task_s_own_claim_keeps_the_flock_and_covers_no_operation() {
+    let dir = lore_base::test_util::TempDir::new("is_task_claim_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+
+    let claim = lore_storage::immutable_store::claim_for_task(&dyn_store, None)
+        .await
+        .expect("the task's own claim");
+    assert!(lock.is_held(), "the task's claim keeps the flock");
+    assert!(
+        !lock.covers(Intent::Read),
+        "the task's claim covers no operation"
+    );
+    drop(claim);
     assert!(!lock.is_held());
 }
 

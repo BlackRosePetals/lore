@@ -517,6 +517,14 @@ impl crate::immutable_store::ImmutableStore for HoldingStore {
         self.inner.clone().hold_for_command().await
     }
 
+    /// Joins the task claim of the store this one wraps.
+    async fn hold_for_task(
+        self: Arc<Self>,
+    ) -> Result<Option<crate::local::store_lock::StoreGuard>, crate::immutable_store::StoreError>
+    {
+        self.inner.clone().hold_for_task().await
+    }
+
     async fn get(
         self: Arc<Self>,
         partition: crate::types::Partition,

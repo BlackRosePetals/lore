@@ -5148,10 +5148,11 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
     }
 
     fn try_join_claim(&self) -> Option<StoreGuard> {
-        self.lock
-            .as_ref()?
-            .try_join(Intent::Read)
-            .map(StoreGuard::into_span)
+        self.lock.as_ref()?.try_join(Intent::Read)
+    }
+
+    async fn hold_for_task(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
+        self.claim(Intent::Read).await
     }
 
     /// One bucket pass per address establishes the best match, so this store never has a reason to

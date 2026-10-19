@@ -150,7 +150,7 @@ pub(crate) async fn drain_in_parallel(entries: Vec<(u64, std::sync::Arc<store::S
     for (_, store) in entries {
         lore_base::lore_spawn!(tasks, async move {
             store.mark_invalid_and_await().await;
-            let claims = close::claims_for_flush(&store).await;
+            let claims = close::claims_for_flush(&store);
             close::spawn_flush_stores(
                 store.immutable.clone(),
                 store.mutable.clone(),

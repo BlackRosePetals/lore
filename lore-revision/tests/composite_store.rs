@@ -2622,7 +2622,7 @@ mod tests {
         }
     }
 
-    /// **A composite claims the local store it wraps.**
+    /// **A composite claims the local store it wraps**, for a command and for a task.
     ///
     /// The replicas and the durable upstream are remote and have nothing to claim, so
     /// the local target's claim is the whole of it. A composite answering `None` would
@@ -2642,12 +2642,17 @@ mod tests {
         let durable_path = durable_dir.path().to_path_buf();
         LORE_CONTEXT
             .scope(execution, async move {
-                let local: Arc<dyn lore_storage::ImmutableStore> = LocalImmutableStore::new(
+                let local_store = LocalImmutableStore::new(
                     Some(local_path.clone()),
                     ImmutableStoreSettings::default(),
                 )
                 .await
                 .expect("local store");
+                let local_lock = local_store
+                    .lock
+                    .clone()
+                    .expect("a disk-backed store has a lock");
+                let local: Arc<dyn lore_storage::ImmutableStore> = local_store;
                 // A store of its own as the durable target, so the claim can be seen to land
                 // on the local store and not on the one a durable read would reach.
                 let durable: Arc<dyn lore_storage::ImmutableStore> = LocalImmutableStore::new(
@@ -2666,7 +2671,11 @@ mod tests {
                         .expect("composite builds"),
                 );
 
-                let claim = composite.hold_for_command().await.expect("claim taken");
+                let claim = composite
+                    .clone()
+                    .hold_for_command()
+                    .await
+                    .expect("claim taken");
                 assert!(
                     claim.is_some(),
                     "a composite wrapping a store with files on disk must claim it, \
@@ -2681,6 +2690,18 @@ mod tests {
                 };
                 assert!(held(&local_path), "the claim holds the local store");
                 assert!(!held(&durable_path), "and not the durable one");
+                drop(claim);
+
+                let task_claim = composite.hold_for_task().await.expect("claim taken");
+                assert!(
+                    task_claim.is_some(),
+                    "a task's claim lands on the local store too"
+                );
+                assert!(held(&local_path), "the task's claim holds the local store");
+                assert!(
+                    !local_lock.covers(lore_storage::local::store_lock::Intent::Read),
+                    "and covers no operation, as the local store's own task claim does"
+                );
             })
             .await;
     }

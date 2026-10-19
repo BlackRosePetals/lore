@@ -455,9 +455,13 @@ pub async fn query_one(
 /// `joined` is what [`ImmutableStore::try_join_claim`] returned to the operation before it
 /// spawned the task: a guard on the span's flock, which holds it without a gap from the
 /// operation to the end of the work it spawned. Where the operation could not join, the task
-/// claims `store` here as its first step. Held until the task ends. `None` for a store with
-/// nothing on disk to claim, or where the claim cannot be taken, which leaves the task's
-/// operations to claim for themselves and fail as they would have.
+/// claims `store` here as its first step, see [`ImmutableStore::hold_for_task`]. Held until the
+/// task ends. `None` for a store with nothing on disk to claim, or where the claim cannot be
+/// taken, which leaves the task's operations to claim for themselves and fail as they would have.
+///
+/// The claim keeps the flock and covers no operation: once the span has ended, each of the
+/// task's operations takes a guard of its own, and an operation outside the task does not run on
+/// a claim that ends with the task.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -469,7 +473,7 @@ pub fn claim_for_task(
         if joined.is_some() {
             return joined;
         }
-        store.clone().hold_for_command().await.ok().flatten()
+        store.clone().hold_for_task().await.ok().flatten()
     }
 }
 
@@ -481,8 +485,7 @@ pub trait ImmutableStore: Any + Send + Sync {
     }
 
     /// Claims this store for the span it is about to be used — a storage handle from
-    /// open to close, one repository command, or work spawned to outlive the operation
-    /// that started it.
+    /// open to close, or one repository command.
     ///
     /// The claim is what tells other processes this one is using the store, so it
     /// belongs to the span rather than to each call within it. It is also the pair a
@@ -510,6 +513,19 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// delegates it as it delegates [`Self::hold_for_command`].
     fn try_join_claim(&self) -> Option<StoreGuard> {
         None
+    }
+
+    /// Claims this store for work spawned to outlive the operation that started it, where the
+    /// operation could not join its claim: as [`Self::hold_for_command`], but the guard keeps the
+    /// flock for that work and covers no operation, see [`claim_for_task`]. The default is
+    /// [`Self::hold_for_command`]; a store with files on disk, and a wrapper around one, override
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::hold_for_command`].
+    async fn hold_for_task(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
+        self.hold_for_command().await
     }
 
     /// Whether this store refuses to serve a payload it only found under another partition.

@@ -137,6 +137,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore-storage`: a claim for work spawned to outlive an operation keeps the store's lock for that work and covers no
+  other operation: the guard `try_join_claim` returns, the claim `claim_for_task` takes through the new
+  `ImmutableStore::hold_for_task` where the operation could not join, and a closing handle's claims for its flush. As
+  spans, they covered every operation outside a span on the store, each of which then ran with no lock once the work
+  ended
 - A local immutable store's first flush of a group at the full bucket level, which every group of a server store is
   at, writes a bucket emptied since an obliterate, a size eviction or a compaction wrote its file. The flush left the
   file, which kept the removed entries; the next open loaded them back, pointing into packfile ranges compaction had

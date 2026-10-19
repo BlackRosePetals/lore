@@ -1876,10 +1876,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
     }
 
     fn try_join_claim(&self) -> Option<StoreGuard> {
-        self.lock
-            .as_ref()?
-            .try_join(Intent::Read)
-            .map(StoreGuard::into_span)
+        self.lock.as_ref()?.try_join(Intent::Read)
     }
 
     // Assumes that payload has been validated to match the given hash prior to

@@ -98,7 +98,7 @@ fn close_impl(
             let sync_data = lore_revision::lore::execution_context()
                 .globals()
                 .sync_data();
-            let claims = crate::storage::close::claims_for_flush(store).await;
+            let claims = crate::storage::close::claims_for_flush(store);
             crate::storage::close::spawn_flush_for_closed_tree(
                 store.immutable.clone(),
                 store.mutable.clone(),

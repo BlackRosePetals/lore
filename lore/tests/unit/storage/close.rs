@@ -142,7 +142,7 @@ async fn the_claims_joined_for_a_flush_outlive_the_handle() {
         "an open handle claims both stores"
     );
 
-    let claims = claims_for_flush(&store).await;
+    let claims = claims_for_flush(&store);
     assert_eq!(claims.len(), 2, "the flush joins a claim on each store");
     drop(store);
     assert!(

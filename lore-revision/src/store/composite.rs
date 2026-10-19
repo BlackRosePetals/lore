@@ -1092,6 +1092,12 @@ impl ImmutableStore for CompositeStore {
         self.local.target.try_join_claim()
     }
 
+    async fn hold_for_task(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, lore_storage::StoreError> {
+        self.local.target.clone().hold_for_task().await
+    }
+
     /// The local store is the one a read is served from without leaving the process, so its setting
     /// is the one that decides whether bytes can cross a partition here.
     fn isolates_partitions(&self) -> bool {
