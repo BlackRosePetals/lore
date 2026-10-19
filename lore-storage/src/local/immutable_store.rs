@@ -1611,6 +1611,8 @@ impl ImmutableStoreGroup {
     #[lore_macro::test_pub]
     async fn flush_delayed(weak_ref: Weak<LocalImmutableStore>, group_index: usize, delay: u64) {
         tokio::time::sleep(Duration::from_secs(delay)).await;
+        #[cfg(feature = "test-util")]
+        let _task = crate::test_util::store_task(crate::test_util::StoreTask::DelayedFlush);
         if let Some(store) = weak_ref.upgrade()
             && let Some(path) = store.path.as_ref()
         {
@@ -3634,6 +3636,8 @@ impl LocalImmutableStore {
         for (bucket_index, sizes) in bucket_sizes.iter().enumerate() {
             while serialize_tasks.try_join_next().is_some() {}
 
+            #[cfg(feature = "test-util")]
+            crate::test_util::pause_point(crate::test_util::PausePoint::Evicting).await;
             if self.gc_stop_requested() {
                 lore_base::lore_debug!(
                     "Size eviction for group {group_index} stopping at bucket {bucket_index}"

@@ -4,11 +4,15 @@
 //! `test-util`, so a test can count the decodes, hashes and fetches a read costs, answer a remote
 //! fetch without a remote, order what concurrent reads, stores and compactions do, fail packfile
 //! opens, writes, syncs and metadata reads and store directory stats or keep writes in flight,
-//! interrupt a payload gate hold, and hold a read's memory past the read.
+//! interrupt a payload gate hold, hold a read's memory past the read, and count the tasks the store
+//! runs of its own accord.
 
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use tokio::sync::Notify;
@@ -63,6 +67,53 @@ pub enum PausePoint {
     /// A fan-out commit's `level.pending` is on disk, and the write has not yet returned to the
     /// commit.
     Committing,
+    /// A size eviction is about to check for a stop or a fan-out and evict from its next bucket.
+    Evicting,
+}
+
+/// A task the store runs of its own accord rather than for a caller, see [`count_store_tasks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreTask {
+    /// A group's delayed flush in the immutable store.
+    DelayedFlush,
+    /// A group's delayed flush in the mutable store.
+    MutableDelayedFlush,
+    /// An eviction or compaction pass the store starts itself, periodic or when loading crosses a
+    /// cap.
+    Collection,
+}
+
+impl StoreTask {
+    /// Every task, in the order [`count_store_tasks`] counts them, with its name.
+    pub const ALL: [(StoreTask, &'static str); 3] = [
+        (StoreTask::DelayedFlush, "delayed-flush"),
+        (StoreTask::MutableDelayedFlush, "mutable-delayed-flush"),
+        (StoreTask::Collection, "collection"),
+    ];
+}
+
+static STORE_TASKS: OnceLock<&'static [AtomicUsize]> = OnceLock::new();
+
+/// Counts each [`StoreTask`] running in `counters`, one per task in the order of
+/// [`StoreTask::ALL`], from now on in this process.
+pub fn count_store_tasks(counters: &'static [AtomicUsize]) {
+    let _ = STORE_TASKS.set(counters);
+}
+
+/// Counts `task` as running until the returned guard drops, where [`count_store_tasks`] asked.
+pub(crate) fn store_task(task: StoreTask) -> Option<StoreTaskRunning> {
+    let counter = STORE_TASKS.get()?.get(task as usize)?;
+    counter.fetch_add(1, Ordering::Relaxed);
+    Some(StoreTaskRunning(counter))
+}
+
+/// A [`StoreTask`] counted as running, until dropped.
+pub(crate) struct StoreTaskRunning(&'static AtomicUsize);
+
+impl Drop for StoreTaskRunning {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A hold armed at a [`PausePoint`]: `reached` is notified when a task arrives there, which then

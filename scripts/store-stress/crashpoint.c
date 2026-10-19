@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //
-// An LD_PRELOAD shim that kills its process, or fails a file operation, at an exact point in the
-// file operations a store makes, for the store stress suite. See README.md beside it.
+// An LD_PRELOAD shim that kills its process, fails a file operation, or holds one up, at an exact
+// point in the file operations a store makes, for the store stress suite. See README.md beside it.
 //
-// It counts the file operations on paths containing $STRESS_PATH, in the order the process makes
-// them, and then, as the environment asks:
+// It watches the file operations on paths containing one of the comma separated $STRESS_PATH,
+// counts those the filters below select, in the order the process makes them, and then, as the
+// environment asks:
 //
 //   STRESS_CRASH_AT=N      SIGKILL the process once operation N is done
 //   STRESS_CRASH_BEFORE=1  ... before doing it instead
@@ -16,9 +17,13 @@
 //                           when none is (see `natural`). A failed write or read moves part of its
 //                           bytes and returns the short count instead when STRESS_SHORT=1
 //   STRESS_FAIL_PROB=P     fail each operation with probability P instead, from STRESS_SEED
+//   STRESS_DELAY_US=U      hold each operation up for U microseconds before doing it, as a slow
+//                           device does, with probability STRESS_DELAY_PROB, 1 by default, or
+//                           only operation STRESS_DELAY_AT
 //   STRESS_OPS=a,b         count only these: write, sync, rename, truncate, unlink, open, read,
 //                           stat, list, mkdir (default: the five that change the disk)
-//   STRESS_CLASS=a,b       count only operations on these kinds of file (see `classify`)
+//   STRESS_CLASS=a,b       count only operations on these kinds of file (see `classify`), the
+//                           mutable store's named `mutable-<kind>`
 //   STRESS_DURING=a,b      count only operations made while one of these store operations runs,
 //                           as the harness registers them; `idle` for while none does
 //   STRESS_TRACE=file      append one line per counted operation to file
@@ -26,9 +31,13 @@
 //   STRESS_PLACES=file     write at exit, or at the kill, how many operations of each kind, file
 //                           kind and running store operations were counted, and which were failed
 //   STRESS_KILLED=file     write where the kill landed to file
+//   STRESS_STATE=file      keep the store operations running and the watched operations in flight
+//                           in file, mapped shared, so that a kill from outside the process can be
+//                           placed from what it left there (see `struct state`)
 //
-// The harness registers the store operations it runs with `crashpoint_register`, and ends the
-// faults with `crashpoint_disarm` to check that the store recovers from them in the same process.
+// The harness registers the store operations it runs with `crashpoint_register`, ends the faults
+// with `crashpoint_disarm` to check that the store recovers from them in the same process, and asks
+// which watched operations are in flight with `crashpoint_in_flight`.
 //
 // The store uses the psync I/O backend by default, which makes every file operation through
 // libc; the uring backend bypasses the shim for reads and writes.
@@ -43,18 +52,23 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_FDS 65536
-#define MAX_KINDS 32
+// Kinds of running store operation, which the placement key holds as a mask of 47 bits.
+#define MAX_KINDS 47
+#define MAX_FILTERS 8
 
 enum op {
     OP_WRITE = 1,
@@ -74,7 +88,7 @@ static const char *const op_names[] = {"write", "sync", "rename", "truncate", "u
 
 // The kinds of file a store keeps, by name. A rename takes the kind of the file it renames, so
 // that installing a bucket written to a temporary file and installing a `.new` file of a fan-out
-// commit are told apart.
+// commit are told apart. The mutable store's are numbered past `C_COUNT`, see `classify`.
 enum class_id {
     C_PACK,
     C_BUCKET,
@@ -87,23 +101,55 @@ enum class_id {
     C_PENDING_TMP,
     C_COMPACT,
     C_COMPACT_TMP,
+    C_EPOCH,
+    C_EPOCH_NEW,
     C_ROOT_FILE,
     C_DIR,
     C_OTHER,
     C_COUNT
 };
-static const char *const class_names[] = {"pack",    "bucket",      "bucket.tmp",  "new",
-                                          "new.tmp", "level",       "level.tmp",   "pending",
-                                          "pending.tmp", "compact", "compact.tmp", "root-file",
-                                          "dir",     "other"};
+static const char *const store_class_names[] = {"pack",    "bucket",      "bucket.tmp",  "new",
+                                                "new.tmp", "level",       "level.tmp",   "pending",
+                                                "pending.tmp", "compact", "compact.tmp", "epoch",
+                                                "epoch.new", "root-file", "dir",         "other"};
+#define CLASS_COUNT (2 * C_COUNT)
+// Every kind's name, the mutable store's prefixed, filled in at load.
+static char class_names[CLASS_COUNT][24];
 
-static const char *filter;
+// What a process leaves for the orchestrator: the names of the store operations it runs, of the
+// file operations and of the kinds of file, the store operations running, which the harness
+// counts here, and the watched file operations in flight. Read at fixed offsets by stress.py.
+struct state {
+    char magic[8];
+    uint32_t kind_count;
+    uint32_t pid;
+    char kind_names[MAX_KINDS][24];
+    char op_names[OP_COUNT][12];
+    char class_names[CLASS_COUNT][24];
+    // The running store operations when the last watched operation began, and that operation, as
+    // its index and kind plus one.
+    uint64_t last_mask;
+    uint32_t last_op, last_class;
+    size_t running[MAX_KINDS];
+    uint32_t in_flight[OP_COUNT][CLASS_COUNT];
+};
+_Static_assert(offsetof(struct state, op_names) == 1144, "stress.py reads the state at these offsets");
+_Static_assert(offsetof(struct state, class_names) == 1264, "stress.py reads the state at these offsets");
+_Static_assert(offsetof(struct state, last_op) == 2040, "stress.py reads the state at these offsets");
+_Static_assert(offsetof(struct state, running) == 2048, "stress.py reads the state at these offsets");
+_Static_assert(offsetof(struct state, in_flight) == 2424, "stress.py reads the state at these offsets");
+static struct state local_state;
+static struct state *state = &local_state;
+
+static const char *filters[MAX_FILTERS];
+static int filter_count;
 static int ops_mask = OP_WRITE | OP_SYNC | OP_RENAME | OP_TRUNCATE | OP_UNLINK;
-static unsigned class_mask = ~0u;
-static long crash_at = -1, fail_at = -1, fail_count = 1;
+static uint64_t class_mask = ~0ull;
+static long crash_at = -1, fail_at = -1, fail_count = 1, delay_at = -1;
 static int crash_before, tear, short_io;
 static int fail_errnos[8], fail_errno_count;
-static double fail_prob;
+static double fail_prob, delay_prob = 1.0;
+static long delay_us;
 static uint64_t rng_state = 0x9E3779B97F4A7C15ull;
 static int trace_fd = -1;
 static const char *count_path, *places_path, *killed_path;
@@ -111,10 +157,9 @@ static long counter, faults;
 static unsigned char watched[MAX_FDS];
 static int initialized, disarmed;
 
-// The store operations the harness runs: a count per kind, which it updates, and their names.
+
+// The store operations the harness runs: a count per kind, which it updates.
 static const volatile size_t *running;
-static int kind_count;
-static char kind_names[MAX_KINDS][24];
 static const char *during_spec;
 static uint64_t during_mask;
 static int during_idle, during_set;
@@ -176,7 +221,7 @@ static uint64_t running_mask(void) {
     uint64_t mask = 0;
     if (!running)
         return 0;
-    for (int index = 0; index < kind_count; index++)
+    for (uint32_t index = 0; index < state->kind_count; index++)
         if (__atomic_load_n(&running[index], __ATOMIC_RELAXED) > 0)
             mask |= 1ull << index;
     return mask;
@@ -185,7 +230,8 @@ static uint64_t running_mask(void) {
 static void note_place(int op_index, int class, uint64_t mask, int fault) {
     if (!places_path)
         return;
-    uint64_t key = (mask << 16) | ((uint64_t)op_index << 9) | ((uint64_t)class << 1) | (uint64_t)fault | (1ull << 63);
+    uint64_t key = ((mask & ((1ull << MAX_KINDS) - 1)) << 16) | ((uint64_t)op_index << 9) | ((uint64_t)class << 1) |
+                   (uint64_t)fault | (1ull << 63);
     uint64_t slot = (key * 0x9E3779B97F4A7C15ull) >> 51;
     while (__atomic_exchange_n(&places_lock, 1, __ATOMIC_ACQUIRE))
         ;
@@ -205,10 +251,10 @@ static int format_mask(uint64_t mask, char *buffer, size_t size) {
         return snprintf(buffer, size, "idle");
     size_t used = 0;
     buffer[0] = 0;
-    for (int index = 0; index < kind_count && used + 1 < size; index++) {
+    for (uint32_t index = 0; index < state->kind_count && used + 1 < size; index++) {
         if (!(mask & (1ull << index)))
             continue;
-        int written = snprintf(buffer + used, size - used, "%s%s", used ? "+" : "", kind_names[index]);
+        int written = snprintf(buffer + used, size - used, "%s%s", used ? "+" : "", state->kind_names[index]);
         if (written < 0)
             break;
         used += (size_t)written;
@@ -226,7 +272,7 @@ static void write_places(void) {
         uint64_t key = places[index].key;
         if (!key)
             continue;
-        char during[512], line[700];
+        char during[1200], line[1400];
         format_mask((key & ~(1ull << 63)) >> 16, during, sizeof during);
         int length = snprintf(line, sizeof line, "%s %s %s %s %ld\n", (key & 1) ? "fault" : "op",
                               op_names[(key >> 9) & 127], class_names[(key >> 1) & 255], during,
@@ -270,6 +316,41 @@ static int errno_named(const char *name, size_t length) {
         if (strlen(known[index].name) == length && !strncmp(known[index].name, name, length))
             return known[index].value;
     return 0;
+}
+
+// The mask of the operations a comma separated list names.
+static int parse_ops(const char *list) {
+    int mask = 0;
+    for (int index = 0; index < OP_COUNT; index++)
+        if (strstr(list, op_names[index]))
+            mask |= 1 << index;
+    return mask;
+}
+
+// The mask of the kinds of file a comma separated list names.
+static uint64_t parse_classes(const char *list) {
+    uint64_t mask = 0;
+    for (const char *item = list; *item;) {
+        size_t length = strcspn(item, ",");
+        for (int index = 0; index < CLASS_COUNT; index++)
+            if (strlen(class_names[index]) == length && !strncmp(class_names[index], item, length))
+                mask |= 1ull << index;
+        item += length + (item[length] == ',');
+    }
+    return mask;
+}
+
+// Map the file `path` names as the state, so that what the process leaves there outlives it.
+static void map_state(const char *path) {
+    int fd = real_open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return;
+    if (real_ftruncate(fd, sizeof(struct state)) == 0) {
+        void *mapped = mmap(NULL, sizeof(struct state), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mapped != MAP_FAILED)
+            state = mapped;
+    }
+    real_close(fd);
 }
 
 static void *real(const char *name) { return dlsym(RTLD_NEXT, name); }
@@ -318,27 +399,30 @@ __attribute__((constructor)) static void init(void) {
     real_mkdir = real("mkdir");
     real_mkdirat = real("mkdirat");
 
-    filter = getenv("STRESS_PATH");
-    if (filter && !*filter)
-        filter = NULL;
+    for (int index = 0; index < CLASS_COUNT; index++)
+        snprintf(class_names[index], sizeof class_names[index], "%s%s", index < C_COUNT ? "" : "mutable-",
+                 store_class_names[index % C_COUNT]);
+    const char *state_path = getenv("STRESS_STATE");
+    if (state_path && *state_path)
+        map_state(state_path);
+    memcpy(state->magic, "STRESS1", 8);
+    state->pid = (uint32_t)getpid();
+    for (int index = 0; index < OP_COUNT; index++)
+        snprintf(state->op_names[index], sizeof state->op_names[index], "%s", op_names[index]);
+    memcpy(state->class_names, class_names, sizeof class_names);
+    const char *paths = getenv("STRESS_PATH");
+    for (const char *item = paths ? paths : ""; *item && filter_count < MAX_FILTERS;) {
+        size_t length = strcspn(item, ",");
+        if (length)
+            filters[filter_count++] = strndup(item, length);
+        item += length + (item[length] == ',');
+    }
     const char *ops = getenv("STRESS_OPS");
-    if (ops && *ops) {
-        ops_mask = 0;
-        for (int index = 0; index < OP_COUNT; index++)
-            if (strstr(ops, op_names[index]))
-                ops_mask |= 1 << index;
-    }
+    if (ops && *ops)
+        ops_mask = parse_ops(ops);
     const char *classes = getenv("STRESS_CLASS");
-    if (classes && *classes) {
-        class_mask = 0;
-        for (const char *item = classes; *item;) {
-            size_t length = strcspn(item, ",");
-            for (int index = 0; index < C_COUNT; index++)
-                if (strlen(class_names[index]) == length && !strncmp(class_names[index], item, length))
-                    class_mask |= 1u << index;
-            item += length + (item[length] == ',');
-        }
-    }
+    if (classes && *classes)
+        class_mask = parse_classes(classes);
     during_spec = getenv("STRESS_DURING");
     if (during_spec && !*during_spec)
         during_spec = NULL;
@@ -351,6 +435,11 @@ __attribute__((constructor)) static void init(void) {
     const char *probability = getenv("STRESS_FAIL_PROB");
     if (probability && *probability)
         fail_prob = strtod(probability, NULL);
+    delay_us = env_long("STRESS_DELAY_US", 0);
+    delay_at = env_long("STRESS_DELAY_AT", -1);
+    const char *delay_probability = getenv("STRESS_DELAY_PROB");
+    if (delay_probability && *delay_probability)
+        delay_prob = strtod(delay_probability, NULL);
     rng_state ^= (uint64_t)env_long("STRESS_SEED", 1) * 0xBF58476D1CE4E5B9ull;
     const char *errno_list = getenv("STRESS_FAIL_ERRNO");
     for (const char *item = errno_list ? errno_list : ""; *item && fail_errno_count < 8;) {
@@ -377,26 +466,32 @@ __attribute__((constructor)) static void init(void) {
     initialized = 1;
 }
 
+// Counters for `count` kinds of store operation, which outlive the process with the state when
+// STRESS_STATE names a file, or NULL for more than the shim holds.
+size_t *crashpoint_counters(size_t count) {
+    return count <= MAX_KINDS ? (size_t *)state->running : NULL;
+}
+
 // The harness's store operations: `counts[i]` running operations of the kind named by the i-th
 // of the comma separated `names`.
 void crashpoint_register(const volatile size_t *counts, const char *names) {
-    int count = 0;
+    uint32_t count = 0;
     for (const char *item = names; *item && count < MAX_KINDS;) {
         size_t length = strcspn(item, ",");
-        size_t take = length < sizeof kind_names[0] - 1 ? length : sizeof kind_names[0] - 1;
-        memcpy(kind_names[count], item, take);
-        kind_names[count][take] = 0;
+        size_t take = length < sizeof state->kind_names[0] - 1 ? length : sizeof state->kind_names[0] - 1;
+        memcpy(state->kind_names[count], item, take);
+        state->kind_names[count][take] = 0;
         count++;
         item += length + (item[length] == ',');
     }
-    kind_count = count;
+    state->kind_count = count;
     if (during_spec) {
         for (const char *item = during_spec; *item;) {
             size_t length = strcspn(item, ",");
             if (length == 4 && !strncmp(item, "idle", 4))
                 during_idle = 1;
-            for (int index = 0; index < kind_count; index++)
-                if (strlen(kind_names[index]) == length && !strncmp(kind_names[index], item, length))
+            for (uint32_t index = 0; index < count; index++)
+                if (strlen(state->kind_names[index]) == length && !strncmp(state->kind_names[index], item, length))
                     during_mask |= 1ull << index;
             item += length + (item[length] == ',');
         }
@@ -405,7 +500,8 @@ void crashpoint_register(const volatile size_t *counts, const char *names) {
     __atomic_store_n(&during_set, 1, __ATOMIC_RELEASE);
 }
 
-// Fail nothing more and kill nowhere from now on, returning how many operations were failed.
+// Fail nothing more, hold nothing up and kill nowhere from now on, returning how many operations
+// were failed.
 long crashpoint_disarm(void) {
     __atomic_store_n(&disarmed, 1, __ATOMIC_SEQ_CST);
     return __atomic_load_n(&faults, __ATOMIC_SEQ_CST);
@@ -414,16 +510,37 @@ long crashpoint_disarm(void) {
 // How many operations were failed so far.
 long crashpoint_faults(void) { return __atomic_load_n(&faults, __ATOMIC_SEQ_CST); }
 
+// The watched operations in flight, as `op:kind` separated by commas, into `buffer`, returning the
+// length written.
+int crashpoint_in_flight(char *buffer, size_t size) {
+    size_t used = 0;
+    buffer[0] = 0;
+    for (int op = 0; op < OP_COUNT; op++)
+        for (int class = 0; class < CLASS_COUNT; class++) {
+            if (!__atomic_load_n(&state->in_flight[op][class], __ATOMIC_RELAXED) || used + 1 >= size)
+                continue;
+            int written = snprintf(buffer + used, size - used, "%s%s:%s", used ? "," : "", op_names[op],
+                                   class_names[class]);
+            if (written < 0 || (size_t)written >= size - used)
+                return (int)used;
+            used += (size_t)written;
+        }
+    return (int)used;
+}
+
 static int path_matches(const char *path) {
-    return filter && path && strstr(path, filter);
+    for (int index = 0; path && index < filter_count; index++)
+        if (strstr(path, filters[index]))
+            return 1;
+    return 0;
 }
 
 static int fd_watched(int fd) {
-    return initialized && filter && fd >= 0 && fd < MAX_FDS && watched[fd];
+    return initialized && filter_count && fd >= 0 && fd < MAX_FDS && watched[fd];
 }
 
 static void note_open(int fd) {
-    if (!initialized || !filter || fd < 0 || fd >= MAX_FDS)
+    if (!initialized || !filter_count || fd < 0 || fd >= MAX_FDS)
         return;
     char link[64], target[PATH_MAX];
     snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
@@ -441,45 +558,55 @@ static int ends_with(const char *text, size_t length, const char *suffix) {
     return length >= suffix_length && !memcmp(text + length - suffix_length, suffix, suffix_length);
 }
 
-// The kind of store file `path` names.
+// The store directory `path` lies in, named `name`: where its name ends, or NULL.
+static const char *store_root(const char *path, const char *name) {
+    size_t length = strlen(name);
+    for (const char *found = strstr(path, name); found; found = strstr(found + 1, name))
+        if (found[length] == '/' || !found[length])
+            return found + length;
+    return NULL;
+}
+
+// The kind of store file `path` names, numbered past `C_COUNT` for the mutable store's.
 static int classify(const char *path) {
     if (!path)
+        return C_OTHER;
+    const char *root = store_root(path, "/mutable");
+    int offset = root ? C_COUNT : 0;
+    if (!root)
+        root = store_root(path, "/immutable");
+    if (!root)
         return C_OTHER;
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
     size_t length = strlen(base);
     const char *pack = strstr(path, "/pack/");
     if (pack && !strchr(pack + 6, '/') && pack[6])
-        return C_PACK;
+        return offset + C_PACK;
     if (!strncmp(base, "index_", 6)) {
         if (ends_with(base, length, ".new.tmp"))
-            return C_NEW_TMP;
+            return offset + C_NEW_TMP;
         if (ends_with(base, length, ".new"))
-            return C_NEW;
+            return offset + C_NEW;
         if (ends_with(base, length, ".tmp"))
-            return C_BUCKET_TMP;
-        return length == 8 ? C_BUCKET : C_OTHER;
+            return offset + C_BUCKET_TMP;
+        return offset + (length == 8 ? C_BUCKET : C_OTHER);
     }
-    if (!strcmp(base, "level"))
-        return C_LEVEL;
-    if (!strcmp(base, "level.tmp"))
-        return C_LEVEL_TMP;
-    if (!strcmp(base, "level.pending"))
-        return C_PENDING;
-    if (!strcmp(base, "level.pending.tmp"))
-        return C_PENDING_TMP;
-    if (!strcmp(base, "compact"))
-        return C_COMPACT;
-    if (!strcmp(base, "compact.tmp"))
-        return C_COMPACT_TMP;
-    // A directory of the store: `immutable`, `index`, a group, or a group's `pack`.
-    if (!strcmp(base, "immutable") || !strcmp(base, "index") || !strcmp(base, "pack") ||
-        (length == 2 && strstr(path, "/index/")))
-        return C_DIR;
-    const char *immutable = strstr(path, "/immutable/");
-    if (immutable && !strchr(immutable + 11, '/'))
-        return C_ROOT_FILE;
-    return C_OTHER;
+    static const struct {
+        const char *name;
+        int class;
+    } named[] = {{"level", C_LEVEL},     {"level.tmp", C_LEVEL_TMP},     {"level.pending", C_PENDING},
+                 {"level.pending.tmp", C_PENDING_TMP}, {"compact", C_COMPACT}, {"compact.tmp", C_COMPACT_TMP},
+                 {"epoch", C_EPOCH},     {"epoch.new", C_EPOCH_NEW}};
+    for (size_t index = 0; index < sizeof named / sizeof named[0]; index++)
+        if (!strcmp(base, named[index].name))
+            return offset + named[index].class;
+    // A directory of the store: its own, `index`, a group, or a group's `pack`.
+    if (!*root || !strcmp(base, "index") || !strcmp(base, "pack") || (length == 2 && strstr(path, "/index/")))
+        return offset + C_DIR;
+    if (*root == '/' && !strchr(root + 1, '/'))
+        return offset + C_ROOT_FILE;
+    return offset + C_OTHER;
 }
 
 static uint64_t next_random(void) {
@@ -487,6 +614,10 @@ static uint64_t next_random(void) {
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
     return z ^ (z >> 31);
+}
+
+static int chance(double probability) {
+    return probability > 0 && (double)(next_random() >> 11) / (double)(1ull << 53) < probability;
 }
 
 static void fd_detail(int fd, char *buffer, size_t size) {
@@ -553,7 +684,7 @@ static void die(void) {
     if (killed_path) {
         int fd = real_open(killed_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
-            char during[512], line[PATH_MAX + 700];
+            char during[1200], line[PATH_MAX + 1400];
             format_mask(crash_mask, during, sizeof during);
             int length = snprintf(line, sizeof line, "%s %s %s %s\n", crash_op ? crash_op : "-",
                                   class_names[crash_class], during, crash_path ? crash_path : "-");
@@ -569,8 +700,14 @@ static void die(void) {
         pause();
 }
 
-// What to do with counted operation `sequence`.
+// What to do with a watched operation.
 enum action { PROCEED, FAIL, CRASH_BEFORE, CRASH_AFTER, TEAR };
+
+// A watched operation under way: what to do with it, and where it counts as in flight.
+struct call {
+    enum action action;
+    int op_index, class;
+};
 
 static enum action decide(long sequence) {
     if (__atomic_load_n(&disarmed, __ATOMIC_RELAXED))
@@ -582,7 +719,7 @@ static enum action decide(long sequence) {
     }
     if (fail_at >= 0 && sequence >= fail_at && sequence < fail_at + fail_count)
         return FAIL;
-    if (fail_prob > 0 && (double)(next_random() >> 11) / (double)(1ull << 53) < fail_prob)
+    if (chance(fail_prob))
         return FAIL;
     return PROCEED;
 }
@@ -590,7 +727,7 @@ static enum action decide(long sequence) {
 static void trace_line(long sequence, const char *name, int class, uint64_t mask, const char *detail, long result) {
     if (trace_fd < 0)
         return;
-    char during[512], line[PATH_MAX + 700];
+    char during[1200], line[PATH_MAX + 1400];
     format_mask(mask, during, sizeof during);
     int length = snprintf(line, sizeof line, "%ld %s %s %s %s %ld\n", sequence, name, class_names[class], during,
                           detail ? detail : "-", result);
@@ -601,7 +738,7 @@ static void trace_line(long sequence, const char *name, int class, uint64_t mask
 // Whether an operation of kind `op` on a file of kind `class` is one to count, given which store
 // operations run now.
 static int counted(int op, int class, uint64_t mask) {
-    if (!(ops_mask & op) || !(class_mask & (1u << class)))
+    if (!(ops_mask & op) || !(class_mask & (1ull << class)))
         return 0;
     if (!during_spec)
         return 1;
@@ -610,37 +747,58 @@ static int counted(int op, int class, uint64_t mask) {
     return (mask & during_mask) || (during_idle && !mask);
 }
 
-// Count an operation and decide what to do with it. `creates` says whether an open or a listing
-// makes something, which decides the errors it can meet. Sets `*error` for a failure.
-static enum action begin(int op, const char *name, const char *detail, int creates, int *error) {
-    int class = classify(detail);
-    uint64_t mask = running_mask();
-    if (!counted(op, class, mask))
-        return PROCEED;
-    long sequence = __atomic_add_fetch(&counter, 1, __ATOMIC_SEQ_CST);
-    enum action action = decide(sequence);
-    note_place(op_index_of(op), class, mask, 0);
-    if (action == FAIL) {
-        *error = fail_errno_for(op, creates);
-        __atomic_add_fetch(&faults, 1, __ATOMIC_SEQ_CST);
-        note_place(op_index_of(op), class, mask, 1);
-        trace_line(sequence, name, class, mask, detail, -*error);
-    } else {
-        trace_line(sequence, name, class, mask, detail, 0);
-    }
-    if (action == CRASH_BEFORE || action == CRASH_AFTER || action == TEAR) {
-        crash_op = op_names[op_index_of(op)];
-        crash_class = class;
-        crash_mask = mask;
-        crash_path = detail;
-        if (action == CRASH_BEFORE)
-            die();
-    }
-    return action;
+static void sleep_us(long us) {
+    struct timespec duration = {us / 1000000, (us % 1000000) * 1000};
+    while (nanosleep(&duration, &duration) && errno == EINTR)
+        ;
 }
 
-static void end(enum action action) {
-    if (action == CRASH_AFTER)
+// Count a watched operation and decide what to do with it, recording it as in flight unless it
+// fails, and holding it up first as asked. `creates` says whether an open or a listing makes
+// something, which decides the errors it can meet. Sets `*error` for a failure.
+static struct call begin(int op, const char *name, const char *detail, int creates, int *error) {
+    int class = classify(detail);
+    int op_index = op_index_of(op);
+    struct call call = {PROCEED, op_index, class};
+    uint64_t mask = running_mask();
+    __atomic_store_n(&state->last_mask, mask, __ATOMIC_RELAXED);
+    __atomic_store_n(&state->last_op, (uint32_t)op_index + 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&state->last_class, (uint32_t)class + 1, __ATOMIC_RELAXED);
+    int delay = 0;
+    long sequence = 0;
+    if (counted(op, class, mask)) {
+        sequence = __atomic_add_fetch(&counter, 1, __ATOMIC_SEQ_CST);
+        call.action = decide(sequence);
+        note_place(op_index, class, mask, 0);
+        if (call.action == FAIL) {
+            *error = fail_errno_for(op, creates);
+            __atomic_add_fetch(&faults, 1, __ATOMIC_SEQ_CST);
+            note_place(op_index, class, mask, 1);
+            trace_line(sequence, name, class, mask, detail, -*error);
+            return call;
+        }
+        trace_line(sequence, name, class, mask, detail, 0);
+        if (call.action != PROCEED) {
+            crash_op = op_names[op_index];
+            crash_class = class;
+            crash_mask = mask;
+            crash_path = detail;
+            if (call.action == CRASH_BEFORE)
+                die();
+        }
+        if (delay_us > 0 && !__atomic_load_n(&disarmed, __ATOMIC_RELAXED) &&
+            (delay_at >= 0 ? sequence == delay_at : chance(delay_prob)))
+            delay = 1;
+    }
+    __atomic_add_fetch(&state->in_flight[op_index][class], 1, __ATOMIC_RELAXED);
+    if (delay)
+        sleep_us(delay_us);
+    return call;
+}
+
+static void end(struct call call) {
+    __atomic_sub_fetch(&state->in_flight[call.op_index][call.class], 1, __ATOMIC_RELAXED);
+    if (call.action == CRASH_AFTER)
         die();
 }
 
@@ -656,15 +814,15 @@ static size_t partial(size_t length) {
     return length > 1 ? (size_t)(next_random() % (length - 1)) + 1 : 0;
 }
 
-#define WRITE_BODY(call, partial_call, length)                                     \
+#define WRITE_BODY(call_, partial_call, length)                                    \
     do {                                                                           \
         if (!fd_watched(fd))                                                       \
-            return call;                                                           \
+            return call_;                                                          \
         char detail[PATH_MAX];                                                     \
         fd_detail(fd, detail, sizeof detail);                                      \
         int error = 0;                                                             \
-        enum action action = begin(OP_WRITE, __func__, detail, 0, &error);         \
-        if (action == FAIL) {                                                      \
+        struct call call = begin(OP_WRITE, __func__, detail, 0, &error);           \
+        if (call.action == FAIL) {                                                 \
             if (short_io && (length) > 1) {                                        \
                 size_t part = partial(length);                                     \
                 ssize_t done = partial_call;                                       \
@@ -674,13 +832,13 @@ static size_t partial(size_t length) {
             errno = error;                                                         \
             return -1;                                                             \
         }                                                                          \
-        if (action == TEAR) {                                                      \
+        if (call.action == TEAR) {                                                 \
             size_t part = partial(length);                                         \
             (void)(partial_call);                                                  \
             die();                                                                 \
         }                                                                          \
-        ssize_t result = call;                                                     \
-        end(action);                                                               \
+        ssize_t result = call_;                                                    \
+        end(call);                                                                 \
         return result;                                                             \
     } while (0)
 
@@ -731,17 +889,17 @@ ssize_t pwritev2(int fd, const struct iovec *iov, int count, off_t offset, int f
 
 // A read about to fail: with STRESS_SHORT, it reads and then reports only part of what it read,
 // which a caller must take as a short read and continue from.
-#define READ_BODY(call)                                                            \
+#define READ_BODY(call_)                                                           \
     do {                                                                           \
         if (!fd_watched(fd))                                                       \
-            return call;                                                           \
+            return call_;                                                          \
         char detail[PATH_MAX];                                                     \
         fd_detail(fd, detail, sizeof detail);                                      \
         int error = 0;                                                             \
-        enum action action = begin(OP_READ, __func__, detail, 0, &error);          \
-        if (action == FAIL) {                                                      \
+        struct call call = begin(OP_READ, __func__, detail, 0, &error);            \
+        if (call.action == FAIL) {                                                 \
             if (short_io) {                                                        \
-                ssize_t done = call;                                               \
+                ssize_t done = call_;                                              \
                 if (done > 1)                                                      \
                     return (ssize_t)partial((size_t)done);                         \
                 if (done >= 0)                                                     \
@@ -750,10 +908,10 @@ ssize_t pwritev2(int fd, const struct iovec *iov, int count, off_t offset, int f
             errno = error;                                                         \
             return -1;                                                             \
         }                                                                          \
-        if (action == TEAR)                                                        \
+        if (call.action == TEAR)                                                   \
             die();                                                                 \
-        ssize_t result = call;                                                     \
-        end(action);                                                               \
+        ssize_t result = call_;                                                    \
+        end(call);                                                                 \
         return result;                                                             \
     } while (0)
 
@@ -773,22 +931,22 @@ ssize_t preadv2(int fd, const struct iovec *iov, int count, off_t offset, int fl
     READ_BODY(real_preadv2(fd, iov, count, offset, flags));
 }
 
-#define FD_BODY(op, call)                                                          \
+#define FD_BODY(op, call_)                                                         \
     do {                                                                           \
         if (!fd_watched(fd))                                                       \
-            return call;                                                           \
+            return call_;                                                          \
         char detail[PATH_MAX];                                                     \
         fd_detail(fd, detail, sizeof detail);                                      \
         int error = 0;                                                             \
-        enum action action = begin(op, __func__, detail, 0, &error);               \
-        if (action == FAIL) {                                                      \
+        struct call call = begin(op, __func__, detail, 0, &error);                 \
+        if (call.action == FAIL) {                                                 \
             errno = error;                                                         \
             return -1;                                                             \
         }                                                                          \
-        if (action == TEAR)                                                        \
+        if (call.action == TEAR)                                                   \
             die();                                                                 \
-        int result = call;                                                         \
-        end(action);                                                               \
+        int result = call_;                                                        \
+        end(call);                                                                 \
         return result;                                                             \
     } while (0)
 
@@ -797,20 +955,20 @@ int fdatasync(int fd) { FD_BODY(OP_SYNC, real_fdatasync(fd)); }
 int ftruncate(int fd, off_t length) { FD_BODY(OP_TRUNCATE, real_ftruncate(fd, length)); }
 int ftruncate64(int fd, off_t length) { FD_BODY(OP_TRUNCATE, real_ftruncate64(fd, length)); }
 
-#define PATH_BODY(op, matched, detail, creates, call)                              \
+#define PATH_BODY(op, matched, detail, creates, call_)                             \
     do {                                                                           \
         if (!initialized || !(matched))                                            \
-            return call;                                                           \
+            return call_;                                                          \
         int error = 0;                                                             \
-        enum action action = begin(op, __func__, detail, creates, &error);         \
-        if (action == FAIL) {                                                      \
+        struct call call = begin(op, __func__, detail, creates, &error);           \
+        if (call.action == FAIL) {                                                 \
             errno = error;                                                         \
             return -1;                                                             \
         }                                                                          \
-        if (action == TEAR)                                                        \
+        if (call.action == TEAR)                                                   \
             die();                                                                 \
-        int result = call;                                                         \
-        end(action);                                                               \
+        int result = call_;                                                        \
+        end(call);                                                                 \
         return result;                                                             \
     } while (0)
 
@@ -854,22 +1012,22 @@ static void stat_detail(int dir, const char *path, char *buffer, size_t size) {
         fd_detail(dir, buffer, size);
 }
 
-#define STAT_BODY(dir, path, flags, call)                                          \
+#define STAT_BODY(dir, path, flags, call_)                                         \
     do {                                                                           \
         if (!initialized || !stat_matched(dir, path, flags))                       \
-            return call;                                                           \
+            return call_;                                                          \
         char detail[PATH_MAX];                                                     \
         stat_detail(dir, path, detail, sizeof detail);                             \
         int error = 0;                                                             \
-        enum action action = begin(OP_STAT, __func__, detail, 0, &error);          \
-        if (action == FAIL) {                                                      \
+        struct call call = begin(OP_STAT, __func__, detail, 0, &error);            \
+        if (call.action == FAIL) {                                                 \
             errno = error;                                                         \
             return -1;                                                             \
         }                                                                          \
-        if (action == TEAR)                                                        \
+        if (call.action == TEAR)                                                   \
             die();                                                                 \
-        int result = call;                                                         \
-        end(action);                                                               \
+        int result = call_;                                                        \
+        end(call);                                                                 \
         return result;                                                             \
     } while (0)
 
@@ -925,37 +1083,37 @@ DIR *opendir(const char *path) {
         return dir;
     }
     int error = 0;
-    enum action action = begin(OP_LIST, __func__, path, 1, &error);
-    if (action == FAIL) {
+    struct call call = begin(OP_LIST, __func__, path, 1, &error);
+    if (call.action == FAIL) {
         errno = error;
         return NULL;
     }
-    if (action == TEAR)
+    if (call.action == TEAR)
         die();
     DIR *dir = real_opendir(path);
     if (dir)
         note_open(dirfd(dir));
-    end(action);
+    end(call);
     return dir;
 }
 
-#define READDIR_BODY(type, call)                                                   \
+#define READDIR_BODY(type, call_)                                                  \
     do {                                                                           \
         int fd = dirfd(dir);                                                       \
         if (!fd_watched(fd))                                                       \
-            return call;                                                           \
+            return call_;                                                          \
         char detail[PATH_MAX];                                                     \
         fd_detail(fd, detail, sizeof detail);                                      \
         int error = 0;                                                             \
-        enum action action = begin(OP_LIST, __func__, detail, 0, &error);          \
-        if (action == FAIL) {                                                      \
+        struct call call = begin(OP_LIST, __func__, detail, 0, &error);            \
+        if (call.action == FAIL) {                                                 \
             errno = error;                                                         \
             return NULL;                                                           \
         }                                                                          \
-        if (action == TEAR)                                                        \
+        if (call.action == TEAR)                                                   \
             die();                                                                 \
-        type *entry = call;                                                        \
-        end(action);                                                               \
+        type *entry = call_;                                                       \
+        end(call);                                                                 \
         return entry;                                                              \
     } while (0)
 
@@ -966,16 +1124,16 @@ static int open_common(int (*real_call)(const char *, int, ...), const char *nam
                        mode_t mode) {
     if (initialized && path_matches(path)) {
         int error = 0;
-        enum action action = begin(OP_OPEN, name, path, (flags & O_CREAT) != 0, &error);
-        if (action == FAIL) {
+        struct call call = begin(OP_OPEN, name, path, (flags & O_CREAT) != 0, &error);
+        if (call.action == FAIL) {
             errno = error;
             return -1;
         }
-        if (action == TEAR)
+        if (call.action == TEAR)
             die();
         int fd = real_call(path, flags, mode);
         note_open(fd);
-        end(action);
+        end(call);
         return fd;
     }
     int fd = real_call(path, flags, mode);
@@ -987,16 +1145,16 @@ static int openat_common(int (*real_call)(int, const char *, int, ...), const ch
                          int flags, mode_t mode) {
     if (initialized && path_matches(path)) {
         int error = 0;
-        enum action action = begin(OP_OPEN, name, path, (flags & O_CREAT) != 0, &error);
-        if (action == FAIL) {
+        struct call call = begin(OP_OPEN, name, path, (flags & O_CREAT) != 0, &error);
+        if (call.action == FAIL) {
             errno = error;
             return -1;
         }
-        if (action == TEAR)
+        if (call.action == TEAR)
             die();
         int fd = real_call(dir, path, flags, mode);
         note_open(fd);
-        end(action);
+        end(call);
         return fd;
     }
     int fd = real_call(dir, path, flags, mode);

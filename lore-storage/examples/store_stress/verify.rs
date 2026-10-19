@@ -1088,6 +1088,115 @@ fn stale_new_file(path: &Path, config: &Config, lengths: &[Option<u64>], report:
     }
 }
 
+/// What an entry records, its access stamp left out.
+type EntryRecord = (
+    Hash,
+    lore_storage::Partition,
+    lore_storage::Context,
+    u32,
+    u32,
+    u64,
+    u32,
+    u32,
+);
+
+/// What `entry` records, its access stamp left out.
+fn record_of(entry: &ImmutableStoreEntry) -> EntryRecord {
+    let data = &entry.data;
+    (
+        entry.address.hash,
+        entry.partition,
+        entry.address.context,
+        data.flags,
+        data.size_payload,
+        data.size_content,
+        data.pack_offset,
+        data.pack_file,
+    )
+}
+
+/// The entries the bucket file at `path` records, sorted, none for a missing file, or why they
+/// cannot be read: the file could not be read, or is not laid out as this store writes them.
+fn bucket_file_records(path: &Path) -> Result<Vec<EntryRecord>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(err) => return Err(format!("the file could not be read: {err}")),
+    };
+    parse_bucket_file(&bytes).ok_or_else(|| "the file does not parse".to_string())
+}
+
+/// The entries `bytes`, a bucket file's contents, record, sorted, or `None` for a file not laid
+/// out as this store writes them.
+fn parse_bucket_file(bytes: &[u8]) -> Option<Vec<EntryRecord>> {
+    use zerocopy::FromBytes;
+    let count = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?) as usize;
+    let size = size_of::<ImmutableStoreEntry>();
+    let entries = bytes.get(HEADER_SIZE + count * 4..HEADER_SIZE + count * (4 + size))?;
+    let mut records: Vec<EntryRecord> = entries
+        .chunks_exact(size)
+        .map(|entry| {
+            ImmutableStoreEntry::read_from_bytes(entry)
+                .ok()
+                .map(|entry| record_of(&entry))
+        })
+        .collect::<Option<_>>()?;
+    records.sort_unstable();
+    Some(records)
+}
+
+/// Each bucket of `store` whose file on disk records other entries than its memory holds, leaving
+/// out buckets flagged for a flush: what an older write of a bucket file landing over a newer one
+/// leaves, which reads from memory never see and the next flush of the bucket repairs. Each group
+/// is held under its flush lock, so that no write of it is in flight.
+pub async fn files_behind_memory(store: &Arc<LocalImmutableStore>) -> Vec<String> {
+    let Some(path) = store.path.clone() else {
+        return vec![];
+    };
+    let index = path.join("index");
+    let mut findings = vec![];
+    for (group_index, group) in store.group.iter().enumerate() {
+        let level = group.bucket_count.load(atomic::Ordering::Relaxed);
+        if !(0..level).any(|bucket| group.try_bucket(bucket).is_some()) {
+            continue;
+        }
+        let _flushing =
+            lore_storage::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
+        if group.pending_level.load(atomic::Ordering::Relaxed) != 0
+            || group.committed_level.load(atomic::Ordering::Relaxed) != level
+        {
+            continue;
+        }
+        let directory = lore_storage::local::fan_out::group_dir_path(&index, group_index);
+        for bucket_index in 0..level {
+            let Some(bucket) = group.try_bucket(bucket_index) else {
+                continue;
+            };
+            let bucket = bucket.read().await;
+            if !bucket.deserialized || group.needs_flush(bucket_index) {
+                continue;
+            }
+            let mut memory: Vec<EntryRecord> = bucket.entry.iter().map(record_of).collect();
+            memory.sort_unstable();
+            let file = lore_storage::local::fan_out::bucket_path(&directory, bucket_index);
+            match bucket_file_records(&file) {
+                Ok(records) if records == memory => {}
+                Ok(records) => findings.push(format!(
+                    "group {group_index:02x} bucket {bucket_index:02x}: the file records {} entries, \
+                     {} of them not in memory, which holds {} entries",
+                    records.len(),
+                    records.iter().filter(|record| memory.binary_search(record).is_err()).count(),
+                    memory.len()
+                )),
+                Err(reason) => findings.push(format!(
+                    "group {group_index:02x} bucket {bucket_index:02x}: {reason}"
+                )),
+            }
+        }
+    }
+    findings
+}
+
 /// The header and recorded packfile sizes of one bucket file, against the packfiles.
 fn audit_bucket_file(
     path: &Path,

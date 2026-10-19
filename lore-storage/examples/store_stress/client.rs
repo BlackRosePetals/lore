@@ -13,13 +13,17 @@
 //!
 //! - `call <op>...` runs a call and answers `ran <loads> <loads> <outcome>...`.
 //! - `unflushed <op>...` runs a call that does not flush, and answers the same.
+//! - `cancel <point> <op>...` runs a call whose flush its caller drops once it reaches the pause
+//!   point `<point>`, see [`pause_point`], and answers the same, or `unreached` for a flush that
+//!   ended before it reached the point. What the store runs on of the flush stays held there until
+//!   the next request.
 //! - `probed <op>...` answers `probed <busy> <busy>`, whether another process holds each store's
 //!   flock, before it claims the stores, then runs the call and answers as `call` does.
 //! - `hold <op>...` runs the operations of a call and answers as `call` does, then keeps the call
 //!   open until the process is killed.
-//! - `pause committing <op>...` runs the operations of a call and answers as `call` does, then
-//!   holds its flush where a fan-out commit has written its `level.pending` and renamed none of
-//!   its `.new` files, answers `paused` once there, and stays there until the process is killed.
+//! - `pause <point> <op>...` runs the operations of a call and its flush until they reach the
+//!   pause point `<point>`, answers `paused` once there, or `unreached` if they ended first, and
+//!   stays there until the process is killed.
 //! - `flush` flushes the kept stores outside any call, and `sweep` runs their delayed flushes that
 //!   are due, as they run once their delay is up.
 
@@ -63,6 +67,26 @@ const FLUSH_DELAY_SECONDS: u64 = 60 * 60;
 /// Seconds a request may run before the client counts itself hung and exits, so that the script
 /// waiting on its reply reads its end instead.
 const HANG_SECONDS: u64 = 60;
+
+/// The pause point `name` names, in lower case, where a `pause` or `cancel` request stops a call.
+fn pause_point(name: &str) -> Result<PausePoint, String> {
+    const POINTS: [(&str, PausePoint); 9] = [
+        ("reserved", PausePoint::Reserved),
+        ("written", PausePoint::Written),
+        ("located", PausePoint::Located),
+        ("selected", PausePoint::Selected),
+        ("stopped", PausePoint::Stopped),
+        ("serializing", PausePoint::Serializing),
+        ("syncing", PausePoint::Syncing),
+        ("committing", PausePoint::Committing),
+        ("evicting", PausePoint::Evicting),
+    ];
+    POINTS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, point)| *point)
+        .ok_or_else(|| format!("no pause point {name}"))
+}
 
 /// Both stores of a directory.
 pub struct Stores {
@@ -392,6 +416,7 @@ async fn serve(dir: &Path, keeps: bool) -> Result<(), String> {
         keeps,
         loads: Loads::new(dir)?,
         kept: None,
+        held: None,
     };
     let (lines, mut requests) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -429,20 +454,25 @@ struct Client {
     loads: Loads,
     /// The stores the last call kept, where the client keeps them.
     kept: Option<Stores>,
+    /// The pause point a `cancel` request left a flush held at, released at the next request.
+    held: Option<Arc<lore_storage::test_util::Pause>>,
 }
 
 impl Client {
     /// Serve the request `line`, see the module documentation.
     async fn handle(&mut self, line: &str) -> Result<(), String> {
+        if let Some(pause) = self.held.take() {
+            pause.resume.notify_one();
+        }
         let mut words = line.split_whitespace();
         let request = words.next().unwrap_or_default();
         let point = match request {
-            "pause" => Some(words.next().unwrap_or_default()),
+            "pause" | "cancel" => Some(pause_point(words.next().unwrap_or_default())?),
             _ => None,
         };
         let ops: Vec<Op> = words.map(str::parse).collect::<Result<_, _>>()?;
-        match request {
-            "call" | "unflushed" | "probed" => {
+        match (request, point) {
+            ("call" | "unflushed" | "probed" | "cancel", _) => {
                 if request == "probed" {
                     let busy = self.loads.busy().await?;
                     answer(&format!("probed {} {}", busy[0], busy[1]))?;
@@ -450,7 +480,18 @@ impl Client {
                 let before = self.loads.now();
                 let (stores, claims) = self.begin().await?;
                 let outcomes = self.run_all(&stores, &ops).await;
-                if request != "unflushed" {
+                if let Some(point) = point {
+                    let pause = lore_storage::test_util::pause_at(point);
+                    tokio::select! {
+                        biased;
+                        () = pause.reached.notified() => {}
+                        _ = stores.flush() => {
+                            pause.resume.notify_one();
+                            return answer("unreached");
+                        }
+                    }
+                    self.held = Some(pause);
+                } else if request != "unflushed" {
                     for flushed in stores.flush().await {
                         flushed.map_err(|err| format!("the call's flush failed: {err}"))?;
                     }
@@ -461,24 +502,34 @@ impl Client {
                 }
                 answer(&ran(self.loads.since(before), &outcomes))
             }
-            "hold" | "pause" => {
-                if request == "pause" && point != Some("committing") {
-                    return Err(format!("no pause point {point:?}"));
-                }
+            ("hold", _) => {
                 let before = self.loads.now();
                 let (stores, _claims) = self.begin().await?;
                 let outcomes = self.run_all(&stores, &ops).await;
                 answer(&ran(self.loads.since(before), &outcomes))?;
-                if request == "hold" {
-                    return std::future::pending().await;
+                std::future::pending().await
+            }
+            ("pause", Some(point)) => {
+                let (stores, _claims) = self.begin().await?;
+                let pause = lore_storage::test_util::pause_at(point);
+                // Held, not dropped, once at the step, so that nothing it started goes on or
+                // unwinds before the process is killed.
+                let mut work = std::pin::pin!(async {
+                    self.run_all(&stores, &ops).await;
+                    stores.flush().await
+                });
+                tokio::select! {
+                    biased;
+                    () = pause.reached.notified() => {}
+                    _ = &mut work => {
+                        pause.resume.notify_one();
+                        return answer("unreached");
+                    }
                 }
-                let pause = lore_storage::test_util::pause_at(PausePoint::Committing);
-                let _flushing = lore_base::lore_spawn!(async move { stores.flush().await });
-                pause.reached.notified().await;
                 answer("paused")?;
                 std::future::pending().await
             }
-            "flush" | "sweep" => {
+            ("flush" | "sweep", _) => {
                 let before = self.loads.now();
                 let stores = self
                     .kept

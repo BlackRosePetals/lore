@@ -86,6 +86,10 @@ fn scripts() -> Vec<(&'static str, Keyed)> {
         script!(increments_from_every_process_add_up),
         script!(a_fresh_writer_invalidates_kept_stores),
         script!(a_kept_store_stays_current_through_its_own_writes),
+        script!(a_dropped_flush_leaves_its_changes_to_the_next_flush),
+        script!(a_dropped_flush_keeps_the_store_claimed_until_its_writes_end),
+        script!(a_writer_killed_at_every_pause_point_leaves_a_consistent_store),
+        script!(a_kept_store_follows_its_directory_deleted_and_created_again),
     ]
 }
 
@@ -137,8 +141,13 @@ pub fn main(args: &Args) -> u8 {
     u8::from(failed > 0)
 }
 
-/// Run `script` against clients A, B and C on a new store directory `dir` over `config`.
-fn run(dir: &Path, config: Config, script: Script) -> Result<(), String> {
+/// Run `script` against clients A, B and C on a new store directory `dir` over `config`, then
+/// hold the files they left to the store's structure, see [`crate::scenarios::check`].
+fn run(
+    dir: &Path,
+    config: Config,
+    script: impl FnOnce(&mut Clients) -> Result<(), String>,
+) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir)
         .and_then(|()| std::fs::write(dir.join(CONFIG_FILE), config.serialize()))
@@ -148,13 +157,26 @@ fn run(dir: &Path, config: Config, script: Script) -> Result<(), String> {
         b: Client::spawn(dir, "B", true)?,
         c: Client::spawn(dir, "C", false)?,
         dir: dir.to_path_buf(),
-        config,
+        config: config.clone(),
     };
     script(&mut clients)?;
     for client in [clients.a, clients.b, clients.c] {
         client.finish()?;
     }
-    Ok(())
+    let report = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?
+        .block_on(crate::scenarios::check(dir, &config, &[], &[]));
+    match report.violation_count() {
+        0 => Ok(()),
+        count => {
+            report.print();
+            Err(format!(
+                "the store files hold {count} violations, printed above"
+            ))
+        }
+    }
 }
 
 struct Clients {
@@ -251,7 +273,7 @@ impl Client {
                 ));
             }
             let line = line.trim_end();
-            if ["ran ", "probed ", "paused"]
+            if ["ran ", "probed ", "paused", "unreached"]
                 .iter()
                 .any(|reply| line.starts_with(reply))
             {
@@ -328,18 +350,41 @@ impl Client {
         self.expect(step, loads, outcomes)
     }
 
-    /// As [`Self::call`], for a call whose flush stops in a fan-out commit, once it has written
-    /// its `level.pending` and renamed none of its `.new` files, until the client is killed.
-    fn pause(
+    /// Run a call of `ops` whose operations and flush stop at the pause point `point`, as the
+    /// client names it, until the client is killed.
+    fn pause(&mut self, step: &str, point: &str, ops: &[Op]) -> Result<(), String> {
+        self.send(&format!("pause {point}"), ops)?;
+        self.expect_reply(step, "paused")
+    }
+
+    /// As [`Self::call`], for a call whose flush is dropped at the pause point `point`.
+    fn cancel(
         &mut self,
         step: &str,
+        point: &str,
         ops: &[Op],
         loads: [usize; 2],
         outcomes: &[Outcome],
     ) -> Result<(), String> {
-        self.send("pause committing", ops)?;
-        self.expect(step, loads, outcomes)?;
-        self.expect_reply(step, "paused")
+        self.send(&format!("cancel {point}"), ops)?;
+        self.expect(step, loads, outcomes)
+    }
+
+    /// Run a call of `ops`, and return what each found, as the reply words them, once each store
+    /// loaded at most once.
+    fn read(&mut self, step: &str, ops: &[Op]) -> Result<Vec<String>, String> {
+        self.send("call", ops)?;
+        let reply = self.reply()?;
+        let words: Vec<&str> = reply.split_whitespace().collect();
+        let loads_once = words.get(1..3).is_some_and(|loads| {
+            loads
+                .iter()
+                .all(|count| count.parse::<usize>().is_ok_and(|count| count <= 1))
+        });
+        if words.first() != Some(&"ran") || !loads_once || words.len() != 3 + ops.len() {
+            return Err(format!("{} {step}: answered `{reply}`", self.name));
+        }
+        Ok(words[3..].iter().map(|word| (*word).to_string()).collect())
     }
 
     /// Flush the stores outside any call, and check that neither loaded.
@@ -843,9 +888,8 @@ fn a_kept_store_rolls_forward_a_fan_out_a_killed_process_left_pending(
     )?;
     a.pause(
         "puts x and y, fanning the group out, and stops in the commit",
+        "committing",
         &[put(x), put(y)],
-        [0, 0],
-        &[Done, Done],
     )?;
     if !pending.exists() {
         return Err("the stopped commit left no level.pending".to_string());
@@ -880,9 +924,8 @@ fn a_kept_store_rolls_forward_a_mutable_fan_out_a_killed_process_left_pending(
     )?;
     a.pause(
         "stores keys 2 and 4, fanning their group out, and stops in the commit",
+        "committing",
         &[Op::Store(2, 2), Op::Store(4, 3)],
-        [0, 0],
-        &[Done, Done],
     )?;
     a.kill_and_restart()?;
     b.call("loads and lists after A was killed", &reads, [0, 1], &found)?;
@@ -1026,4 +1069,214 @@ fn a_kept_store_stays_current_through_its_own_writes(clients: &mut Clients) -> R
     a.call("reads them all", &reads, [0, 0], &found)?;
     b.call("reads them all", &reads, [1, 1], &found)?;
     c.call("reads them all", &reads, [1, 1], &found)
+}
+
+/// **A flush its caller dropped part way leaves what it did not write to the next flush, and
+/// keeps the claims on both stores until then.** A's flush is dropped at the immutable store's
+/// first bucket write, which the store runs on, so the mutable store's change stays unwritten.
+fn a_dropped_flush_leaves_its_changes_to_the_next_flush(
+    clients: &mut Clients,
+) -> Result<(), String> {
+    let x = clients.keys(1, &mut HashSet::new())[0];
+    let Clients { a, b, c, .. } = clients;
+    let reads = [get(x), Op::Load(0)];
+    let flushed = [Found, Outcome::Value(1)];
+    b.call("opens its stores", &reads, [1, 1], &[Absent, Absent])?;
+    a.cancel(
+        "puts x and stores 1 for key 0, its flush dropped at the first bucket write",
+        "serializing",
+        &[put(x), Op::Store(0, 1)],
+        [1, 1],
+        &[Done, Done],
+    )?;
+    b.probed("starts reading", &reads, [true, true])?;
+    a.flush("flushes")?;
+    b.expect("reads once A flushed", [1, 1], &flushed)?;
+    c.call("reads", &reads, [1, 1], &flushed)
+}
+
+/// **A writer killed at any pause point of a call leaves a store every process reads alike**:
+/// what earlier calls flushed, and of the killed call's changes all or some, never a damaged
+/// payload. Each case runs on a directory of its own: A puts and stores a baseline, B reads it,
+/// A runs the case's call until it reaches the pause point and is killed there, and then B, C
+/// and A restarted read the same, the baseline unchanged where the call did not change it.
+fn a_writer_killed_at_every_pause_point_leaves_a_consistent_store(
+    clients: &mut Clients,
+) -> Result<(), String> {
+    let [x, y, z, d] = clients.keys(4, &mut HashSet::new())[..] else {
+        return Err("four keys".to_string());
+    };
+    let reads = [
+        get(x),
+        Op::Get(d, DURABLE),
+        get(y),
+        get(z),
+        Op::Level(x),
+        Op::Load(0),
+        Op::Load(2),
+        Op::Load(4),
+    ];
+    // Each case: the pause point, the call reaching it, and the reads the call may change.
+    let cases: [(&str, Vec<Op>, &[usize]); 14] = [
+        ("reserved", vec![put(y)], &[2]),
+        ("written", vec![put(y)], &[2]),
+        ("serializing", vec![put(y)], &[2]),
+        ("committing", vec![put(y), put(z)], &[2, 3, 4]),
+        ("serializing", vec![Op::Obliterate(x, LOCAL)], &[0]),
+        ("syncing", vec![Op::Obliterate(x, LOCAL)], &[0]),
+        (
+            "selected",
+            vec![Op::Obliterate(x, LOCAL), Op::Compact],
+            &[0, 1],
+        ),
+        (
+            "stopped",
+            vec![Op::Obliterate(x, LOCAL), Op::Compact],
+            &[0, 1],
+        ),
+        ("serializing", vec![Op::Compact], &[1]),
+        ("evicting", vec![Op::Compact], &[1]),
+        ("serializing", vec![Op::Evict], &[1]),
+        ("serializing", vec![Op::Store(2, 2)], &[6]),
+        (
+            "committing",
+            vec![Op::Store(2, 2), Op::Store(4, 3)],
+            &[6, 7],
+        ),
+        ("serializing", vec![Op::Swap(0, 1, 5)], &[5]),
+    ];
+    for (index, (point, call, changed)) in cases.into_iter().enumerate() {
+        let case = format!("{point} in {}", call[0]);
+        run(
+            &clients.dir.join(format!("case{index}")),
+            clients.config.clone(),
+            |clients| {
+                let Clients { a, b, c, .. } = clients;
+                a.call(
+                    "puts x, puts d durably and stores 1 for key 0",
+                    &[put(x), Op::Put(d, DURABLE), Op::Store(0, 1)],
+                    [1, 1],
+                    &[Done, Done, Done],
+                )?;
+                let before = b.read("reads the baseline", &reads)?;
+                a.pause(&case, point, &call)?;
+                a.kill_and_restart()?;
+                let after = b.read(&format!("reads after A was killed at {case}"), &reads)?;
+                for (reader, step) in [(&mut *c, "reads"), (&mut *a, "reads, restarted")] {
+                    let read = reader.read(step, &reads)?;
+                    if read != after {
+                        return Err(format!(
+                            "{} {step} after A was killed at {case}: {read:?}, where B read {after:?}",
+                            reader.name
+                        ));
+                    }
+                }
+                let damaged = after
+                    .iter()
+                    .any(|outcome| outcome.starts_with("wrong") || outcome.starts_with("failed"));
+                let moved = (0..reads.len())
+                    .any(|read| !changed.contains(&read) && after[read] != before[read]);
+                match damaged || moved {
+                    true => Err(format!(
+                        "after A was killed at {case}, B read {after:?} where it read {before:?}"
+                    )),
+                    false => Ok(()),
+                }
+            },
+        )
+        .map_err(|err| format!("{case}: {err}"))?;
+    }
+    Ok(())
+}
+
+/// **A flush its caller dropped keeps the store claimed until the group flushes it left running
+/// end**, so that another process neither writes the bucket under them nor has its write
+/// replaced by theirs. C drops its flush once a group flush reaches its bucket write, which the
+/// store runs on, held there until C's next request, and lets its claims and stores go.
+fn a_dropped_flush_keeps_the_store_claimed_until_its_writes_end(
+    clients: &mut Clients,
+) -> Result<(), String> {
+    let [x, y, z] = clients.keys(3, &mut HashSet::new())[..] else {
+        return Err("three keys".to_string());
+    };
+    let Clients { a, b, c, .. } = clients;
+    let reads = [get(x), get(y), get(z)];
+    a.call("puts x", &[put(x)], [1, 1], &[Done])?;
+    c.cancel(
+        "puts y, its flush dropped at the bucket write",
+        "serializing",
+        &[put(y)],
+        [1, 1],
+        &[Done],
+    )?;
+    b.probed("starts putting z in the bucket", &[put(z)], [true, false])?;
+    c.call(
+        "lets the dropped flush go on, and reads x",
+        &[get(x)],
+        [1, 1],
+        &[Found],
+    )?;
+    b.expect("puts z once C's flush ended", [1, 1], &[Done])?;
+    a.call("reads x, y and z", &reads, [1, 0], &[Found, Found, Found])
+}
+
+/// **Kept stores whose directory was deleted, or deleted and created again, between calls read the
+/// store found there now**, as a process opening the path afresh does, and every process's claims
+/// exclude the others' on the files there now.
+fn a_kept_store_follows_its_directory_deleted_and_created_again(
+    clients: &mut Clients,
+) -> Result<(), String> {
+    let keys = clients.keys(4, &mut HashSet::new());
+    let dir = clients.dir.clone();
+    let config = clients.config.serialize();
+    let Clients { a, b, c, .. } = clients;
+    for (round, (x, y)) in [(keys[0], keys[1]), (keys[2], keys[3])]
+        .into_iter()
+        .enumerate()
+    {
+        let (first, second) = (2 * round as u64 + 1, 2 * round as u64 + 2);
+        let reads = [get(x), get(y), Op::Load(0)];
+        let opens = usize::from(round == 0);
+        a.call(
+            "puts x and stores a value for key 0",
+            &[put(x), Op::Store(0, first)],
+            [opens, opens],
+            &[Done, Done],
+        )?;
+        b.call(
+            "reads x and key 0",
+            &reads,
+            [1, 1],
+            &[Found, Absent, Outcome::Value(first)],
+        )?;
+        let deleted = match round {
+            0 => ["immutable", "mutable"]
+                .iter()
+                .try_for_each(|store| std::fs::remove_dir_all(dir.join(store))),
+            _ => std::fs::remove_dir_all(&dir)
+                .and_then(|()| std::fs::create_dir_all(&dir))
+                .and_then(|()| std::fs::write(dir.join(CONFIG_FILE), &config)),
+        };
+        deleted.map_err(|err| format!("delete the store directories: {err}"))?;
+        c.call(
+            "reads where the stores were deleted",
+            &reads,
+            [1, 1],
+            &[Absent, Absent, Absent],
+        )?;
+        c.call(
+            "puts y and stores another value for key 0",
+            &[put(y), Op::Store(0, second)],
+            [1, 1],
+            &[Done, Done],
+        )?;
+        let now = [Absent, Found, Outcome::Value(second)];
+        a.call("reads the stores there now", &reads, [1, 1], &now)?;
+        b.call("reads the stores there now", &reads, [1, 1], &now)?;
+        b.hold("holds its claims", &[get(y)], [0, 0], &[Found])?;
+        a.probed("starts reading", &[get(y)], [true, true])?;
+        b.kill_and_restart()?;
+        a.expect("reads once B was killed", [0, 0], &[Found])?;
+    }
+    Ok(())
 }

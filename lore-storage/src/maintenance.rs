@@ -58,6 +58,8 @@ pub async fn evictor(
             let Some(real_store) = store.upgrade() else {
                 break;
             };
+            #[cfg(feature = "test-util")]
+            let _task = crate::test_util::store_task(crate::test_util::StoreTask::Collection);
             // Background maintenance is silent — not tied to any command's event stream.
             if let Err(err) = real_store.evict(max_capacity, sync_data, None).await {
                 lore_base::lore_warn!("Store evictor failed: {err}");
@@ -93,6 +95,8 @@ pub async fn compactor(
             let Some(real_store) = store.upgrade() else {
                 break;
             };
+            #[cfg(feature = "test-util")]
+            let _task = crate::test_util::store_task(crate::test_util::StoreTask::Collection);
             // A pass that was stopped rather than finished leaves its resume point behind,
             // so re-reading after the wait picks that group back up instead of restarting.
             if at.is_none() {
@@ -130,6 +134,8 @@ pub async fn gc(
     sync_data: bool,
     sink: Option<GcEventSinkRef>,
 ) {
+    #[cfg(feature = "test-util")]
+    let _task = crate::test_util::store_task(crate::test_util::StoreTask::Collection);
     if max_capacity > 0 {
         let _ = store
             .clone()

@@ -1399,6 +1399,8 @@ impl LocalMutableStore {
     #[lore_macro::test_pub]
     async fn flush_delayed(weak_ref: Weak<LocalMutableStore>, group_index: usize, delay: u64) {
         tokio::time::sleep(Duration::from_secs(delay)).await;
+        #[cfg(feature = "test-util")]
+        let _task = crate::test_util::store_task(crate::test_util::StoreTask::MutableDelayedFlush);
         if let Some(store) = weak_ref.upgrade()
             && let Some(path) = store.path.as_ref()
         {

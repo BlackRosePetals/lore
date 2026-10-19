@@ -28,6 +28,7 @@ use lore_storage::test_util::PausePoint;
 use lore_storage::test_util::pause_at;
 
 use crate::args::Args;
+use crate::client::Stores;
 use crate::model::Config;
 use crate::model::Served;
 use crate::snapshot::copy_tree;
@@ -80,7 +81,6 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
         scenario!(failed_packfile_open_leaves_the_store_writable),
         scenario!(sync_failure_blocks_durable_flushes),
         scenario!(durable_flush_syncs_what_a_delayed_flush_wrote),
-        scenario!(second_open_waits_for_the_lock),
         scenario!(read_racing_compaction_truncate),
         scenario!(store_racing_compaction_stop),
         scenario!(copy_and_force_put_racing_compaction),
@@ -91,6 +91,11 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
         scenario!(obliterate_a_fragment_list_not_held_locally),
         scenario!(obliterate_a_fragment_list_racing_compaction),
         scenario!(descriptor_exhaustion_at_open),
+        scenario!(compaction_interrupted_by_a_fan_out),
+        scenario!(size_eviction_interrupted_by_a_fan_out),
+        scenario!(a_dropped_compaction_s_bucket_write_lands_before_the_next_flush),
+        scenario!(a_successor_store_waits_for_a_dropped_store_s_writes),
+        scenario!(a_store_opened_where_a_kept_store_s_directory_was_replaced_starts_anew),
     ]
 }
 
@@ -263,6 +268,24 @@ async fn open(dir: &Path, config: &Config) -> Arc<LocalImmutableStore> {
         .expect("store opens")
 }
 
+/// [`open`], with a span of the store held, as a command holds one, so that the lock is not
+/// released between operations: a release closes the packfiles, and the next operation's claim
+/// reloads the store under whatever the scenario holds part way, as a compaction.
+async fn open_in_span(
+    dir: &Path,
+    config: &Config,
+) -> (
+    Arc<LocalImmutableStore>,
+    Option<lore_storage::local::store_lock::StoreGuard>,
+) {
+    let store = open(dir, config).await;
+    let span = dyn_store(&store)
+        .hold_for_command()
+        .await
+        .expect("the store is claimed");
+    (store, span)
+}
+
 fn dyn_store(store: &Arc<LocalImmutableStore>) -> Arc<dyn ImmutableStore> {
     store.clone()
 }
@@ -387,7 +410,7 @@ fn crash(dir: &Path, name: &str) -> PathBuf {
 
 /// Open the store in `dir` and check its index against its packfiles and every key in `reads`,
 /// each of which must read back correct when listed in `present`.
-async fn check(
+pub async fn check(
     dir: &Path,
     config: &Config,
     reads: &[(u64, u32)],
@@ -1253,7 +1276,7 @@ async fn crash_around_a_packfile_filling(dir: PathBuf) -> Outcome {
         .and_then(|file| file.set_len(LIMIT - 300 * 1024))
         .expect("sparse packfile");
     let keys = keys(&config, 0..255, 60_000..250_000, 12, &mut HashSet::new());
-    let store = open(&dir, &config).await;
+    let (store, _span) = open_in_span(&dir, &config).await;
     let mut report = Report::default();
     let mut stored = vec![];
     for (index, &key) in keys.iter().enumerate() {
@@ -1355,30 +1378,6 @@ async fn durable_flush_syncs_what_a_delayed_flush_wrote(dir: PathBuf) -> Outcome
              with no dirty bucket before reaching the packstore sync. Only a machine failure loses \
              them"
         ))
-    }
-}
-
-/// A second open of a store directory waits for the first to close.
-async fn second_open_waits_for_the_lock(dir: PathBuf) -> Outcome {
-    let config = config(1000);
-    let store = open(&dir, &config).await;
-    let second_dir = dir.clone();
-    let second_config = config.clone();
-    let mut second = lore_base::lore_spawn!(async move {
-        LocalImmutableStore::new(Some(second_dir), second_config.settings(false, 3600))
-            .await
-            .map(drop)
-    });
-    let early = tokio::time::timeout(Duration::from_secs(2), &mut second).await;
-    drop(store);
-    if let Ok(early) = early {
-        return Outcome::Fail(format!(
-            "a second open finished while the first was open: {early:?}"
-        ));
-    }
-    match tokio::time::timeout(Duration::from_secs(10), second).await {
-        Ok(Ok(Ok(()))) => Outcome::Pass("the second open waited, then opened".to_string()),
-        late => Outcome::Fail(format!("second open after the first closed: {late:?}")),
     }
 }
 
@@ -1508,7 +1507,7 @@ async fn copy_and_force_put_racing_compaction(dir: PathBuf) -> Outcome {
         PausePoint::Serializing,
     ] {
         let run = dir.join(format!("{point:?}"));
-        let store = open(&run, &config).await;
+        let (store, span) = open_in_span(&run, &config).await;
         for &key in kept.iter().chain(&dropped) {
             put(&store, &config, key, 0).await;
         }
@@ -1574,6 +1573,7 @@ async fn copy_and_force_put_racing_compaction(dir: PathBuf) -> Outcome {
         }
         flush(&store, false).await;
         let snapshot = crash(&run, "after");
+        drop(span);
         drop(store);
         let mut reads: Vec<(u64, u32)> = kept.iter().map(|key| (*key, 0)).collect();
         reads.extend(kept[..8].iter().map(|key| (*key, 1)));
@@ -1972,7 +1972,7 @@ async fn obliterate_a_fragment_list_racing_compaction(dir: PathBuf) -> Outcome {
         PausePoint::Serializing,
     ] {
         let run = dir.join(format!("{point:?}"));
-        let store = open(&run, &config).await;
+        let (store, span) = open_in_span(&run, &config).await;
         let mut parents = vec![];
         for _ in 0..4 {
             let children = keys(&config, 0..255, 512..8000, 4, &mut taken);
@@ -2024,6 +2024,7 @@ async fn obliterate_a_fragment_list_racing_compaction(dir: PathBuf) -> Outcome {
             let _ = compaction.await;
         }
         flush(&store, false).await;
+        drop(span);
         drop(store);
         let reopened = open(&run, &config).await;
         for (parent, children) in &parents {
@@ -2225,4 +2226,485 @@ async fn descriptor_exhaustion_at_open(dir: PathBuf) -> Outcome {
          median; failures: {refusals:?}",
         took[took.len() / 2]
     ))
+}
+
+/// Keys enough to fan group [`GROUP`] of `store` out from the level it is at, all in its first
+/// bucket, none in `taken`, or `None` for a group at the last level.
+fn fan_out_keys(
+    store: &LocalImmutableStore,
+    config: &Config,
+    taken: &mut HashSet<u64>,
+) -> Option<Vec<u64>> {
+    let level = store.group[GROUP as usize]
+        .bucket_count
+        .load(atomic::Ordering::Relaxed);
+    let width = (256 / level.max(1)).min(255) as u8;
+    (level < 256).then(|| {
+        keys(
+            config,
+            0..width,
+            512..4096,
+            config.fan_out_threshold + 1,
+            taken,
+        )
+    })
+}
+
+/// A flush that fans the group out while a compaction rewrites one of its packfiles stops the
+/// compaction at that packfile, whose sweep followed the layout before the fan-out, and loses
+/// nothing. The compaction is held in its first bucket write, which holds the group's flush lock;
+/// the flush waits for that lock, and takes it before the compaction's next bucket.
+async fn compaction_interrupted_by_a_fan_out(dir: PathBuf) -> Outcome {
+    crate::coverage::capture_logs();
+    let config = config(8);
+    let mut taken = HashSet::new();
+    let kept = keys(&config, 0..255, 512..20_000, 40, &mut taken);
+    let dropped = keys(&config, 0..255, 512..20_000, 40, &mut taken);
+    let (store, span) = open_in_span(&dir, &config).await;
+    for &key in kept.iter().chain(&dropped) {
+        put(&store, &config, key, 0).await;
+    }
+    flush(&store, false).await;
+    for &key in &dropped {
+        obliterate(&store, &config, key, 0).await;
+    }
+    flush(&store, false).await;
+    let _ = dyn_store(&store).load_index().await;
+    let Some(fresh) = fan_out_keys(&store, &config, &mut taken) else {
+        return Outcome::Fail("the group reached the last level before the test".to_string());
+    };
+    let compacting = store.clone();
+    let mut compaction = None;
+    let pause = pause_nth(PausePoint::Serializing, 1, || {
+        compaction = Some(lore_base::lore_spawn!(async move {
+            compacting
+                .clone()
+                .compact_group_packfiles(
+                    GROUP as usize,
+                    compacting.path.clone(),
+                    0,
+                    true,
+                    false,
+                    CompactionInstruments::default(),
+                    None,
+                )
+                .await
+        }));
+    })
+    .await;
+    for &key in &fresh {
+        put(&store, &config, key, 0).await;
+    }
+    let flushing = dyn_store(&store);
+    let fan_out = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    // The flush queues on the flush lock the held bucket write holds.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    pause.resume.notify_one();
+    let compacted = match compaction {
+        Some(compaction) => compaction.await,
+        None => return Outcome::Fail("no compaction ran".to_string()),
+    };
+    let flushed = fan_out.await;
+    drop(span);
+    drop(store);
+    if !matches!(flushed, Ok(Ok(()))) {
+        return Outcome::Fail(format!("the fan-out's flush failed: {flushed:?}"));
+    }
+    let interrupted = crate::coverage::reached("compaction interrupted by a fan-out");
+    if interrupted == 0 || !matches!(compacted, Ok(Ok(false))) {
+        return Outcome::Fail(format!(
+            "the fan-out did not interrupt the compaction, which returned {compacted:?}"
+        ));
+    }
+    let reads: Vec<(u64, u32)> = kept
+        .iter()
+        .chain(&dropped)
+        .chain(&fresh)
+        .map(|key| (*key, 0))
+        .collect();
+    let present: Vec<(u64, u32)> = kept.iter().chain(&fresh).map(|key| (*key, 0)).collect();
+    let snapshot = crash(&dir, "after");
+    let report = check(&snapshot, &config, &reads, &present).await;
+    outcome(
+        &report,
+        "the fan-out stopped the compaction at its packfile, and nothing was lost",
+    )
+}
+
+/// A flush that fans the group out while a size eviction walks its buckets stops the eviction
+/// there, as the sizes it goes by follow the layout before the fan-out, and loses nothing. The
+/// eviction is held at its last bucket, so that the buckets before it are evicted and their
+/// writes under way when the fan-out lands.
+async fn size_eviction_interrupted_by_a_fan_out(dir: PathBuf) -> Outcome {
+    crate::coverage::capture_logs();
+    let mut config = config(8);
+    config.partitions = 2;
+    config.contexts = 1;
+    config.evictable_partitions = 1;
+    let durable = 1;
+    let mut taken = HashSet::new();
+    let evictable = keys(&config, 0..255, 512..20_000, 40, &mut taken);
+    let (store, span) = open_in_span(&dir, &config).await;
+    for &key in &evictable {
+        put(&store, &config, key, durable).await;
+    }
+    flush(&store, false).await;
+    let _ = dyn_store(&store).load_index().await;
+    let Some(fresh) = fan_out_keys(&store, &config, &mut taken) else {
+        return Outcome::Fail("the group reached the last level before the test".to_string());
+    };
+    let buckets = store.group[GROUP as usize]
+        .bucket_count
+        .load(atomic::Ordering::Relaxed);
+    let compacting = store.clone();
+    let mut compaction = None;
+    let pause = pause_nth_within(
+        PausePoint::Evicting,
+        buckets,
+        Duration::from_secs(10),
+        || {
+            compaction = Some(lore_base::lore_spawn!(async move {
+                compacting
+                    .clone()
+                    .compact_group_packfiles(
+                        GROUP as usize,
+                        compacting.path.clone(),
+                        0,
+                        true,
+                        false,
+                        CompactionInstruments::default(),
+                        None,
+                    )
+                    .await
+            }));
+        },
+    )
+    .await;
+    let Ok(pause) = pause else {
+        crate::coverage::report_logs();
+        return Outcome::Fail("the size eviction did not reach its last bucket".to_string());
+    };
+    for &key in &fresh {
+        put(&store, &config, key, 0).await;
+    }
+    let flushed = dyn_store(&store).flush(false).await;
+    pause.resume.notify_one();
+    let compacted = match compaction {
+        Some(compaction) => compaction.await,
+        None => return Outcome::Fail("no compaction ran".to_string()),
+    };
+    drop(span);
+    drop(store);
+    if let Err(err) = flushed {
+        return Outcome::Fail(format!("the fan-out's flush failed: {err}"));
+    }
+    if crate::coverage::reached("size eviction interrupted by a fan-out") == 0 {
+        return Outcome::Fail(format!(
+            "the fan-out did not interrupt the size eviction; the compaction returned {compacted:?}"
+        ));
+    }
+    if crate::coverage::reached("size eviction evicted") == 0 {
+        return Outcome::Fail("the size eviction evicted nothing before the fan-out".to_string());
+    }
+    let reads: Vec<(u64, u32)> = evictable
+        .iter()
+        .map(|key| (*key, durable))
+        .chain(fresh.iter().map(|key| (*key, 0)))
+        .collect();
+    let present: Vec<(u64, u32)> = fresh.iter().map(|key| (*key, 0)).collect();
+    let snapshot = crash(&dir, "after");
+    let report = check(&snapshot, &config, &reads, &present).await;
+    outcome(
+        &report,
+        "the fan-out stopped the size eviction at its bucket, and nothing was lost",
+    )
+}
+
+/// A compaction dropped once one of its bucket writes is in flight, as a caller giving up on it
+/// drops it, leaves the write running, and the group's next flush waits for it to land before it
+/// writes the bucket again, so that the older write cannot land over the newer one: the files then
+/// hold what the store holds. For a bucket write of a packfile's rewrite and one of a size
+/// eviction. A flush dropped by its caller runs its group flushes on, detached, so only these and
+/// the store's own tasks leave a bucket write behind.
+async fn a_dropped_compaction_s_bucket_write_lands_before_the_next_flush(dir: PathBuf) -> Outcome {
+    let mut config = config(1000);
+    config.partitions = 2;
+    config.contexts = 1;
+    config.evictable_partitions = 1;
+    let mut report = Report::default();
+    for (case, variant) in [("rewrite", 0), ("size-eviction", 1)] {
+        let run = dir.join(case);
+        let mut taken = HashSet::new();
+        let kept = keys(&config, 0..255, 512..20_000, 20, &mut taken);
+        let dropped = keys(&config, 0..255, 512..20_000, 20, &mut taken);
+        let fresh = keys(&config, 0..255, 512..20_000, 1, &mut taken)[0];
+        let (store, span) = open_in_span(&run, &config).await;
+        for &key in kept.iter().chain(&dropped) {
+            put(&store, &config, key, variant).await;
+        }
+        flush(&store, false).await;
+        for &key in &dropped {
+            obliterate(&store, &config, key, variant).await;
+        }
+        flush(&store, false).await;
+        let _ = dyn_store(&store).load_index().await;
+        let held = lore_storage::test_util::hold_store_write();
+        let compacting = store.clone();
+        let compaction = lore_base::lore_spawn!(async move {
+            compacting
+                .clone()
+                .compact_group_packfiles(
+                    GROUP as usize,
+                    compacting.path.clone(),
+                    0,
+                    true,
+                    false,
+                    CompactionInstruments::default(),
+                    None,
+                )
+                .await
+        });
+        if tokio::time::timeout(Duration::from_secs(10), held.issued.notified())
+            .await
+            .is_err()
+        {
+            return Outcome::Fail(format!("{case}: the compaction issued no bucket write"));
+        }
+        compaction.abort();
+        let _ = compaction.await;
+        put(&store, &config, fresh, 0).await;
+        let (waited, flushed) = {
+            let mut next = std::pin::pin!(dyn_store(&store).flush(false));
+            let waited = tokio::time::timeout(Duration::from_secs(1), &mut next)
+                .await
+                .is_err();
+            held.complete();
+            (
+                waited,
+                tokio::time::timeout(Duration::from_secs(10), next).await,
+            )
+        };
+        if !waited || !matches!(flushed, Ok(Ok(()))) {
+            report.violation(
+                "dropped-bucket-write",
+                format!(
+                    "{case}: the next flush waited for the dropped write {waited}, then returned \
+                     {flushed:?}"
+                ),
+            );
+            continue;
+        }
+        for finding in crate::verify::files_behind_memory(&store).await {
+            report.violation("bucket-file-behind-memory", format!("{case}: {finding}"));
+        }
+        drop(span);
+        drop(store);
+        let reads: Vec<(u64, u32)> = kept
+            .iter()
+            .chain(&dropped)
+            .map(|key| (*key, variant))
+            .chain([(fresh, 0)])
+            .collect();
+        let mut present = vec![(fresh, 0)];
+        if !config.evictable(variant) {
+            present.extend(kept.iter().map(|key| (*key, variant)));
+        }
+        let snapshot = crash(&run, "after");
+        let found = check(&snapshot, &config, &reads, &present).await;
+        if found.violation_count() > 0 {
+            found.print();
+            report.violation("dropped-bucket-write", format!("{case}: entries lost"));
+        }
+    }
+    outcome(
+        &report,
+        "each next flush waited for the dropped compaction's bucket write, and the files held \
+         every entry",
+    )
+}
+
+/// A store object dropped with a packfile or bucket write in flight leaves the write running, and
+/// a store object opened after it on the same directory, in the same process, waits for the write
+/// to land before it loads the store and sizes its packfiles, so that the write lands neither
+/// over a payload the successor stores nor over a bucket file it writes. With and without reusing
+/// state across holds, as a client's store cache drops a store whose keep-alive window ended.
+async fn a_successor_store_waits_for_a_dropped_store_s_writes(dir: PathBuf) -> Outcome {
+    let config = config(1000);
+    let mut report = Report::default();
+    for keeps in [false, true] {
+        for packfile in [true, false] {
+            let case = format!(
+                "{} write, keeps {keeps}",
+                if packfile { "packfile" } else { "bucket" }
+            );
+            let run = dir.join(case.replace([' ', ','], "-"));
+            std::fs::create_dir_all(&run).expect("store directory");
+            let mut taken = HashSet::new();
+            let first = keys(&config, 0..255, 64..4096, 2, &mut taken);
+            let held_key = keys(&config, 0..255, 64..4096, 1, &mut taken)[0];
+            let later = keys(&config, 0..255, 64..4096, 4, &mut taken);
+            let Ok((stores, claims)) = Stores::open(&run, &config, keeps, 3600).await else {
+                return Outcome::Fail(format!("{case}: the stores did not open"));
+            };
+            for &key in &first {
+                put(&stores.immutable, &config, key, 0).await;
+            }
+            flush(&stores.immutable, false).await;
+            let (held, abandoned) = if packfile {
+                let held = lore_storage::test_util::hold_packfile_write();
+                let putting = stores.immutable.clone();
+                let held_config = config.clone();
+                let task = lore_base::lore_spawn!(async move {
+                    try_put(&putting, &held_config, held_key, 0).await
+                });
+                (held, task)
+            } else {
+                put(&stores.immutable, &config, held_key, 0).await;
+                let held = lore_storage::test_util::hold_store_write();
+                let flushing = dyn_store(&stores.immutable);
+                (
+                    held,
+                    lore_base::lore_spawn!(async move { flushing.flush(false).await }),
+                )
+            };
+            if tokio::time::timeout(Duration::from_secs(5), held.issued.notified())
+                .await
+                .is_err()
+            {
+                return Outcome::Fail(format!("{case}: no write was issued to hold"));
+            }
+            abandoned.abort();
+            let _ = abandoned.await;
+            drop(claims);
+            drop(stores);
+            let successor_dir = run.clone();
+            let successor_config = config.clone();
+            let mut opening = lore_base::lore_spawn!(async move {
+                Stores::open(&successor_dir, &successor_config, keeps, 3600).await
+            });
+            let waited = tokio::time::timeout(Duration::from_secs(1), &mut opening)
+                .await
+                .is_err();
+            held.complete();
+            let Ok(Ok(Ok((stores, claims)))) =
+                tokio::time::timeout(Duration::from_secs(10), opening).await
+            else {
+                return Outcome::Fail(format!("{case}: the successor did not open"));
+            };
+            for &key in &later {
+                put(&stores.immutable, &config, key, 0).await;
+            }
+            flush(&stores.immutable, false).await;
+            for finding in crate::verify::files_behind_memory(&stores.immutable).await {
+                report.violation("bucket-file-behind-memory", format!("{case}: {finding}"));
+            }
+            drop(claims);
+            drop(stores);
+            if !waited {
+                report.violation(
+                    "successor-did-not-wait",
+                    format!(
+                        "{case}: the successor opened with the dropped store's write in flight"
+                    ),
+                );
+            }
+            let reads: Vec<(u64, u32)> = first
+                .iter()
+                .chain([&held_key])
+                .chain(&later)
+                .map(|key| (*key, 0))
+                .collect();
+            let present: Vec<(u64, u32)> =
+                first.iter().chain(&later).map(|key| (*key, 0)).collect();
+            let snapshot = crash(&run, "after");
+            let found = check(&snapshot, &config, &reads, &present).await;
+            if found.violation_count() > 0 {
+                found.print();
+                report.violation(
+                    "successor",
+                    format!("{case}: the payloads did not read back"),
+                );
+            }
+        }
+    }
+    outcome(
+        &report,
+        "every successor waited for the dropped store's write, and every payload read back",
+    )
+}
+
+/// A store opened on a path whose directory was deleted, or deleted and created again, while a
+/// store object of the same process kept the old one, retaining its state across holds, starts
+/// from what the path holds now, and so does the kept store object at its next claim: neither
+/// serves what the old directory held.
+async fn a_store_opened_where_a_kept_store_s_directory_was_replaced_starts_anew(
+    dir: PathBuf,
+) -> Outcome {
+    let config = config(1000);
+    let mut report = Report::default();
+    for recreate in [false, true] {
+        let case = if recreate { "recreated" } else { "deleted" };
+        let run = dir.join(case);
+        std::fs::create_dir_all(&run).expect("store directory");
+        let [old, new] = keys(&config, 0..255, 64..4096, 2, &mut HashSet::new())[..] else {
+            unreachable!()
+        };
+        let Ok((kept, claims)) = Stores::open(&run, &config, true, 3600).await else {
+            return Outcome::Fail(format!("{case}: the stores did not open"));
+        };
+        put(&kept.immutable, &config, old, 0).await;
+        flush(&kept.immutable, false).await;
+        drop(claims);
+        let _ = std::fs::remove_dir_all(&run);
+        if recreate {
+            std::fs::create_dir_all(&run).expect("store directory");
+        }
+        let opened = tokio::time::timeout(
+            Duration::from_secs(10),
+            Stores::open(&run, &config, true, 3600),
+        )
+        .await;
+        let (stores, claims) = match opened {
+            Ok(Ok(opened)) => opened,
+            Ok(Err(err)) => return Outcome::Fail(format!("{case}: the path did not open: {err}")),
+            Err(_) => return Outcome::Fail(format!("{case}: opening the path again hung")),
+        };
+        let fresh = read(&stores.immutable, &config, old, 0).await;
+        put(&stores.immutable, &config, new, 0).await;
+        flush(&stores.immutable, false).await;
+        drop(claims);
+        drop(stores);
+        let claimed = dyn_store(&kept.immutable).hold_for_command().await;
+        let kept_reads = [
+            read(&kept.immutable, &config, old, 0).await,
+            read(&kept.immutable, &config, new, 0).await,
+        ];
+        drop(claimed);
+        drop(kept);
+        if fresh != Read::NotFound || kept_reads != [Read::NotFound, Read::Served(Served::Correct)]
+        {
+            report.violation(
+                "replaced-directory",
+                format!(
+                    "{case}: the store opened again read the old entry as {fresh:?}, and the kept \
+                     store read the old and the new as {kept_reads:?}"
+                ),
+            );
+        }
+        let snapshot = crash(&run, "after");
+        let found = check(&snapshot, &config, &[(old, 0), (new, 0)], &[(new, 0)]).await;
+        let reopened = open(&snapshot, &config).await;
+        let old_read = read(&reopened, &config, old, 0).await;
+        if found.violation_count() > 0 || old_read != Read::NotFound {
+            found.print();
+            report.violation(
+                "replaced-directory",
+                format!("{case}: the files hold the old entry as {old_read:?}"),
+            );
+        }
+    }
+    outcome(
+        &report,
+        "the path opened again and the kept store both read the directory there now",
+    )
 }

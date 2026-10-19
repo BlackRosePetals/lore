@@ -26,6 +26,7 @@ use parking_lot::Mutex;
 
 use crate::journal::History;
 use crate::journal::Journal;
+use crate::journal::Store;
 use crate::journal::Value;
 use crate::model::Config;
 use crate::model::Rng;
@@ -180,18 +181,23 @@ impl CallView {
     }
 }
 
-/// What a mutable operation needs of the run: the store, the journal, the call's view, and where
-/// a violation goes, by class, key and detail.
+/// What a mutable operation needs of the run: the store, the journal, the call's view, where a
+/// violation goes, by class, key and detail, and whether faults reach the store's files.
 pub struct Context<'a> {
     pub store: Arc<dyn MutableStore>,
     pub journal: &'a Journal,
     pub view: &'a Mutex<CallView>,
     pub violation: &'a (dyn Fn(&str, u64, &str) + Sync),
+    pub faults: bool,
 }
 
 /// Store a new value for a random key.
 pub async fn store(context: &Context<'_>, rng: &mut Rng) -> Result<(), String> {
-    let index = rng.below(KEYS);
+    store_key(context, rng.below(KEYS)).await.map(drop)
+}
+
+/// Store a new value for key `index`, journaled, and return the value.
+async fn store_key(context: &Context<'_>, index: u64) -> Result<u64, String> {
     let stored = (context.journal.generation() << 32) | context.journal.unique();
     context.view.lock().touched.insert(index);
     let id = context.journal.start_with("ms", index, stored);
@@ -203,12 +209,47 @@ pub async fn store(context: &Context<'_>, rng: &mut Rng) -> Result<(), String> {
     match result {
         Ok(()) => {
             context.journal.ack(id);
-            Ok(())
+            Ok(stored)
         }
         Err(err) => {
             context.journal.fail(id, false);
             Err(failed_write(context, index, &err))
         }
+    }
+}
+
+/// Store a new value for one key, flush the store, `strong` when no other write of it can be
+/// running, and load the value back, adding what failed to `failures`: the check that the store
+/// takes writes again once faults end, see [`crate::work::Work::probe`].
+pub async fn probe(context: &Context<'_>, strong: bool, failures: &mut Vec<String>) {
+    let index = context.journal.generation() % KEYS;
+    let stored = match store_key(context, index).await {
+        Ok(stored) => Some(stored),
+        Err(message) => {
+            failures.push(format!("store of mutable key {index}: {message}"));
+            None
+        }
+    };
+    let id = context.journal.flush_start(Store::Mutable, false, strong);
+    let flushed = context.store.clone().flush(false).await;
+    context
+        .journal
+        .flush_end(Store::Mutable, id, flushed.is_ok());
+    if let Err(err) = flushed {
+        failures.push(format!("flush of the mutable store: {err}"));
+    }
+    let loaded = context
+        .store
+        .clone()
+        .load(partition(), key(index), KEY_TYPE)
+        .await;
+    match (Read::of(index, &loaded), stored) {
+        (Ok(Read::Is(found)), Some(stored)) if found == stored => {}
+        (Ok(found), Some(stored)) => failures.push(format!(
+            "load of mutable key {index} found {found:?} where {stored} was stored"
+        )),
+        (Err(message), _) => failures.push(format!("load of mutable key {index}: {message}")),
+        (Ok(_), None) => {}
     }
 }
 
@@ -308,9 +349,11 @@ pub async fn list_all(context: &Context<'_>) -> Result<(), String> {
             .map(|index| view.expected(index))
             .collect()
     };
-    let pairs = list(&context.store)
-        .await
-        .inspect_err(|err| (context.violation)("list-failed", 0, err))?;
+    let pairs = list(&context.store).await.inspect_err(|err| {
+        if !context.faults {
+            (context.violation)("list-failed", 0, err);
+        }
+    })?;
     let mut listed: HashMap<u64, Read> = HashMap::new();
     for (hash, stored) in pairs {
         let Some(index) = index_of(&hash) else {
@@ -333,21 +376,27 @@ pub async fn list_all(context: &Context<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// What `loaded` found for key `index`. A failure is a violation: no fault reaches the mutable
-/// store's files.
+/// What `loaded` found for key `index`. A failure is a violation unless faults reach the store's
+/// files.
 fn read(
     context: &Context<'_>,
     index: u64,
     loaded: &Result<Hash, StoreError>,
 ) -> Result<Read, String> {
-    Read::of(index, loaded).inspect_err(|err| (context.violation)("unreadable-value", index, err))
+    Read::of(index, loaded).inspect_err(|err| {
+        if !context.faults {
+            (context.violation)("unreadable-value", index, err);
+        }
+    })
 }
 
 /// Report a write of key `index` that failed, a violation for the reason [`read`] gives, and
 /// return its message.
 fn failed_write(context: &Context<'_>, index: u64, err: &StoreError) -> String {
     let message = err.to_string();
-    (context.violation)("mutable-write-failed", index, &message);
+    if !context.faults {
+        (context.violation)("mutable-write-failed", index, &message);
+    }
     message
 }
 

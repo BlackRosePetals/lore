@@ -17,6 +17,7 @@ import os
 import random
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -96,11 +97,90 @@ def strata(places):
     return totals, during
 
 
+# Where the shim's state file, see `struct state` in crashpoint.c, holds each field.
+STATE_KINDS, STATE_OPS, STATE_CLASSES = 47, 10, 32
+STATE_LAYOUT = {"kind_count": 8, "kind_names": 16, "op_names": 1144, "class_names": 1264, "last_op": 2040,
+                "running": 2048, "in_flight": 2424, "size": 3704}
+
+
+def read_state(path):
+    """What a process the shim watched left in its state file as it died: the store operations
+    running, `idle` for none, and the file operations in flight, `op:kind`, or when none was, the
+    last one begun as `after:op:kind`, which is no step a kill landed in. None without a state."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    if len(data) < STATE_LAYOUT["size"] or not data.startswith(b"STRESS1"):
+        return None
+
+    def names(offset, count, width):
+        return [data[offset + width * index:offset + width * (index + 1)].split(b"\0")[0].decode(errors="replace")
+                for index in range(count)]
+
+    kinds = names(STATE_LAYOUT["kind_names"], struct.unpack_from("<I", data, STATE_LAYOUT["kind_count"])[0], 24)
+    ops = names(STATE_LAYOUT["op_names"], STATE_OPS, 12)
+    classes = names(STATE_LAYOUT["class_names"], STATE_CLASSES, 24)
+    running = struct.unpack_from(f"<{STATE_KINDS}Q", data, STATE_LAYOUT["running"])
+    operations = [kind for kind, count in zip(kinds, running) if count] or ["idle"]
+    in_flight = struct.unpack_from(f"<{STATE_OPS * STATE_CLASSES}I", data, STATE_LAYOUT["in_flight"])
+    steps = [f"{ops[index // STATE_CLASSES]}:{classes[index % STATE_CLASSES]}"
+             for index, count in enumerate(in_flight) if count]
+    last_op, last_class = struct.unpack_from("<II", data, STATE_LAYOUT["last_op"])
+    if not steps and last_op and last_class:
+        steps = [f"after:{ops[last_op - 1]}:{classes[last_class - 1]}"]
+    return operations, steps or ["no-file-op"]
+
+
+# The operations a caller may drop unfinished: `work`'s kinds but those it never drops, and a
+# call's flush, which `calls` tracks as `end`.
+CANCELLABLE = {"put", "putf", "putm", "get", "getinto", "meta", "query", "copy", "ob", "flush", "flushsync",
+               "compact", "evict", "loadindex", "verify", "mstore", "mload", "mswap", "mlist", "end"}
+
+
+def eligible(event, operation, step):
+    """Whether `event` can land in `operation` at `step`: a kill counts at a file operation that
+    changes the disk, never at `after:op:kind`, between file operations, and a cancellation in an
+    operation a caller may drop."""
+    if event == "kill":
+        return step.split(":")[0] in MUTATIONS
+    if event == "cancel":
+        return operation in CANCELLABLE
+    return True
+
+
+def event_lines(events):
+    """Report `events`, keyed by event, store operation, step and mode: per store operation and
+    step, the file operations counted and where each kill, fault and cancellation landed, by mode,
+    then, where any file operations were counted, per event any landed, the operations and steps
+    counted that none hit. A kill between file operations is listed at `after:op:kind`, a step of
+    its own, so that it hits none counted."""
+    rows = defaultdict(lambda: defaultdict(Counter))
+    for (event, operation, step, mode), count in events.items():
+        rows[(operation, step)][event][mode] += count
+    if not rows:
+        return []
+    lines = ["events by store operation and step (seen: file operations counted; kill, fault, cancel: where "
+             "each landed), by mode:"]
+    for (operation, step), by_event in sorted(rows.items()):
+        cells = [f"{event} " + " ".join(f"{mode}={count}" for mode, count in sorted(by_event[event].items()))
+                 for event in ["seen", "kill", "fault", "cancel"] if event in by_event]
+        lines.append(f"  {operation} {step}: " + "; ".join(cells))
+    seen = {key for key, by_event in rows.items() if "seen" in by_event}
+    for event in ["kill", "fault", "cancel"]:
+        hit = {key for key, by_event in rows.items() if event in by_event}
+        if hit and seen:
+            missed = sorted(f"{operation} {step}" for operation, step in seen - hit if eligible(event, operation, step))
+            lines.append(f"{event} gaps, counted and never hit ({len(missed)}): {', '.join(missed) or 'none'}")
+    return lines
+
+
 class Campaign:
     def __init__(self, args, name):
         self.args = args
         self.binary = Path(args.binary)
         # The process id keeps two campaigns of a mode started together apart.
+        self.mode = name
         self.root = Path(args.results) / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
         self.root.mkdir(parents=True, exist_ok=True)
         self.scratch = Path(args.scratch) / self.root.name
@@ -113,10 +193,11 @@ class Campaign:
         self.coverage_runs = 0
         self.notes = Counter()
         self.failures = Counter()
-        # Where kills and faults landed, by operation, file kind and running store operation, and
-        # the strata the counting runs saw.
-        self.placed = Counter()
-        self.seen_strata = set()
+        # Per event, the store operation it landed in and the step, `op:kind`, or `after:op:kind`
+        # for a kill between file operations: `seen` for the file operations counting runs
+        # counted, and `kill`, `fault` and `cancel` for where each simulated crash, I/O error and
+        # cancellation landed.
+        self.events = Counter()
         # Losses only a machine failure would expose, which the suite reports but does not fail.
         self.reports = {}
         self.started = time.time()
@@ -232,6 +313,9 @@ class Campaign:
             elif line.startswith("COVERAGE calls "):
                 _, _, name, count = line.split()
                 self.coverage[f"calls {name}"] += int(count)
+            elif line.startswith("COVERAGE cancel "):
+                _, event, operation, step, count = line.split()
+                self.events[(event, operation, step)] += int(count)
             elif line.startswith("COVERAGE shapes "):
                 parts = line.split()[2:]
                 for name, value in zip(["max-level", "max-packfiles", "max-writeable", "settled", "max-unsettled"], parts):
@@ -257,13 +341,34 @@ class Campaign:
             self.coverage_runs += 1
         return journal_lost
 
-    def place(self, prefix, places):
-        """Count where the shim's kills or faults landed."""
+    def place(self, places):
+        """Count the file operations a shim's placement file says it counted, by the store
+        operations running, and where its faults landed."""
         for (kind, op, file_class, running), count in places.items():
-            if kind == "fault":
-                for name in running.split("+"):
-                    self.placed[f"{prefix} {op} {file_class} during {name}"] += count
-                self.placed[f"{prefix} {op} {file_class}"] += count
+            for name in running.split("+"):
+                self.events[("seen" if kind == "op" else "fault", name, f"{op}:{file_class}")] += count
+
+    def note_kill(self, killed_file):
+        """Count where a kill the shim made landed, from its killed file, returning whether it
+        made one."""
+        try:
+            op, file_class, running, *_ = Path(killed_file).read_text().split()
+        except (OSError, ValueError):
+            return False
+        for name in running.split("+"):
+            self.events[("kill", name, f"{op}:{file_class}")] += 1
+        return True
+
+    def note_state_kill(self, state_file):
+        """Count where a SIGKILL from outside landed, from the state file the shim left."""
+        state = read_state(state_file)
+        if state is None:
+            self.notes["kill unplaced"] += 1
+            return
+        operations, steps = state
+        for name in operations:
+            for step in steps:
+                self.events[("kill", name, step)] += 1
 
     def record(self, run_dir, store, classes):
         new = False
@@ -282,21 +387,9 @@ class Campaign:
             marker = "NEW" if unknown else "known"
             print(f"  {run_dir.name}: {marker} {dict(classes)}", flush=True)
 
-    def placement_lines(self):
-        lines = []
-        for prefix in ["kill", "fault"]:
-            hit = {tuple(name.split()[1:3]) for name in self.placed
-                   if name.startswith(prefix + " ") and " during " not in name}
-            # A mode places kills or faults, not both.
-            if not hit and (not self.seen_strata or any(not name.startswith(prefix) for name in self.placed)):
-                continue
-            missed = sorted(f"{op}:{file_class}" for op, file_class in self.seen_strata - hit
-                            if prefix == "fault" or op in MUTATIONS)
-            lines.append(f"{prefix}s landed in {len(hit)} operation and file kinds; "
-                         f"seen but never hit: {', '.join(missed) if missed else 'none'}")
-        for name, count in sorted(self.placed.items()):
-            lines.append(f"  {name}: {count}")
-        return lines
+    def event_lines(self):
+        return event_lines({(event, operation, step, self.mode): count
+                            for (event, operation, step), count in self.events.items()})
 
     def summary(self):
         lines = [f"campaign {self.root.name}: {self.runs} runs in {(time.time() - self.started) / 60:.1f} min, "
@@ -322,7 +415,7 @@ class Campaign:
             if count == 0 and not name.startswith("shape") and name not in MACHINE_FAILURE_ONLY:
                 gaps.append(name)
         lines.append("coverage gaps: " + (", ".join(gaps) if gaps else "none"))
-        lines.extend(self.placement_lines())
+        lines.extend(self.event_lines())
         text = "\n".join(lines)
         (self.root / "summary.txt").write_text(text + "\n")
         (self.root / "summary.json").write_text(json.dumps({
@@ -335,8 +428,7 @@ class Campaign:
             "reports": self.reports,
             "coverage": dict(self.coverage),
             "coverage_runs": self.coverage_runs,
-            "placed": dict(self.placed),
-            "seen_strata": sorted(f"{op}:{file_class}" for op, file_class in self.seen_strata),
+            "events": [[*key, count] for key, count in sorted(self.events.items())],
         }, indent=1))
         print(text, flush=True)
 
@@ -344,8 +436,7 @@ class Campaign:
 def report(results):
     """Merge the summaries of every campaign under `results`: violations, reports and failures
     with the campaigns that found them, coverage summed, and the gaps no campaign reached."""
-    violations, failures, notes, reports, coverage, placed = Counter(), Counter(), Counter(), {}, Counter(), Counter()
-    seen = set()
+    violations, failures, notes, reports, coverage, events = Counter(), Counter(), Counter(), {}, Counter(), Counter()
     found_in = defaultdict(list)
     runs = coverage_runs = 0
     campaigns = sorted(Path(results).glob("*/summary.json"))
@@ -360,8 +451,9 @@ def report(results):
         failures.update(summary["failures"])
         notes.update(summary.get("notes", {}))
         reports.update(summary["reports"])
-        placed.update(summary.get("placed", {}))
-        seen.update(summary.get("seen_strata", []))
+        mode = name.rsplit("-", 3)[0]
+        for event, operation, step, count in summary.get("events", []):
+            events[(event, operation, step, mode)] += count
         for kind, count in summary["coverage"].items():
             if kind.startswith("shape"):
                 coverage[kind] = max(coverage[kind], count)
@@ -387,11 +479,7 @@ def report(results):
     gaps = [kind for kind, count in sorted(coverage.items())
             if count == 0 and not kind.startswith("shape") and kind not in MACHINE_FAILURE_ONLY]
     lines.append("coverage gaps: " + (", ".join(gaps) if gaps else "none"))
-    for prefix in ["kill", "fault"]:
-        hit = {":".join(name.split()[1:3]) for name in placed if name.startswith(prefix + " ") and " during " not in name}
-        missed = sorted(stratum for stratum in seen - hit
-                        if prefix == "fault" or stratum.split(":")[0] in MUTATIONS)
-        lines.append(f"{prefix}s landed in {len(hit)} kinds; seen but never hit: {', '.join(missed) or 'none'}")
+    lines.extend(event_lines(events))
     print("\n".join(lines))
     return 1 if violations or failures else 0
 
@@ -416,6 +504,10 @@ def random_store_options(rng, profile):
         options.append("--real-hash")
     if rng.random() < 0.5:
         options.append("--lists")
+    if profile == "gc-storm":
+        # Groups fanning out throughout the run, which interrupts compaction and size eviction.
+        options += ["--keys", rng.choice([6000, 20000]), "--groups", rng.choice(["16", "all"]),
+                    "--fan-out-threshold", rng.choice([2, 3, 4])]
     return options
 
 
@@ -449,7 +541,7 @@ def random_run_options(rng, profile):
     ]
     mix = rng.choice(MIXES)
     if profile == "gc-storm":
-        mix = "compact=8,evict=8,stopgc=1," + mix
+        mix = "compact=8,evict=8,stopgc=1,put=40,flush=6," + mix
     if rng.random() < 0.2:
         mix += ",failwrite=0.3,failsync=0.05"
     if mix:
@@ -469,6 +561,9 @@ def random_run_options(rng, profile):
     if rng.random() < 0.25:
         # Callers giving up on operations, which drops them unfinished.
         options += ["--cancel", rng.choice([0.01, 0.05, 0.2]), "--cancel-us", rng.choice([50, 500, 5000])]
+    if rng.random() < 0.5:
+        # Operations in spans of a claim, as commands run them, and flushes outliving them.
+        options += ["--spans", rng.choice([1, 8, 64]), "--spawn-flushes", rng.choice([0, 0.3])]
     options += ["--end", rng.choice(["flush", "flush", "sync", "drop", "exit", "abort"])]
     return options
 
@@ -477,6 +572,17 @@ def backend(rng, share=0.25):
     """The I/O backend for a run the shim does not watch: now and then uring, which the shim
     cannot see into."""
     return {"LORE_IO_BACKEND": "uring" if rng.random() < share else "psync"}
+
+
+def watched(campaign, store, state=None, **env):
+    """The environment that runs a process under the shim, watching the files of both stores in
+    `store`, leaving its state in `state`, with the shim's other settings `env`."""
+    watch = {"LORE_IO_BACKEND": "psync", "LD_PRELOAD": str(campaign.args.shim),
+             "STRESS_PATH": f"{store / 'immutable'},{store / 'mutable'}"}
+    if state:
+        watch["STRESS_STATE"] = str(state)
+    watch.update({name: str(value) for name, value in env.items()})
+    return watch
 
 
 def kill_loop(campaign, profile="mixed"):
@@ -498,6 +604,8 @@ def kill_loop(campaign, profile="mixed"):
             options = (store_options if generation == 0 else []) + random_run_options(rng, profile)
             options += ["--seconds", seconds]
             env = backend(rng)
+            if env["LORE_IO_BACKEND"] == "psync":
+                env = watched(campaign, store, run_dir / "state")
             if real_hash and rng.random() < 0.3:
                 env["LORE_IMMUTABLE_STORE_VERIFY_WRITE"] = "1"
             if real_hash and rng.random() < 0.2:
@@ -512,6 +620,8 @@ def kill_loop(campaign, profile="mixed"):
                 kill_after = None
             code, killed = campaign.run(campaign.command("work", store, *options), run_dir / "work.log",
                                         env=env, timeout=seconds + 600, kill_after=kill_after)
+            if killed and "STRESS_STATE" in env:
+                campaign.note_state_kill(env["STRESS_STATE"])
             if campaign.parse_work(run_dir / "work.log", run_dir):
                 # Judged against an incomplete history, the store would show losses it never had.
                 break
@@ -528,29 +638,39 @@ def kill_loop(campaign, profile="mixed"):
 
 
 def prepare_base(campaign, base, run_dir, rng):
-    """A store to sweep over: empty at times, which leaves the windows of a group's first writes
-    to the sweep, otherwise grown for a while, now and then up to the packfile size limit."""
+    """A store to sweep over, and the workload the sweep runs on it: `work`, or now and then one
+    `calls` process, which uses the mutable store beside the immutable one. Empty at times, which
+    leaves the windows of a group's first writes to the sweep, otherwise grown for a while, now
+    and then up to the packfile size limit. Returns the workload, and the store options of an
+    empty store, which the sweep's first run passes."""
     shutil.rmtree(base, ignore_errors=True)
+    workload = rng.choice(["work", "work", "calls"])
     store_options = random_store_options(rng, "mixed")
     if rng.random() < 0.25:
         base.mkdir(parents=True)
-        return store_options
+        return workload, store_options
     prefill = ["--prefill-near-limit", rng.choice(["1m", "8m"])] if rng.random() < 0.3 else []
-    campaign.run(campaign.command("work", base, *store_options, *prefill, "--seconds", rng.choice([1, 2]),
+    campaign.run(campaign.command(workload, base, *store_options, *prefill, "--seconds", rng.choice([1, 2]),
                                   "--end", "flush"), run_dir / "prepare.log", timeout=600)
-    return []
+    return workload, []
 
 
-def count_operations(campaign, store, options, run_dir, ops):
-    """Run `work` once under the shim counting its file operations of kinds `ops`, returning where
-    they fell."""
-    places = run_dir / "places.txt"
-    env = {"LD_PRELOAD": str(campaign.args.shim), "STRESS_PATH": str(store / "immutable"),
-           "STRESS_OPS": ",".join(ops), "STRESS_PLACES": str(places)}
-    campaign.run(campaign.command("work", store, *options), run_dir / "count.log", env=env, timeout=600)
-    totals, during = strata(read_places(places))
-    campaign.seen_strata.update(totals)
-    return totals, during
+def workload_options(rng, workload):
+    """The options of one run of `workload` over an existing store directory."""
+    if workload == "calls":
+        return calls_options(rng, rng.random() < 0.5)
+    return random_run_options(rng, "mixed")
+
+
+def count_operations(campaign, store, workload, options, run_dir, ops):
+    """Run `workload` once under the shim counting its file operations of kinds `ops`, returning
+    where they fell."""
+    places_file = run_dir / "places.txt"
+    env = watched(campaign, store, STRESS_OPS=",".join(ops), STRESS_PLACES=places_file)
+    campaign.run(campaign.command(workload, store, *options), run_dir / "count.log", env=env, timeout=600)
+    places = read_places(places_file)
+    campaign.place(places)
+    return strata(places)
 
 
 def pick_stratum(rng, totals, during):
@@ -567,39 +687,39 @@ def pick_stratum(rng, totals, during):
 
 
 def target_env(campaign, store, op, file_class, running):
-    env = {"LD_PRELOAD": str(campaign.args.shim), "STRESS_PATH": str(store / "immutable"),
-           "STRESS_OPS": op, "STRESS_CLASS": file_class}
+    env = watched(campaign, store, STRESS_OPS=op, STRESS_CLASS=file_class)
     if running:
         env["STRESS_DURING"] = running
     return env
 
 
-def note_kill(campaign, killed_file, missed_label):
-    try:
-        op, file_class, running, *_ = killed_file.read_text().split()
-    except (OSError, ValueError):
-        campaign.placed[missed_label] += 1
-        return
-    campaign.placed[f"kill {op} {file_class}"] += 1
-    for name in running.split("+"):
-        campaign.placed[f"kill {op} {file_class} during {name}"] += 1
+def crash_env(rng, op, point, killed):
+    """What has the shim kill its process at the `point`-th counted operation, of kind `op`,
+    before, after or part way through it, and write where to `killed`."""
+    mode = rng.choice(["after", "before", "tear"] if op == "write" else ["after", "before"])
+    env = {"STRESS_CRASH_AT": str(point), "STRESS_KILLED": str(killed)}
+    if mode == "before":
+        env["STRESS_CRASH_BEFORE"] = "1"
+    elif mode == "tear":
+        env["STRESS_TEAR"] = "1"
+    return mode, env
 
 
 def crash_sweep(campaign):
     """Kill the process right before, right after, or in the middle of file operations picked
-    evenly across every kind of operation on every kind of store file a run makes, and across the
-    store operations running then. Check a copy, then let a second process recover the store
-    itself, killing it during the recovery at times, and check again."""
+    evenly across every kind of operation on every kind of file of either store a run makes, and
+    across the store operations running then. Check a copy, then let a second process recover the
+    store itself, killing it during the recovery at times, and check again."""
     args = campaign.args
     rng = campaign.rng
     while not campaign.out_of_time():
         base = campaign.scratch / "sweep-base"
         prepare = campaign.run_dir("sweep-prepare")
-        first_options = prepare_base(campaign, base, prepare, rng)
-        run_options = first_options + random_run_options(rng, "mixed") + ["--seconds", rng.choice([1, 3])]
+        workload, first_options = prepare_base(campaign, base, prepare, rng)
+        options = first_options + workload_options(rng, workload) + ["--seconds", rng.choice([1, 3])]
         probe = campaign.scratch / "sweep-probe"
         copy_store(base, probe)
-        totals, during = count_operations(campaign, probe, run_options, prepare, MUTATIONS)
+        totals, during = count_operations(campaign, probe, workload, options, prepare, MUTATIONS)
         shutil.rmtree(probe, ignore_errors=True)
         if not totals:
             continue
@@ -608,58 +728,57 @@ def crash_sweep(campaign):
                 break
             op, file_class, running, count = pick_stratum(rng, totals, during)
             point = rng.randrange(1, count + 1)
-            mode = rng.choice(["after", "before", "tear"] if op == "write" else ["after", "before"])
             store = campaign.scratch / "sweep-run"
             copy_store(base, store)
-            run_dir = campaign.run_dir(f"crash-{mode}-{op}-{file_class}-{point}")
+            run_dir = campaign.run_dir(f"crash-{workload}-{op}-{file_class}-{point}")
             env = target_env(campaign, store, op, file_class, running)
-            env.update({"STRESS_CRASH_AT": str(point), "STRESS_KILLED": str(run_dir / "killed.txt")})
-            if mode == "before":
-                env["STRESS_CRASH_BEFORE"] = "1"
-            elif mode == "tear":
-                env["STRESS_TEAR"] = "1"
-            campaign.run(campaign.command("work", store, *run_options), run_dir / "work.log", env=env, timeout=600)
-            note_kill(campaign, run_dir / "killed.txt", "kill missed")
-            campaign.parse_work(run_dir / "work.log", run_dir)
+            mode, crash = crash_env(rng, op, point, run_dir / "killed.txt")
+            env.update(crash)
+            campaign.run(campaign.command(workload, store, *options), run_dir / f"{workload}.log", env=env,
+                         timeout=600)
+            if not campaign.note_kill(run_dir / "killed.txt"):
+                campaign.notes["kill missed"] += 1
+            campaign.parse_work(run_dir / f"{workload}.log", run_dir)
             classes = campaign.verify(store, run_dir, copy=True)
             if not classes:
-                recover(campaign, store, run_dir, rng)
+                recover(campaign, store, workload, run_dir, rng)
             shutil.rmtree(store, ignore_errors=True)
 
 
-def recover(campaign, store, run_dir, rng):
+def recover(campaign, store, workload, run_dir, rng):
     """The next process carries on from whatever the kill left, recovering it itself; at times it
     is killed during that recovery too, and a third process recovers both."""
     if rng.random() < 0.4:
         op = rng.choice(["rename", "unlink", "write", "sync"])
-        env = {"LD_PRELOAD": str(campaign.args.shim), "STRESS_PATH": str(store / "immutable"), "STRESS_OPS": op,
-               "STRESS_DURING": "open", "STRESS_CRASH_AT": str(rng.randrange(1, 6)),
-               "STRESS_KILLED": str(run_dir / "killed-recovery.txt")}
-        campaign.run(campaign.command("work", store, "--seconds", 1, "--end", "flush"), run_dir / "work-recovery.log",
-                     env=env, timeout=600)
-        note_kill(campaign, run_dir / "killed-recovery.txt", "recovery kill missed")
-        campaign.parse_work(run_dir / "work-recovery.log", run_dir)
-    campaign.run(campaign.command("work", store, "--seconds", 2, "--end", "flush"), run_dir / "work2.log", timeout=600)
-    campaign.parse_work(run_dir / "work2.log", run_dir)
+        env = watched(campaign, store, STRESS_OPS=op, STRESS_DURING="open", STRESS_CRASH_AT=rng.randrange(1, 6),
+                      STRESS_KILLED=run_dir / "killed-recovery.txt")
+        campaign.run(campaign.command(workload, store, "--seconds", 1, "--end", "flush"),
+                     run_dir / "recovery.log", env=env, timeout=600)
+        if not campaign.note_kill(run_dir / "killed-recovery.txt"):
+            campaign.notes["recovery kill missed"] += 1
+        campaign.parse_work(run_dir / "recovery.log", run_dir)
+    campaign.run(campaign.command(workload, store, "--seconds", 2, "--end", "flush"), run_dir / "after.log",
+                 timeout=600)
+    campaign.parse_work(run_dir / "after.log", run_dir)
     campaign.verify(store, run_dir, deep=True, label="verify2")
 
 
 def fault_sweep(campaign):
-    """Fail file operations, picked evenly across every kind of operation on every kind of store
-    file, reads, stats and listings included, with an error each can meet on its own; the run goes
-    on through them, then checks that the store takes writes again once they end. Check a copy,
-    then run the store on without faults and check again."""
+    """Fail file operations, picked evenly across every kind of operation on every kind of file of
+    either store, reads, stats and listings included, with an error each can meet on its own; the
+    run goes on through them, then checks that the store takes writes again once they end. Check a
+    copy, then run the store on without faults and check again."""
     args = campaign.args
     rng = campaign.rng
     while not campaign.out_of_time():
         base = campaign.scratch / "fault-base"
         prepare = campaign.run_dir("fault-prepare")
-        first_options = prepare_base(campaign, base, prepare, rng)
+        workload, first_options = prepare_base(campaign, base, prepare, rng)
         seconds = rng.choice([2, 5])
-        run_options = first_options + random_run_options(rng, "mixed") + ["--seconds", seconds, "--liveness"]
+        options = first_options + workload_options(rng, workload) + ["--seconds", seconds, "--liveness"]
         probe = campaign.scratch / "fault-probe"
         copy_store(base, probe)
-        totals, during = count_operations(campaign, probe, run_options, prepare, ALL_OPS)
+        totals, during = count_operations(campaign, probe, workload, options, prepare, ALL_OPS)
         shutil.rmtree(probe, ignore_errors=True)
         if not totals:
             continue
@@ -669,7 +788,7 @@ def fault_sweep(campaign):
             op, file_class, running, count = pick_stratum(rng, totals, during)
             store = campaign.scratch / "fault-run"
             copy_store(base, store)
-            run_dir = campaign.run_dir(f"fault-{op}-{file_class}")
+            run_dir = campaign.run_dir(f"fault-{workload}-{op}-{file_class}")
             env = target_env(campaign, store, op, file_class, running)
             errnos = rng.sample(NATURAL_ERRNOS[op], k=min(2, len(NATURAL_ERRNOS[op])))
             env.update({"STRESS_FAIL_ERRNO": ",".join(errnos), "STRESS_SEED": str(rng.randrange(1 << 30)),
@@ -680,13 +799,14 @@ def fault_sweep(campaign):
                 env["STRESS_FAIL_AT"] = str(rng.randrange(1, count + 1))
                 env["STRESS_FAIL_COUNT"] = str(rng.choice([1, 1, 3, 50, 100000]))
             kill_after = rng.uniform(0.5, seconds + 2) if rng.random() < 0.3 else None
-            campaign.run(campaign.command("work", store, *run_options), run_dir / "work.log", env=env,
+            campaign.run(campaign.command(workload, store, *options), run_dir / f"{workload}.log", env=env,
                          timeout=seconds + 600, kill_after=kill_after)
-            campaign.place("fault", read_places(run_dir / "places.txt"))
-            campaign.parse_work(run_dir / "work.log", run_dir)
+            campaign.place(read_places(run_dir / "places.txt"))
+            campaign.parse_work(run_dir / f"{workload}.log", run_dir)
             campaign.verify(store, run_dir, copy=True)
-            campaign.run(campaign.command("work", store, "--seconds", 3, "--end", "sync"), run_dir / "work2.log", timeout=600)
-            campaign.parse_work(run_dir / "work2.log", run_dir)
+            campaign.run(campaign.command(workload, store, "--seconds", 3, "--end", "sync"), run_dir / "after.log",
+                         timeout=600)
+            campaign.parse_work(run_dir / "after.log", run_dir)
             campaign.verify(store, run_dir, deep=True, label="verify2")
             shutil.rmtree(store, ignore_errors=True)
 
@@ -800,9 +920,11 @@ def deterministic(campaign, command):
 
 def multi_process(campaign):
     """Rounds of processes sharing one store directory in calls, some keeping their stores between
-    calls and some opening them for each, killed with SIGKILL and restarted at random moments, some
-    under the shim's faults. Each round is verified on a copy, a quarter of them deeply, and the
-    next round carries on from what the last left."""
+    calls and some opening them for each, every one dropping operations and flushes unfinished,
+    killed with SIGKILL and restarted at random moments or killed by the shim at a chosen file
+    operation, some under the shim's faults on either store's files or with its file operations
+    slowed. Each round is verified on a copy, a quarter of them deeply, and the next round carries
+    on from what the last left."""
     rng = campaign.rng
     while not campaign.out_of_time():
         store = campaign.scratch / f"shared-{campaign.runs + 1:05d}"
@@ -824,7 +946,7 @@ def multi_process(campaign):
 
 
 def calls_options(rng, keeps):
-    """Options of one process of a shared round."""
+    """Options of one `calls` process."""
     options = [
         "--run-seed", rng.randrange(1, 1 << 30),
         "--tasks", rng.choice([1, 2, 4, 8]),
@@ -838,76 +960,105 @@ def calls_options(rng, keeps):
         "--threads", rng.choice([2, 4, 8]),
         "--compact-max-size", rng.choice(["1", "1,256k,4m,64m", "64k"]),
         "--evict-max-capacity", rng.choice(["1", "1,4096,1m", "100"]),
-        "--hang-seconds", 60,
+        "--hang-seconds", 120,
+        # Callers giving up on operations and on the flushes that end calls.
+        "--cancel", rng.choice([0.01, 0.05, 0.1, 0.2]), "--cancel-us", rng.choice([50, 500, 5000, 50000]),
+        "--audit-files", rng.choice([0, 0.25, 1]),
+        "--spawn-flushes", rng.choice([0, 0.5]),
     ]
     mix = rng.choice(MIXES)
     if mix:
         options += ["--mix", mix]
     if rng.random() < 0.5:
         options.append("--serialize-flushes")
-    if rng.random() < 0.15:
-        options += ["--cancel", rng.choice([0.01, 0.05]), "--cancel-us", rng.choice([50, 500, 5000])]
     if keeps:
         options.append("--keeps")
+        if rng.random() < 0.5:
+            # A keep-alive window, at times shorter than a slowed write.
+            options += ["--keep-alive-ms", rng.choice([30, 300])]
     return options
 
 
 def shared_round(campaign, store, run_dir):
     """Run `--processes` processes on `store` for a while, half of them keeping their stores, each
-    killed now and then, and started again in its place once it is gone."""
+    killed now and then, and started again in its place once it is gone. Most run under the shim,
+    whose state places each kill by the store operations running and the file operations in
+    flight."""
     rng = campaign.rng
     seconds = rng.choice([5, 10, 20])
     deadline = time.time() + seconds
     slots = []
+    runs = Counter()
 
     def start(slot):
         keeps = slot % 2 == 0
         remaining = max(0.5, deadline - time.time())
+        runs[slot] += 1
+        name = run_dir / f"p{slot}-{runs[slot]}"
         env = backend(rng, 0.1)
-        if rng.random() < 0.15:
-            # Faults on the immutable store's files, which the store meets on its own: the
-            # mutable store's are left alone, so that its flock is never held past a call.
-            op = rng.choice(ALL_OPS)
-            env.update({"LORE_IO_BACKEND": "psync", "LD_PRELOAD": str(campaign.args.shim),
-                        "STRESS_PATH": str(store / "immutable"), "STRESS_OPS": op,
-                        "STRESS_FAIL_ERRNO": ",".join(rng.sample(NATURAL_ERRNOS[op], k=1)),
-                        "STRESS_FAIL_PROB": str(rng.choice([0.001, 0.01])), "STRESS_SEED": str(rng.randrange(1 << 30))})
-        log = run_dir / f"p{slot}.log"
+        if env["LORE_IO_BACKEND"] == "psync":
+            env = watched(campaign, store, name.with_suffix(".state"), STRESS_OPS=",".join(ALL_OPS),
+                          STRESS_PLACES=name.with_suffix(".places"))
+            counted = sorted(key for key in campaign.events if key[0] == "seen" and eligible("kill", key[1], key[2]))
+            roll = rng.random()
+            if roll < 0.25:
+                # Faults on the files of either store or both, each an error the store meets on its own.
+                op = rng.choice(ALL_OPS)
+                env.update({"STRESS_OPS": op, "STRESS_FAIL_ERRNO": rng.choice(NATURAL_ERRNOS[op]),
+                            "STRESS_FAIL_PROB": str(rng.choice([0.001, 0.01])),
+                            "STRESS_SEED": str(rng.randrange(1 << 30))})
+                files = rng.choice(["immutable", "mutable", None])
+                if files:
+                    env["STRESS_PATH"] = str(store / files)
+            elif roll < 0.4 and counted:
+                # Killed at a file operation of a kind counted so far, in a store operation it ran in.
+                _, operation, step = rng.choice(counted)
+                op, file_class = step.split(":", 1)
+                env.update(target_env(campaign, store, op, file_class, None if operation == "idle" else operation))
+                env.update(crash_env(rng, op, rng.randint(1, 20), name.with_suffix(".killed"))[1])
+            if rng.random() < 0.2:
+                # A slow device: file operations held up, some for longer than a keep-alive window.
+                micros, probability = rng.choice([(2000, 0.2), (20000, 0.02), (200000, 0.005)])
+                env.update({"STRESS_DELAY_US": str(micros), "STRESS_DELAY_PROB": str(probability)})
         command = campaign.command("calls", store, *calls_options(rng, keeps), "--seconds", f"{remaining:.1f}")
-        return campaign.start(command, log, env=env)
+        return campaign.start(command, name.with_suffix(".log"), env=env), name
 
     def reap(slot, killed):
         """Wait for the process in `slot`, mark it dead in the journal, which ends any generation
-        it left unended, and take its log, then start another in its place while the round
-        lasts."""
-        process = slots[slot]
+        it left unended, place where it was killed, take its log and placements, then start another
+        in its place while the round lasts."""
+        process, name = slots[slot]
         code = process.wait()
         with open(store / "stress.journal", "a") as journal:
             journal.write(f"0 g dead pid={process.pid}\n")
-        if not killed and code not in (0, 1):
+        crashed = campaign.note_kill(name.with_suffix(".killed"))
+        if killed and name.with_suffix(".state").exists():
+            campaign.note_state_kill(name.with_suffix(".state"))
+        elif not killed and not crashed and code not in (0, 1):
             campaign.failures[f"calls-exit-{code}"] += 1
-        campaign.parse_work(run_dir / f"p{slot}.log", run_dir)
+        campaign.place(read_places(name.with_suffix(".places")))
+        campaign.parse_work(name.with_suffix(".log"), run_dir)
         slots[slot] = start(slot) if time.time() < deadline - 0.5 else None
 
     for slot in range(campaign.args.processes):
         slots.append(start(slot))
     while time.time() < deadline:
         time.sleep(rng.uniform(0.05, 0.5))
-        for slot, process in enumerate(slots):
-            if process is not None and process.poll() is not None:
+        for slot, entry in enumerate(slots):
+            if entry is not None and entry[0].poll() is not None:
                 reap(slot, False)
         slot = rng.randrange(len(slots))
-        if rng.random() < 0.3 and slots[slot] is not None and slots[slot].poll() is None:
-            slots[slot].send_signal(signal.SIGKILL)
+        if rng.random() < 0.3 and slots[slot] is not None and slots[slot][0].poll() is None:
+            slots[slot][0].send_signal(signal.SIGKILL)
             reap(slot, True)
-    for slot, process in enumerate(slots):
-        if process is None:
+    for slot, entry in enumerate(slots):
+        if entry is None:
             continue
         try:
-            process.wait(timeout=180)
+            entry[0].wait(timeout=180)
             reap(slot, False)
         except subprocess.TimeoutExpired:
-            process.send_signal(signal.SIGKILL)
+            entry[0].send_signal(signal.SIGKILL)
             reap(slot, True)
             campaign.record(run_dir, store, {"calls-did-not-end": 1})
 

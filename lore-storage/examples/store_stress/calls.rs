@@ -18,6 +18,7 @@
 //! shows, and not when none could have. Stores opened afresh load once each.
 
 use std::collections::BTreeMap;
+use std::ffi::c_long;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,6 +60,7 @@ pub async fn main(args: &Args) -> u8 {
 
 async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
     let config = Config::load_or_create(dir, args).map_err(|err| err.to_string())?;
+    crate::work::prefill_near_limit(dir, &config, args);
     let journal = Arc::new(Journal::open(dir).map_err(|err| err.to_string())?);
     let rng = Rng::new(args.number("run-seed", journal.generation()) ^ config.seed);
     let flush_delay = args.number("flush-delay", 3600);
@@ -72,13 +74,13 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
     }
     let overlaps = coverage::Overlaps::new(crate::work::kind_names());
     overlaps.register_with_shim();
-    let work = Arc::new(Work::new(
+    let work = Work::new(
         config.clone(),
         journal.clone(),
         options,
         Mix::parse(Some(&mix_spec)),
         overlaps,
-    ));
+    );
     let hang_seconds = args.number("hang-seconds", 120);
     let watchdog = crate::work::watch_for_hangs(work.progress(), hang_seconds, journal.clone());
     let mut calls = Calls {
@@ -89,14 +91,21 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
         call_ops: args.number("call-ops", 24).max(1),
         tasks: args.number("tasks", 4).max(1),
         unflushed: args.float("unflushed", 0.2),
-        faults: std::env::var_os("LD_PRELOAD").is_some(),
+        keep_alive: Duration::from_millis(args.number("keep-alive-ms", u64::MAX)),
+        audit_files: args.float("audit-files", 0.0),
+        faults: [
+            crate::shim::faults_on("immutable"),
+            crate::shim::faults_on("mutable"),
+        ],
         loads: Loads::new(dir)?,
         history: History::default(),
         journal,
         work,
         rng,
         kept: None,
+        last_call: Instant::now(),
         opened: false,
+        loads_unaccounted: false,
         coverage: BTreeMap::new(),
     };
     let pause_ms = args.number("pause-ms", 20);
@@ -109,6 +118,17 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
         }
         let pause = calls.rng.below(pause_ms + 1);
         tokio::time::sleep(Duration::from_millis(pause)).await;
+    }
+    if calls.work.options().liveness
+        && let Some(faults) = crate::shim::disarm()
+        && let Err(err) = calls.probe(faults).await
+    {
+        calls.work.violation(
+            "stuck-after-faults",
+            0,
+            0,
+            &format!("after {faults} faults: {err}"),
+        );
     }
     calls.end().await;
     watchdog.store(true, Ordering::Relaxed);
@@ -127,9 +147,15 @@ struct Calls {
     tasks: u64,
     /// The share of a keeping process's calls that end without a flush of the stores.
     unflushed: f64,
-    /// Whether the process runs under the fault shim, whose failed reads of the epoch reload a
-    /// store with nothing written.
-    faults: bool,
+    /// How long a keeping process keeps its stores after a call, as the client's keep-alive window
+    /// does: past it, the next call flushes what they hold and opens them afresh.
+    keep_alive: Duration,
+    /// The share of flushed calls after which the bucket files on disk are held to the immutable
+    /// store's memory.
+    audit_files: f64,
+    /// Whether the shim fails operations on the files of the immutable and of the mutable store,
+    /// whose failed reads of the epoch reload a store with nothing written.
+    faults: [bool; 2],
     loads: Loads,
     history: History,
     journal: Arc<Journal>,
@@ -137,9 +163,15 @@ struct Calls {
     rng: Rng,
     /// The stores the last call kept, where the process keeps them.
     kept: Option<Stores>,
+    /// When the last call ended.
+    last_call: Instant,
     /// Whether a call opened stores yet, after which a process that opens them afresh starts a
     /// generation for each.
     opened: bool,
+    /// Whether the last call failed before it read the journal, so that the loads of the next
+    /// call's claims cannot be held to what the journal added since: a store the failed call
+    /// claimed had loaded for writes the next call is the first to read.
+    loads_unaccounted: bool,
     coverage: BTreeMap<&'static str, u64>,
 }
 
@@ -150,16 +182,16 @@ impl Calls {
 
     /// Run one call.
     async fn call(&mut self) -> Result<(), String> {
+        if self.last_call.elapsed() > self.keep_alive && self.kept.is_some() {
+            self.count("keep-alive-expired");
+            self.end().await;
+        }
         let before = self.loads.now();
-        let (stores, openings) = if let Some(stores) = self.kept.take() {
-            (stores, None)
-        } else {
-            let (stores, openings) = self.open().await?;
-            (stores, Some(openings))
-        };
-        let claims = match stores.claim().await {
+        let (stores, openings) = self.stores().await?;
+        let claims = match self.claim(&stores).await {
             Ok(claims) => claims,
             Err(err) => {
+                self.loads_unaccounted = true;
                 self.end_call(stores);
                 return Err(err);
             }
@@ -170,12 +202,17 @@ impl Calls {
         let added = match self.history.update(&self.dir) {
             Ok(added) => added,
             Err(err) => {
+                self.loads_unaccounted = true;
                 drop(claims);
                 self.end_call(stores);
                 return Err(format!("read the journal: {err}"));
             }
         };
-        self.check_loads(loads, opened, &added);
+        if std::mem::take(&mut self.loads_unaccounted) {
+            self.count("loads-unaccounted");
+        } else {
+            self.check_loads(loads, opened, &added);
+        }
         let generation = self.journal.generation();
         self.work.learn(
             &self.history,
@@ -189,12 +226,54 @@ impl Calls {
         self.run_operations().await;
         if self.keeps && self.rng.chance(self.unflushed) {
             self.count("unflushed");
-        } else {
-            self.flush(&stores).await;
+        } else if self.flush(&stores).await && !self.faults[0] && self.rng.chance(self.audit_files)
+        {
+            self.count("files-audited");
+            for finding in crate::verify::files_behind_memory(&stores.immutable).await {
+                self.work
+                    .violation("bucket-file-behind-memory", 0, 0, &finding);
+            }
         }
         drop(claims);
         self.end_call(stores);
         Ok(())
+    }
+
+    /// The stores of a call: the kept ones, or ones opened for it, with the claims they were
+    /// opened under.
+    async fn stores(&mut self) -> Result<(Stores, Option<Claims>), String> {
+        if let Some(stores) = self.kept.take() {
+            return Ok((stores, None));
+        }
+        let work = self.work.clone();
+        let _opening = work.track(crate::work::OPEN);
+        let (stores, openings) = self.open().await?;
+        Ok((stores, Some(openings)))
+    }
+
+    /// Claim `stores` for a call.
+    async fn claim(&self, stores: &Stores) -> Result<Claims, String> {
+        let _claiming = self.work.track(crate::work::CLAIM);
+        stores.claim().await
+    }
+
+    /// Check that the stores take writes again once the faults end, after `faults` of them, as
+    /// [`Work::probe`] does, in a call of its own: on the kept stores, or on stores opened for it
+    /// as a call opens them. An error is the stores refusing the call.
+    async fn probe(&mut self, faults: c_long) -> Result<(), String> {
+        let (stores, openings) = self.stores().await?;
+        let claimed = self.claim(&stores).await;
+        drop(openings);
+        let result = match claimed {
+            Ok(claims) => {
+                self.work.probe(faults).await;
+                drop(claims);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        };
+        self.end_call(stores);
+        result
     }
 
     /// Open the stores for a call. Each store object's life is a generation, so stores opened
@@ -219,10 +298,16 @@ impl Calls {
     /// Keep the stores for the next call, or let them go and end their generation.
     fn end_call(&mut self, stores: Stores) {
         self.count("calls");
+        self.last_call = Instant::now();
         if self.keeps {
             self.kept = Some(stores);
             return;
         }
+        self.end_generation(stores);
+    }
+
+    /// Let `stores` go and end their generation.
+    fn end_generation(&mut self, stores: Stores) {
         self.work.use_stores(None, None);
         drop(stores);
         self.journal.log(format_args!("g end"));
@@ -261,7 +346,7 @@ impl Calls {
                 "kept-store-reloaded-twice"
             } else if wrote && loaded == 0 {
                 "kept-store-missed-a-write"
-            } else if !may_have && loaded > 0 && !self.faults {
+            } else if !may_have && loaded > 0 && !self.faults[index] {
                 "kept-store-reloaded-for-nothing"
             } else {
                 continue;
@@ -283,7 +368,8 @@ impl Calls {
     }
 
     /// Run a random number of operations on a random number of tasks, now and then with a
-    /// compaction and eviction task alongside.
+    /// compaction and eviction task alongside. Flushes spawned to outlive their operations end
+    /// within the call, whose generation they journal under.
     async fn run_operations(&mut self) {
         self.work.allow(1 + self.rng.below(self.call_ops));
         let tasks = 1 + self.rng.below(self.tasks) as usize;
@@ -298,20 +384,40 @@ impl Calls {
                 self.work.violation("panic", 0, 0, &err.to_string());
             }
         }
+        self.work.join_spawned().await;
     }
 
-    /// Flush the stores, as a call ends. A flush covers every operation of the call
+    /// Flush the stores, as a call ends, now and then dropping a flush unfinished as the
+    /// operations are, and return whether both flushed. A flush covers every operation of the call
     /// when no delayed flush can run alongside it.
-    async fn flush(&self, stores: &Stores) {
+    async fn flush(&mut self, stores: &Stores) -> bool {
         let strong = self.flush_delay >= 1000;
+        let options = self.work.options();
+        let mut flushed_both = true;
         for store in [Store::Immutable, Store::Mutable] {
+            let cancel = self.rng.chance(options.cancel);
+            let after = Duration::from_micros(self.rng.below(options.cancel_us + 1));
+            let ending = self.work.track(crate::work::END);
             let id = self.journal.flush_start(store, false, strong);
-            let flushed = stores.flush_store(store).await;
+            let flushed = match cancel {
+                true => tokio::time::timeout(after, stores.flush_store(store)).await,
+                false => Ok(stores.flush_store(store).await),
+            };
+            drop(ending);
+            let flushed = flushed.map_or_else(
+                |_| {
+                    self.work.cancelled(crate::work::END);
+                    Err("cancelled".to_string())
+                },
+                |flushed| flushed.map_err(|err| err.to_string()),
+            );
             if let Err(err) = &flushed {
                 eprintln!("a call's flush of the {store:?} store failed: {err}");
             }
             self.journal.flush_end(store, id, flushed.is_ok());
+            flushed_both &= flushed.is_ok();
         }
+        flushed_both
     }
 
     /// Flush what a keeping process's last call left, and end its generation.
@@ -323,9 +429,7 @@ impl Calls {
             self.flush(&stores).await;
             drop(claims);
         }
-        self.work.use_stores(None, None);
-        drop(stores);
-        self.journal.log(format_args!("g end"));
+        self.end_generation(stores);
     }
 
     fn report(&self, elapsed: f64) {
