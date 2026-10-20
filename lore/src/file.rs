@@ -7,6 +7,9 @@ use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::file;
+use lore_revision::file::audit::AuditOptions;
+pub use lore_revision::file::audit::DEFAULT_MAX_REVISIONS;
+use lore_revision::file::audit::Whitespace;
 pub use lore_revision::file::diff::DEFAULT_CONTEXT_LINES;
 use lore_revision::file::dump::DumpError;
 use lore_revision::file::hash::HashError;
@@ -1363,4 +1366,95 @@ fn history_local(
 
         file::history::history(repository, path, options)
     })
+}
+
+/// Arguments for attributing the lines of a file to the revisions that last changed them.
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[handler(audit_local)]
+pub struct LoreFileAuditArgs {
+    /// A path to a file
+    pub path: LoreString,
+
+    /// Revision to read the file at, in any form a revision specifier takes: a
+    /// whole hash signature, `[branch]@<number>`, `[branch]@LATEST` or
+    /// `<branch>@<hash>`, optionally followed by `~<count>` to step back that many
+    /// parents. Empty reads the revision the instance is synced to and accounts for
+    /// the file on disk
+    pub revision: LoreString,
+
+    /// Revisions of the file's predecessor chain to walk, `0` for the default of
+    /// 100 and `UINT32_MAX` for the whole chain. Zero means the default rather
+    /// than no limit, as `lore_file_history_args_t::length` does, so a
+    /// zero-initialized value is bounded
+    pub max_revisions: u32,
+
+    /// Count a line that differs only in trailing whitespace as changed.
+    /// Trailing whitespace is ignored by default, so the field is stated as the
+    /// refusal and a zero-initialized value carries the default
+    pub no_ignore_space_at_eol: u8,
+
+    /// Collapse runs of internal whitespace to a single space before comparing,
+    /// which leaves a reindented line with the revision that wrote its text
+    pub ignore_space_change: u8,
+}
+
+/// Attributes each line of a file to the revision that last changed it.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## File Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::FileAudit`](crate::interface::LoreEvent::FileAudit) | Emitted for each range of consecutive lines sharing an attribution |
+pub async fn audit(
+    globals: LoreGlobalArgs,
+    args: LoreFileAuditArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, audit_local).await
+}
+
+fn audit_local(
+    globals: LoreGlobalArgs,
+    args: LoreFileAuditArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    repository_call_read(globals, callback, args, audit, move |repository, args| {
+        let path = args.path.to_string();
+
+        let options = AuditOptions {
+            revision: args.revision.into(),
+            max_revisions: audit_bound(args.max_revisions),
+            whitespace: Whitespace {
+                ignore_space_at_eol: args.no_ignore_space_at_eol == 0,
+                ignore_space_change: args.ignore_space_change != 0,
+            },
+        };
+
+        file::audit::audit(repository, path, options)
+    })
+}
+
+/// The bound an audit walk runs under: none where the largest bound asks for
+/// the whole chain, and the default where the caller named no number.
+#[lore_macro::test_pub]
+fn audit_bound(max_revisions: u32) -> Option<u32> {
+    match max_revisions {
+        0 => Some(DEFAULT_MAX_REVISIONS),
+        u32::MAX => None,
+        _ => Some(max_revisions),
+    }
 }

@@ -98,6 +98,7 @@ use crate::event::revision_tree::LoreRevisionTreeMoveCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeNodeInfoEventData;
 use crate::event::revision_tree::LoreRevisionTreeNodePathEventData;
 use crate::event::revision_tree::LoreRevisionTreeResolvePathCompleteEventData;
+use crate::file::audit::LoreFileAuditEventData;
 use crate::file::diff::LoreFileDiffEventData;
 use crate::file::dump::LoreFileDumpEventData;
 use crate::file::hash::LoreFileHashEventData;
@@ -1319,6 +1320,8 @@ pub enum LoreEvent {
     AuthPending(LoreAuthPendingEventData),
     /// One leaf fragment and its payload for a get-resolved item.
     StorageGetFragment(LoreStorageGetFragmentEventData),
+    /// One range of a file's lines, attributed to the revision that last changed them.
+    FileAudit(LoreFileAuditEventData),
 }
 
 /// Encodes as the event it refers to, so that a sender can encode an event it only borrows.

@@ -17,6 +17,8 @@ Run as a script, this module is the driver a test invokes as a subprocess:
     python lore_ffi.py repository-delete <library-path> <repository-path> <repository-url>
     python lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
     python lore_ffi.py revision-bisect <library-path> <repository-path> <start> <end> <keep-store-alive-seconds>
+    python lore_ffi.py file-audit <library-path> <repository-path> <path>
+                                  [--stop-after <n>]
 
 exiting with the call's FFI code. Tests go through `Lore`'s `*_capi` methods
 rather than importing `LoreLibrary` directly:
@@ -34,11 +36,15 @@ lore-base/src/error.rs for the code registry).
 """
 
 import ctypes
+import json
+import os
 import re
 import sys
 from ctypes import (
+    CFUNCTYPE,
     POINTER,
     Structure,
+    Union,
     c_char_p,
     c_int,
     c_int32,
@@ -53,9 +59,12 @@ from pathlib import Path
 # FFI codes from lore-base/src/error.rs (`#[ffi_code(...)]`), which the
 # header does not export as constants. That module allocates codes in blocks
 # by error group: 16-27 is authentication and authorization, 3-15 is input and
-# validation.
+# validation, 28-39 is connectivity and availability, 80-95 is not-found.
 NOT_AUTHENTICATED = 16
 NOT_SUPPORTED = 9
+DISCONNECTED = 28
+NOT_CONNECTED = 29
+FILE_NOT_FOUND = 82
 
 # The generated header the structs below mirror, checked against them by
 # test_lore_ffi.py. Relative to this file so it resolves wherever the tests run.
@@ -186,10 +195,111 @@ class LoreRevisionBisectArgs(Structure):
     _fields_ = [("start", LoreString), ("end", LoreString)]
 
 
+class LoreHash(Structure):
+    """`lore_hash_t`: the raw 32 bytes of a hash digest."""
+
+    _fields_ = [("data", c_uint8 * 32)]
+
+    def hex(self) -> str:
+        return bytes(self.data).hex()
+
+
+class LorePartition(Structure):
+    """`lore_partition_t`, which `lore_repository_id_t` aliases."""
+
+    _fields_ = [("data", c_uint8 * 16)]
+
+    def hex(self) -> str:
+        return bytes(self.data).hex()
+
+
+class LoreTraceLocationArray(Structure):
+    """`lore_trace_location_array_t`. The locations themselves are not read
+    here, so the pointer is left opaque."""
+
+    _fields_ = [("ptr", c_void_p), ("count", c_size_t)]
+
+
+class LoreErrorDetail(Structure):
+    """`lore_error_detail_t`: the failure's own FFI code, message and trace."""
+
+    _fields_ = [
+        ("error_code", c_int32),
+        ("message", LoreString),
+        ("trace_locations", LoreTraceLocationArray),
+    ]
+
+
+class LoreCompleteEventData(Structure):
+    """`lore_complete_event_data_t`, the one event a terminal failure is
+    reported on (ADR-00017)."""
+
+    _fields_ = [("status", c_int32), ("error", LoreErrorDetail)]
+
+
+class LoreFileAuditArgs(Structure):
+    """`lore_file_audit_args_t`. `max_revisions` of `UINT32_MAX` asks for the
+    whole chain and `0` means the default of 100, so a zero-initialized struct
+    is a bounded walk."""
+
+    _fields_ = [
+        ("path", LoreString),
+        ("revision", LoreString),
+        ("max_revisions", c_uint32),
+        ("no_ignore_space_at_eol", c_uint8),
+        ("ignore_space_change", c_uint8),
+    ]
+
+
+class LoreFileAuditEventData(Structure):
+    """`lore_file_audit_event_data_t`: one range of lines and what it resolved
+    to. `outcome` is a C enum, so it is `int`."""
+
+    _fields_ = [
+        ("repository", LorePartition),
+        ("revision", LoreHash),
+        ("line_first", c_uint32),
+        ("line_last", c_uint32),
+        ("outcome", c_int),
+    ]
+
+
+class LoreEventData(Union):
+    """The payload union of `lore_event_t`.
+
+    Only the members this module reads are declared. Every member of a C union
+    starts at the same offset, and the offset the union itself sits at follows
+    the widest alignment among its members, which is a pointer's whether the
+    union holds two members or two hundred. So the members below sit where the
+    library wrote them, and the size difference does not matter: the library
+    allocates the event and this module only reads it.
+    """
+
+    _fields_ = [
+        ("complete", LoreCompleteEventData),
+        ("file_audit", LoreFileAuditEventData),
+    ]
+
+
+class LoreEvent(Structure):
+    """`lore_event_t`: the tag naming the event, then its payload."""
+
+    _fields_ = [("tag", c_uint32), ("data", LoreEventData)]
+
+
+# `void (*)(const lore_event_t *event, uint64_t user_context)`, the callback
+# `lore_event_callback_config_t::func` holds.
+EVENT_CALLBACK = CFUNCTYPE(None, POINTER(LoreEvent), c_uint64)
+
 # Every struct above, paired with the header type it mirrors. A struct bound
 # here belongs in this list: it is what test_lore_ffi.py checks the mirrors
 # against, so a field added to the C API is reported as a named mismatch rather
 # than read past the end of an allocation at the next call.
+#
+# A struct with an array field is left out: `header_struct_fields` reads a field
+# name from the end of its declaration and an array's ends in `]`, so
+# `lore_hash_t` and `lore_partition_t` cannot be compared this way. Both are
+# fixed-width byte buffers that no change to a verb can widen.
 MIRRORED_STRUCTS = [
     ("lore_string_t", LoreString),
     ("lore_string_array_t", LoreStringArray),
@@ -203,6 +313,11 @@ MIRRORED_STRUCTS = [
     ("lore_repository_delete_args_t", LoreRepositoryDeleteArgs),
     ("lore_revision_sync_args_t", LoreRevisionSyncArgs),
     ("lore_revision_bisect_args_t", LoreRevisionBisectArgs),
+    ("lore_trace_location_array_t", LoreTraceLocationArray),
+    ("lore_error_detail_t", LoreErrorDetail),
+    ("lore_complete_event_data_t", LoreCompleteEventData),
+    ("lore_file_audit_args_t", LoreFileAuditArgs),
+    ("lore_file_audit_event_data_t", LoreFileAuditEventData),
 ]
 
 # One field per line, either a function pointer (`void (*func)(...)`) or a plain
@@ -234,6 +349,49 @@ def header_struct_fields(struct_name: str) -> list[str]:
             raise ValueError(f"cannot read a field name from {struct_name}: {line}")
         fields.append(field.group("pointer") or field.group("plain"))
     return fields
+
+
+def header_enum_value(enum_name: str, enumerator: str) -> int:
+    """The value of `enumerator` in `enum_name` as `lore.h` declares it.
+
+    The event tags are not exported as constants and carry no explicit values,
+    so a tag's value is its position in the enum — which moves whenever a tag is
+    added ahead of it. Reading it from the header is what keeps a driver reading
+    the member the library actually wrote.
+    """
+    header = HEADER_PATH.read_text()
+    body = re.search(rf"enum {enum_name} \{{(.*?)\n\}}", header, re.S)
+    if body is None:
+        raise LookupError(f"{enum_name} is not declared in {HEADER_PATH}")
+
+    value = 0
+    for line in body.group(1).splitlines():
+        line = line.strip().rstrip(",")
+        if not line or line.startswith("//"):
+            continue
+        name, _, assigned = (part.strip() for part in line.partition("="))
+        if assigned:
+            value = int(assigned, 0)
+        if name == enumerator:
+            return value
+        value += 1
+    raise LookupError(f"{enum_name} declares no {enumerator}")
+
+
+def audit_record(data: LoreFileAuditEventData) -> dict:
+    """One `lore_file_audit_event_data_t` as a plain dict, so the driver can
+    hand it to a test as a JSON line.
+
+    The event is valid only while the callback runs, so every field is copied
+    out here rather than referenced.
+    """
+    return {
+        "repository": data.repository.hex(),
+        "revision": data.revision.hex(),
+        "lineFirst": data.line_first,
+        "lineLast": data.line_last,
+        "outcome": data.outcome,
+    }
 
 
 class LoreLibrary:
@@ -287,6 +445,12 @@ class LoreLibrary:
         self._lib.lore_revision_bisect.argtypes = [
             POINTER(LoreGlobalArgs),
             POINTER(LoreRevisionBisectArgs),
+            LoreEventCallbackConfig,
+        ]
+        self._lib.lore_file_audit.restype = c_int32
+        self._lib.lore_file_audit.argtypes = [
+            POINTER(LoreGlobalArgs),
+            POINTER(LoreFileAuditArgs),
             LoreEventCallbackConfig,
         ]
 
@@ -433,6 +597,68 @@ class LoreLibrary:
             LoreEventCallbackConfig(0, None),
         )
 
+    def file_audit(
+        self,
+        repository_path: str,
+        path: str,
+        stop_after: int | None = None,
+    ) -> int:
+        """Call `lore_file_audit`, printing one JSON line per event the callback
+        received and returning the call's FFI code.
+
+        This is the entry point an editor integration reaches attribution
+        through, so the records it prints are exactly the structured data such a
+        consumer reads — no terminal output is parsed anywhere in the path.
+
+        `stop_after` stops the process from inside the callback once that many
+        range events have arrived, which is a caller that took what it needed and
+        walked away: the records it already has stand, and nothing waits for the
+        walk to reach the end of the chain.
+        """
+        # Encoded buffers must outlive the call; keep references on the stack.
+        path_bytes = repository_path.encode()
+        audited_bytes = path.encode()
+
+        globals_args = LoreGlobalArgs()
+        globals_args.repository_path = LoreString(path_bytes, len(path_bytes))
+
+        args = LoreFileAuditArgs()
+        args.path = LoreString(audited_bytes, len(audited_bytes))
+
+        file_audit_tag = header_enum_value("lore_event_id_t", "LORE_EVENT_FILE_AUDIT")
+        complete_tag = header_enum_value("lore_event_id_t", "LORE_EVENT_COMPLETE")
+        ranges = 0
+
+        def on_event(event, _user_context):
+            nonlocal ranges
+            if event[0].tag == file_audit_tag:
+                print(json.dumps(audit_record(event[0].data.file_audit)), flush=True)
+                ranges += 1
+                if stop_after is not None and ranges >= stop_after:
+                    # Not a graceful return: the point is that the caller is gone
+                    # before the walk finished, so nothing after this line runs.
+                    sys.stdout.flush()
+                    os._exit(0)
+            elif event[0].tag == complete_tag:
+                complete = event[0].data.complete
+                print(
+                    json.dumps(
+                        {
+                            "complete": complete.status,
+                            "errorCode": complete.error.error_code,
+                        }
+                    ),
+                    flush=True,
+                )
+
+        # The callback must outlive the call, so it is held in a local.
+        callback = EVENT_CALLBACK(on_event)
+        return self._lib.lore_file_audit(
+            ctypes.byref(globals_args),
+            ctypes.byref(args),
+            LoreEventCallbackConfig(0, ctypes.cast(callback, c_void_p).value),
+        )
+
 
 USAGE = """usage:
   lore_ffi.py auth-user-info <library-path> <repository-path> [user-id...]
@@ -443,7 +669,9 @@ USAGE = """usage:
   lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
   lore_ffi.py repository-delete <library-path> <repository-path> <repository-url>
   lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
-  lore_ffi.py revision-bisect <library-path> <repository-path> <start> <end> <keep-store-alive-seconds>"""
+  lore_ffi.py revision-bisect <library-path> <repository-path> <start> <end> <keep-store-alive-seconds>
+  lore_ffi.py file-audit <library-path> <repository-path> <path>
+                         [--stop-after <n>]"""
 
 
 def main(argv: list[str]) -> int:
@@ -469,6 +697,19 @@ def main(argv: list[str]) -> int:
         case ["revision-bisect", library_path, repository_path, start, end, keep_alive]:
             return LoreLibrary(library_path).revision_bisect(
                 repository_path, start, end, int(keep_alive)
+            )
+        case ["file-audit", library_path, repository_path, path, *options]:
+            stop_after = None
+            while options:
+                match options:
+                    case ["--stop-after", count, *rest]:
+                        stop_after = int(count)
+                        options = rest
+                    case _:
+                        print(USAGE, file=sys.stderr)
+                        return 2
+            return LoreLibrary(library_path).file_audit(
+                repository_path, path, stop_after
             )
         case _:
             print(USAGE, file=sys.stderr)

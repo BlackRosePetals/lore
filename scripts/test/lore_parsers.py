@@ -249,6 +249,15 @@ def parse_layer_remove_json(output: str) -> dict | None:
     return entries[0] if entries else None
 
 
+def parse_file_audit_json(output: str) -> list[dict]:
+    """Parse `lore file audit --json` output into a list of range dicts, sorted
+    by first line. The command emits ranges as it resolves them, not in line
+    order; read them with `parse_jsonl` to check the emitted order."""
+    return sorted(
+        parse_jsonl(output, "fileAudit"), key=lambda entry: entry["lineFirst"]
+    )
+
+
 def parse_complete_json(output: str) -> dict | None:
     """Parse `--json` output and return the terminal complete event."""
     entries = parse_jsonl(output, "complete")

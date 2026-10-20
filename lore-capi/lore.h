@@ -188,6 +188,34 @@ typedef enum lore_error_code_t {
   LORE_ERROR_CODE_SLOW_DOWN = 31,
 } lore_error_code_t;
 
+// What a range of lines resolved to, or why it did not resolve.
+//
+// An outcome is named the same way wherever it is reported, as
+// `binary-in-history` rather than `binaryInHistory`.
+typedef enum lore_file_audit_outcome_t {
+  // Resolved to the revision that last changed the lines.
+  LORE_FILE_AUDIT_OUTCOME_ATTRIBUTED = 0,
+  // Differs on disk from the revision the audit read, so no revision holds it.
+  LORE_FILE_AUDIT_OUTCOME_UNCOMMITTED = 1,
+  // The revision budget ran out before the lines resolved.
+  LORE_FILE_AUDIT_OUTCOME_BUDGET_EXHAUSTED = 2,
+  // A version the walk had to compare no longer holds its content, the
+  // address it is stored at surviving the payload.
+  LORE_FILE_AUDIT_OUTCOME_OBLITERATED = 3,
+  // A version the walk had to compare holds binary content, which cannot be
+  // compared line by line.
+  LORE_FILE_AUDIT_OUTCOME_BINARY_IN_HISTORY = 4,
+  // The chain continues in a linked repository that is unauthorized or out
+  // of reach.
+  LORE_FILE_AUDIT_OUTCOME_LINK_UNAVAILABLE = 5,
+  // A version the walk had to compare is not held locally, and the instance
+  // reads its local store alone.
+  LORE_FILE_AUDIT_OUTCOME_CONTENT_UNAVAILABLE = 6,
+  // The walk ended with an error before it reached the lines. The error
+  // arrives on the completion event.
+  LORE_FILE_AUDIT_OUTCOME_UNRESOLVED = 7,
+} lore_file_audit_outcome_t;
+
 // Which authentication path a client takes if a server advertises both its
 // gRPC auth service and an OIDC issuer. A path the server does not
 // advertise cannot be taken.
@@ -3340,6 +3368,35 @@ typedef struct lore_storage_get_fragment_event_data_t {
   struct lore_bytes_t bytes;
 } lore_storage_get_fragment_event_data_t;
 
+// Data for the event carrying one range of lines in a file.
+//
+// A range names the revision that last changed it and nothing more of that
+// revision: a caller reads the revision's metadata itself, once per distinct
+// revision. It carries no revision number, because numbers are per-branch and
+// reporting one would make the answer depend on the caller's branch.
+//
+// Each range is sent as soon as the step of the walk that resolves it ends, so
+// ranges arrive most recently changed first rather than in line order. Each
+// range is complete and never needs joining with another. A walk that ends
+// with an error still reports every line: the lines it resolved keep their outcomes, and the lines
+// it did not reach are reported as `LORE_FILE_AUDIT_OUTCOME_UNRESOLVED`. An
+// audit that fails before the walk starts reports no range. Read the
+// completion status before treating the ranges received as the whole answer.
+typedef struct lore_file_audit_event_data_t {
+  // Identifier of the repository the range came from. A walk that follows
+  // the file into a linked repository reports that repository.
+  lore_repository_id_t repository;
+  // Revision that last changed the range. Zero unless `outcome` is
+  // `Attributed`.
+  struct lore_hash_t revision;
+  // First line of the range, 1-based.
+  uint32_t line_first;
+  // Last line of the range, 1-based and inclusive.
+  uint32_t line_last;
+  // What the range resolved to, or why it did not resolve.
+  enum lore_file_audit_outcome_t outcome;
+} lore_file_audit_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -3819,6 +3876,8 @@ enum lore_event_id_t {
   LORE_EVENT_AUTH_PENDING,
   // One leaf fragment and its payload for a get-resolved item.
   LORE_EVENT_STORAGE_GET_FRAGMENT,
+  // One range of a file's lines, attributed to the revision that last changed them.
+  LORE_EVENT_FILE_AUDIT,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -4062,6 +4121,7 @@ typedef struct lore_event_t {
     struct lore_service_message_event_data_t service_message;
     struct lore_auth_pending_event_data_t auth_pending;
     struct lore_storage_get_fragment_event_data_t storage_get_fragment;
+    struct lore_file_audit_event_data_t file_audit;
   };
 } lore_event_t;
 
@@ -4514,6 +4574,30 @@ typedef struct lore_file_history_args_t {
   // Number of revisions to search initially
   uint32_t depth;
 } lore_file_history_args_t;
+
+// Arguments for attributing the lines of a file to the revisions that last changed them.
+typedef struct lore_file_audit_args_t {
+  // A path to a file
+  struct lore_string_t path;
+  // Revision to read the file at, in any form a revision specifier takes: a
+  // whole hash signature, `[branch]@<number>`, `[branch]@LATEST` or
+  // `<branch>@<hash>`, optionally followed by `~<count>` to step back that many
+  // parents. Empty reads the revision the instance is synced to and accounts for
+  // the file on disk
+  struct lore_string_t revision;
+  // Revisions of the file's predecessor chain to walk, `0` for the default of
+  // 100 and `UINT32_MAX` for the whole chain. Zero means the default rather
+  // than no limit, as `lore_file_history_args_t::length` does, so a
+  // zero-initialized value is bounded
+  uint32_t max_revisions;
+  // Count a line that differs only in trailing whitespace as changed.
+  // Trailing whitespace is ignored by default, so the field is stated as the
+  // refusal and a zero-initialized value carries the default
+  uint8_t no_ignore_space_at_eol;
+  // Collapse runs of internal whitespace to a single space before comparing,
+  // which leaves a reindented line with the revision that wrote its text
+  uint8_t ignore_space_change;
+} lore_file_audit_args_t;
 
 // Arguments for clearing all metadata associated with a file.
 typedef struct lore_file_metadata_clear_args_t {
@@ -7867,6 +7951,73 @@ int32_t lore_file_history(const struct lore_global_args_t *globals,
 void lore_file_history_async(const struct lore_global_args_t *globals,
                              const struct lore_file_history_args_t *args,
                              struct lore_event_callback_config_t callback);
+
+// Attribute each line of a file to the revision that last changed it.
+//
+// One `LORE_EVENT_FILE_AUDIT` event carries each range of consecutive lines
+// sharing an attribution. Each range arrives as soon as the step of the walk
+// that resolves it ends. The walk resolves the most recently changed lines
+// first, so ranges arrive in that order, not in line order. Each range is
+// complete and never needs joining with another. A caller with what it needs
+// may stop reading; the events already delivered stand.
+//
+// A range names its revision and repository, not the revision's metadata. Read
+// the metadata with `lore_revision_info`, once per distinct revision.
+//
+// An error that ends the walk, such as a lost connection to the remote, ends
+// the audit: every line is still delivered, those the walk did not reach with
+// the outcome `LORE_FILE_AUDIT_OUTCOME_UNRESOLVED`, and `LORE_EVENT_COMPLETE`
+// carries the error.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## File Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_FILE_AUDIT` | `lore_file_audit_event_data_t` | Emitted for each range of consecutive lines sharing an attribution |
+int32_t lore_file_audit(const struct lore_global_args_t *globals,
+                        const struct lore_file_audit_args_t *args,
+                        struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_file_audit`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## File Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_FILE_AUDIT` | `lore_file_audit_event_data_t` | Emitted for each range of consecutive lines sharing an attribution |
+void lore_file_audit_async(const struct lore_global_args_t *globals,
+                           const struct lore_file_audit_args_t *args,
+                           struct lore_event_callback_config_t callback);
 
 // Clear all metadata from a file.
 //

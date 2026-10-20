@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::borrow::Cow;
+
 use lore_revision::file::diff::*;
 
 #[test]
@@ -47,34 +49,63 @@ fn diff_content_empty_constructor_is_text() {
 }
 
 #[test]
-fn normalise_line_strips_trailing_whitespace() {
-    assert_eq!(normalise_line("foo   \n", true, false), "foo\n");
-    assert_eq!(normalise_line("foo\t\t\n", true, false), "foo\n");
-    assert_eq!(normalise_line("foo", true, false), "foo");
-    assert_eq!(normalise_line("foo   ", true, false), "foo");
+fn normalise_text_strips_trailing_whitespace() {
+    assert_eq!(normalise_text("foo   \n", true, false), "foo\n");
+    assert_eq!(normalise_text("foo\t\t\n", true, false), "foo\n");
+    assert_eq!(normalise_text("foo", true, false), "foo");
+    assert_eq!(normalise_text("foo   ", true, false), "foo");
 }
 
 #[test]
-fn normalise_line_collapses_runs() {
-    assert_eq!(normalise_line("a  b   c\n", false, true), "a b c\n");
-    assert_eq!(normalise_line("a\t\tb\n", false, true), "a b\n");
+fn normalise_text_collapses_runs() {
+    assert_eq!(normalise_text("a  b   c\n", false, true), "a b c\n");
+    assert_eq!(normalise_text("a\t\tb\n", false, true), "a b\n");
     // Internal whitespace gone entirely is NOT invented back.
-    assert_eq!(normalise_line("abc\n", false, true), "abc\n");
+    assert_eq!(normalise_text("abc\n", false, true), "abc\n");
 }
 
 #[test]
-fn normalise_line_both_flags() {
-    assert_eq!(normalise_line("a  b   \n", true, true), "a b\n");
+fn normalise_text_both_flags() {
+    assert_eq!(normalise_text("a  b   \n", true, true), "a b\n");
+}
+
+/// A whole side normalises line by line, so it keeps its line count and each
+/// line follows the same rules as it would alone.
+#[test]
+fn normalise_text_normalises_every_line_and_keeps_the_line_count() {
+    let text = "a  b   \n\tc\t\r\n\nlast  word  ";
+    assert_eq!(normalise_text(text, true, false), "a  b\n\tc\n\nlast  word");
+    assert_eq!(normalise_text(text, false, true), "a b \n c \n\nlast word ");
+    assert_eq!(normalise_text(text, true, true), "a b\n c\n\nlast word");
+    assert_eq!(normalise_text(text, false, false), text);
+    assert_eq!(normalise_text("", true, true), "");
+}
+
+/// With no rule selected the side is compared as written, so it is not copied.
+#[test]
+fn normalise_text_without_rules_borrows_the_text() {
+    let text = "a  b   \n";
+    assert!(matches!(
+        normalise_text(text, false, false),
+        Cow::Borrowed(borrowed) if std::ptr::eq(borrowed, text)
+    ));
+    assert!(matches!(normalise_text(text, true, false), Cow::Owned(_)));
 }
 
 #[test]
-fn normalise_line_crlf_trailing_treated_as_whitespace() {
+fn diff_content_into_text_moves_the_text_out() {
+    assert_eq!(make_diff_content(b"a\nb\n").into_text(), "a\nb\n");
+    assert_eq!(DiffContent::Binary.into_text(), "");
+}
+
+#[test]
+fn normalise_text_crlf_trailing_treated_as_whitespace() {
     // CRLF inputs (e.g. Python text-mode writes on Windows) must compare equal
     // to LF inputs under ignore_eol — the trailing `\r` counts as EOL whitespace.
-    assert_eq!(normalise_line("foo   \r\n", true, false), "foo\n");
-    assert_eq!(normalise_line("foo\r\n", true, false), "foo\n");
+    assert_eq!(normalise_text("foo   \r\n", true, false), "foo\n");
+    assert_eq!(normalise_text("foo\r\n", true, false), "foo\n");
     // No-flag path keeps the `\r` intact.
-    assert_eq!(normalise_line("foo\r\n", false, false), "foo\r\n");
+    assert_eq!(normalise_text("foo\r\n", false, false), "foo\r\n");
 }
 
 #[test]

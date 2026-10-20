@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -11,6 +12,8 @@ use clap::Subcommand;
 use lore::call_delegation::run_command;
 use lore::dependency;
 use lore::file::DEFAULT_CONTEXT_LINES;
+use lore::file::DEFAULT_MAX_REVISIONS;
+use lore::file::LoreFileAuditArgs;
 use lore::file::LoreFileObliterateArgs;
 use lore::interface::*;
 use parking_lot::Mutex;
@@ -18,6 +21,7 @@ use parking_lot::Mutex;
 use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
 use crate::cli::output_formatter;
+use crate::commands::auth;
 use crate::pager::Pager;
 use crate::print;
 use crate::println;
@@ -423,6 +427,48 @@ pub struct FileHistoryArgs {
     pub oneline: bool,
 }
 
+#[lore_macro::test_pub]
+#[derive(Args)]
+pub struct FileAuditArgs {
+    /// File path to attribute
+    path: String,
+
+    /// Revision to read the file at: a revision signature, `[branch]@<number>`,
+    /// `[branch]@LATEST` or `<branch>@<hash>`, optionally followed by `~<count>`
+    /// to step back that many parents. Without it the file is read at the
+    /// revision the instance is synced to, and the file on disk is accounted for
+    #[clap(long, value_name = "revision")]
+    revision: Option<String>,
+
+    /// Comparisons of the file's predecessor chain to make, 0 for no limit.
+    ///
+    /// This bounds the work, not the number of revisions the answer can name. A
+    /// comparison against the revision that added the file resolves that
+    /// revision too, and a comparison at a revision that left the file alone
+    /// resolves none, so the rows reported can be one more or one fewer than the
+    /// bound allows.
+    #[clap(long, value_name = "n", default_value_t = DEFAULT_MAX_REVISIONS)]
+    max_revisions: u32,
+
+    /// Treat lines that differ only in trailing whitespace as unchanged
+    ///
+    /// On by default, unlike `lore file diff`: attribution asks who wrote a
+    /// line, and trailing-space or line-ending churn does not answer that. Turn
+    /// it off with --no-ignore-space-at-eol.
+    #[clap(long, action, required = false)]
+    ignore_space_at_eol: bool,
+
+    /// Count a line that differs only in trailing whitespace as changed
+    #[clap(long, action, required = false, conflicts_with = "ignore_space_at_eol")]
+    no_ignore_space_at_eol: bool,
+
+    /// Collapse runs of internal whitespace to a single space before comparing
+    ///
+    /// Leaves a reindented line with the revision that wrote its text.
+    #[clap(long, action, required = false)]
+    ignore_space_change: bool,
+}
+
 #[derive(Args)]
 pub struct FileWriteArgs {
     /// Address of a blob
@@ -568,6 +614,8 @@ pub enum FileCommands {
     Dump(FileDumpArgs),
     /// List revisions of a file
     History(FileHistoryArgs),
+    /// Attribute each line of a file to the revision that last changed it
+    Audit(FileAuditArgs),
     /// Show differences between two revisions of a file
     Diff(FileDiffArgs),
     /// Write data to a specific location
@@ -1513,6 +1561,269 @@ pub fn handle_file_history(globals: LoreGlobalArgs, args: &FileHistoryArgs) -> u
     return run_command(globals, log_args.into(), callback) as u8;
 }
 
+/// The line span of an audit range. A range of one line prints as that line.
+#[lore_macro::test_pub]
+fn audit_span(line_first: u32, line_last: u32) -> String {
+    if line_first == line_last {
+        line_first.to_string()
+    } else {
+        format!("{line_first}-{line_last}")
+    }
+}
+
+/// The day a revision was committed, and `-` where it records no timestamp.
+#[lore_macro::test_pub]
+fn audit_date(timestamp: u64) -> String {
+    match DateTime::from_timestamp_millis(timestamp as i64) {
+        Some(timestamp) if timestamp.timestamp_millis() != 0 => {
+            timestamp.format("%Y-%m-%d").to_string()
+        }
+        _ => "-".to_string(),
+    }
+}
+
+/// What the audit summary shows of a revision: who brought the work into the
+/// branch, and when.
+#[lore_macro::test_pub]
+#[derive(Clone, Default, Debug, PartialEq)]
+struct AuditAttribution {
+    /// The revision's `merged-by`, or its `committed-by` where it records no
+    /// merger, usually a user identity ID, and empty where it records neither.
+    author: String,
+    /// The `timestamp` the revision records, in milliseconds since the Unix
+    /// epoch, and `0` where it records none.
+    timestamp: u64,
+}
+
+/// One row of the audit summary: the line span, then what the range resolved to.
+///
+/// The revision prints whole. Lore refuses a partial hash as a revision
+/// identifier, so a shortened one would name something no other command takes.
+/// `attribution` is `None` where the revision's metadata could not be read; the
+/// range is still attributed, so the row keeps the revision and prints
+/// `unresolved` for the author and the date. The author prints as the name
+/// `names` maps its ID to, and as the stored ID where `names` has none.
+fn audit_row(
+    data: &LoreFileAuditEventData,
+    attribution: Option<&AuditAttribution>,
+    names: &HashMap<String, String>,
+) -> String {
+    let span = audit_span(data.line_first, data.line_last);
+
+    let detail = match (data.outcome, attribution) {
+        (LoreFileAuditOutcome::Attributed, Some(attribution)) => {
+            let author = if attribution.author.is_empty() {
+                "-".to_string()
+            } else {
+                format_value(metadata::MERGED_BY, &attribution.author, Some(names))
+            };
+            format!(
+                "{}  {:<16}  {}",
+                data.revision,
+                author,
+                audit_date(attribution.timestamp)
+            )
+        }
+        (LoreFileAuditOutcome::Attributed, None) => {
+            format!("{}  {:<16}  unresolved", data.revision, "unresolved")
+        }
+        (outcome, _) => outcome.as_string().to_string(),
+    };
+
+    format!("{span:>12}  {detail}")
+}
+
+/// The rows of the audit summary, reading each revision's attribution through
+/// `read_attribution`, which answers `None` for a revision it cannot read, and
+/// the authors' names through `resolve_names`, which maps each ID it knows to a
+/// name.
+///
+/// Many ranges usually share one revision, so each distinct revision is read
+/// once. A revision is keyed with its repository, because one hash in two
+/// repositories names two revisions. The authors are resolved together in one
+/// call once every revision is read, rather than once per row.
+#[lore_macro::test_pub]
+fn audit_rows(
+    ranges: &[LoreFileAuditEventData],
+    mut read_attribution: impl FnMut(Hash) -> Option<AuditAttribution>,
+    resolve_names: impl FnOnce(&[LoreString]) -> HashMap<String, String>,
+) -> Vec<String> {
+    let mut attributions: HashMap<(Partition, Hash), Option<AuditAttribution>> = HashMap::new();
+    for data in ranges
+        .iter()
+        .filter(|data| data.outcome == LoreFileAuditOutcome::Attributed)
+    {
+        attributions
+            .entry((data.repository, data.revision))
+            .or_insert_with(|| read_attribution(data.revision));
+    }
+
+    let authors: Vec<LoreString> = attributions
+        .values()
+        .flatten()
+        .map(|attribution| attribution.author.as_str())
+        .filter(|author| !author.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(LoreString::from)
+        .collect();
+    let names = if authors.is_empty() {
+        HashMap::new()
+    } else {
+        resolve_names(&authors)
+    };
+
+    ranges
+        .iter()
+        .map(|data| {
+            let attribution = attributions
+                .get(&(data.repository, data.revision))
+                .and_then(Option::as_ref);
+            audit_row(data, attribution, &names)
+        })
+        .collect()
+}
+
+/// The author and `timestamp` among the metadata `lore revision info` reported
+/// for a revision, and `None` where it reported none.
+///
+/// The author is the `merged-by`, and the `committed-by` where the revision
+/// records no merger: the person who brought the lines into this branch.
+///
+/// `revision info` reports a revision whose metadata it cannot read without any
+/// metadata, and still succeeds. Every committed revision records a timestamp,
+/// so a reply carrying no metadata at all is one whose metadata was not read.
+#[lore_macro::test_pub]
+fn audit_attribution(reported: &[LoreMetadataEventData]) -> Option<AuditAttribution> {
+    if reported.is_empty() {
+        return None;
+    }
+
+    let mut merged_by = String::new();
+    let mut committed_by = String::new();
+    let mut timestamp = 0;
+    for data in reported {
+        match (data.key.as_str(), &data.value) {
+            (metadata::MERGED_BY, LoreMetadata::String(value)) => {
+                merged_by = value.to_string();
+            }
+            (metadata::COMMITTED_BY, LoreMetadata::String(value)) => {
+                committed_by = value.to_string();
+            }
+            (metadata::TIMESTAMP, LoreMetadata::Numeric(value)) => {
+                timestamp = *value;
+            }
+            _ => (),
+        }
+    }
+    let author = if merged_by.is_empty() {
+        committed_by
+    } else {
+        merged_by
+    };
+    Some(AuditAttribution { author, timestamp })
+}
+
+/// Read a revision's attribution through `lore revision info`, and `None` where
+/// the call fails or its metadata cannot be read.
+fn read_audit_attribution(globals: LoreGlobalArgs, revision: Hash) -> Option<AuditAttribution> {
+    let info_args = LoreRevisionInfoArgs {
+        revision: LoreString::from(revision.to_string()),
+        delta: 0,
+        metadata: 0,
+    };
+
+    let reported: Arc<Mutex<Vec<LoreMetadataEventData>>> = Arc::new(Mutex::new(Vec::new()));
+    let reported_clone = reported.clone();
+    // Sub-operation callback; safe to ignore error events.
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
+        LoreEvent::Metadata(data) => {
+            reported_clone.lock().push(data.clone());
+        }
+        LoreEvent::Maintenance(data) => {
+            util::handle_maintenance_event(data);
+        }
+        _ => (),
+    }));
+
+    let result = run_command(globals, info_args.into(), callback);
+    if result != 0 {
+        return None;
+    }
+
+    audit_attribution(&reported.lock())
+}
+
+/// Translate the parsed command into the library's arguments.
+///
+/// `--max-revisions 0` asks for an unbounded walk, which the library takes as
+/// the largest bound rather than as a zero so that a zero-initialized argument
+/// struct stays bounded. Trailing whitespace is ignored by default for the same reason the
+/// library states it as a refusal: `--ignore-space-at-eol` names what is
+/// already happening, and `--no-ignore-space-at-eol` is what changes it.
+#[lore_macro::test_pub]
+fn audit_args(args: &FileAuditArgs) -> LoreFileAuditArgs {
+    LoreFileAuditArgs {
+        path: args.path.as_str().into(),
+        revision: args.revision.as_ref().into(),
+        max_revisions: if args.max_revisions == 0 {
+            u32::MAX
+        } else {
+            args.max_revisions
+        },
+        no_ignore_space_at_eol: u8::from(args.no_ignore_space_at_eol),
+        ignore_space_change: u8::from(args.ignore_space_change),
+    }
+}
+
+/// Run an audit. `--json` prints each range as the library emits it. The
+/// summary collects the ranges first and then reads each distinct revision's
+/// attribution and resolves the authors' names, because a revision can only be
+/// read once the audit has returned.
+///
+/// An audit whose walk fails still reports every line, those it did not reach
+/// as `unresolved`, so the summary prints them and the command still returns
+/// the failure.
+pub fn handle_file_audit(globals: LoreGlobalArgs, args: &FileAuditArgs) -> u8 {
+    let audit_args = audit_args(args);
+
+    if let Some(formatter) = output_formatter() {
+        return run_command(globals, audit_args.into(), formatter) as u8;
+    }
+
+    let ranges: Arc<Mutex<Vec<LoreFileAuditEventData>>> = Arc::new(Mutex::new(Vec::new()));
+    let ranges_clone = ranges.clone();
+    let callback = Some(
+        (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::FileAudit(data) => {
+                ranges_clone.lock().push(data.clone());
+            }
+            LoreEvent::Maintenance(data) => {
+                util::handle_maintenance_event(data);
+            }
+            _ => (),
+        }) as EventCallbackFn)
+            .with_defaults(),
+    );
+
+    let result = run_command(globals.clone(), audit_args.into(), callback) as u8;
+
+    let _pager = Pager::new();
+
+    let mut ranges = ranges.lock();
+    // The library sends ranges as it resolves them; the summary reads top to bottom.
+    ranges.sort_unstable_by_key(|data| data.line_first);
+    for row in audit_rows(
+        &ranges,
+        |revision| read_audit_attribution(globals.clone(), revision),
+        |user_ids| auth::resolve_user_ids(globals.clone(), user_ids),
+    ) {
+        println!("{row}");
+    }
+
+    result
+}
+
 pub fn handle_file_write(globals: LoreGlobalArgs, args: &FileWriteArgs) -> u8 {
     let write_args = LoreFileWriteArgs {
         address: LoreString::from(&args.address),
@@ -1881,6 +2192,9 @@ pub fn handle_file_commands(cmd: &FileCommands, globals: LoreGlobalArgs) -> u8 {
         }
         FileCommands::History(args) => {
             return handle_file_history(globals, args);
+        }
+        FileCommands::Audit(args) => {
+            return handle_file_audit(globals, args);
         }
         FileCommands::Obliterate(args) => {
             return handle_file_obliterate(globals, args);

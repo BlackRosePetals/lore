@@ -37,6 +37,11 @@ class NotFound(LoreException): ...
 class RevisionNotFound(NotFound): ...
 
 
+class FileNotFound(NotFound):
+    """Raised when a command names a path the revision it reads does not hold,
+    whether the path was never added or was deleted."""
+
+
 class BranchBehindLatest(LoreException): ...
 
 
@@ -203,6 +208,11 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Repository not found", UninitializedRepositoryError),
     ("Failed to find revision", RevisionNotFound),
     ("revision not found:", RevisionNotFound),
+    # Matched on the reported error line rather than as a bare substring: the
+    # patterns here are tested against the whole output, and `Root file not
+    # found:` from a clone naming a missing root path would otherwise be
+    # reported as this, which it is not.
+    (re.compile(r"\[Error\] file not found:"), FileNotFound),
     ("Not found", NotFound),
     ("Branch behind latest revision", BranchBehindLatest),
     ("Multiple files with case-only differences", CaseVariantConflict),

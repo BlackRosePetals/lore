@@ -63,8 +63,7 @@ typedef struct lore_file_audit_args_t {
   struct lore_string_t path;
   struct lore_string_t revision;    // a signature, [branch]@<number>, [branch]@LATEST or <branch>@<hash>;
                                     // empty: the synced revision, accounting for the file on disk
-  uint32_t max_revisions;           // 0: the default budget of 100
-  uint8_t unlimited;                // walk the whole chain, ignoring max_revisions
+  uint32_t max_revisions;           // 0: the default budget of 100; UINT32_MAX: the whole chain
   uint8_t no_ignore_space_at_eol;   // compare trailing whitespace literally
   uint8_t ignore_space_change;      // collapse runs of internal whitespace
 } lore_file_audit_args_t;

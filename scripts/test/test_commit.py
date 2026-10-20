@@ -4,7 +4,7 @@ import logging
 import os
 
 import pytest
-from error_types import UnknownLoreError
+from error_types import FileNotFound
 from lore_parsers import (
     parse_commit_stats_json,
     parse_jsonl,
@@ -410,7 +410,7 @@ def test_failed_commit_records_no_modified_times(new_lore_repo):
     # the other one has been fragmented. Unlike a killed process, this exits cleanly, so
     # anything written to the mutable store along the way is flushed and survives.
     os.remove(os.path.join(repo.path, removed))
-    with pytest.raises(UnknownLoreError):
+    with pytest.raises(FileNotFound):
         repo.commit(offline=True)
 
     # Put the committed bytes back. `reset` cannot do it while the file is staged, and

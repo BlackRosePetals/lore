@@ -7,6 +7,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+- C API: the new `LORE_EVENT_FILE_AUDIT` event adds a member to `lore_event_t`, so C consumers must rebuild against the
+  new `lore.h`
 - `[environment.endpoint] user_url` now names a `lore.user.v1.UserService` (`UserGet`, `UserFind`), replacing the
   `UrcAuthApi` `GetUserInfo` and `GetUserId` calls. Without `user_url`, clients ask `auth_url` over `UrcAuthApi` as
   before. With `user_url`, the server also lists repositories there (`PartitionList`) by default, through the new
@@ -26,6 +28,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `lore file audit <path>` is a new command that shows, for each line of a file, the revision that last changed it,
+  grouped into ranges of consecutive lines. The C API offers the same query as `lore_file_audit` and
+  `lore_file_audit_async`
 - `--trust-remote` (C API: `trust_remote` on `lore_global_args_t`) skips hash verification of data fetched from the
   remote, keeping only a size check, for machines inside the remote's own infrastructure where performance comes first,
   such as build servers. The field sits in the struct's padding, so callers must zero the whole struct, padding

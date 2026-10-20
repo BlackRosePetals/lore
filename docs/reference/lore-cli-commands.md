@@ -124,6 +124,7 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * [`lore file reset`↴](#lore-file-reset)
 * [`lore file obliterate`↴](#lore-file-obliterate)
 * [`lore file history`↴](#lore-file-history)
+* [`lore file audit`↴](#lore-file-audit)
 * [`lore file diff`↴](#lore-file-diff)
 * [`lore file write`↴](#lore-file-write)
 * [`lore file hash`↴](#lore-file-hash)
@@ -1461,6 +1462,7 @@ File commands
 * `reset` — Reset changes to a path or file to the current revision, discarding your local changes
 * `obliterate` — Obliterate a file or fragment
 * `history` — List revisions of a file
+* `audit` — Attribute each line of a file to the revision that last changed it
 * `diff` — Show differences between two revisions of a file
 * `write` — Write data to a specific location
 * `hash` — Hash a local file
@@ -1779,6 +1781,37 @@ List revisions of a file
 * `--branch <branch>` — Show branch revisions
 * `--depth <depth>` — Number of revisions to search initially
 * `--oneline` — Output each revision on one line only
+
+## `lore file audit`
+
+Attribute each line of a file to the revision that last changed it
+
+**Usage:** `lore file audit [OPTIONS] <PATH>`
+
+###### **Arguments:**
+
+* `<PATH>` — File path to attribute
+
+###### **Options:**
+
+* `--revision <revision>` — Revision to read the file at: a revision signature, `[branch]@<number>`, `[branch]@LATEST`
+  or `<branch>@<hash>`, optionally followed by `~<count>` to step back that many parents. Without it the file is read at
+  the revision the instance is synced to, and the file on disk is accounted for
+* `--max-revisions <n>` — Comparisons of the file's predecessor chain to make, 0 for no limit.
+
+  This bounds the work, not the number of revisions the answer can name. A comparison against the revision that added
+  the file resolves that revision too, and a comparison at a revision that left the file alone resolves none, so the
+  rows reported can be one more or one fewer than the bound allows.
+
+  Default value: `100`
+* `--ignore-space-at-eol` — Treat lines that differ only in trailing whitespace as unchanged
+
+  On by default, unlike `lore file diff`: attribution asks who wrote a line, and trailing-space or line-ending churn
+  does not answer that. Turn it off with --no-ignore-space-at-eol.
+* `--no-ignore-space-at-eol` — Count a line that differs only in trailing whitespace as changed
+* `--ignore-space-change` — Collapse runs of internal whitespace to a single space before comparing
+
+  Leaves a reindented line with the revision that wrote its text.
 
 ## `lore file diff`
 

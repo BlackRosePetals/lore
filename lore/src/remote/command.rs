@@ -169,4 +169,5 @@ pub enum LoreCommand {
     StorageGetFileResolved(crate::storage::get_file_resolved::LoreStorageGetFileResolvedArgs),
     StoragePutFileResolved(crate::storage::put_file_resolved::LoreStoragePutFileResolvedArgs),
     ServiceStatus(crate::service::LoreServiceStatusArgs),
+    FileAudit(crate::file::LoreFileAuditArgs),
 }

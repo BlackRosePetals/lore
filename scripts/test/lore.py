@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import filecmp
+import json
 import logging
 import os
 import pathlib
@@ -1590,6 +1591,29 @@ class Lore:
             **kwargs,
         )
 
+    def file_audit(
+        self,
+        path: str | None = None,
+        revision: str | None = None,
+        max_revisions: int | None = None,
+        no_ignore_space_at_eol: bool = False,
+        ignore_space_change: bool = False,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["file", "audit"]
+            + ([self._fix_path(path)] if path else [])
+            + (["--revision", revision] if revision else [])
+            + (
+                ["--max-revisions", str(max_revisions)]
+                if max_revisions is not None
+                else []
+            )
+            + (["--no-ignore-space-at-eol"] if no_ignore_space_at_eol else [])
+            + (["--ignore-space-change"] if ignore_space_change else []),
+            **kwargs,
+        )
+
     def file_diff(
         self,
         paths: str | list[str] | Path | list[Path] | None = None,
@@ -1742,9 +1766,11 @@ class Lore:
             **kwargs,
         )
 
-    def _capi_driver(self, library_path: str, command: str, *args: str) -> int:
+    def _capi_driver_output(
+        self, library_path: str, command: str, *args: str
+    ) -> tuple[int, str]:
         """Runs `lore_ffi.py` as a subprocess, returning the FFI code the call it
-        drives answered: 0 on success, the failing error's code otherwise.
+        drives answered and whatever the driver printed.
 
         Out of process so the call reads this repository's isolated auth and
         global directories, and so a crash in the library fails one test rather
@@ -1775,7 +1801,37 @@ class Lore:
             result.returncode,
             result.stdout + result.stderr,
         )
-        return result.returncode
+        return result.returncode, result.stdout
+
+    def _capi_driver(self, library_path: str, command: str, *args: str) -> int:
+        """The FFI code a driven call answered, for a call whose events a test
+        does not read."""
+        code, _output = self._capi_driver_output(library_path, command, *args)
+        return code
+
+    def file_audit_capi(
+        self,
+        library_path: str,
+        path: str,
+        stop_after: int | None = None,
+    ) -> tuple[int, list[dict]]:
+        """Attribute a file's lines through the public C API, returning the FFI
+        code and the records the event callback received.
+
+        The CLI prints a text summary from the same events, so driving it covers
+        the formatting rather than the structured records an editor integration
+        reads. `stop_after` ends the process from inside the callback once that
+        many range events have arrived.
+        """
+        options: list[str] = []
+        if stop_after is not None:
+            options += ["--stop-after", str(stop_after)]
+
+        code, output = self._capi_driver_output(
+            library_path, "file-audit", self.path, path, *options
+        )
+        events = [json.loads(line) for line in output.splitlines() if line.strip()]
+        return code, events
 
     def auth_user_info_capi(
         self, library_path: str, user_ids: str | list[str] | None = None

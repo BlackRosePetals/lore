@@ -369,17 +369,7 @@ async fn find_start_revision(
         return Err(FileHistoryError::internal("Invalid options"));
     }
     if let Some(revision_spec) = options.revision {
-        return revision::resolve(
-            repository.clone(),
-            revision_spec.as_str(),
-            execution_context().globals().search_location(),
-        )
-        .await
-        .map_err(|_err| {
-            FileHistoryError::from(RevisionNotFound {
-                revision: revision_spec,
-            })
-        });
+        return resolve_revision(repository, revision_spec.as_str()).await;
     }
 
     let branch = if options.branch.is_none() {
@@ -475,6 +465,27 @@ async fn find_start_revision(
             break Ok(local_latest);
         }
     }
+}
+
+/// The revision a specifier names, in the forms `revision::resolve` accepts.
+pub(crate) async fn resolve_revision(
+    repository: Arc<RepositoryContext>,
+    revision: &str,
+) -> Result<Hash, FileHistoryError> {
+    revision::resolve(
+        repository,
+        revision,
+        execution_context().globals().search_location(),
+    )
+    .await
+    .map_err(|err| {
+        FileHistoryError::RevisionNotFound(
+            RevisionNotFound {
+                revision: revision.to_string(),
+            }
+            .chain_err_from(err, "resolving the revision to query at"),
+        )
+    })
 }
 
 async fn history_start(
