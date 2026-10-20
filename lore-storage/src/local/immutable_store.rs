@@ -4154,7 +4154,7 @@ impl LocalImmutableStore {
             BackgroundClaim::Busy => return Ok(None),
         };
         if starting_pass {
-            let total_size = self.packstore_total_size().await;
+            let total_size = self.measure_packstores().await;
             self.instruments
                 .compaction
                 .total_size
@@ -4296,7 +4296,7 @@ impl LocalImmutableStore {
         self.report_compaction_end(sink.as_ref());
 
         if group_index < GROUP_COUNT {
-            let total_size = self.packstore_total_size().await;
+            let total_size = self.measure_packstores().await;
             lore_base::lore_debug!("Packstore compaction complete, new total size {total_size}");
             self.instruments
                 .compaction
@@ -4902,6 +4902,19 @@ impl LocalImmutableStore {
         let Ok(_reading) = self.hold(Intent::Read).await else {
             return 0;
         };
+        self.measure_packstores().await
+    }
+
+    /// The size of every packfile, as the packstores hold it, measured under a claim the caller
+    /// holds.
+    ///
+    /// A compaction pass measures under the claims it took for itself, never through
+    /// [`Self::packstore_total_size`], whose claim a span of whatever use of the store is under
+    /// way would cover: that span can end while the pass measures, and the pass runs on its own
+    /// schedule.
+    async fn measure_packstores(&self) -> usize {
+        #[cfg(feature = "test-util")]
+        crate::test_util::pause_point(crate::test_util::PausePoint::Measuring).await;
         let mut total_size = 0;
         for group in self.group.iter() {
             total_size += group.packstore.total_size().await.unwrap_or_default();

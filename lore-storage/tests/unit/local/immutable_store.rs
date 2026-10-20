@@ -4147,6 +4147,51 @@ async fn a_compaction_claims_to_write_on_its_own_past_another_span() {
     );
 }
 
+/// **A compaction measures the store on its own claims.** A pass measures the packstores as it
+/// starts, under its claim to read, and as a step ends, under its claim to write, never on the
+/// cover of a span of whatever use of the store is under way, which can end while it measures. A
+/// measurement the span covered is counted as one, and fails test builds where the span ends
+/// between the check and the count.
+#[tokio::test]
+async fn a_compaction_measures_the_store_on_its_own_claims_past_another_span() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_measure_");
+    let partition = Partition::from([0x33u8; 16]);
+    let (_, payloads) = payloads_in_one_group(4);
+    let store = store_for_rewrite(&dir, partition, &payloads, 2).await;
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+    let span = ImmutableStore::hold_for_command(store.clone())
+        .await
+        .unwrap();
+    let measures = [
+        pause_at(PausePoint::Measuring),
+        pause_at(PausePoint::Measuring),
+    ];
+    let compacting = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { store.compact(1, None, false, None).await })
+    };
+    for (measure, when) in measures
+        .iter()
+        .zip(["as the pass starts", "as the step ends"])
+    {
+        tokio::time::timeout(Duration::from_secs(5), measure.reached.notified())
+            .await
+            .unwrap_or_else(|_| panic!("the pass measures the store {when}"));
+        assert_eq!(
+            lock.shared.covered.load(atomic::Ordering::Relaxed),
+            0,
+            "the pass measures the store {when} on its own claim, counted on no span"
+        );
+        measure.resume.notify_one();
+    }
+    let next = compacting.await.expect("the pass ends").expect("compacts");
+    assert!(next.is_some(), "the step left groups for the next one");
+    drop(span);
+}
+
 /// **A healing verify releases the store.** Its flush runs inside the pass's own
 /// write claim, so the pass itself has to release what that claim marked.
 #[tokio::test]

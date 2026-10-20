@@ -78,6 +78,9 @@ pub enum PausePoint {
     /// A mutable store list has handed its stream back, and one of its producers, which read its
     /// group's buckets into memory before, has sent none of their keys yet.
     Listing,
+    /// A measurement of the packstores' size holds the claim it runs on and has measured none
+    /// yet.
+    Measuring,
 }
 
 /// A task the store runs of its own accord rather than for a caller, see [`count_store_tasks`].
