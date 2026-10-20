@@ -4056,6 +4056,97 @@ async fn an_eviction_writes_what_it_evicted_and_releases_the_store() {
     assert!(entry.is_empty(), "the eviction reached disk");
 }
 
+/// **An eviction writes what it evicted on its own claim**, never on the span of another use of
+/// the store, which can end while the write runs: on that span alone, the flock would go as the
+/// last bucket write lands, with the write still counted as running, which test builds fail. A
+/// pass on its own schedule, or one a load fired, runs alongside whatever use is under way.
+#[tokio::test]
+async fn an_eviction_writes_on_its_own_claim_past_another_span() {
+    use lore_storage::immutable_store::ImmutableStore;
+    use lore_storage::test_util::PausePoint;
+
+    let dir = lore_base::test_util::TempDir::new("is_evict_span_");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            protect_local_fragment: false,
+            ..quiet_settings()
+        },
+    )
+    .await
+    .unwrap();
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
+    store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+    store.clone().flush(true).await.unwrap();
+
+    let span = ImmutableStore::hold_for_command(store.clone())
+        .await
+        .unwrap();
+    let scanning = lore_storage::test_util::pause_at(PausePoint::Scanning);
+    let evicting = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { store.evict(1, false, None).await })
+    };
+    scanning.reached.notified().await;
+    assert_eq!(
+        lock.shared.covered.load(atomic::Ordering::Relaxed),
+        0,
+        "the write of what the pass evicted counts on no span"
+    );
+    drop(span);
+    scanning.resume.notify_one();
+    let evicted = evicting.await.expect("the pass ends").expect("evicts");
+
+    assert!(evicted > 0, "a cap of one evicts the fragment");
+    assert!(
+        !lock.is_held(),
+        "the pass let the store go once it had written what it evicted"
+    );
+}
+
+/// **A compaction claims to write on its own**, never on the span of another use of the store,
+/// which can end while the pass runs, as its claim to read is its own. A claim the span covered
+/// is counted as one, and fails test builds where the span ends between the check and the count.
+#[tokio::test]
+async fn a_compaction_claims_to_write_on_its_own_past_another_span() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_span_");
+    let partition = Partition::from([0x32u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(5);
+    let store = store_for_rewrite(&dir, partition, &payloads[..4], 2).await;
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+    let span = ImmutableStore::hold_for_command(store.clone())
+        .await
+        .unwrap();
+    put_payload(&store, partition, Context::default(), &payloads[4], false).await;
+    let selected = pause_at(PausePoint::Selected);
+    let compacting = {
+        let store = store.clone();
+        lore_base::lore_spawn!(
+            async move { store.compact(1, Some(group_index), false, None).await }
+        )
+    };
+    tokio::time::timeout(Duration::from_secs(5), selected.reached.notified())
+        .await
+        .expect("the pass selects packfiles of the group to rewrite");
+    assert_eq!(
+        lock.shared.covered.load(atomic::Ordering::Relaxed),
+        0,
+        "the pass's claim to write counts on no span"
+    );
+    drop(span);
+    selected.resume.notify_one();
+    compacting.await.expect("the pass ends").expect("compacts");
+    store.clone().flush(false).await.unwrap();
+    assert!(
+        !lock.is_held(),
+        "the pass let the store go once it had ended"
+    );
+}
+
 /// **A healing verify releases the store.** Its flush runs inside the pass's own
 /// write claim, so the pass itself has to release what that claim marked.
 #[tokio::test]

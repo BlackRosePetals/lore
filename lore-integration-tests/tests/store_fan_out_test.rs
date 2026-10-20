@@ -614,7 +614,7 @@ mod tests {
         store_dyn.clone().flush(true).await.unwrap();
 
         // evict_oldest with generous capacity: no actual eviction, but the bucket-iteration path runs at every level.
-        let _evicted = store.evict_oldest(1_000_000_000, None).await;
+        let (_evicted, _) = store.evict_oldest(1_000_000_000, None).await;
 
         let mut at = None;
         for _ in 0..=lore_storage::local::immutable_store::GROUP_COUNT {

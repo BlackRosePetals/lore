@@ -3904,26 +3904,34 @@ impl LocalImmutableStore {
         eviction
     }
 
+    /// Evicts the least recently accessed entries of every bucket over its share of
+    /// `max_capacity`, and returns how many, with the write claim the pass took at its first
+    /// eviction, if it took one.
+    ///
+    /// The claim is handed back rather than dropped, for the caller to hold until it has
+    /// written what the pass evicted. Without it, that flush runs on whatever span another use
+    /// of the store holds at the time, and that span can end, and its flock go, while the
+    /// flush still runs.
     pub async fn evict_oldest(
         &self,
         max_capacity: usize,
         sink: Option<&crate::gc_event::GcEventSinkRef>,
-    ) -> usize {
+    ) -> (usize, Option<StoreGuard>) {
         let mut evict_count = 0;
         let mut began = false;
-        // Held from the first eviction to the end of the pass, so the epoch advances
+        // Taken at the first eviction and handed back with the count, so the epoch advances
         // once rather than per bucket, and not at all when there is nothing to evict.
         let mut writing = None;
 
         if self.gc_stop_requested() {
-            return 0;
+            return (0, None);
         }
         let Ok(_permit) = self.eviction.acquire().await else {
             lore_base::lore_warn!("Evict oldest failed to get permit");
-            return 0;
+            return (0, None);
         };
         if self.gc_stop_requested() {
-            return 0;
+            return (0, None);
         }
 
         let target_percentage = if self.settings.target_capacity_percentage > 0
@@ -3982,11 +3990,11 @@ impl LocalImmutableStore {
                     // the eviction permit `stop_gc` waits for; the next pass comes anyway.
                     Ok(BackgroundClaim::Busy) => {
                         lore_base::lore_debug!("Eviction deferred: the store is in use");
-                        return evict_count;
+                        return (evict_count, None);
                     }
                     Err(err) => {
                         lore_base::lore_warn!("Eviction could not claim the store: {err}");
-                        return evict_count;
+                        return (evict_count, None);
                     }
                 }
                 if let Some(sink) = sink {
@@ -4030,10 +4038,7 @@ impl LocalImmutableStore {
             );
         }
 
-        // Released with the pass rather than at the first eviction: one claim covers
-        // the whole run, so the epoch advances once however many buckets it touches.
-        drop(writing);
-        evict_count
+        (evict_count, writing)
     }
 
     /// Whether eviction may take an entry holding `data`, or its payload: any entry, or with
@@ -4181,14 +4186,16 @@ impl LocalImmutableStore {
         // Past the size check, the permit and the stop checks, this pass is going to
         // rewrite packfiles, so it claims to write here rather than at entry: a pass that
         // found the store under its cap, or was stopped, returns without announcing
-        // anything.
+        // anything. The claim is the pass's own, as its read claim is, and never a span's
+        // cover: the pass runs on its own schedule, and the span of whatever use of the store
+        // is under way can end while it runs.
         //
         // **A write claim that reloaded the store ends the pass.** The buckets loaded above
         // are gone with the reload, and rewriting packfiles against buckets that no longer
         // describe them would truncate payloads still referenced on disk. The resume point
         // stays where it was, so the next pass starts from state loaded under its own claim.
-        let writing = self.hold(Intent::Write).await?;
-        if writing.as_ref().is_some_and(Claim::is_stale) {
+        let writing = self.claim(Intent::Write).await?;
+        if writing.as_ref().is_some_and(StoreGuard::is_stale) {
             return Ok(at);
         }
         let _writing = writing;
@@ -5641,20 +5648,29 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         // from it. No claim is taken to look, because a write claim advances the epoch as it
         // is taken: claiming to write while evicting nothing would tell every other process
         // on the store that it changed, several times a minute.
+        let writing;
         let evicted = timed!(
             self.instruments.operation_latency,
             &self.instruments.get_labels_for_operation_context("evict"),
-            Ok(self.evict_oldest(max_capacity, sink.as_ref()).await)
+            {
+                let (count, claim) = self.evict_oldest(max_capacity, sink.as_ref()).await;
+                writing = claim;
+                Ok(count)
+            }
         );
-        // **What a pass evicts, the pass writes.** Eviction empties buckets in memory
-        // and nothing else is scheduled to write them, so left dirty they would keep the
-        // flock for as long as this process kept the store — for a timer running in the
-        // background of a process that has finished with the store, indefinitely.
+        // **What a pass evicts, the pass writes, under its own claim.** Eviction empties
+        // buckets in memory and nothing else is scheduled to write them, so left dirty they
+        // would keep the flock for as long as this process kept the store — for a timer
+        // running in the background of a process that has finished with the store,
+        // indefinitely. The write runs on the claim the eviction took rather than through
+        // `flush`, whose claim a span of whatever use of the store is under way would cover,
+        // and that span can end while the write runs.
         if let Ok(count) = &evicted.result
             && *count > 0
         {
-            let _ = crate::immutable_store::ImmutableStore::flush(self.clone(), sync_data).await;
+            let _ = self.clone().flush_all(self.path.clone(), sync_data).await;
         }
+        drop(writing);
         evicted.into()
     }
 
