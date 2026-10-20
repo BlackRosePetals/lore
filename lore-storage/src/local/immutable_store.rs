@@ -2900,57 +2900,89 @@ impl LocalImmutableStore {
             && pack_file != 0
             && fragment_flags & FragmentFlags::PayloadObliterated == 0
         {
-            let gate = self.group[group_index].payload_gate.hold();
-            let find = self
-                .find(partition, address, Lookup::Write)
-                .await
-                .inspect_err(|err| {
-                    lore_base::lore_warn!(
-                        "Store write verify failed: {err}\n{}",
-                        Backtrace::force_capture()
-                    );
-                })
-                .forward::<LocalImmutableStoreError>("Failed to verify written data")?;
-
-            #[cfg(feature = "test-util")]
-            crate::test_util::pause_point(crate::test_util::PausePoint::Located).await;
-            let data = Self::load(&self.group[find.group].packstore, find.data)
-                .await
-                .inspect_err(|err| {
-                    lore_base::lore_warn!(
-                        "Store write verify failed: {err}\n{}",
-                        Backtrace::force_capture()
-                    );
-                })
-                .forward::<LocalImmutableStoreError>("Failed to verify written data")?;
-            drop(gate);
-
-            let hash = if fragment_flags & FragmentFlags::PayloadCompressed != 0 {
-                let (_fragment, data) = compress::decompress(fragment, &data)
-                    .inspect_err(|err| {
-                        lore_base::lore_warn!(
-                            "Store write verify failed: {err}\n{}",
-                            Backtrace::force_capture()
-                        );
-                    })
-                    .forward::<LocalImmutableStoreError>("Failed to verify written data")?;
-                hash::hash_slice(&data)
-            } else {
-                hash::hash_slice(&data)
-            };
-            if hash != address.hash {
-                lore_base::lore_warn!(
-                    "Store write verify failed: Hash verification failed {} != {}\n{}",
-                    hash,
-                    address.hash,
-                    Backtrace::force_capture()
-                );
-                return Err(LocalImmutableStoreError::internal(
-                    "Failed to verify written data",
-                ));
-            }
+            // Boxed: verifying writes is rare, and carried inline its state would be part of
+            // every store's future.
+            Box::pin(self.verify_written(
+                partition,
+                address,
+                fragment,
+                fragment_flags,
+                group_index,
+            ))
+            .await?;
         }
 
+        Ok(())
+    }
+
+    /// Read back the payload a put of `address` stored with `fragment_flags` and hold it to the
+    /// address's hash, as a store that verifies its writes does.
+    ///
+    /// An eviction or an obliterate may take the payload, or the whole entry, between the put
+    /// and the read, as it may take any payload it ranks: the put stored what it was given, and
+    /// nothing of it is left to verify. Only a payload still held is read back.
+    async fn verify_written(
+        &self,
+        partition: Partition,
+        address: Address,
+        fragment: Fragment,
+        fragment_flags: u32,
+        group_index: usize,
+    ) -> Result<(), LocalImmutableStoreError> {
+        #[cfg(feature = "test-util")]
+        crate::test_util::pause_point(crate::test_util::PausePoint::Verifying).await;
+        let gate = self.group[group_index].payload_gate.hold();
+        let find = self
+            .find(partition, address, Lookup::Write)
+            .await
+            .inspect_err(|err| {
+                lore_base::lore_warn!(
+                    "Store write verify failed: {err}\n{}",
+                    Backtrace::force_capture()
+                );
+            })
+            .forward::<LocalImmutableStoreError>("Failed to verify written data")?;
+        if find.data.pack_file == 0 {
+            return Ok(());
+        }
+
+        #[cfg(feature = "test-util")]
+        crate::test_util::pause_point(crate::test_util::PausePoint::Located).await;
+        let data = Self::load(&self.group[find.group].packstore, find.data)
+            .await
+            .inspect_err(|err| {
+                lore_base::lore_warn!(
+                    "Store write verify failed: {err}\n{}",
+                    Backtrace::force_capture()
+                );
+            })
+            .forward::<LocalImmutableStoreError>("Failed to verify written data")?;
+        drop(gate);
+
+        let hash = if fragment_flags & FragmentFlags::PayloadCompressed != 0 {
+            let (_fragment, data) = compress::decompress(fragment, &data)
+                .inspect_err(|err| {
+                    lore_base::lore_warn!(
+                        "Store write verify failed: {err}\n{}",
+                        Backtrace::force_capture()
+                    );
+                })
+                .forward::<LocalImmutableStoreError>("Failed to verify written data")?;
+            hash::hash_slice(&data)
+        } else {
+            hash::hash_slice(&data)
+        };
+        if hash != address.hash {
+            lore_base::lore_warn!(
+                "Store write verify failed: Hash verification failed {} != {}\n{}",
+                hash,
+                address.hash,
+                Backtrace::force_capture()
+            );
+            return Err(LocalImmutableStoreError::internal(
+                "Failed to verify written data",
+            ));
+        }
         Ok(())
     }
 

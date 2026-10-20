@@ -8889,6 +8889,50 @@ async fn a_verified_store_holds_the_payload_gate_while_it_loads_the_payload() {
     assert_payloads_read_back(&store, partition, [(address, payloads[0].clone())]).await;
 }
 
+/// **A verified store succeeds once an eviction took what it stored.** A store verifying its
+/// writes finds its entry again once it is in and reads the payload back, and an eviction may take
+/// the entry in between, as it takes any it ranks: the store stored what it was given, and nothing
+/// of it is left to verify.
+#[tokio::test]
+async fn a_verified_store_succeeds_once_an_eviction_took_what_it_stored() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_verify_write_evicted_");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            verify_write: true,
+            ..client_settings()
+        },
+    )
+    .await
+    .unwrap();
+    let partition = Partition::from([0x3du8; 16]);
+    let (_, payloads) = payloads_in_one_group(1);
+
+    let verifying = pause_at(PausePoint::Verifying);
+    let storing = {
+        let store = store.clone();
+        let payload = payloads[0].clone();
+        lore_base::lore_spawn!(async move {
+            try_put_payload(&store, partition, Context::default(), &payload, true, false).await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), verifying.reached.notified())
+        .await
+        .expect("the store verifies what it wrote");
+    let evicted = store.clone().evict(1, false, None).await.unwrap();
+    assert_eq!(
+        evicted, 1,
+        "the eviction takes the durable entry the store put in"
+    );
+    verifying.resume.notify_one();
+    storing
+        .await
+        .expect("the store ends")
+        .expect("a store whose entry an eviction took succeeds");
+}
+
 /// Stores of one new hash in flight together each write the payload. Every entry takes the
 /// payload of the store that inserted first, the other copy stays unreferenced, and each address
 /// reads the payload back.

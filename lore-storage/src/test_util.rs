@@ -81,6 +81,9 @@ pub enum PausePoint {
     /// A measurement of the packstores' size holds the claim it runs on and has measured none
     /// yet.
     Measuring,
+    /// A put that verifies its writes has stored its entry and not yet found it again to read its
+    /// payload back.
+    Verifying,
 }
 
 /// A task the store runs of its own accord rather than for a caller, see [`count_store_tasks`].
