@@ -28,8 +28,11 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 
 # Classes the verifier reports for defects already known, kept apart from new findings: class name
-# to the defect. Empty while none is open.
-KNOWN = {}
+# to the defect.
+KNOWN = {
+    "list-left-out-a-key-under-faults": "a mutable list producer that cannot read a bucket ends the "
+                                        "stream early, with no error the caller sees",
+}
 
 
 # Coverage events only a machine failure or a damaged file produces, which no run is expected to
@@ -56,6 +59,14 @@ NATURAL_ERRNOS = {
     "stat": ["EIO", "ENOMEM"],
     "list": ["EIO", "EMFILE", "ENFILE", "ENOMEM"],
 }
+
+
+def fault_errnos(rng, op, persistent):
+    """Up to two of the errors `op` meets on its own, for the shim to fail it with. A fault that
+    fails it every time, or every time from some point on, never interrupts it: an interrupted call
+    is retried, so one interrupted every time never returns, which no signal does."""
+    errnos = [name for name in NATURAL_ERRNOS[op] if not (persistent and name == "EINTR")]
+    return ",".join(rng.sample(errnos, k=min(2, len(errnos))))
 
 
 def known(name):
@@ -149,29 +160,39 @@ def eligible(event, operation, step):
     return True
 
 
+def owned(events):
+    """The store operations and steps of `events` whose file operations are the operation's own:
+    counted while it ran alone, or, for summaries that count no such thing, counted at all. A file
+    operation counted only alongside other store operations is likely one of theirs."""
+    alone = {(operation, step) for (event, operation, step, *_) in events if event == "alone"}
+    return alone or {(operation, step) for (event, operation, step, *_) in events if event == "seen"}
+
+
 def event_lines(events):
     """Report `events`, keyed by event, store operation, step and mode: per store operation and
-    step, the file operations counted and where each kill, fault and cancellation landed, by mode,
-    then, where any file operations were counted, per event any landed, the operations and steps
-    counted that none hit. A kill between file operations is listed at `after:op:kind`, a step of
-    its own, so that it hits none counted."""
+    step, the file operations counted, those counted with the operation running alone, and where
+    each kill, fault and cancellation landed, by mode, then, where any file operations were
+    counted, per event any landed, the operations and steps counted as their own, see `owned`,
+    that none hit. A kill between file operations is listed at `after:op:kind`, a step of its own,
+    so that it hits none counted."""
     rows = defaultdict(lambda: defaultdict(Counter))
     for (event, operation, step, mode), count in events.items():
         rows[(operation, step)][event][mode] += count
     if not rows:
         return []
-    lines = ["events by store operation and step (seen: file operations counted; kill, fault, cancel: where "
-             "each landed), by mode:"]
+    lines = ["events by store operation and step (seen: file operations counted; alone: counted with the "
+             "operation running alone; kill, fault, cancel: where each landed), by mode:"]
     for (operation, step), by_event in sorted(rows.items()):
         cells = [f"{event} " + " ".join(f"{mode}={count}" for mode, count in sorted(by_event[event].items()))
-                 for event in ["seen", "kill", "fault", "cancel"] if event in by_event]
+                 for event in ["seen", "alone", "kill", "fault", "cancel"] if event in by_event]
         lines.append(f"  {operation} {step}: " + "; ".join(cells))
-    seen = {key for key, by_event in rows.items() if "seen" in by_event}
+    own = owned(events)
     for event in ["kill", "fault", "cancel"]:
         hit = {key for key, by_event in rows.items() if event in by_event}
-        if hit and seen:
-            missed = sorted(f"{operation} {step}" for operation, step in seen - hit if eligible(event, operation, step))
-            lines.append(f"{event} gaps, counted and never hit ({len(missed)}): {', '.join(missed) or 'none'}")
+        if hit and own:
+            missed = sorted(f"{operation} {step}" for operation, step in own - hit if eligible(event, operation, step))
+            lines.append(f"{event} gaps, counted as the operation's own and never hit ({len(missed)}): "
+                         f"{', '.join(missed) or 'none'}")
     return lines
 
 
@@ -195,9 +216,12 @@ class Campaign:
         self.failures = Counter()
         # Per event, the store operation it landed in and the step, `op:kind`, or `after:op:kind`
         # for a kill between file operations: `seen` for the file operations counting runs
-        # counted, and `kill`, `fault` and `cancel` for where each simulated crash, I/O error and
-        # cancellation landed.
+        # counted, `alone` for those counted with the operation running alone, and `kill`,
+        # `fault` and `cancel` for where each simulated crash, I/O error and cancellation landed.
         self.events = Counter()
+        # Per store operation and step, how many placement files counted it alone, which with
+        # `alone` gives how many of it a process makes.
+        self.placements = Counter()
         # Losses only a machine failure would expose, which the suite reports but does not fail.
         self.reports = {}
         self.started = time.time()
@@ -343,10 +367,21 @@ class Campaign:
 
     def place(self, places):
         """Count the file operations a shim's placement file says it counted, by the store
-        operations running, and where its faults landed."""
+        operations running, those counted with one store operation running alone apart, and where
+        its faults landed."""
         for (kind, op, file_class, running), count in places.items():
-            for name in running.split("+"):
+            names = running.split("+")
+            for name in names:
                 self.events[("seen" if kind == "op" else "fault", name, f"{op}:{file_class}")] += count
+            if kind == "op" and len(names) == 1:
+                self.events[("alone", names[0], f"{op}:{file_class}")] += count
+                self.placements[(names[0], f"{op}:{file_class}")] += 1
+
+    def point(self, rng, operation, step):
+        """Which of a process's file operations at `step` in `operation` to fail or kill it at: one
+        of as many as a process that made any made on average, half the time the first."""
+        made = self.events[("alone", operation, step)] / max(1, self.placements[(operation, step)])
+        return 1 if rng.random() < 0.5 else rng.randint(1, max(1, round(made)))
 
     def note_kill(self, killed_file):
         """Count where a kill the shim made landed, from its killed file, returning whether it
@@ -673,9 +708,40 @@ def count_operations(campaign, store, workload, options, run_dir, ops):
     return strata(places)
 
 
-def pick_stratum(rng, totals, during):
+def missed(campaign, event, pairs):
+    """Those of `pairs`, store operations and steps, that `event` has not landed in during the
+    campaign."""
+    hit = {(operation, step) for (kind, operation, step) in campaign.events if kind == event}
+    return [pair for pair in pairs if pair not in hit]
+
+
+def pick_target(campaign, rng, event):
+    """A store operation, or `idle`, and a step, `op:kind`, for `event` to land in: three times in
+    four one of the operation's own steps, see `owned`, that no such event has landed in during the
+    campaign, otherwise any of them. None until some run has counted where file operations fall."""
+    candidates = sorted(pair for pair in owned(campaign.events) if eligible(event, *pair))
+    if not candidates:
+        return None
+    gaps = missed(campaign, event, candidates)
+    return rng.choice(gaps if gaps and rng.random() < 0.75 else candidates)
+
+
+def pick_stratum(rng, totals, during, campaign=None, event=None):
     """An operation kind and file kind, picked evenly among those the counting run saw, with the
-    store operation it must land during now and then, and how many of them there are."""
+    store operation it must land during now and then, and how many of them there are. With a
+    `campaign`, three times in four among the store operations and steps the counting run saw, of
+    those the campaign counts as the operation's own, that no `event` has landed in during the
+    campaign, during that operation."""
+    if campaign is not None:
+        own = owned(campaign.events)
+        pairs = [(name, f"{op}:{file_class}") for (op, file_class), names in during.items() for name in names]
+        gaps = missed(campaign, event, [pair for pair in pairs if pair in own])
+        if gaps and rng.random() < 0.75:
+            name, step = rng.choice(sorted(gaps))
+            op, file_class = step.split(":", 1)
+            if name == "idle":
+                return op, file_class, None, totals[(op, file_class)]
+            return op, file_class, name, during[(op, file_class)][name]
     op, file_class = rng.choice(sorted(totals))
     count = totals[(op, file_class)]
     running = None
@@ -726,7 +792,7 @@ def crash_sweep(campaign):
         for _ in range(args.points):
             if campaign.out_of_time():
                 break
-            op, file_class, running, count = pick_stratum(rng, totals, during)
+            op, file_class, running, count = pick_stratum(rng, totals, during, campaign, "kill")
             point = rng.randrange(1, count + 1)
             store = campaign.scratch / "sweep-run"
             copy_store(base, store)
@@ -785,19 +851,21 @@ def fault_sweep(campaign):
         for _ in range(max(1, args.points // 4)):
             if campaign.out_of_time():
                 break
-            op, file_class, running, count = pick_stratum(rng, totals, during)
+            op, file_class, running, count = pick_stratum(rng, totals, during, campaign, "fault")
             store = campaign.scratch / "fault-run"
             copy_store(base, store)
             run_dir = campaign.run_dir(f"fault-{workload}-{op}-{file_class}")
             env = target_env(campaign, store, op, file_class, running)
-            errnos = rng.sample(NATURAL_ERRNOS[op], k=min(2, len(NATURAL_ERRNOS[op])))
-            env.update({"STRESS_FAIL_ERRNO": ",".join(errnos), "STRESS_SEED": str(rng.randrange(1 << 30)),
-                        "STRESS_SHORT": rng.choice(["0", "1"]), "STRESS_PLACES": str(run_dir / "places.txt")})
+            env.update({"STRESS_SEED": str(rng.randrange(1 << 30)), "STRESS_SHORT": rng.choice(["0", "1"]),
+                        "STRESS_PLACES": str(run_dir / "places.txt")})
             if rng.random() < 0.3:
                 env["STRESS_FAIL_PROB"] = str(rng.choice([0.01, 0.05, 0.3]))
+                persistent = False
             else:
                 env["STRESS_FAIL_AT"] = str(rng.randrange(1, count + 1))
                 env["STRESS_FAIL_COUNT"] = str(rng.choice([1, 1, 3, 50, 100000]))
+                persistent = int(env["STRESS_FAIL_COUNT"]) >= 50
+            env["STRESS_FAIL_ERRNO"] = fault_errnos(rng, op, persistent)
             kill_after = rng.uniform(0.5, seconds + 2) if rng.random() < 0.3 else None
             campaign.run(campaign.command(workload, store, *options), run_dir / f"{workload}.log", env=env,
                          timeout=seconds + 600, kill_after=kill_after)
@@ -922,15 +990,19 @@ def multi_process(campaign):
     """Rounds of processes sharing one store directory in calls, some keeping their stores between
     calls and some opening them for each, every one dropping operations and flushes unfinished,
     killed with SIGKILL and restarted at random moments or killed by the shim at a chosen file
-    operation, some under the shim's faults on either store's files or with its file operations
-    slowed. Each round is verified on a copy, a quarter of them deeply, and the next round carries
-    on from what the last left."""
+    operation, some under the shim's faults on either store's files, checking that their stores
+    take a call once the faults end, or with its file operations slowed. Each round is verified on
+    a copy, a quarter of them deeply, and the next round carries on from what the last left; see
+    `shared_round`."""
     rng = campaign.rng
     while not campaign.out_of_time():
         store = campaign.scratch / f"shared-{campaign.runs + 1:05d}"
         prepare = campaign.run_dir("shared-prepare")
         # Low fan-out thresholds, so that both stores' groups fan out through their levels.
         options = random_store_options(rng, "client") + ["--fan-out-threshold", rng.choice([2, 3, 8, 24])]
+        if rng.random() < 0.15:
+            # Packfiles near the size limit, which the processes then roll over to new ones.
+            options += ["--prefill-near-limit", rng.choice(["1m", "8m"])]
         # One process first, which fixes the keyspace and writes what a store's first opening does.
         campaign.run(campaign.command("calls", store, *options, "--seconds", 1), prepare / "prepare.log", timeout=600)
         for round_index in range(rng.randint(1, 3)):
@@ -945,8 +1017,9 @@ def multi_process(campaign):
             shutil.rmtree(store, ignore_errors=True)
 
 
-def calls_options(rng, keeps):
-    """Options of one `calls` process."""
+def calls_options(rng, keeps, collects=False):
+    """Options of one `calls` process, which with `collects` collects the immutable store's garbage
+    as a client keeping its stores does."""
     options = [
         "--run-seed", rng.randrange(1, 1 << 30),
         "--tasks", rng.choice([1, 2, 4, 8]),
@@ -976,32 +1049,45 @@ def calls_options(rng, keeps):
         if rng.random() < 0.5:
             # A keep-alive window, at times shorter than a slowed write.
             options += ["--keep-alive-ms", rng.choice([30, 300])]
+        if collects:
+            # Caps a load crossing fires a pass at, and now and then the store's own passes.
+            options += ["--gc-max-size", rng.choice(["1", "1m", "64m"]),
+                        "--gc-max-capacity", rng.choice(["1", "1000", "100000"])]
+            if rng.random() < 0.7:
+                options += ["--background-gc", "--gc-delay-ms", rng.choice([50, 300, 2000])]
     return options
 
 
 def shared_round(campaign, store, run_dir):
-    """Run `--processes` processes on `store` for a while, half of them keeping their stores, each
-    killed now and then, and started again in its place once it is gone. Most run under the shim,
-    whose state places each kill by the store operations running and the file operations in
-    flight."""
+    """Run up to `--processes` processes on `store` for a while, half of them keeping their stores,
+    or all or none of them, each killed now and then, and started again in its place once it is
+    gone. In some rounds the keeping processes collect the immutable store's garbage as clients
+    do. Most run under the shim, whose state places each kill by the store operations running and
+    the file operations in flight; some it kills, or fails file operations for, in a store
+    operation and step picked to reach those no kill or fault has reached in the campaign."""
     rng = campaign.rng
     seconds = rng.choice([5, 10, 20])
     deadline = time.time() + seconds
+    most = campaign.args.processes
+    processes = most if rng.random() < 0.5 else rng.randint(min(2, most), most)
+    keeping = rng.choice(["half", "half", "all", "none"])
+    collecting = rng.random() < 0.3
     slots = []
     runs = Counter()
 
     def start(slot):
-        keeps = slot % 2 == 0
+        keeps = keeping == "all" or (keeping == "half" and slot % 2 == 0)
+        collects = collecting and keeps and rng.random() < 0.6
         remaining = max(0.5, deadline - time.time())
         runs[slot] += 1
         name = run_dir / f"p{slot}-{runs[slot]}"
         env = backend(rng, 0.1)
+        faulted = False
         if env["LORE_IO_BACKEND"] == "psync":
             env = watched(campaign, store, name.with_suffix(".state"), STRESS_OPS=",".join(ALL_OPS),
                           STRESS_PLACES=name.with_suffix(".places"))
-            counted = sorted(key for key in campaign.events if key[0] == "seen" and eligible("kill", key[1], key[2]))
             roll = rng.random()
-            if roll < 0.25:
+            if roll < 0.15:
                 # Faults on the files of either store or both, each an error the store meets on its own.
                 op = rng.choice(ALL_OPS)
                 env.update({"STRESS_OPS": op, "STRESS_FAIL_ERRNO": rng.choice(NATURAL_ERRNOS[op]),
@@ -1010,37 +1096,63 @@ def shared_round(campaign, store, run_dir):
                 files = rng.choice(["immutable", "mutable", None])
                 if files:
                     env["STRESS_PATH"] = str(store / files)
-            elif roll < 0.4 and counted:
-                # Killed at a file operation of a kind counted so far, in a store operation it ran in.
-                _, operation, step = rng.choice(counted)
+                faulted = True
+            elif roll < 0.3 and (target := pick_target(campaign, rng, "fault")):
+                # Faults on file operations of a kind, in a store operation, picked to reach steps no
+                # fault has.
+                operation, step = target
                 op, file_class = step.split(":", 1)
                 env.update(target_env(campaign, store, op, file_class, None if operation == "idle" else operation))
-                env.update(crash_env(rng, op, rng.randint(1, 20), name.with_suffix(".killed"))[1])
+                env.update({"STRESS_SEED": str(rng.randrange(1 << 30)), "STRESS_SHORT": rng.choice(["0", "1"])})
+                if rng.random() < 0.5:
+                    env["STRESS_FAIL_PROB"] = str(rng.choice([0.05, 0.3, 1.0]))
+                    persistent = env["STRESS_FAIL_PROB"] == "1.0"
+                else:
+                    env["STRESS_FAIL_AT"] = str(campaign.point(rng, operation, step))
+                    env["STRESS_FAIL_COUNT"] = str(rng.choice([1, 3, 100000]))
+                    persistent = env["STRESS_FAIL_COUNT"] == "100000"
+                env["STRESS_FAIL_ERRNO"] = fault_errnos(rng, op, persistent)
+                faulted = True
+            elif roll < 0.55 and (target := pick_target(campaign, rng, "kill")):
+                # Killed at a file operation of a kind, in a store operation, picked to reach steps no
+                # kill has: among them the recovery a claim makes of a fan-out commit another
+                # process's kill left half made.
+                operation, step = target
+                op, file_class = step.split(":", 1)
+                env.update(target_env(campaign, store, op, file_class, None if operation == "idle" else operation))
+                env.update(crash_env(rng, op, campaign.point(rng, operation, step), name.with_suffix(".killed"))[1])
             if rng.random() < 0.2:
                 # A slow device: file operations held up, some for longer than a keep-alive window.
                 micros, probability = rng.choice([(2000, 0.2), (20000, 0.02), (200000, 0.005)])
                 env.update({"STRESS_DELAY_US": str(micros), "STRESS_DELAY_PROB": str(probability)})
-        command = campaign.command("calls", store, *calls_options(rng, keeps), "--seconds", f"{remaining:.1f}")
-        return campaign.start(command, name.with_suffix(".log"), env=env), name
+        options = calls_options(rng, keeps, collects)
+        if faulted and rng.random() < 0.7:
+            # Once its calls end, the process ends the faults and checks that its stores take a call again.
+            options.append("--liveness")
+        command = campaign.command("calls", store, *options, "--seconds", f"{remaining:.1f}")
+        return campaign.start(command, name.with_suffix(".log"), env=env), name, faulted
 
     def reap(slot, killed):
         """Wait for the process in `slot`, mark it dead in the journal, which ends any generation
         it left unended, place where it was killed, take its log and placements, then start another
-        in its place while the round lasts."""
-        process, name = slots[slot]
+        in its place while the round lasts. A process whose faults kept it from starting is noted,
+        not counted a failure."""
+        process, name, faulted = slots[slot]
         code = process.wait()
         with open(store / "stress.journal", "a") as journal:
             journal.write(f"0 g dead pid={process.pid}\n")
         crashed = campaign.note_kill(name.with_suffix(".killed"))
         if killed and name.with_suffix(".state").exists():
             campaign.note_state_kill(name.with_suffix(".state"))
+        elif not killed and not crashed and code == 3 and faulted:
+            campaign.notes["calls-refused-to-start-under-faults"] += 1
         elif not killed and not crashed and code not in (0, 1):
             campaign.failures[f"calls-exit-{code}"] += 1
         campaign.place(read_places(name.with_suffix(".places")))
         campaign.parse_work(name.with_suffix(".log"), run_dir)
         slots[slot] = start(slot) if time.time() < deadline - 0.5 else None
 
-    for slot in range(campaign.args.processes):
+    for slot in range(processes):
         slots.append(start(slot))
     while time.time() < deadline:
         time.sleep(rng.uniform(0.05, 0.5))

@@ -341,7 +341,9 @@ pub async fn swap(context: &Context<'_>, rng: &mut Rng) -> Result<(), String> {
     Ok(())
 }
 
-/// List every key, and hold each pair to the call's view.
+/// List every key, and hold each pair to the call's view. Where faults reach the store's files, a
+/// key the list leaves out is classed apart: a bucket a list producer cannot read ends that
+/// producer, and the stream with it, with no error the caller can see.
 pub async fn list_all(context: &Context<'_>) -> Result<(), String> {
     let expected: Vec<Value> = {
         let view = context.view.lock();
@@ -371,6 +373,14 @@ pub async fn list_all(context: &Context<'_>) -> Result<(), String> {
             continue;
         }
         let found = listed.get(&index).copied().unwrap_or(Read::Absent);
+        if context.faults && found == Read::Absent && matches!(expected, Value::Is(_)) {
+            (context.violation)(
+                "list-left-out-a-key-under-faults",
+                index,
+                &format!("list found nothing where the journal settled {expected:?}"),
+            );
+            continue;
+        }
         check(context, index, expected, found, "list");
     }
     Ok(())

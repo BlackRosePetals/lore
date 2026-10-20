@@ -50,7 +50,10 @@ Every kill, fault and cancellation is counted against the store operations runni
 landed and the step, the file operation and kind of file, it landed in. A kill that landed between
 file operations is counted after the last one begun, as `after:<op>:<kind>`, a step of its own.
 Each summary lists the operations and steps the runs reached that none hit, which a kill between
-file operations does not.
+file operations does not. A step counts as an operation's own once a file operation of it was
+counted with that operation running alone; one only ever counted alongside other operations is
+likely theirs, and is left out of the gaps. The sweeps and `multi-process` aim most of their kills
+and faults at the operations' own steps that none has hit yet in the campaign.
 
 ## Parts
 
@@ -93,7 +96,12 @@ file operations does not.
     bucket files to the store's memory after that share of the calls that flushed, where no
     simulated I/O errors reach the store's files. A call that fails before it reads the journal
     leaves the loads of the next call's claims unchecked, since a store it claimed had loaded for
-    writes the next call is the first to read. `--prefill-near-limit` fills the packfiles before
+    writes the next call is the first to read. With `--gc-max-size` or `--gc-max-capacity`, a
+    process that keeps its stores collects the immutable store's garbage as a client does: a load
+    crossing a cap fires a pass, and with `--background-gc` the store's own passes run every
+    `--gc-delay-ms`, between calls and during them. The journal does not see those passes, so
+    another process's kept store may reload for them, and the generation ends only once they have
+    let its stores go. `--prefill-near-limit` fills the packfiles before
     the stores open, as for `work`, and `--liveness` runs the probe as a call of its own once the
     run ends, on the kept stores or on stores opened for it, the mutable store included: a store,
     a flush and a load of it must succeed as the immutable store's puts, flush and gets must.
@@ -203,13 +211,14 @@ The modes:
 | `emfile` | Runs stores under a descriptor limit low enough that opens fail, then verifies with a normal limit. |
 | `scenarios` | Every deterministic scenario, under both builds, and the production build again on `uring`. |
 | `retention` | Every retention script, under both builds, and the production build again on `uring`. |
-| `multi-process` | Rounds of `--processes` `calls` processes on one store directory, half of them keeping their stores, some for a keep-alive window, each killed with SIGKILL at random moments and started again, the store's options random and its fan-out threshold low. Every process drops operations and flushes unfinished, and most run under the shim, which places each kill; some under its faults on either store's files, some killed by it at a file operation of a kind the round counted, and some with their file operations slowed past a keep-alive window. Each round is verified on a copy, a quarter of them deeply, and the next round carries on from what the last left. |
+| `multi-process` | Rounds of up to `--processes` `calls` processes on one store directory, half, all or none of them keeping their stores, some for a keep-alive window, each killed with SIGKILL at random moments and started again, the store's options random, its fan-out threshold low, and now and then its packfiles filled near the size limit first. In some rounds the keeping processes collect the immutable store's garbage as clients do. Every process drops operations and flushes unfinished, and most run under the shim, which places each kill; some under its faults on either store's files, most of those checking once their calls end that their stores take a call again, some killed by it, or failed by it, at a file operation of a kind in a store operation picked among the steps no kill or fault has reached in the campaign, a claim's recovery of another process's half-made fan-out commit among them, and some with their file operations slowed past a keep-alive window. Each round is verified on a copy, a quarter of them deeply, and the next round carries on from what the last left. |
 
 Useful options:
 
 - `--minutes` is the time budget per mode.
 - `--seed` replays a campaign's random choices; the summary records it.
-- `--processes` is how many processes share a store in a `multi-process` round.
+- `--processes` is the most processes that share a store in a `multi-process` round; half the
+  rounds run that many.
 - `--keep` keeps scratch stores.
 - `--stop-on-new` stops at the first violation class not listed in `KNOWN` in `stress.py`.
 

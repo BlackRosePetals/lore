@@ -592,6 +592,14 @@ impl History {
         }
     }
 
+    /// Whether a generation other than `generation` may have collected garbage where the journal
+    /// does not see it after `line`, as a client collects a store it keeps.
+    pub fn unseen_gc_after(&self, line: usize, generation: u64) -> bool {
+        self.unseen_gc
+            .iter()
+            .any(|collector| *collector != generation && self.ran_after(*collector, None, line))
+    }
+
     /// Whether `generation`, or a pass it started that ended at `end`, may have run after `line`.
     fn ran_after(&self, generation: u64, end: Option<usize>, line: usize) -> bool {
         end.or_else(|| self.end_of(generation))

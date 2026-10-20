@@ -70,7 +70,7 @@ const HANG_SECONDS: u64 = 60;
 
 /// The pause point `name` names, in lower case, where a `pause` or `cancel` request stops a call.
 fn pause_point(name: &str) -> Result<PausePoint, String> {
-    const POINTS: [(&str, PausePoint); 10] = [
+    const POINTS: [(&str, PausePoint); 11] = [
         ("reserved", PausePoint::Reserved),
         ("written", PausePoint::Written),
         ("located", PausePoint::Located),

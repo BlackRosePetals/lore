@@ -16,6 +16,12 @@
 //! [`crate::mutable`]. A call also holds the loads its claims made to it. A kept store reloads at
 //! its claim when another process wrote to it since its last call, which a write that succeeded
 //! shows, and not when none could have. Stores opened afresh load once each.
+//!
+//! With `--gc-max-size` or `--gc-max-capacity`, a process that keeps its stores collects the
+//! immutable store's garbage as a client does: a load crossing a cap fires a pass, and with
+//! `--background-gc` the store's own passes run every `--gc-delay-ms` between calls and during
+//! them. The journal does not see those passes, so the generation is marked as collecting where it
+//! does not see, and another process may have written the store whenever it was alive.
 
 use std::collections::BTreeMap;
 use std::ffi::c_long;
@@ -25,6 +31,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+
+use lore_storage::ImmutableStore;
+use lore_storage::LocalImmutableStore;
+use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 
 use crate::args::Args;
 use crate::client::Claims;
@@ -83,10 +93,12 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
     );
     let hang_seconds = args.number("hang-seconds", 120);
     let watchdog = crate::work::watch_for_hangs(work.progress(), hang_seconds, journal.clone());
+    let keeps = args.flag("keeps");
     let mut calls = Calls {
         dir: dir.to_path_buf(),
         config,
-        keeps: args.flag("keeps"),
+        keeps,
+        collection: Collection::from_args(args).filter(|_| keeps),
         flush_delay,
         call_ops: args.number("call-ops", 24).max(1),
         tasks: args.number("tasks", 4).max(1),
@@ -106,6 +118,7 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
         last_call: Instant::now(),
         opened: false,
         loads_unaccounted: false,
+        loads_at_end: [0; 2],
         coverage: BTreeMap::new(),
     };
     let pause_ms = args.number("pause-ms", 20);
@@ -136,11 +149,56 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
     Ok(u8::from(calls.work.violations() > 0))
 }
 
+/// The garbage collection a process runs on the immutable store it keeps, as a client does.
+struct Collection {
+    /// The caps a load crossing fires a pass at, 0 for none.
+    max_size: usize,
+    max_capacity: usize,
+    /// How long the store's own passes wait between them, when they run.
+    background: Option<Duration>,
+}
+
+impl Collection {
+    /// The collection `args` ask for, if any.
+    fn from_args(args: &Args) -> Option<Collection> {
+        let collection = Collection {
+            max_size: args.number("gc-max-size", 0) as usize,
+            max_capacity: args.number("gc-max-capacity", 0) as usize,
+            background: args
+                .flag("background-gc")
+                .then(|| Duration::from_millis(args.number("gc-delay-ms", 500))),
+        };
+        (collection.max_size > 0 || collection.max_capacity > 0).then_some(collection)
+    }
+
+    /// Set `store`'s caps, and start its own passes when they run.
+    fn start(&self, store: &Arc<LocalImmutableStore>) {
+        store.set_gc_caps(self.max_size, self.max_capacity, false);
+        if let Some(delay) = self.background {
+            let store: Arc<dyn ImmutableStore> = store.clone();
+            lore_storage::maintenance::spawn_gc(
+                &store,
+                &ImmutableStoreCreateOptions {
+                    max_capacity: (self.max_capacity > 0).then_some(self.max_capacity),
+                    eviction_delay: Some(delay),
+                    max_size: (self.max_size > 0).then_some(self.max_size),
+                    compaction_delay: Some(delay),
+                },
+            );
+        }
+    }
+}
+
+/// How long the end of a collecting generation waits for its passes to let its stores go.
+const COLLECTION_END_SECONDS: u64 = 100;
+
 /// A process's calls.
 struct Calls {
     dir: PathBuf,
     config: Config,
     keeps: bool,
+    /// The collection a keeping process runs on its stores, if any.
+    collection: Option<Collection>,
     flush_delay: u64,
     /// The most operations a call runs, and the most tasks it runs them on.
     call_ops: u64,
@@ -172,6 +230,9 @@ struct Calls {
     /// call's claims cannot be held to what the journal added since: a store the failed call
     /// claimed had loaded for writes the next call is the first to read.
     loads_unaccounted: bool,
+    /// The loads when the last call ended. A kept store that a collection pass claimed between
+    /// calls reloaded then for what another process wrote, not at the next call's claim.
+    loads_at_end: [usize; 2],
     coverage: BTreeMap<&'static str, u64>,
 }
 
@@ -187,31 +248,33 @@ impl Calls {
             self.end().await;
         }
         let before = self.loads.now();
+        let between = self.loads.since(self.loads_at_end);
         let (stores, openings) = self.stores().await?;
         let claims = match self.claim(&stores).await {
             Ok(claims) => claims,
             Err(err) => {
                 self.loads_unaccounted = true;
-                self.end_call(stores);
+                self.end_call(stores).await;
                 return Err(err);
             }
         };
         let opened = openings.is_some();
         drop(openings);
         let loads = self.loads.since(before);
+        let since = self.history.lines;
         let added = match self.history.update(&self.dir) {
             Ok(added) => added,
             Err(err) => {
                 self.loads_unaccounted = true;
                 drop(claims);
-                self.end_call(stores);
+                self.end_call(stores).await;
                 return Err(format!("read the journal: {err}"));
             }
         };
         if std::mem::take(&mut self.loads_unaccounted) {
             self.count("loads-unaccounted");
         } else {
-            self.check_loads(loads, opened, &added);
+            self.check_loads(loads, between, opened, &added, since);
         }
         let generation = self.journal.generation();
         self.work.learn(
@@ -235,7 +298,7 @@ impl Calls {
             }
         }
         drop(claims);
-        self.end_call(stores);
+        self.end_call(stores).await;
         Ok(())
     }
 
@@ -272,7 +335,7 @@ impl Calls {
             }
             Err(err) => Err(err),
         };
-        self.end_call(stores);
+        self.end_call(stores).await;
         result
     }
 
@@ -290,36 +353,68 @@ impl Calls {
             std::process::id(),
             u8::from(self.keeps)
         ));
+        if let Some(collection) = &self.collection {
+            self.journal.log(format_args!("g gc-unseen"));
+            collection.start(&stores.immutable);
+        }
         self.work
             .use_stores(Some(stores.immutable.clone()), Some(stores.mutable.clone()));
         Ok((stores, openings))
     }
 
     /// Keep the stores for the next call, or let them go and end their generation.
-    fn end_call(&mut self, stores: Stores) {
+    async fn end_call(&mut self, stores: Stores) {
         self.count("calls");
         self.last_call = Instant::now();
+        self.loads_at_end = self.loads.now();
         if self.keeps {
             self.kept = Some(stores);
             return;
         }
-        self.end_generation(stores);
+        self.end_generation(stores).await;
     }
 
-    /// Let `stores` go and end their generation.
-    fn end_generation(&mut self, stores: Stores) {
+    /// Let `stores` go and end their generation. A collecting generation ends once its passes,
+    /// which hold the stores while they run, have let them go, so that none runs past its end.
+    async fn end_generation(&mut self, stores: Stores) {
         self.work.use_stores(None, None);
+        let immutable = Arc::downgrade(&stores.immutable);
+        let mutable = Arc::downgrade(&stores.mutable);
         drop(stores);
+        if self.collection.is_some() {
+            let waited = Instant::now();
+            while immutable.strong_count() + mutable.strong_count() > 0 {
+                if waited.elapsed() > Duration::from_secs(COLLECTION_END_SECONDS) {
+                    println!(
+                        "NOTE store-outlived-its-generation: a collection pass held the stores \
+                         {COLLECTION_END_SECONDS}s past their generation's end"
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         self.journal.log(format_args!("g end"));
     }
 
     /// Hold the loads a call's claims made to what the journal says another process did since
-    /// this process's last call: see the module documentation.
-    fn check_loads(&mut self, loads: [usize; 2], opened: bool, added: &Added) {
+    /// this process's last call, the journal's line `since` on: see the module documentation.
+    /// `between` are the loads since the last call ended, which in a collecting process a pass
+    /// that claimed a kept store made for another process's write before this call claimed it.
+    fn check_loads(
+        &mut self,
+        loads: [usize; 2],
+        between: [usize; 2],
+        opened: bool,
+        added: &Added,
+        since: usize,
+    ) {
         let generation = self.journal.generation();
+        let collected = self.history.unseen_gc_after(since, generation);
         for (index, store) in [Store::Immutable, Store::Mutable].into_iter().enumerate() {
             let name = ["immutable", "mutable"][index];
             let loaded = loads[index];
+            let reloaded_before = self.collection.is_some() && between[index] > 0;
             if opened {
                 if loaded != 1 {
                     self.work.violation(
@@ -336,7 +431,7 @@ impl Calls {
                 .iter()
                 .filter(|(of, by, _)| *of == store && *by != generation);
             let wrote = writes.clone().any(|(_, _, claimed)| *claimed);
-            let may_have = writes.count() > 0;
+            let may_have = writes.count() > 0 || (store == Store::Immutable && collected);
             self.count(match (loaded, wrote) {
                 (0, _) => "kept-reused",
                 (_, true) => "kept-reloaded-after-a-write",
@@ -344,7 +439,7 @@ impl Calls {
             });
             let class = if loaded > 1 {
                 "kept-store-reloaded-twice"
-            } else if wrote && loaded == 0 {
+            } else if wrote && loaded == 0 && !reloaded_before {
                 "kept-store-missed-a-write"
             } else if !may_have && loaded > 0 && !self.faults[index] {
                 "kept-store-reloaded-for-nothing"
@@ -429,7 +524,7 @@ impl Calls {
             self.flush(&stores).await;
             drop(claims);
         }
-        self.end_generation(stores);
+        self.end_generation(stores).await;
     }
 
     fn report(&self, elapsed: f64) {
