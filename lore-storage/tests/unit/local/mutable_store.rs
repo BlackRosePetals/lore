@@ -300,6 +300,189 @@ async fn assert_bucket_file_holds(dir: &Path, group_index: usize, key: &Hash) {
     );
 }
 
+/// **A list that cannot read a bucket fails**, rather than handing back a stream that ends as if
+/// complete with that bucket's keys left out, which a caller cannot tell from keys that are not
+/// there.
+#[tokio::test]
+async fn a_list_that_cannot_read_a_bucket_fails() {
+    use futures::StreamExt;
+    use lore_storage::mutable_store::MutableStore;
+    let dir = lore_base::test_util::TempDir::new("ms_list_unreadable_");
+    let settings = || MutableStoreSettings {
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    let keys = {
+        let store = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.path()),
+                settings(),
+                make_in_memory_immutable().await,
+            )
+            .await
+            .expect("store opens"),
+        );
+        let keys = store_keys(&store, Partition::default(), 2).await;
+        let flushing: Arc<dyn MutableStore> = store;
+        flushing.flush(false).await.expect("flush");
+        keys
+    };
+    let store = |path: PathBuf| async move {
+        Arc::new(
+            LocalMutableStore::new(Some(path), settings(), make_in_memory_immutable().await)
+                .await
+                .expect("store opens"),
+        )
+    };
+    let listing: Arc<dyn MutableStore> = store(dir.path().to_path_buf()).await;
+    let listed = listing
+        .list(Partition::default(), KeyType::BranchMetadata)
+        .await
+        .expect("lists")
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(listed.len(), keys.len(), "a list reads every bucket");
+
+    // Group 1's bucket file replaced by a directory, which opens and fails every read.
+    let bucket = format_bucket_path(&dir.path().join("mutable"), 1, 0);
+    std::fs::remove_file(&bucket).expect("bucket file");
+    std::fs::create_dir(&bucket).expect("directory in its place");
+    let reopened = store(dir.path().to_path_buf()).await;
+    let lock = reopened
+        .lock
+        .clone()
+        .expect("a disk-backed store has a lock");
+    let listing: Arc<dyn MutableStore> = reopened;
+    assert!(
+        listing
+            .list(Partition::default(), KeyType::BranchMetadata)
+            .await
+            .is_err(),
+        "a list that could not read a bucket handed back a stream leaving its keys out"
+    );
+    wait_for(
+        async || !lock.is_held(),
+        "the producers waiting to send ended with the list, and released the claim",
+    )
+    .await;
+}
+
+/// A store over `dir` whose group `07` fanned out past one bucket, opened afresh so that none of
+/// its buckets is in memory.
+async fn fanned_out_store(dir: &Path) -> Arc<LocalMutableStore> {
+    use lore_storage::mutable_store::MutableStore;
+    let settings = || MutableStoreSettings {
+        fan_out_threshold: 2,
+        flush_delay_seconds: 3600,
+        ..client_settings()
+    };
+    let store = Arc::new(
+        LocalMutableStore::new(Some(dir), settings(), make_in_memory_immutable().await)
+            .await
+            .expect("store opens"),
+    );
+    let writing: Arc<dyn MutableStore> = store.clone();
+    store_spread_keys(&writing, 0..6).await;
+    writing.flush(false).await.expect("flush");
+    assert!(
+        store.group[7].bucket_count.load(atomic::Ordering::Relaxed) > 1,
+        "the group fanned out"
+    );
+    Arc::new(
+        LocalMutableStore::new(Some(dir), settings(), make_in_memory_immutable().await)
+            .await
+            .expect("store reopens"),
+    )
+}
+
+/// Spawn a list of `store`'s keys, which ends once the stream is handed back, and drive it for
+/// 100 ms, which it is still waiting at when group `07`'s first bucket is held.
+async fn start_listing(
+    store: &Arc<LocalMutableStore>,
+) -> tokio::task::JoinHandle<
+    Result<lore_storage::store_types::KeyValueStream, lore_storage::StoreError>,
+> {
+    use lore_storage::mutable_store::MutableStore;
+    let listing: Arc<dyn MutableStore> = store.clone();
+    let mut listing = lore_base::lore_spawn!(async move {
+        listing
+            .list(Partition::default(), KeyType::BranchMetadata)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut listing)
+            .await
+            .is_err(),
+        "the list waits for the group it cannot read yet"
+    );
+    listing
+}
+
+/// **A list dropped before it returns stops reading buckets.** Its producers go on only while
+/// something can still receive the stream: one left reading its group would otherwise read every
+/// remaining bucket file of it, and keep the store claimed, for no caller.
+#[tokio::test]
+async fn a_list_dropped_before_it_returns_stops_reading_buckets() {
+    let dir = lore_base::test_util::TempDir::new("ms_list_dropped_");
+    let store = fanned_out_store(dir.path()).await;
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+    let group = store.group[7].clone();
+
+    // Group 7's producer waits at its first bucket, which the list waits for.
+    let blocker = group.bucket(0).clone().write_owned().await;
+    let listing = start_listing(&store).await;
+    listing.abort();
+    assert!(listing.await.is_err_and(|err| err.is_cancelled()));
+    drop(blocker);
+
+    wait_for(
+        async || !lock.is_held(),
+        "the producers ended and released the claim",
+    )
+    .await;
+    assert_eq!(
+        group.bucket(1).read().await.entry.len(),
+        0,
+        "the producer left the rest of its group unread"
+    );
+}
+
+/// **A list's producers send nothing until it hands its stream back.** Keys sent sooner would
+/// queue in the stream with no caller yet to take them, all of a large store's while one group is
+/// slow to read, and go for nothing if that group then fails the list.
+#[tokio::test]
+async fn a_list_sends_nothing_before_it_returns() {
+    use futures::StreamExt;
+    use lore_storage::test_util::PausePoint;
+    let dir = lore_base::test_util::TempDir::new("ms_list_gated_");
+    let store = fanned_out_store(dir.path()).await;
+    let sending = lore_storage::test_util::pause_at(PausePoint::Listing);
+
+    // Group 7's producer waits at its first bucket, which the list waits for; every other group
+    // has been read meanwhile.
+    let blocker = store.group[7].bucket(0).clone().write_owned().await;
+    let listing = start_listing(&store).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            sending.reached.notified()
+        )
+        .await
+        .is_err(),
+        "no producer sends while the list waits for another group"
+    );
+
+    drop(blocker);
+    let stream = listing.await.expect("the list ends").expect("lists");
+    sending.reached.notified().await;
+    sending.resume.notify_one();
+    assert_eq!(
+        stream.collect::<Vec<_>>().await.len(),
+        6,
+        "and once it has returned, every key is sent"
+    );
+}
+
 /// A `version` file that cannot be read fails the open and is left as it is.
 #[tokio::test]
 async fn an_unreadable_version_file_fails_the_open_and_is_kept() {
@@ -1946,8 +2129,8 @@ async fn a_listing_keeps_the_store_claimed_while_it_reads() {
     store.clone().flush(true).await.unwrap();
     assert!(!lock.is_held());
 
-    // Holds the first bucket the group-0 producer reads, so it is still at work.
-    let blocker = store.group[0].bucket(0).clone().write_owned().await;
+    // Holds the first producer that has read its group, so it is still at work.
+    let listing = lore_storage::test_util::pause_at(lore_storage::test_util::PausePoint::Listing);
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         store
@@ -1959,7 +2142,7 @@ async fn a_listing_keeps_the_store_claimed_while_it_reads() {
     .unwrap();
     assert!(lock.is_held(), "a listing still reading holds its claim");
 
-    drop(blocker);
+    listing.resume.notify_one();
     drop(stream);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while lock.is_held() {
@@ -1994,8 +2177,8 @@ async fn a_listing_keeps_the_store_claimed_past_the_span_it_started_in() {
     assert!(!lock.is_held());
 
     let span = store.clone().hold_for_command().await.unwrap();
-    // Holds the first bucket the group-0 producer reads, so it is still at work.
-    let blocker = store.group[0].bucket(0).clone().write_owned().await;
+    // Holds the first producer that has read its group, so it is still at work.
+    let listing = lore_storage::test_util::pause_at(lore_storage::test_util::PausePoint::Listing);
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         store
@@ -2011,7 +2194,7 @@ async fn a_listing_keeps_the_store_claimed_past_the_span_it_started_in() {
         "a listing still reading holds the store past the span"
     );
 
-    drop(blocker);
+    listing.resume.notify_one();
     drop(stream);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while lock.is_held() {

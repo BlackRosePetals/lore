@@ -47,7 +47,7 @@ tokio::task_local! {
     static UNVALIDATED_PUTS: ();
 }
 
-/// A point where [`pause_at`] holds a store, a read, a flush or a compaction.
+/// A point where [`pause_at`] holds a store, a read, a list, a flush or a compaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PausePoint {
     /// A packfile write has reserved its range and not yet written it.
@@ -75,6 +75,9 @@ pub enum PausePoint {
     /// A flush is about to try a group's flush lock, under which it reads whether the group has
     /// anything to write.
     Scanning,
+    /// A mutable store list has handed its stream back, and one of its producers, which read its
+    /// group's buckets into memory before, has sent none of their keys yet.
+    Listing,
 }
 
 /// A task the store runs of its own accord rather than for a caller, see [`count_store_tasks`].

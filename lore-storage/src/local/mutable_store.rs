@@ -1867,6 +1867,57 @@ impl LockedStore for LocalMutableStore {
     }
 }
 
+/// Reads into memory the first `active_buckets` buckets of `group`, group `group_index` of the
+/// store at `path`, that are not there yet, for a `list` producer before it sends any of them
+/// down `stream`. Stops before the next bucket once nothing can receive `stream`: a list whose
+/// caller dropped it, or that failed for another producer, has no use for the rest.
+///
+/// A bucket a producer cannot read is an error the caller of `list` has to see: once the stream
+/// is handed back, the producer has no way to report one, and the stream would end as if
+/// complete with that bucket's keys left out. So `list` returns only once every producer has
+/// loaded its group, and fails if any could not. The producers send nothing until it returns:
+/// keys sent sooner would queue in the unbounded stream with no caller yet to take them, and go
+/// for nothing if a later group fails. A list that fails or is dropped before it returns ends
+/// the producers still waiting to send.
+///
+/// # Errors
+///
+/// [`StoreError`] if a bucket file cannot be read or parsed.
+async fn load_group_buckets(
+    group: &MutableStoreGroup,
+    path: Option<&Path>,
+    group_index: usize,
+    active_buckets: usize,
+    authoritative: bool,
+    stream: &UnboundedSender<(Hash, Hash)>,
+) -> Result<(), StoreError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    for bucket_index in 0..active_buckets {
+        if stream.is_closed() {
+            break;
+        }
+        let bucket = group.bucket(bucket_index);
+        if bucket.read().await.deserialized {
+            continue;
+        }
+        // TODO (raghav.narula) limit the number of deserialized buckets kept in memory on the client/cli
+        Box::pin(async {
+            bucket
+                .write()
+                .await
+                .deserialize(path, group_index, bucket_index, false, authoritative)
+                .await
+        })
+        .await
+        .map_err(|err| {
+            StoreError::internal_with_context(err, "Failed to deserialize mutable store bucket")
+        })?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl crate::mutable_store::MutableStore for LocalMutableStore {
     async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
@@ -2108,51 +2159,44 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         // work. A producer stops once the stream is dropped, which releases it.
         let hold = self.claim(Intent::Read).await?.map(Arc::new);
 
+        let mut loading = Vec::with_capacity(self.group.len());
+        let (returning, returned) = tokio::sync::watch::channel(false);
         for group_index in 0..self.group.len() {
             let path = self.path.clone();
             let authoritative = self.authoritative;
             let sender = sender.clone();
             let group = self.group[group_index].clone();
             let hold = hold.clone();
+            let (loaded, loaded_receiver) = tokio::sync::oneshot::channel();
+            loading.push(loaded_receiver);
+            let mut returned = returned.clone();
             let task = async move {
                 let _hold = hold;
                 let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+                let load = load_group_buckets(
+                    &group,
+                    path.as_deref().map(PathBuf::as_path),
+                    group_index,
+                    active_buckets,
+                    authoritative,
+                    &sender,
+                )
+                .await;
+                let failed = load.is_err();
+                if loaded.send(load).is_err()
+                    || failed
+                    || returned.wait_for(|returned| *returned).await.is_err()
+                {
+                    return Ok(());
+                }
+                #[cfg(feature = "test-util")]
+                crate::test_util::pause_point(crate::test_util::PausePoint::Listing).await;
                 for bucket_index in 0..active_buckets {
                     if sender.is_closed() {
                         break;
                     }
-                    let bucket_ref = group.bucket(bucket_index).clone();
-                    let mut bucket = bucket_ref.read().await;
+                    let bucket = group.bucket(bucket_index).read().await;
                     let sender = sender.clone();
-
-                    if !bucket.deserialized && path.is_some() {
-                        drop(bucket);
-
-                        let bucket_clone = bucket_ref.clone();
-                        let path = path.clone();
-                        Box::pin(async move {
-                            let mut bucket_write = bucket_clone.write().await;
-                            // TODO (raghav.narula) limit the number of deserialized buckets kept in memory on the client/cli
-                            bucket_write
-                                .deserialize(
-                                    path.as_ref().unwrap(),
-                                    group_index,
-                                    bucket_index,
-                                    false,
-                                    authoritative,
-                                )
-                                .await
-                                .map_err(|err| {
-                                    StoreError::internal_with_context(
-                                        err,
-                                        "Failed to deserialize mutable store bucket",
-                                    )
-                                })
-                        })
-                        .await?;
-
-                        bucket = bucket_ref.read().await;
-                    }
 
                     fn handle_slot(
                         key_type: KeyType,
@@ -2243,6 +2287,15 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
             lore_base::lore_spawn!(task);
         }
 
+        for loaded in loading {
+            loaded.await.map_err(|err| {
+                StoreError::internal_with_context(
+                    err,
+                    "A mutable store list producer ended before loading its buckets",
+                )
+            })??;
+        }
+        returning.send_replace(true);
         Ok(stream)
     }
 

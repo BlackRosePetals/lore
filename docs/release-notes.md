@@ -137,6 +137,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore-storage`: listing a local mutable store fails when a bucket file cannot be read, where the listing ended as
+  if complete with that bucket's keys left out
 - `lore-storage`: a write dropped while it advanced a local store's epoch no longer makes a kept store reload for
   nothing or fails the next write with "No such file or directory"
 - `lore-storage`: a claim for work spawned to outlive an operation keeps the store's lock for that work and covers no
