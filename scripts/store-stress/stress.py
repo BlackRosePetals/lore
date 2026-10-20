@@ -28,11 +28,8 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 
 # Classes the verifier reports for defects already known, kept apart from new findings: class name
-# to the defect.
-KNOWN = {
-    "list-left-out-a-key-under-faults": "a mutable list producer that cannot read a bucket ends the "
-                                        "stream early, with no error the caller sees",
-}
+# to the defect. Empty while none is open.
+KNOWN = {}
 
 
 # Coverage events only a machine failure or a damaged file produces, which no run is expected to

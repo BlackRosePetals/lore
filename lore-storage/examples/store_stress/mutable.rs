@@ -342,8 +342,8 @@ pub async fn swap(context: &Context<'_>, rng: &mut Rng) -> Result<(), String> {
 }
 
 /// List every key, and hold each pair to the call's view. Where faults reach the store's files, a
-/// key the list leaves out is classed apart: a bucket a list producer cannot read ends that
-/// producer, and the stream with it, with no error the caller can see.
+/// key the list leaves out is classed apart: a list that cannot read a bucket must fail, not end
+/// with that bucket's keys left out.
 pub async fn list_all(context: &Context<'_>) -> Result<(), String> {
     let expected: Vec<Value> = {
         let view = context.view.lock();
