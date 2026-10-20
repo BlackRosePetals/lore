@@ -68,6 +68,7 @@ fn main() -> ExitCode {
     if command == "retention" {
         return ExitCode::from(retention::main(&args));
     }
+    work::note_spawned_panics();
     let threads = args.number("threads", 8) as usize;
     let runtime = match command.as_str() {
         // Scenarios and clients arm pause points, which are per thread, so they run on one.

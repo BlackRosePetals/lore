@@ -29,12 +29,18 @@ REPO = HERE.parent.parent
 
 # Classes the verifier reports for defects already known, kept apart from new findings: class name
 # to the defect. Empty while none is open.
-KNOWN = {}
+KNOWN = {
+    "panic: lore-storage/src/local/store_lock.rs:792:13: in a spawned task":
+        "an operation of work spawned on a joined claim ran on the cover of a span that ended first, "
+        "which test builds fail though the work's claim keeps the flock: open, ADR-00024's rule",
+}
 
 
-# Coverage events only a machine failure or a damaged file produces, which no run is expected to
-# reach: an index pointing past what its packfile holds, a bucket file that does not parse.
-MACHINE_FAILURE_ONLY = {"event lost-payload-locations-cleared", "event corrupt-bucket-reset"}
+# Coverage events of the store repairing what only a machine losing writes or a damaged file
+# leaves, which no run is expected to reach and the harness reports as a violation where one is:
+# an index pointing past what its packfile holds, a bucket file that does not parse.
+REPAIR_EVENTS = {"event lost-payload-locations-cleared", "event corrupt-bucket-reset",
+                 "event corrupt-mutable-bucket-reset"}
 
 # The file operations the shim counts, those that change the disk first.
 MUTATIONS = ["write", "sync", "rename", "truncate", "unlink", "mkdir"]
@@ -69,6 +75,21 @@ def fault_errnos(rng, op, persistent):
 def known(name):
     """What a violation class is known as, or None for a new one."""
     return KNOWN.get(name.removeprefix("online-"))
+
+
+def exits(options):
+    """The exits a run with `options` may end with: 0, 1 for violations, and a run told to end by
+    aborting, SIGABRT."""
+    return (0, 1, -6, 134) if "abort" in options else (0, 1)
+
+
+def mark_dead(store, pid):
+    """Record in `store`'s journal that process `pid` is gone, which ends its shared generations
+    and lets go of the claims it held, see `journal.rs`."""
+    journal = store / "stress.journal"
+    if journal.exists():
+        with open(journal, "a") as output:
+            output.write(f"0 g dead pid={pid}\n")
 
 
 def copy_store(source, destination):
@@ -143,7 +164,12 @@ def read_state(path):
 # The operations a caller may drop unfinished: `work`'s kinds but those it never drops, and a
 # call's flush, which `calls` tracks as `end`.
 CANCELLABLE = {"put", "putf", "putm", "get", "getinto", "meta", "query", "copy", "ob", "flush", "flushsync",
-               "compact", "evict", "loadindex", "verify", "mstore", "mload", "mswap", "mlist", "end"}
+               "compact", "evict", "loadindex", "verify", "mstore", "mload", "mswap", "mlist", "mflush",
+               "mflushsync", "end", "open", "claim"}
+
+# The store operations of collection: compaction and eviction the workload runs, and the passes the
+# store runs itself.
+COLLECTION = {"compact", "evict", "stopgc", "evictor", "compactor", "gc-pass"}
 
 
 def eligible(event, operation, step):
@@ -254,7 +280,8 @@ class Campaign:
 
     def run(self, command, log, env=None, timeout=None, kill_after=None, prefix=None):
         """Run `command`, its output to `log`, killing it with SIGKILL after `kill_after` seconds.
-        Returns (exit code or -signal, killed by us)."""
+        Returns (exit code or -signal, killed by us). A `calls` process gone is marked dead in its
+        store's journal, see `mark_dead`."""
         process = self.start(command, log, env, prefix)
         killed = False
         deadline = time.time() + (timeout or 3600)
@@ -272,8 +299,26 @@ class Campaign:
             if now >= deadline:
                 process.send_signal(signal.SIGKILL)
                 process.wait()
-                return (-9, False)
+                code, killed = -9, False
+                break
+        if len(command) > 2 and Path(command[0]).name == self.binary.name and command[1] == "calls":
+            mark_dead(Path(command[2]), process.pid)
         return (code, killed)
+
+    def check_exit(self, run_dir, name, code, allowed, faulted=False, store=None):
+        """Hold a process `name`, of `store`'s, that exited with `code` to `allowed`: one that could
+        not open its stores, which exits 3, is noted where faults or its environment refused it,
+        and otherwise a violation, and any other exit a harness failure."""
+        if code in allowed:
+            return
+        if code == 3:
+            if faulted:
+                self.notes[f"{name}-refused-to-start-under-faults"] += 1
+            else:
+                self.record(run_dir, store, {f"{name}-failed-to-start": 1})
+            return
+        self.failures[f"{name}-exit-{code}"] += 1
+        print(f"  {run_dir.name}: {name} exited {code}", flush=True)
 
     def verify(self, store, run_dir, deep=False, label="verify", copy=False):
         """Check `store`, or with `copy` a copy of it, leaving the store as the kill left it for the
@@ -357,7 +402,8 @@ class Campaign:
                 self.failures["journal-lost"] += 1
                 journal_lost = True
             elif "panicked at" in line:
-                self.record(run_dir, None, {"panic: " + line.split("panicked at")[-1].strip()[:80]: 1})
+                where = " in a spawned task" if "PANIC-IN spawned-task" in text else ""
+                self.record(run_dir, None, {"panic: " + line.split("panicked at")[-1].strip()[:80] + where: 1})
         if covered:
             self.coverage_runs += 1
         return journal_lost
@@ -434,6 +480,8 @@ class Campaign:
             lines.append(f"  {name}: {count} in {len(runs)} runs [{label}] e.g. {', '.join(runs[:4])}")
         if not self.violations:
             lines.append("  none")
+        lines.append("harness failures: " + (", ".join(f"{name} {count}" for name, count in
+                                                      sorted(self.failures.items())) or "none"))
         if self.notes:
             lines.append("notes: " + ", ".join(f"{name} {count}" for name, count in sorted(self.notes.items())))
         if self.reports:
@@ -444,7 +492,7 @@ class Campaign:
         gaps = []
         for name, count in sorted(self.coverage.items()):
             lines.append(f"  {name}: {count}")
-            if count == 0 and not name.startswith("shape") and name not in MACHINE_FAILURE_ONLY:
+            if count == 0 and not name.startswith("shape") and name not in REPAIR_EVENTS:
                 gaps.append(name)
         lines.append("coverage gaps: " + (", ".join(gaps) if gaps else "none"))
         lines.extend(self.event_lines())
@@ -509,7 +557,7 @@ def report(results):
     for kind, count in sorted(coverage.items()):
         lines.append(f"  {kind}: {count}")
     gaps = [kind for kind, count in sorted(coverage.items())
-            if count == 0 and not kind.startswith("shape") and kind not in MACHINE_FAILURE_ONLY]
+            if count == 0 and not kind.startswith("shape") and kind not in REPAIR_EVENTS]
     lines.append("coverage gaps: " + (", ".join(gaps) if gaps else "none"))
     lines.extend(event_lines(events))
     print("\n".join(lines))
@@ -581,6 +629,10 @@ def random_run_options(rng, profile):
     if rng.random() < 0.3 or profile == "gc-storm":
         options += ["--background-gc", "--gc-max-size", rng.choice(["1", "1m", "64m"]),
                     "--gc-max-capacity", rng.choice(["1", "1000", "100000"]), "--gc-delay-ms", rng.choice([50, 300, 2000])]
+        if rng.random() < 0.5:
+            # The periodic evictor's floor lowered, so that its passes evict from these small stores.
+            options += ["--evictor-floor", rng.choice([1, 100])]
+    options += tuning(rng)
     if rng.random() < 0.2:
         options.append("--load-index")
     if rng.random() < 0.1:
@@ -594,10 +646,36 @@ def random_run_options(rng, profile):
         # Callers giving up on operations, which drops them unfinished.
         options += ["--cancel", rng.choice([0.01, 0.05, 0.2]), "--cancel-us", rng.choice([50, 500, 5000])]
     if rng.random() < 0.5:
-        # Operations in spans of a claim, as commands run them, and flushes outliving them.
-        options += ["--spans", rng.choice([1, 8, 64]), "--spawn-flushes", rng.choice([0, 0.3])]
+        # Operations in spans of a claim, as commands run them.
+        options += ["--spans", rng.choice([1, 8, 64])]
+    if rng.random() < 0.5:
+        # Flushes, puts and copies handed to tasks that outlive their operations, on the claims
+        # those joined.
+        options += ["--spawn-flushes", rng.choice([0, 0.3]), "--spawn-ops", rng.choice([0, 0.1, 0.3])]
     options += ["--end", rng.choice(["flush", "flush", "sync", "drop", "exit", "abort"])]
     return options
+
+
+def tuning(rng):
+    """Store settings a run varies now and then: how many groups a compaction step covers, from
+    one, which writes a resume point after every group, to all of them, which never does, and the
+    shares of their caps eviction and compaction reclaim down to."""
+    options = []
+    if rng.random() < 0.4:
+        options += ["--compaction-groups", rng.choice([1, 2, 8, 256])]
+    if rng.random() < 0.3:
+        options += ["--target-capacity", rng.choice([0, 50, 100]), "--target-size", rng.choice([0, 50, 100])]
+    return options
+
+
+def collecting(rng):
+    """Options that leave a run's store to its own collection: one task reading and now and then
+    storing, and the store's passes every few dozen milliseconds, evicting and compacting toward
+    caps it is over, so that the passes' file operations are counted with them running alone."""
+    return ["--tasks", 1, "--gc-tasks", 0, "--mix", "*=0,get=6,put=1", "--background-gc",
+            "--gc-max-size", rng.choice(["1", "1m"]), "--gc-max-capacity", rng.choice(["1", "100"]),
+            "--gc-delay-ms", rng.choice([20, 50, 100]), "--evictor-floor", rng.choice([1, 100]),
+            *tuning(rng)]
 
 
 def backend(rng, share=0.25):
@@ -617,9 +695,50 @@ def watched(campaign, store, state=None, **env):
     return watch
 
 
+def aim(campaign, rng, env, store, run_dir, operations=None):
+    """Aim `env`, a watched run's, at a store operation among `operations` and a step no kill or
+    fault has reached in the campaign, see `pick_target`: a kill the shim makes there, or faults
+    there, now and then followed by a kill at a later one of them. Returns what it aimed, `kill`
+    or `fault`, or None for nothing to aim at."""
+    event = "kill" if rng.random() < 0.6 else "fault"
+    target = pick_target(campaign, rng, event, operations)
+    if target is None:
+        return None
+    operation, step = target
+    op, file_class = step.split(":", 1)
+    env.update(target_env(campaign, store, op, file_class, None if operation == "idle" else operation))
+    point = campaign.point(rng, operation, step)
+    if event == "kill":
+        env.update(crash_env(rng, op, point, run_dir / "killed.txt")[1])
+        return event
+    env.update(fault_env(rng, op, point))
+    if op in MUTATIONS and rng.random() < 0.25:
+        # Killed once the faults sent the store down its error paths.
+        env.update(crash_env(rng, op, point + rng.randint(1, 3), run_dir / "killed.txt")[1])
+    return event
+
+
+def fault_env(rng, op, point):
+    """What has the shim fail operations of kind `op` from the `point`-th of them, a few or for
+    good, or at random, with errors they meet on their own."""
+    env = {"STRESS_SEED": str(rng.randrange(1 << 30)), "STRESS_SHORT": rng.choice(["0", "1"])}
+    if rng.random() < 0.4:
+        env["STRESS_FAIL_PROB"] = str(rng.choice([0.05, 0.3, 1.0]))
+        persistent = env["STRESS_FAIL_PROB"] == "1.0"
+    else:
+        env["STRESS_FAIL_AT"] = str(point)
+        env["STRESS_FAIL_COUNT"] = str(rng.choice([1, 3, 100000]))
+        persistent = env["STRESS_FAIL_COUNT"] == "100000"
+    env["STRESS_FAIL_ERRNO"] = fault_errnos(rng, op, persistent)
+    return env
+
+
 def kill_loop(campaign, profile="mixed"):
     """Generations of random work on random stores, each killed at a random moment or left to end,
-    each checked on a copy, so that the next generation recovers what the kill left itself."""
+    each checked on a copy, so that the next generation recovers what the kill left itself. Runs
+    the shim watches count where their file operations fall, and some are killed, or meet faults,
+    at a step picked to reach those no kill or fault has reached: in a GC storm, those of
+    compaction and eviction, whichever runs them."""
     args = campaign.args
     rng = campaign.rng
     while not campaign.out_of_time():
@@ -636,14 +755,23 @@ def kill_loop(campaign, profile="mixed"):
             options = (store_options if generation == 0 else []) + random_run_options(rng, profile)
             options += ["--seconds", seconds]
             env = backend(rng)
+            aimed = None
             if env["LORE_IO_BACKEND"] == "psync":
-                env = watched(campaign, store, run_dir / "state")
+                env = watched(campaign, store, run_dir / "state", STRESS_OPS=",".join(ALL_OPS),
+                              STRESS_PLACES=run_dir / "places.txt")
+                if rng.random() < (0.4 if profile == "gc-storm" else 0.15):
+                    aimed = aim(campaign, rng, env, store, run_dir,
+                                COLLECTION if profile == "gc-storm" else None)
+            if aimed == "fault" and rng.random() < 0.7:
+                options.append("--liveness")
             if real_hash and rng.random() < 0.3:
                 env["LORE_IMMUTABLE_STORE_VERIFY_WRITE"] = "1"
             if real_hash and rng.random() < 0.2:
                 options.append("--heal")
             roll = rng.random()
-            if roll < 0.2 and generation > 0:
+            if aimed == "kill":
+                kill_after = None
+            elif roll < 0.2 and generation > 0:
                 # Early, while the store opens and recovers what the last kill left.
                 kill_after = rng.uniform(0.01, 0.4)
             elif roll < 0.8:
@@ -652,15 +780,17 @@ def kill_loop(campaign, profile="mixed"):
                 kill_after = None
             code, killed = campaign.run(campaign.command("work", store, *options), run_dir / "work.log",
                                         env=env, timeout=seconds + 600, kill_after=kill_after)
-            if killed and "STRESS_STATE" in env:
+            crashed = campaign.note_kill(run_dir / "killed.txt")
+            if aimed == "kill" and not crashed:
+                campaign.notes["kill missed"] += 1
+            if killed and not crashed and "STRESS_STATE" in env:
                 campaign.note_state_kill(env["STRESS_STATE"])
+            campaign.place(read_places(run_dir / "places.txt"))
             if campaign.parse_work(run_dir / "work.log", run_dir):
                 # Judged against an incomplete history, the store would show losses it never had.
                 break
-            if code not in (0, 1) and not killed and code not in (-6, 134):
-                campaign.failures[f"work-exit-{code}"] += 1
-                if code == 3:
-                    campaign.record(run_dir, store, {"work-failed-to-start": 1})
+            if not killed and not crashed:
+                campaign.check_exit(run_dir, "work", code, exits(options), faulted=aimed == "fault", store=store)
             deep = rng.random() < 0.25
             classes = campaign.verify(store, run_dir, deep=deep, copy=True)
             if classes and args.stop_on_new and any(known(name) is None for name in classes):
@@ -682,26 +812,36 @@ def prepare_base(campaign, base, run_dir, rng):
         base.mkdir(parents=True)
         return workload, store_options
     prefill = ["--prefill-near-limit", rng.choice(["1m", "8m"])] if rng.random() < 0.3 else []
-    campaign.run(campaign.command(workload, base, *store_options, *prefill, "--seconds", rng.choice([1, 2]),
-                                  "--end", "flush"), run_dir / "prepare.log", timeout=600)
+    code, _ = campaign.run(campaign.command(workload, base, *store_options, *prefill, "--seconds",
+                                            rng.choice([1, 2]), "--end", "flush"), run_dir / "prepare.log", timeout=600)
+    campaign.parse_work(run_dir / "prepare.log", run_dir)
+    campaign.check_exit(run_dir, workload, code, (0, 1), store=base)
     return workload, []
 
 
 def workload_options(rng, workload):
-    """The options of one run of `workload` over an existing store directory."""
+    """The options of one run of `workload` over an existing store directory: now and then one
+    left to the store's own collection, whose passes' file operations a sweep then reaches."""
     if workload == "calls":
-        return calls_options(rng, rng.random() < 0.5)
-    return random_run_options(rng, "mixed")
+        keeps = rng.random() < 0.5
+        return calls_options(rng, keeps, collects=rng.random() < 0.3)
+    options = random_run_options(rng, "mixed")
+    if rng.random() < 0.2:
+        options += collecting(rng)
+    return options
 
 
 def count_operations(campaign, store, workload, options, run_dir, ops):
     """Run `workload` once under the shim counting its file operations of kinds `ops`, returning
-    where they fell."""
+    where they fell. The run is a workload like any other, checked as one."""
     places_file = run_dir / "places.txt"
     env = watched(campaign, store, STRESS_OPS=",".join(ops), STRESS_PLACES=places_file)
-    campaign.run(campaign.command(workload, store, *options), run_dir / "count.log", env=env, timeout=600)
+    code, _ = campaign.run(campaign.command(workload, store, *options), run_dir / "count.log", env=env, timeout=600)
     places = read_places(places_file)
     campaign.place(places)
+    if not campaign.parse_work(run_dir / "count.log", run_dir):
+        campaign.check_exit(run_dir, workload, code, exits(options), store=store)
+        campaign.verify(store, run_dir, label="verify-count")
     return strata(places)
 
 
@@ -712,11 +852,13 @@ def missed(campaign, event, pairs):
     return [pair for pair in pairs if pair not in hit]
 
 
-def pick_target(campaign, rng, event):
+def pick_target(campaign, rng, event, operations=None):
     """A store operation, or `idle`, and a step, `op:kind`, for `event` to land in: three times in
     four one of the operation's own steps, see `owned`, that no such event has landed in during the
-    campaign, otherwise any of them. None until some run has counted where file operations fall."""
-    candidates = sorted(pair for pair in owned(campaign.events) if eligible(event, *pair))
+    campaign, otherwise any of them, among `operations` when given. None until some run has counted
+    where file operations fall."""
+    candidates = sorted(pair for pair in owned(campaign.events) if eligible(event, *pair)
+                        and (operations is None or pair[0] in operations))
     if not candidates:
         return None
     gaps = missed(campaign, event, candidates)
@@ -797,10 +939,11 @@ def crash_sweep(campaign):
             env = target_env(campaign, store, op, file_class, running)
             mode, crash = crash_env(rng, op, point, run_dir / "killed.txt")
             env.update(crash)
-            campaign.run(campaign.command(workload, store, *options), run_dir / f"{workload}.log", env=env,
-                         timeout=600)
+            code, _ = campaign.run(campaign.command(workload, store, *options), run_dir / f"{workload}.log",
+                                   env=env, timeout=600)
             if not campaign.note_kill(run_dir / "killed.txt"):
                 campaign.notes["kill missed"] += 1
+                campaign.check_exit(run_dir, workload, code, exits(options), store=store)
             campaign.parse_work(run_dir / f"{workload}.log", run_dir)
             classes = campaign.verify(store, run_dir, copy=True)
             if not classes:
@@ -809,28 +952,51 @@ def crash_sweep(campaign):
 
 
 def recover(campaign, store, workload, run_dir, rng):
-    """The next process carries on from whatever the kill left, recovering it itself; at times it
-    is killed during that recovery too, and a third process recovers both."""
-    if rng.random() < 0.4:
-        op = rng.choice(["rename", "unlink", "write", "sync"])
-        env = watched(campaign, store, STRESS_OPS=op, STRESS_DURING="open", STRESS_CRASH_AT=rng.randrange(1, 6),
-                      STRESS_KILLED=run_dir / "killed-recovery.txt")
-        campaign.run(campaign.command(workload, store, "--seconds", 1, "--end", "flush"),
-                     run_dir / "recovery.log", env=env, timeout=600)
+    """The next process carries on from whatever the kill left, recovering it itself as its stores
+    open, or for `calls`, as a claim finds what another process left: at times it is killed during
+    that recovery too, before, after or part way through a file operation of a kind the recovery
+    makes, and a third process recovers both, and at times file operations of a kind fail during
+    it, after which the process checks that its stores take writes again."""
+    roll = rng.random()
+    during = rng.choice(["open", "claim"]) if workload == "calls" else "open"
+    if roll < 0.25:
+        op = rng.choice(MUTATIONS)
+        _, crash = crash_env(rng, op, rng.randrange(1, 6), run_dir / "killed-recovery.txt")
+        env = watched(campaign, store, STRESS_OPS=op, STRESS_DURING=during, **crash)
+        code, _ = campaign.run(campaign.command(workload, store, "--seconds", 1, "--end", "flush"),
+                               run_dir / "recovery.log", env=env, timeout=600)
         if not campaign.note_kill(run_dir / "killed-recovery.txt"):
             campaign.notes["recovery kill missed"] += 1
+            campaign.check_exit(run_dir, workload, code, (0, 1), store=store)
         campaign.parse_work(run_dir / "recovery.log", run_dir)
-    campaign.run(campaign.command(workload, store, "--seconds", 2, "--end", "flush"), run_dir / "after.log",
-                 timeout=600)
+    elif roll < 0.45:
+        op = rng.choice(ALL_OPS)
+        env = watched(campaign, store, STRESS_OPS=op, STRESS_DURING=during,
+                      STRESS_PLACES=run_dir / "places-recovery.txt",
+                      **fault_env(rng, op, rng.randrange(1, 6)))
+        code, _ = campaign.run(campaign.command(workload, store, "--seconds", 1, "--end", "flush", "--liveness"),
+                               run_dir / "recovery.log", env=env, timeout=600)
+        faults = read_places(run_dir / "places-recovery.txt")
+        campaign.place(faults)
+        if not any(kind != "op" for (kind, *_) in faults):
+            campaign.notes["recovery fault missed"] += 1
+        campaign.parse_work(run_dir / "recovery.log", run_dir)
+        campaign.check_exit(run_dir, workload, code, (0, 1), faulted=True, store=store)
+    code, _ = campaign.run(campaign.command(workload, store, "--seconds", 2, "--end", "flush"), run_dir / "after.log",
+                           timeout=600)
     campaign.parse_work(run_dir / "after.log", run_dir)
+    campaign.check_exit(run_dir, workload, code, (0, 1), store=store)
     campaign.verify(store, run_dir, deep=True, label="verify2")
 
 
 def fault_sweep(campaign):
     """Fail file operations, picked evenly across every kind of operation on every kind of file of
     either store, reads, stats and listings included, with an error each can meet on its own; the
-    run goes on through them, then checks that the store takes writes again once they end. Check a
-    copy, then run the store on without faults and check again."""
+    run goes on through them, and most runs then check that the store takes writes again once they
+    end, while the rest let the faults reach the run's end, its last flush and the store's shutdown.
+    A quarter of the runs that fail operations that change the disk are then killed at a later one
+    of them, once the faults sent the store down its error paths. Check a copy, then run the store
+    on without faults and check again."""
     args = campaign.args
     rng = campaign.rng
     while not campaign.out_of_time():
@@ -838,11 +1004,19 @@ def fault_sweep(campaign):
         prepare = campaign.run_dir("fault-prepare")
         workload, first_options = prepare_base(campaign, base, prepare, rng)
         seconds = rng.choice([2, 5])
-        options = first_options + workload_options(rng, workload) + ["--seconds", seconds, "--liveness"]
+        liveness = rng.random() < 0.7
+        options = first_options + workload_options(rng, workload) + ["--seconds", seconds]
+        if liveness:
+            options.append("--liveness")
         probe = campaign.scratch / "fault-probe"
         copy_store(base, probe)
         totals, during = count_operations(campaign, probe, workload, options, prepare, ALL_OPS)
         shutil.rmtree(probe, ignore_errors=True)
+        if liveness:
+            # The end of a run that checks liveness comes after the faults end, out of their reach.
+            during = defaultdict(Counter, {step: Counter({name: count for name, count in names.items()
+                                                          if name not in ("end", "probe")})
+                                           for step, names in during.items()})
         if not totals:
             continue
         for _ in range(max(1, args.points // 4)):
@@ -858,20 +1032,32 @@ def fault_sweep(campaign):
             if rng.random() < 0.3:
                 env["STRESS_FAIL_PROB"] = str(rng.choice([0.01, 0.05, 0.3]))
                 persistent = False
+                point = rng.randrange(1, count + 1)
             else:
-                env["STRESS_FAIL_AT"] = str(rng.randrange(1, count + 1))
+                point = rng.randrange(1, count + 1)
+                env["STRESS_FAIL_AT"] = str(point)
                 env["STRESS_FAIL_COUNT"] = str(rng.choice([1, 1, 3, 50, 100000]))
                 persistent = int(env["STRESS_FAIL_COUNT"]) >= 50
             env["STRESS_FAIL_ERRNO"] = fault_errnos(rng, op, persistent)
-            kill_after = rng.uniform(0.5, seconds + 2) if rng.random() < 0.3 else None
-            campaign.run(campaign.command(workload, store, *options), run_dir / f"{workload}.log", env=env,
-                         timeout=seconds + 600, kill_after=kill_after)
-            campaign.place(read_places(run_dir / "places.txt"))
+            crashing = op in MUTATIONS and rng.random() < 0.25
+            if crashing:
+                env.update(crash_env(rng, op, point + rng.randint(1, 3), run_dir / "killed.txt")[1])
+            kill_after = rng.uniform(0.5, seconds + 2) if not crashing and rng.random() < 0.3 else None
+            code, killed = campaign.run(campaign.command(workload, store, *options), run_dir / f"{workload}.log",
+                                        env=env, timeout=seconds + 600, kill_after=kill_after)
+            crashed = campaign.note_kill(run_dir / "killed.txt")
+            places = read_places(run_dir / "places.txt")
+            campaign.place(places)
+            if not any(kind != "op" for (kind, *_) in places):
+                campaign.notes["fault missed"] += 1
             campaign.parse_work(run_dir / f"{workload}.log", run_dir)
+            if not killed and not crashed:
+                campaign.check_exit(run_dir, workload, code, exits(options), faulted=True, store=store)
             campaign.verify(store, run_dir, copy=True)
-            campaign.run(campaign.command(workload, store, "--seconds", 3, "--end", "sync"), run_dir / "after.log",
-                         timeout=600)
+            code, _ = campaign.run(campaign.command(workload, store, "--seconds", 3, "--end", "sync"),
+                                   run_dir / "after.log", timeout=600)
             campaign.parse_work(run_dir / "after.log", run_dir)
+            campaign.check_exit(run_dir, workload, code, (0, 1), store=store)
             campaign.verify(store, run_dir, deep=True, label="verify2")
             shutil.rmtree(store, ignore_errors=True)
 
@@ -892,7 +1078,8 @@ def disk_full(campaign):
         run_dir = campaign.run_dir("enospc")
         size = rng.choice(["4m", "16m", "48m"])
         store_options = " ".join(str(option) for option in random_store_options(rng, "mixed"))
-        run_options = " ".join(f"'{option}'" for option in random_run_options(rng, "mixed"))
+        run_list = random_run_options(rng, "mixed")
+        run_options = " ".join(f"'{option}'" for option in run_list)
         seconds = rng.choice([3, 8, 15])
         filler = rng.choice([0, 1, 2, 4])
         binary = f"/stress-bin/{campaign.binary.name}"
@@ -903,19 +1090,20 @@ S=/full/store
 mkdir -p $S
 ln -s {run_dir}/stress.journal $S/stress.journal
 ln -s {run_dir}/stress.gen $S/stress.gen
-{binary} work $S {store_options} {run_options} --seconds {seconds} > {run_dir}/work.log 2>&1
-echo "work exit $?" >> {run_dir}/work.log
+{binary} work $S {store_options} {run_options} --seconds {seconds} --environment-errors > {run_dir}/work.log 2>&1
+echo "EXIT work $?" >> {run_dir}/work.log
 dd if=/dev/zero of=/full/filler bs=1M count={filler} 2>/dev/null
-{binary} work $S --seconds {seconds} --tasks 16 > {run_dir}/work2.log 2>&1
-echo "work2 exit $?" >> {run_dir}/work2.log
+{binary} work $S --seconds {seconds} --tasks 16 --environment-errors > {run_dir}/work2.log 2>&1
+echo "EXIT work2 $?" >> {run_dir}/work2.log
 rm -f /full/filler
-{binary} work $S --seconds 2 --end sync > {run_dir}/work3.log 2>&1
+{binary} work $S --seconds 2 --end sync --environment-errors > {run_dir}/work3.log 2>&1
+echo "EXIT work3 $?" >> {run_dir}/work3.log
 {binary} verify $S > {run_dir}/verify.log 2>&1
-echo "verify exit $?" >> {run_dir}/verify.log
+echo "EXIT verify $?" >> {run_dir}/verify.log
 # The deep check compacts and syncs, which the full disk leaves no room for: it runs on a copy.
 cp -a $S {run_dir}/copy
 {binary} verify {run_dir}/copy --deep > {run_dir}/verify-deep.log 2>&1
-echo "verify exit $?" >> {run_dir}/verify-deep.log
+echo "EXIT verify-deep $?" >> {run_dir}/verify-deep.log
 if grep -q '^VIOLATION' {run_dir}/verify.log {run_dir}/verify-deep.log; then mv {run_dir}/copy {run_dir}/store; else rm -rf {run_dir}/copy; fi
 """
         command = [
@@ -926,36 +1114,65 @@ if grep -q '^VIOLATION' {run_dir}/verify.log {run_dir}/verify-deep.log; then mv 
         ]
         campaign.run(command, run_dir / "container.log", timeout=seconds * 4 + 900)
         journal_lost = False
+        full = False
         for log in ["work.log", "work2.log", "work3.log"]:
             if (run_dir / log).exists():
                 journal_lost |= campaign.parse_work(run_dir / log, run_dir)
+                full |= "os error 28" in (run_dir / log).read_text(errors="replace")
+        if not full:
+            campaign.notes["disk-never-filled"] += 1
         if journal_lost:
             # Judged against an incomplete history, the store would show losses it never had.
             continue
         classes = {}
         for log in ["verify.log", "verify-deep.log"]:
             if (run_dir / log).exists():
-                classes.update(campaign.parse_verify(run_dir / log))
+                found = campaign.parse_verify(run_dir / log)
+                classes.update(found)
+                for name, code in container_exits(run_dir / log):
+                    if code not in (0, 1) and not found:
+                        classes[f"verify-crashed-{code}"] = 1
             else:
                 classes["enospc-run-failed"] = 1
+        for log in ["work.log", "work2.log", "work3.log"]:
+            for name, code in container_exits(run_dir / log):
+                # A run whose store the full disk kept from opening exits 3.
+                allowed = exits(run_list) if name == "work" else (0, 1)
+                campaign.check_exit(run_dir, name, code, allowed, faulted=True)
         campaign.record(run_dir, None, classes)
 
 
+def container_exits(log):
+    """The exits a container script appended to `log`, each `EXIT <name> <code>`, as (name, code)."""
+    try:
+        lines = Path(log).read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    return [(parts[1], int(parts[2])) for parts in (line.split() for line in lines)
+            if len(parts) == 3 and parts[0] == "EXIT" and parts[2].lstrip("-").isdigit()]
+
+
 def descriptor_exhaustion(campaign):
-    """Run stores with a descriptor limit low enough that opens fail, then check them with a normal
-    limit."""
+    """Run stores with a descriptor limit low enough that opens fail, in `work`, or now and then in
+    one `calls` process, which uses the mutable store beside the immutable one and at times keeps
+    its stores from call to call, then check them with a normal limit."""
     rng = campaign.rng
     while not campaign.out_of_time():
         store = campaign.scratch / f"emfile-{campaign.runs + 1:05d}"
         run_dir = campaign.run_dir("emfile")
+        workload = rng.choice(["work", "work", "calls"])
         store_options = random_store_options(rng, "mixed")
-        campaign.run(campaign.command("work", store, *store_options, "--seconds", 2, "--end", "flush"), run_dir / "prepare.log", timeout=600)
+        code, _ = campaign.run(campaign.command(workload, store, *store_options, "--seconds", 2, "--end", "flush"),
+                               run_dir / "prepare.log", timeout=600)
+        campaign.check_exit(run_dir, workload, code, (0, 1), store=store)
         limit = rng.choice([24, 40, 64, 128])
         seconds = rng.choice([2, 6])
-        options = random_run_options(rng, "mixed") + ["--seconds", seconds]
-        campaign.run(campaign.command("work", store, *options), run_dir / "work.log", timeout=seconds + 600,
-                     prefix=["prlimit", f"--nofile={limit}:{limit}", "--"])
-        campaign.parse_work(run_dir / "work.log", run_dir)
+        options = workload_options(rng, workload) + ["--seconds", seconds, "--environment-errors"]
+        code, _ = campaign.run(campaign.command(workload, store, *options), run_dir / f"{workload}.log",
+                               timeout=seconds + 600, prefix=["prlimit", f"--nofile={limit}:{limit}", "--"])
+        campaign.parse_work(run_dir / f"{workload}.log", run_dir)
+        # A run the limit kept from opening its stores exits 3.
+        campaign.check_exit(run_dir, workload, code, exits(options), faulted=True, store=store)
         campaign.verify(store, run_dir, deep=True)
         shutil.rmtree(store, ignore_errors=True)
 
@@ -965,14 +1182,24 @@ def deterministic(campaign, command):
     both builds, and the production build again on uring."""
     run_dir = campaign.run_dir(command)
     production = campaign.args.binary_na or campaign.args.binary
+    listed = subprocess.run([str(campaign.args.binary), command, "list"], capture_output=True, text=True)
+    cases = len(listed.stdout.split())
     passes = [("assertions", campaign.args.binary, "psync"), ("production", production, "psync"),
               ("production-uring", production, "uring")]
     for label, binary, io in passes:
         log = run_dir / f"{label}.log"
         # Scenarios that inject faults run a workload under the shim.
-        campaign.run([str(binary), command, "all", "--scratch", str(campaign.scratch / f"{command}-{label}")], log,
-                     env={"LORE_IO_BACKEND": io, "STRESS_SHIM": str(campaign.args.shim)}, timeout=7200)
-        for line in log.read_text(errors="replace").splitlines():
+        code, _ = campaign.run([str(binary), command, "all", "--scratch", str(campaign.scratch / f"{command}-{label}")],
+                               log, env={"LORE_IO_BACKEND": io, "STRESS_SHIM": str(campaign.args.shim)}, timeout=7200)
+        lines = log.read_text(errors="replace").splitlines()
+        ran = len({line.split()[1].rstrip(":") for line in lines if line.startswith(("PASS ", "FAIL ", "REPORT "))})
+        failed = any(line.startswith("FAIL ") for line in lines)
+        if ran != cases or (code != 0 and not failed):
+            # Cases that never reported, or a run that ended badly with none failed, as a crash
+            # part way through leaves.
+            campaign.failures[f"{command}-{label}-ran-{ran}-of-{cases}-exit-{code}"] += 1
+            print(f"  {label}: ran {ran} of {cases} cases, exit {code}", flush=True)
+        for line in lines:
             if line.startswith("FAIL "):
                 name = line.split(":")[0][5:]
                 campaign.record(run_dir, None, {f"{command} {name} ({label})": 1})
@@ -995,13 +1222,19 @@ def multi_process(campaign):
     while not campaign.out_of_time():
         store = campaign.scratch / f"shared-{campaign.runs + 1:05d}"
         prepare = campaign.run_dir("shared-prepare")
-        # Low fan-out thresholds, so that both stores' groups fan out through their levels.
-        options = random_store_options(rng, "client") + ["--fan-out-threshold", rng.choice([2, 3, 8, 24])]
+        # Low fan-out thresholds, so that both stores' groups fan out through their levels. Now and
+        # then a server's stores: nothing protected from eviction, every partition isolated, and a
+        # mutable store that is the source of truth.
+        profile = "server" if rng.random() < 0.2 else "client"
+        options = random_store_options(rng, profile) + ["--fan-out-threshold", rng.choice([2, 3, 8, 24])]
         if rng.random() < 0.15:
             # Packfiles near the size limit, which the processes then roll over to new ones.
             options += ["--prefill-near-limit", rng.choice(["1m", "8m"])]
         # One process first, which fixes the keyspace and writes what a store's first opening does.
-        campaign.run(campaign.command("calls", store, *options, "--seconds", 1), prepare / "prepare.log", timeout=600)
+        code, _ = campaign.run(campaign.command("calls", store, *options, "--seconds", 1), prepare / "prepare.log",
+                               timeout=600)
+        campaign.parse_work(prepare / "prepare.log", prepare)
+        campaign.check_exit(prepare, "calls", code, (0, 1), store=store)
         for round_index in range(rng.randint(1, 3)):
             if campaign.out_of_time():
                 break
@@ -1016,7 +1249,7 @@ def multi_process(campaign):
 
 def calls_options(rng, keeps, collects=False):
     """Options of one `calls` process, which with `collects` collects the immutable store's garbage
-    as a client keeping its stores does."""
+    as a client does."""
     options = [
         "--run-seed", rng.randrange(1, 1 << 30),
         "--tasks", rng.choice([1, 2, 4, 8]),
@@ -1024,7 +1257,7 @@ def calls_options(rng, keeps, collects=False):
         "--pause-ms", rng.choice([0, 5, 50]),
         "--unflushed", rng.choice([0, 0.2, 0.5]),
         # A delayed flush that fires during the round, now and then.
-        "--flush-delay", rng.choice([3600, 3600, 3600, 1]),
+        "--flush-delay", rng.choice([3600, 3600, 3600, 1, 3]),
         "--hot-keys", rng.choice([4, 48, 512]),
         "--hot-share", rng.choice([0.0, 0.3, 0.8]),
         "--threads", rng.choice([2, 4, 8]),
@@ -1035,23 +1268,33 @@ def calls_options(rng, keeps, collects=False):
         "--cancel", rng.choice([0.01, 0.05, 0.1, 0.2]), "--cancel-us", rng.choice([50, 500, 5000, 50000]),
         "--audit-files", rng.choice([0, 0.25, 1]),
         "--spawn-flushes", rng.choice([0, 0.5]),
+        "--spawn-ops", rng.choice([0, 0, 0.2]),
+        # Claims made from several tasks at once, as concurrent commands of a service make them.
+        "--claimers", rng.choice([1, 1, 2, 4]),
+        "--sync-flushes", rng.choice([0, 0.2]),
     ]
     mix = rng.choice(MIXES)
     if mix:
         options += ["--mix", mix]
     if rng.random() < 0.5:
         options.append("--serialize-flushes")
+    if rng.random() < 0.25:
+        # Durable writes schedule the immutable store's delayed flush too, as a service's do.
+        options.append("--flush-background")
+    options += tuning(rng)
     if keeps:
         options.append("--keeps")
         if rng.random() < 0.5:
             # A keep-alive window, at times shorter than a slowed write.
             options += ["--keep-alive-ms", rng.choice([30, 300])]
-        if collects:
-            # Caps a load crossing fires a pass at, and now and then the store's own passes.
-            options += ["--gc-max-size", rng.choice(["1", "1m", "64m"]),
-                        "--gc-max-capacity", rng.choice(["1", "1000", "100000"])]
-            if rng.random() < 0.7:
-                options += ["--background-gc", "--gc-delay-ms", rng.choice([50, 300, 2000])]
+    if collects:
+        # Caps a load crossing fires a pass at, and now and then the store's own passes.
+        options += ["--gc-max-size", rng.choice(["1", "1m", "64m"]),
+                    "--gc-max-capacity", rng.choice(["1", "1000", "100000"])]
+        if rng.random() < 0.7:
+            options += ["--background-gc", "--gc-delay-ms", rng.choice([50, 300, 2000])]
+            if rng.random() < 0.5:
+                options += ["--evictor-floor", rng.choice([1, 100])]
     return options
 
 
@@ -1074,7 +1317,7 @@ def shared_round(campaign, store, run_dir):
 
     def start(slot):
         keeps = keeping == "all" or (keeping == "half" and slot % 2 == 0)
-        collects = collecting and keeps and rng.random() < 0.6
+        collects = collecting and rng.random() < 0.6
         remaining = max(0.5, deadline - time.time())
         runs[slot] += 1
         name = run_dir / f"p{slot}-{runs[slot]}"
@@ -1096,19 +1339,14 @@ def shared_round(campaign, store, run_dir):
                 faulted = True
             elif roll < 0.3 and (target := pick_target(campaign, rng, "fault")):
                 # Faults on file operations of a kind, in a store operation, picked to reach steps no
-                # fault has.
+                # fault has, and now and then a kill at a later one of them.
                 operation, step = target
                 op, file_class = step.split(":", 1)
                 env.update(target_env(campaign, store, op, file_class, None if operation == "idle" else operation))
-                env.update({"STRESS_SEED": str(rng.randrange(1 << 30)), "STRESS_SHORT": rng.choice(["0", "1"])})
-                if rng.random() < 0.5:
-                    env["STRESS_FAIL_PROB"] = str(rng.choice([0.05, 0.3, 1.0]))
-                    persistent = env["STRESS_FAIL_PROB"] == "1.0"
-                else:
-                    env["STRESS_FAIL_AT"] = str(campaign.point(rng, operation, step))
-                    env["STRESS_FAIL_COUNT"] = str(rng.choice([1, 3, 100000]))
-                    persistent = env["STRESS_FAIL_COUNT"] == "100000"
-                env["STRESS_FAIL_ERRNO"] = fault_errnos(rng, op, persistent)
+                point = campaign.point(rng, operation, step)
+                env.update(fault_env(rng, op, point))
+                if op in MUTATIONS and rng.random() < 0.25:
+                    env.update(crash_env(rng, op, point + rng.randint(1, 3), name.with_suffix(".killed"))[1])
                 faulted = True
             elif roll < 0.55 and (target := pick_target(campaign, rng, "kill")):
                 # Killed at a file operation of a kind, in a store operation, picked to reach steps no

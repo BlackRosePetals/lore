@@ -17,11 +17,21 @@
 //! its claim when another process wrote to it since its last call, which a write that succeeded
 //! shows, and not when none could have. Stores opened afresh load once each.
 //!
-//! With `--gc-max-size` or `--gc-max-capacity`, a process that keeps its stores collects the
-//! immutable store's garbage as a client does: a load crossing a cap fires a pass, and with
-//! `--background-gc` the store's own passes run every `--gc-delay-ms` between calls and during
-//! them. The journal does not see those passes, so the generation is marked as collecting where it
-//! does not see, and another process may have written the store whenever it was alive.
+//! With `--gc-max-size` or `--gc-max-capacity`, a process collects the immutable store's garbage as
+//! a client does: a load crossing a cap fires a pass, and with `--background-gc` the store's own
+//! passes run every `--gc-delay-ms` between calls and during them. The journal does not see those
+//! passes, so the generation is marked as collecting where it does not see, and another process
+//! may have written the store whenever it was alive. With `--flush-background`, the immutable
+//! store's durable writes schedule its delayed flush too, as a service's do, which then runs
+//! between calls.
+//!
+//! With `--claimers <n>`, a call claims the stores from up to `n - 1` tasks besides its own claim,
+//! all at once, as concurrent commands of a service do; each runs a few operations once its claim
+//! is made. Every claim is journaled from when it is made until just before it goes, so that
+//! `verify` checks that no two processes held a store at once. A store error is a violation unless
+//! the shim fails file operations or the environment refuses them, see
+//! [`crate::work::Work::errors_expected`], and so is a call that fails, unless it gave up on its
+//! opening or its claim.
 
 use std::collections::BTreeMap;
 use std::ffi::c_long;
@@ -52,7 +62,7 @@ use crate::work::Options;
 use crate::work::Work;
 
 /// The operations a call mixes in by default besides `work`'s: the mutable store's.
-const MUTABLE_MIX: &str = "mstore=4,mload=4,mswap=6,mlist=0.5";
+const MUTABLE_MIX: &str = "mstore=4,mload=4,mswap=6,mlist=0.5,mflush=0.5,mflushsync=0.2";
 
 pub async fn main(args: &Args) -> u8 {
     let Some(dir) = args.dir() else {
@@ -81,7 +91,9 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
     }
     if !args.flag("quiet-store") {
         coverage::capture_logs();
+        crate::work::report_repairs(&journal);
     }
+    crate::work::lower_evictor_floor(args);
     let overlaps = coverage::Overlaps::new(crate::work::kind_names());
     overlaps.register_with_shim();
     let work = Work::new(
@@ -98,8 +110,12 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
         dir: dir.to_path_buf(),
         config,
         keeps,
-        collection: Collection::from_args(args).filter(|_| keeps),
+        collection: Collection::from_args(args),
         flush_delay,
+        flush_background: args.flag("flush-background"),
+        sync_flushes: args.float("sync-flushes", 0.0),
+        claimers: args.number("claimers", 1).max(1),
+        claimer_tasks: tokio::task::JoinSet::new(),
         call_ops: args.number("call-ops", 24).max(1),
         tasks: args.number("tasks", 4).max(1),
         unflushed: args.float("unflushed", 0.2),
@@ -128,6 +144,7 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
         if let Err(err) = calls.call().await {
             calls.count("failed");
             eprintln!("call failed: {err}");
+            calls.work.unexpected("call", &err);
         }
         let pause = calls.rng.below(pause_ms + 1);
         tokio::time::sleep(Duration::from_millis(pause)).await;
@@ -203,13 +220,22 @@ struct Calls {
     /// The most operations a call runs, and the most tasks it runs them on.
     call_ops: u64,
     tasks: u64,
+    /// Whether the immutable store's durable writes schedule its delayed flush.
+    flush_background: bool,
+    /// The share of the flushes ending calls that sync what they write.
+    sync_flushes: f64,
+    /// The most claims a call makes at once, its own among them, and the tasks that made the
+    /// others, which end within the call: they write the mutable store, whose reads the call holds
+    /// to what it wrote.
+    claimers: u64,
+    claimer_tasks: tokio::task::JoinSet<()>,
     /// The share of a keeping process's calls that end without a flush of the stores.
     unflushed: f64,
     /// How long a keeping process keeps its stores after a call, as the client's keep-alive window
     /// does: past it, the next call flushes what they hold and opens them afresh.
     keep_alive: Duration,
     /// The share of flushed calls after which the bucket files on disk are held to the immutable
-    /// store's memory.
+    /// store's memory, where neither faults nor the environment keep the audit from reading them.
     audit_files: f64,
     /// Whether the shim fails operations on the files of the immutable and of the mutable store,
     /// whose failed reads of the epoch reload a store with nothing written.
@@ -249,11 +275,14 @@ impl Calls {
         }
         let before = self.loads.now();
         let between = self.loads.since(self.loads_at_end);
-        let (stores, openings) = self.stores().await?;
-        let claims = match self.claim(&stores).await {
+        let (stores, openings) = self.stores(true).await?;
+        let (claimed, go) = self.claim_all(&stores).await;
+        let claims = match claimed {
             Ok(claims) => claims,
             Err(err) => {
                 self.loads_unaccounted = true;
+                drop((go, openings));
+                self.join_claimers().await;
                 self.end_call(stores).await;
                 return Err(err);
             }
@@ -266,7 +295,8 @@ impl Calls {
             Ok(added) => added,
             Err(err) => {
                 self.loads_unaccounted = true;
-                drop(claims);
+                drop((go, claims));
+                self.join_claimers().await;
                 self.end_call(stores).await;
                 return Err(format!("read the journal: {err}"));
             }
@@ -286,10 +316,14 @@ impl Calls {
                 .map(|(slot, _)| *slot),
         );
         self.work.begin_call(&self.history);
+        go.send_replace(true);
         self.run_operations().await;
         if self.keeps && self.rng.chance(self.unflushed) {
             self.count("unflushed");
-        } else if self.flush(&stores).await && !self.faults[0] && self.rng.chance(self.audit_files)
+        } else if self.flush(&stores).await
+            && !self.faults[0]
+            && !self.work.options().environment_errors
+            && self.rng.chance(self.audit_files)
         {
             self.count("files-audited");
             for finding in crate::verify::files_behind_memory(&stores.immutable).await {
@@ -303,29 +337,125 @@ impl Calls {
     }
 
     /// The stores of a call: the kept ones, or ones opened for it, with the claims they were
-    /// opened under.
-    async fn stores(&mut self) -> Result<(Stores, Option<Claims>), String> {
+    /// opened under. With `may_give_up`, the opening is given up on now and then, as a call's
+    /// caller may give up on it.
+    async fn stores(&mut self, may_give_up: bool) -> Result<(Stores, Option<Held>), String> {
         if let Some(stores) = self.kept.take() {
             return Ok((stores, None));
         }
         let work = self.work.clone();
-        let _opening = work.track(crate::work::OPEN);
-        let (stores, openings) = self.open().await?;
-        Ok((stores, Some(openings)))
+        let opening = work.track(crate::work::OPEN);
+        let give_up = self.give_up_after().filter(|_| may_give_up);
+        let (stores, openings) = match give_up {
+            Some(after) => {
+                let Ok(opened) = tokio::time::timeout(after, self.open()).await else {
+                    drop(opening);
+                    self.count("open-cancelled");
+                    self.work.cancelled(crate::work::OPEN);
+                    return Err("cancelled opening the stores".to_string());
+                };
+                opened?
+            }
+            None => self.open().await?,
+        };
+        Ok((stores, Some(Held::new(openings, &self.journal))))
     }
 
-    /// Claim `stores` for a call.
-    async fn claim(&self, stores: &Stores) -> Result<Claims, String> {
-        let _claiming = self.work.track(crate::work::CLAIM);
-        stores.claim().await
+    /// How long to wait before giving up on an opening or a claim, now and then, as on the
+    /// operations, see [`crate::work::Options::cancel`].
+    fn give_up_after(&mut self) -> Option<Duration> {
+        let options = self.work.options();
+        let (cancel, cancel_us) = (options.cancel, options.cancel_us);
+        self.rng
+            .chance(cancel / 2.0)
+            .then(|| Duration::from_micros(self.rng.below(cancel_us + 1)))
+    }
+
+    /// Claim `stores` for a call, giving up after `give_up`, if given.
+    async fn claim(&self, stores: &Stores, give_up: Option<Duration>) -> Result<Held, String> {
+        let claiming = self.work.track(crate::work::CLAIM);
+        let claimed = match give_up {
+            Some(after) => tokio::time::timeout(after, stores.claim())
+                .await
+                .unwrap_or_else(|_| {
+                    self.work.cancelled(crate::work::CLAIM);
+                    Err("cancelled claiming the stores".to_string())
+                }),
+            None => stores.claim().await,
+        };
+        drop(claiming);
+        claimed.map(|claims| Held::new(claims, &self.journal))
+    }
+
+    /// Claim `stores` for a call, and from up to `claimers - 1` tasks alongside, all at once, as
+    /// concurrent commands of a service claim the stores it keeps: one claim loads what another
+    /// process wrote, and the others wait for that load and join it rather than load again. Each
+    /// task runs a few operations under its claim once the call has read what other processes
+    /// journaled, which their reads are held to, as the returned sender says, then lets it go; a
+    /// task whose call failed first runs none. Returns the call's claim once every claim is made or
+    /// failed, so that the loads the call holds to the journal are all of theirs.
+    async fn claim_all(
+        &mut self,
+        stores: &Stores,
+    ) -> (Result<Held, String>, tokio::sync::watch::Sender<bool>) {
+        let extra = self.rng.below(self.claimers);
+        if extra > 0 {
+            self.count("concurrent-claims");
+        }
+        let (go, learned) = tokio::sync::watch::channel(false);
+        let (made, mut claimed) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..extra {
+            let (stores, work, journal, made, mut learned) = (
+                stores.clone(),
+                self.work.clone(),
+                self.journal.clone(),
+                made.clone(),
+                learned.clone(),
+            );
+            let (ops, seed) = (self.rng.below(4), self.rng.next());
+            let tasks = &mut self.claimer_tasks;
+            lore_base::lore_spawn!(tasks, async move {
+                let claiming = work.track(crate::work::CLAIM);
+                let claimed = stores.claim().await;
+                drop(claiming);
+                let _ = made.send(());
+                drop(made);
+                match claimed {
+                    Ok(claims) => {
+                        let held = Held::new(claims, &journal);
+                        if learned.wait_for(|learned| *learned).await.is_ok() {
+                            work.run_some(ops, seed).await;
+                        }
+                        drop(held);
+                    }
+                    Err(err) => work.unexpected("a concurrent claim", &err),
+                }
+            });
+        }
+        drop((made, learned));
+        let give_up = self.give_up_after();
+        let claim = self.claim(stores, give_up).await;
+        while claimed.recv().await.is_some() {}
+        (claim, go)
+    }
+
+    /// Wait for the tasks that claimed the stores alongside the call, see [`Self::claim_all`].
+    async fn join_claimers(&mut self) {
+        while let Some(joined) = self.claimer_tasks.join_next().await {
+            if let Err(err) = joined
+                && err.is_panic()
+            {
+                self.work.violation("panic", 0, 0, &err.to_string());
+            }
+        }
     }
 
     /// Check that the stores take writes again once the faults end, after `faults` of them, as
     /// [`Work::probe`] does, in a call of its own: on the kept stores, or on stores opened for it
     /// as a call opens them. An error is the stores refusing the call.
     async fn probe(&mut self, faults: c_long) -> Result<(), String> {
-        let (stores, openings) = self.stores().await?;
-        let claimed = self.claim(&stores).await;
+        let (stores, openings) = self.stores(false).await?;
+        let claimed = self.claim(&stores, None).await;
         drop(openings);
         let result = match claimed {
             Ok(claims) => {
@@ -342,8 +472,14 @@ impl Calls {
     /// Open the stores for a call. Each store object's life is a generation, so stores opened
     /// after the process's first start one.
     async fn open(&mut self) -> Result<(Stores, Claims), String> {
-        let (stores, openings) =
-            Stores::open(&self.dir, &self.config, self.keeps, self.flush_delay).await?;
+        let (stores, openings) = Stores::open(
+            &self.dir,
+            &self.config,
+            self.keeps,
+            self.flush_delay,
+            self.flush_background,
+        )
+        .await?;
         if self.opened {
             self.journal.renew().map_err(|err| err.to_string())?;
         }
@@ -374,9 +510,11 @@ impl Calls {
         self.end_generation(stores).await;
     }
 
-    /// Let `stores` go and end their generation. A collecting generation ends once its passes,
-    /// which hold the stores while they run, have let them go, so that none runs past its end.
+    /// Let `stores` go and end their generation, once the tasks it spawned ended. A collecting
+    /// generation ends once its passes, which hold the stores while they run, have let them go,
+    /// so that none runs past its end.
     async fn end_generation(&mut self, stores: Stores) {
+        self.work.join_spawned().await;
         self.work.use_stores(None, None);
         let immutable = Arc::downgrade(&stores.immutable);
         let mutable = Arc::downgrade(&stores.mutable);
@@ -399,8 +537,9 @@ impl Calls {
 
     /// Hold the loads a call's claims made to what the journal says another process did since
     /// this process's last call, the journal's line `since` on: see the module documentation.
-    /// `between` are the loads since the last call ended, which in a collecting process a pass
-    /// that claimed a kept store made for another process's write before this call claimed it.
+    /// `between` are the loads since the last call ended, which a collection pass or a delayed
+    /// flush that claimed a kept store made for another process's write before this call claimed
+    /// it.
     fn check_loads(
         &mut self,
         loads: [usize; 2],
@@ -414,7 +553,7 @@ impl Calls {
         for (index, store) in [Store::Immutable, Store::Mutable].into_iter().enumerate() {
             let name = ["immutable", "mutable"][index];
             let loaded = loads[index];
-            let reloaded_before = self.collection.is_some() && between[index] > 0;
+            let reloaded_before = between[index] > 0;
             if opened {
                 if loaded != 1 {
                     self.work.violation(
@@ -463,8 +602,11 @@ impl Calls {
     }
 
     /// Run a random number of operations on a random number of tasks, now and then with a
-    /// compaction and eviction task alongside. Flushes spawned to outlive their operations end
-    /// within the call, whose generation they journal under.
+    /// compaction and eviction task alongside, and wait for the tasks that claimed the stores
+    /// alongside the call. Tasks spawned to outlive their operations, which write only the
+    /// immutable store, end within the call, whose generation they journal under, or in a keeping
+    /// process, whose generation is its life, at times run on past it, holding the claims they
+    /// joined.
     async fn run_operations(&mut self) {
         self.work.allow(1 + self.rng.below(self.call_ops));
         let tasks = 1 + self.rng.below(self.tasks) as usize;
@@ -479,12 +621,17 @@ impl Calls {
                 self.work.violation("panic", 0, 0, &err.to_string());
             }
         }
-        self.work.join_spawned().await;
+        self.join_claimers().await;
+        if self.keeps && self.rng.chance(0.3) {
+            self.count("spawned-past-the-call");
+        } else {
+            self.work.join_spawned().await;
+        }
     }
 
-    /// Flush the stores, as a call ends, now and then dropping a flush unfinished as the
-    /// operations are, and return whether both flushed. A flush covers every operation of the call
-    /// when no delayed flush can run alongside it.
+    /// Flush the stores, as a call ends, now and then syncing, and now and then dropping a flush
+    /// unfinished as the operations are, and return whether both flushed. A flush covers every
+    /// operation of the call when no delayed flush can run alongside it.
     async fn flush(&mut self, stores: &Stores) -> bool {
         let strong = self.flush_delay >= 1000;
         let options = self.work.options();
@@ -492,11 +639,12 @@ impl Calls {
         for store in [Store::Immutable, Store::Mutable] {
             let cancel = self.rng.chance(options.cancel);
             let after = Duration::from_micros(self.rng.below(options.cancel_us + 1));
+            let sync = self.rng.chance(self.sync_flushes);
             let ending = self.work.track(crate::work::END);
-            let id = self.journal.flush_start(store, false, strong);
+            let id = self.journal.flush_start(store, sync, strong);
             let flushed = match cancel {
-                true => tokio::time::timeout(after, stores.flush_store(store)).await,
-                false => Ok(stores.flush_store(store).await),
+                true => tokio::time::timeout(after, stores.flush_store(store, sync)).await,
+                false => Ok(stores.flush_store(store, sync).await),
             };
             drop(ending);
             let flushed = flushed.map_or_else(
@@ -508,6 +656,8 @@ impl Calls {
             );
             if let Err(err) = &flushed {
                 eprintln!("a call's flush of the {store:?} store failed: {err}");
+                self.work
+                    .unexpected(&format!("a call's flush of the {store:?} store"), err);
             }
             self.journal.flush_end(store, id, flushed.is_ok());
             flushed_both &= flushed.is_ok();
@@ -520,9 +670,13 @@ impl Calls {
         let Some(stores) = self.kept.take() else {
             return;
         };
-        if let Ok(claims) = stores.claim().await {
-            self.flush(&stores).await;
-            drop(claims);
+        self.work.join_spawned().await;
+        match self.claim(&stores, None).await {
+            Ok(claims) => {
+                self.flush(&stores).await;
+                drop(claims);
+            }
+            Err(err) => self.work.unexpected("the last claim", &err),
         }
         self.end_generation(stores).await;
     }
@@ -534,6 +688,37 @@ impl Calls {
         }
         for (counter, increments) in self.work.increments() {
             println!("increments counter {counter}: {increments}");
+        }
+    }
+}
+
+/// Claims of the stores, journaled as made when they are, and as let go just before they go, see
+/// [`crate::journal`].
+struct Held {
+    claims: Claims,
+    journal: Arc<Journal>,
+}
+
+impl Held {
+    fn new(claims: Claims, journal: &Arc<Journal>) -> Held {
+        for (claim, store) in claims.iter().zip([Store::Immutable, Store::Mutable]) {
+            if claim.is_some() {
+                journal.claim(store, true);
+            }
+        }
+        Held {
+            claims,
+            journal: journal.clone(),
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for (claim, store) in self.claims.iter().zip([Store::Immutable, Store::Mutable]) {
+            if claim.is_some() {
+                self.journal.claim(store, false);
+            }
         }
     }
 }

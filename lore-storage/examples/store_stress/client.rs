@@ -70,7 +70,7 @@ const HANG_SECONDS: u64 = 60;
 
 /// The pause point `name` names, in lower case, where a `pause` or `cancel` request stops a call.
 fn pause_point(name: &str) -> Result<PausePoint, String> {
-    const POINTS: [(&str, PausePoint); 11] = [
+    const POINTS: [(&str, PausePoint); 12] = [
         ("reserved", PausePoint::Reserved),
         ("written", PausePoint::Written),
         ("located", PausePoint::Located),
@@ -82,6 +82,7 @@ fn pause_point(name: &str) -> Result<PausePoint, String> {
         ("evicting", PausePoint::Evicting),
         ("advanced", PausePoint::Advanced),
         ("scanning", PausePoint::Scanning),
+        ("listing", PausePoint::Listing),
     ];
     POINTS
         .iter()
@@ -91,6 +92,7 @@ fn pause_point(name: &str) -> Result<PausePoint, String> {
 }
 
 /// Both stores of a directory.
+#[derive(Clone)]
 pub struct Stores {
     pub immutable: Arc<LocalImmutableStore>,
     pub mutable: Arc<LocalMutableStore>,
@@ -102,18 +104,20 @@ pub type Claims = [Option<StoreGuard>; 2];
 
 impl Stores {
     /// Open the stores of `dir`, reusing their state across holds when `keeps`, with the claims
-    /// they were opened under.
+    /// they were opened under. With `flush_background`, the immutable store's durable writes
+    /// schedule its delayed flush too, as a service's do.
     pub async fn open(
         dir: &Path,
         config: &Config,
         keeps: bool,
         flush_delay: u64,
+        flush_background: bool,
     ) -> Result<(Stores, Claims), String> {
         let (immutable, immutable_opening) = LocalImmutableStore::new_claimed(
             Some(dir.to_path_buf()),
             ImmutableStoreSettings {
                 reuse_state_across_holds: keeps,
-                ..config.settings(false, flush_delay)
+                ..config.settings(flush_background, flush_delay)
             },
         )
         .await
@@ -143,19 +147,19 @@ impl Stores {
         Ok([immutable, mutable])
     }
 
-    /// Flush `store`.
-    pub async fn flush_store(&self, store: Store) -> Result<(), StoreError> {
+    /// Flush `store`, syncing what it writes when `sync`.
+    pub async fn flush_store(&self, store: Store, sync: bool) -> Result<(), StoreError> {
         match store {
-            Store::Immutable => ImmutableStore::flush(self.immutable.clone(), false).await,
-            Store::Mutable => MutableStore::flush(self.mutable.clone(), false).await,
+            Store::Immutable => ImmutableStore::flush(self.immutable.clone(), sync).await,
+            Store::Mutable => MutableStore::flush(self.mutable.clone(), sync).await,
         }
     }
 
     /// Flush the immutable store, then the mutable store.
     pub async fn flush(&self) -> [Result<(), StoreError>; 2] {
         [
-            self.flush_store(Store::Immutable).await,
-            self.flush_store(Store::Mutable).await,
+            self.flush_store(Store::Immutable, false).await,
+            self.flush_store(Store::Mutable, false).await,
         ]
     }
 
@@ -553,8 +557,14 @@ impl Client {
         let (stores, openings) = if let Some(stores) = self.kept.take() {
             (stores, None)
         } else {
-            let (stores, openings) =
-                Stores::open(&self.dir, &self.config, self.keeps, FLUSH_DELAY_SECONDS).await?;
+            let (stores, openings) = Stores::open(
+                &self.dir,
+                &self.config,
+                self.keeps,
+                FLUSH_DELAY_SECONDS,
+                false,
+            )
+            .await?;
             (stores, Some(openings))
         };
         let claims = stores.claim().await?;

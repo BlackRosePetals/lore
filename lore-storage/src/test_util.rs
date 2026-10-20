@@ -93,21 +93,44 @@ pub enum StoreTask {
     DelayedFlush,
     /// A group's delayed flush in the mutable store.
     MutableDelayedFlush,
-    /// An eviction or compaction pass the store starts itself, periodic or when loading crosses a
-    /// cap.
-    Collection,
+    /// A pass of the periodic evictor.
+    Evictor,
+    /// A step of the periodic compactor.
+    Compactor,
+    /// An eviction then compaction pass run as one, as a load crossing a cap fires.
+    GcPass,
 }
 
 impl StoreTask {
     /// Every task, in the order [`count_store_tasks`] counts them, with its name.
-    pub const ALL: [(StoreTask, &'static str); 3] = [
+    pub const ALL: [(StoreTask, &'static str); 5] = [
         (StoreTask::DelayedFlush, "delayed-flush"),
         (StoreTask::MutableDelayedFlush, "mutable-delayed-flush"),
-        (StoreTask::Collection, "collection"),
+        (StoreTask::Evictor, "evictor"),
+        (StoreTask::Compactor, "compactor"),
+        (StoreTask::GcPass, "gc-pass"),
     ];
 }
 
 static STORE_TASKS: OnceLock<&'static [AtomicUsize]> = OnceLock::new();
+
+static EVICTOR_FLOOR: AtomicUsize = AtomicUsize::new(0);
+
+/// Makes the periodic evictor enforce capacities down to `floor` fragments in this process,
+/// rather than raising any capacity below its floor to the floor, so that a test's small stores
+/// meet its passes.
+pub fn lower_evictor_floor(floor: usize) {
+    EVICTOR_FLOOR.store(floor.max(1), Ordering::Relaxed);
+}
+
+/// The floor the periodic evictor raises a capacity to: the one [`lower_evictor_floor`] set, or
+/// `default`.
+pub(crate) fn evictor_floor(default: usize) -> usize {
+    match EVICTOR_FLOOR.load(Ordering::Relaxed) {
+        0 => default,
+        floor => floor,
+    }
+}
 
 /// Counts each [`StoreTask`] running in `counters`, one per task in the order of
 /// [`StoreTask::ALL`], from now on in this process.

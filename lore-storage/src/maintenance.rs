@@ -38,6 +38,10 @@ pub fn spawn_gc(store: &Arc<dyn ImmutableStore>, options: &ImmutableStoreCreateO
     }
 }
 
+/// The fewest fragments the periodic evictor enforces a capacity down to: a lower capacity is raised
+/// to it, so that its passes leave small stores alone.
+const EVICTOR_FLOOR: usize = 1024 * 1024;
+
 /// Evictor task: enforces max capacity at regular intervals.
 pub async fn evictor(
     store: Weak<dyn ImmutableStore>,
@@ -47,7 +51,11 @@ pub async fn evictor(
 ) {
     use std::cmp::max;
 
-    let max_capacity = max(max_capacity, 1024 * 1024);
+    #[cfg(feature = "test-util")]
+    let floor = crate::test_util::evictor_floor(EVICTOR_FLOOR);
+    #[cfg(not(feature = "test-util"))]
+    let floor = EVICTOR_FLOOR;
+    let max_capacity = max(max_capacity, floor);
     let eviction_delay = eviction_delay.unwrap_or(Duration::from_secs(10));
     lore_base::lore_debug!("Store evictor enforcing max capacity of {max_capacity}");
     // No startup pass: sleep first so short-lived processes exit before the first scan.
@@ -59,7 +67,7 @@ pub async fn evictor(
                 break;
             };
             #[cfg(feature = "test-util")]
-            let _task = crate::test_util::store_task(crate::test_util::StoreTask::Collection);
+            let _task = crate::test_util::store_task(crate::test_util::StoreTask::Evictor);
             // Background maintenance is silent — not tied to any command's event stream.
             if let Err(err) = real_store.evict(max_capacity, sync_data, None).await {
                 lore_base::lore_warn!("Store evictor failed: {err}");
@@ -96,7 +104,7 @@ pub async fn compactor(
                 break;
             };
             #[cfg(feature = "test-util")]
-            let _task = crate::test_util::store_task(crate::test_util::StoreTask::Collection);
+            let _task = crate::test_util::store_task(crate::test_util::StoreTask::Compactor);
             // A pass that was stopped rather than finished leaves its resume point behind,
             // so re-reading after the wait picks that group back up instead of restarting.
             if at.is_none() {
@@ -135,7 +143,7 @@ pub async fn gc(
     sink: Option<GcEventSinkRef>,
 ) {
     #[cfg(feature = "test-util")]
-    let _task = crate::test_util::store_task(crate::test_util::StoreTask::Collection);
+    let _task = crate::test_util::store_task(crate::test_util::StoreTask::GcPass);
     if max_capacity > 0 {
         let _ = store
             .clone()

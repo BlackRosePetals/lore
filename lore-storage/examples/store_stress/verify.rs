@@ -103,13 +103,18 @@ pub async fn main(args: &Args) -> u8 {
         let class = violation.split(' ').nth(2).unwrap_or("unknown");
         report.violation(&format!("online-{class}"), violation.clone());
     }
+    for overlap in &history.overlaps {
+        report.violation("claims-overlapped", overlap.clone());
+    }
     audit_files(&dir, &config, &mut report);
 
+    crate::coverage::capture_logs();
     let mut code = check_store(&dir, &config, &history, &mut report, "first open", false).await;
     crate::mutable::verify(&dir, &config, &history, &mut report).await;
     if code == 0 && args.flag("deep") {
         code = deep(&dir, &config, &history, &mut report).await;
     }
+    repairs(&mut report);
     println!(
         "journal: {} lines, {} generations, {} clean ends",
         history.lines, history.generations, history.clean_ends
@@ -124,6 +129,23 @@ pub async fn main(args: &Args) -> u8 {
     } else {
         println!("RESULT: clean");
         0
+    }
+}
+
+/// Each repair the stores logged while verify opened and checked them, as a violation: dropping a
+/// bucket file they could not parse, or the locations of payloads past the end of their packfile.
+/// Every file the stores write lands whole or not at all, and every payload before the entry that
+/// points at it, so neither a process stopped at any point nor a failed file operation leaves what
+/// these repair; only a machine losing writes, which the suite does not simulate, or a defect does.
+fn repairs(report: &mut Report) {
+    for (milestone, class) in crate::coverage::REPAIRS {
+        let reached = crate::coverage::reached(milestone);
+        if reached > 0 {
+            report.violation(
+                class,
+                format!("the stores logged {milestone} {reached} times"),
+            );
+        }
     }
 }
 
@@ -150,7 +172,7 @@ async fn deep(dir: &Path, config: &Config, history: &History, report: &mut Repor
                 Ok(Some(next)) => at = Some(next),
                 Ok(None) => break,
                 Err(err) => {
-                    report.note("deep-compaction-error", err.to_string());
+                    report.violation("deep-compaction-error", err.to_string());
                     break;
                 }
             }

@@ -17,6 +17,10 @@
 //! `<gen> es <id>` starts an eviction pass and `ee <id> <removed>` ends it; `cs <id>` and `ce <id>`
 //! do the same for a compaction pass, whose size eviction may take payloads.
 //!
+//! `<gen> c <store> on` records that a claim of the immutable (`i`) or mutable (`m`) store was
+//! made, and `<gen> c <store> off` that one is about to be let go: a process holds the store's
+//! flock throughout, so two processes' claims never overlap, see [`History::overlaps`].
+//!
 //! `<gen> g start pid=<pid> ...` starts a generation, with `shared` among its words when other
 //! processes use the store alongside it, and `<gen> g end` ends it cleanly. `0 g dead pid=<pid>`
 //! records that process `pid` was killed, ending its shared generations. A generation that is not
@@ -189,6 +193,18 @@ impl Journal {
             self.log(format_args!("ee {id} {removed}"));
         }
     }
+
+    /// Record that a claim of `store` was made, or with `!held` is about to be let go.
+    pub fn claim(&self, store: Store, held: bool) {
+        let store = match store {
+            Store::Immutable => "i",
+            Store::Mutable => "m",
+        };
+        self.log(format_args!(
+            "c {store} {}",
+            if held { "on" } else { "off" }
+        ));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,6 +370,14 @@ pub struct History {
     /// Whether any run healed the store, which drops entries.
     pub healed: bool,
     pub violations: Vec<String>,
+    /// Claims one process made of a store while another process's generation held it, see
+    /// [`History::claim`].
+    pub overlaps: Vec<String>,
+    /// Per store and generation, how many of its claims are held.
+    claims: HashMap<(char, u64), usize>,
+    /// Per store and generation holding claims, the claims of other processes made meanwhile,
+    /// each its generation and line.
+    claimed_meanwhile: HashMap<(char, u64), Vec<(u64, usize)>>,
     pub generations: u64,
     pub clean_ends: u64,
     pub lines: usize,
@@ -516,6 +540,7 @@ impl History {
                 }
             }
             "v" => self.violations.push(line.to_string()),
+            "c" => self.claim(generation, &rest, line_number),
             "g" => self.lifetime(generation, &rest, line_number),
             _ => {}
         }
@@ -529,6 +554,60 @@ impl History {
             Target::Mutable(key) => self.mutable.get_mut(&key),
         };
         events?.get_mut(index)
+    }
+
+    /// Take a `c` line: a claim of a store made, or about to be let go. A claim made while a
+    /// generation of another process held claims of the same store overlaps them once that
+    /// generation lets go of all of them, which shows that it held them throughout. A generation
+    /// whose process was killed holding one never lets go, and shows nothing.
+    fn claim(&mut self, generation: u64, words: &[&str], line: usize) {
+        let store = match words.first().copied() {
+            Some("i") => 'i',
+            Some("m") => 'm',
+            _ => return,
+        };
+        let pid = |generation: u64| self.lifetimes.get(&generation).and_then(|life| life.pid);
+        match words.get(1).copied() {
+            Some("on") => {
+                for (&(held, holder), &count) in &self.claims {
+                    if held == store && count > 0 && pid(holder) != pid(generation) {
+                        self.claimed_meanwhile
+                            .entry((store, holder))
+                            .or_default()
+                            .push((generation, line));
+                    }
+                }
+                *self.claims.entry((store, generation)).or_default() += 1;
+            }
+            Some("off") => {
+                let Some(count) = self.claims.get_mut(&(store, generation)) else {
+                    return;
+                };
+                *count = count.saturating_sub(1);
+                if *count > 0 {
+                    return;
+                }
+                for (other, at) in self
+                    .claimed_meanwhile
+                    .remove(&(store, generation))
+                    .unwrap_or_default()
+                {
+                    self.overlaps.push(format!(
+                        "generation {other} claimed the {store} store at line {at}, while \
+                         generation {generation} held it until line {line}"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Forget the claims of the generations `ended` says ended, as a process killed holding them
+    /// left them: it let none of them go, and none overlapped another.
+    fn forget_claims(&mut self, ended: impl Fn(u64) -> bool) {
+        self.claims.retain(|(_, generation), _| !ended(*generation));
+        self.claimed_meanwhile
+            .retain(|(_, generation), _| !ended(*generation));
     }
 
     /// Take a `g` line: a generation starting, ending, its process killed, or collecting
@@ -555,6 +634,7 @@ impl History {
                 if let Some(lifetime) = self.lifetimes.get_mut(&generation) {
                     lifetime.end = Some(line);
                 }
+                self.forget_claims(|ended| ended == generation);
             }
             Some("dead") => {
                 for lifetime in self.lifetimes.values_mut() {
@@ -562,6 +642,11 @@ impl History {
                         lifetime.end = Some(line);
                     }
                 }
+                let lifetimes = std::mem::take(&mut self.lifetimes);
+                self.forget_claims(|ended| {
+                    lifetimes.get(&ended).is_some_and(|life| life.pid == pid)
+                });
+                self.lifetimes = lifetimes;
             }
             Some("gc-unseen") => {
                 self.unseen_gc.insert(generation);

@@ -87,6 +87,11 @@ pub struct Config {
     pub initial_level: usize,
     /// Whether every sixteenth key is a fragment list over other keys.
     pub lists: bool,
+    /// How many groups a compaction step covers, and the percentages of their caps eviction and
+    /// compaction reclaim down to: set per run, never saved with the directory's configuration.
+    pub compaction_groups: usize,
+    pub target_capacity: usize,
+    pub target_size: usize,
 }
 
 impl Config {
@@ -118,6 +123,25 @@ impl Config {
             fan_out_threshold: args.number("fan-out-threshold", 24).max(1) as usize,
             initial_level: args.number("initial-level", if server { 256 } else { 1 }) as usize,
             lists: args.flag("lists"),
+            compaction_groups: 8,
+            target_capacity: 70,
+            target_size: 70,
+        }
+        .tuned(args)
+    }
+
+    /// This configuration with the settings a run varies, see [`Config::compaction_groups`], as
+    /// `args` give them.
+    fn tuned(self, args: &Args) -> Config {
+        Config {
+            compaction_groups: args
+                .number("compaction-groups", self.compaction_groups as u64)
+                .clamp(1, 256) as usize,
+            target_capacity: args
+                .number("target-capacity", self.target_capacity as u64)
+                .min(100) as usize,
+            target_size: args.number("target-size", self.target_size as u64).min(100) as usize,
+            ..self
         }
     }
 
@@ -126,7 +150,7 @@ impl Config {
     pub fn load_or_create(dir: &Path, args: &Args) -> std::io::Result<Config> {
         let path = dir.join(CONFIG_FILE);
         if let Ok(text) = std::fs::read_to_string(&path) {
-            return Ok(Config::parse(&text));
+            return Ok(Config::parse(&text).tuned(args));
         }
         std::fs::create_dir_all(dir)?;
         let config = Config::from_args(args);
@@ -210,19 +234,23 @@ impl Config {
             flush_delay_seconds,
             initial_fan_out_level: self.initial_level,
             fan_out_threshold: self.fan_out_threshold,
+            compaction_parallel_groups: self.compaction_groups,
+            target_capacity_percentage: self.target_capacity,
+            target_size_percentage: self.target_size,
             ..ImmutableStoreSettings::default()
         }
     }
 
     /// The settings the mutable store is opened with, reusing its state across holds of its lock
-    /// when `reuse`.
+    /// when `reuse`. A server's store is the source of truth, which fails a load of a bucket it
+    /// cannot read rather than starting it empty.
     pub fn mutable_settings(&self, flush_delay_seconds: u64, reuse: bool) -> MutableStoreSettings {
         MutableStoreSettings {
             flush_delay_seconds,
             initial_fan_out_level: self.initial_level,
             fan_out_threshold: self.fan_out_threshold,
+            authoritative: self.server,
             reuse_state_across_holds: reuse,
-            ..MutableStoreSettings::default()
         }
     }
 

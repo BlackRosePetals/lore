@@ -19,10 +19,20 @@ use parking_lot::Mutex;
 
 static LOG_EVENTS: LazyLock<Mutex<BTreeMap<String, u64>>> = LazyLock::new(Mutex::default);
 
+type RepairHook = Box<dyn Fn(&str, &str) + Send + Sync>;
+
+static REPAIR_HOOK: std::sync::OnceLock<RepairHook> = std::sync::OnceLock::new();
+
+/// Call `hook` with the violation class and the message of each repair, see [`REPAIRS`], the store
+/// logs from now on, as it logs it: a process stopped later still records it.
+pub fn on_repair(hook: impl Fn(&str, &str) + Send + Sync + 'static) {
+    let _ = REPAIR_HOOK.set(Box::new(hook));
+}
+
 /// The store events a run should reach, by the words of the message the store logs for each,
 /// numbers left out. Some are logged as the store sets out to do something, which their names
-/// say. The last two take a machine failure or a damaged file, so a gap there is expected.
-const MILESTONES: [(&str, &str); 15] = [
+/// say. The last three are repairs, see [`REPAIRS`].
+const MILESTONES: [(&str, &str); 16] = [
     ("compaction truncating a packfile", "truncating packfile"),
     (
         "compaction kept a referenced packfile",
@@ -65,11 +75,38 @@ const MILESTONES: [(&str, &str); 15] = [
     ("already obliterated", "already obliterated"),
     ("lost payload locations cleared", "Cleared "),
     ("corrupt bucket reset", "Resetting corrupt immutable bucket"),
+    (
+        "corrupt mutable bucket reset",
+        "Resetting corrupt mutable bucket",
+    ),
+];
+
+/// The milestones that are repairs of what only a machine losing writes or a damaged file leaves,
+/// which no run is expected to reach, each with the violation class reaching it is.
+pub const REPAIRS: [(&str, &str); 3] = [
+    (
+        "lost payload locations cleared",
+        "store-cleared-lost-payload-locations",
+    ),
+    ("corrupt bucket reset", "store-reset-a-corrupt-bucket"),
+    (
+        "corrupt mutable bucket reset",
+        "store-reset-a-corrupt-mutable-bucket",
+    ),
 ];
 
 fn log_callback(level: LoreLogLevel, _location: &str, message: &str) {
     if level < LoreLogLevel::Debug {
         return;
+    }
+    if let Some(hook) = REPAIR_HOOK.get()
+        && let Some((_, class)) = REPAIRS.iter().find(|(milestone, _)| {
+            MILESTONES
+                .iter()
+                .any(|(name, pattern)| name == milestone && message.contains(pattern.trim()))
+        })
+    {
+        hook(class, message);
     }
     // Messages differ by the numbers and hashes in them; the words name the event. Enough of
     // them to hold every milestone's pattern whole.
@@ -367,11 +404,8 @@ pub fn report_logs() -> Vec<String> {
     for (milestone, _) in MILESTONES {
         let reached = reached(milestone);
         println!("COVERAGE event {} {reached}", milestone.replace(' ', "-"));
-        let needs_machine_failure = matches!(
-            milestone,
-            "lost payload locations cleared" | "corrupt bucket reset"
-        );
-        if reached == 0 && !needs_machine_failure {
+        let repair = REPAIRS.iter().any(|(name, _)| *name == milestone);
+        if reached == 0 && !repair {
             missing.push(milestone.to_string());
         }
     }

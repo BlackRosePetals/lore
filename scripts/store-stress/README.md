@@ -5,26 +5,34 @@ and `lore-storage/src/packstore.rs`), and for the local stores shared by process
 (`lore-storage/src/local/store_lock.rs`, with `lore-storage/src/local/mutable_store.rs`), run by
 hand when the stores change, not in CI. It runs on Linux.
 
-It looks for four things:
+It looks for five things:
 
 - **Corruption.** Every payload read back, and every payload location read straight from the
-  packfiles, must be the bytes stored for that hash.
+  packfiles, must be the bytes stored for that hash, and a store must never have to repair its
+  files: drop a bucket file it cannot parse, or clear payload locations past the end of their
+  packfile. Every file it writes lands whole or not at all, and every payload before the entry
+  that points at it, so only a machine losing writes leaves what those repair.
 - **Loss.** An entry a flush acknowledged must survive the process being killed afterwards.
 - **Broken guarantees.** An obliterated association must stay obliterated, `put` must refuse
   invalid fragments, and an entry's flags must agree with its data.
 - **Stale state.** A process that keeps its stores between calls must reload a store another
   process wrote to since, and only then, and no update another process acknowledged may be lost,
-  in either store.
+  in either store. No two processes may hold a store's claims at once.
+- **Unexplained errors.** With no simulated I/O error and nothing in the environment refusing file
+  operations, the store may fail an operation only for what the run's own operations explain: one
+  dropped unfinished, or one that found no entry or no payload to act on.
 
 It builds every extreme that arises on its own, short of a machine failure. Nothing outside the
 store writes over or removes its files. A power loss or kernel crash is out of scope for the runs;
 a durability gap only such a failure would expose is reported, not tested for.
 
 - processes killed at random moments, or at an exact file operation, including part way through a
-  write, and again while the next process recovers what the last kill left;
+  write, and again, the same ways, while the next process recovers what the last kill left;
 - simulated errors in every kind of file operation the store makes (writes, syncs, renames,
   truncates, unlinks, directory creation, opens, reads, stats and directory listings), each with
-  an errno that operation can meet on its own, and short reads and writes;
+  an errno that operation can meet on its own, and short reads and writes, during a recovery too,
+  through a run's end and its store's shutdown, and followed by a kill once the store is on its
+  error paths;
 - kills and errors aimed at each kind of file of either store (packfiles, bucket files and their
   temporary and `.new` copies, level markers, pending fan-out sentinels, the compaction resume
   file, epoch files, directories), and at the store operation running when they land;
@@ -34,17 +42,24 @@ a durability gap only such a failure would expose is reported, not tested for.
 - file operations slowed, as on a slow device;
 - a full disk, and a process out of file descriptors;
 - heavy concurrency, with compaction and eviction running continuously alongside every read and
-  write;
+  write, the store's own evictor, compactor and load-triggered passes in every kind of process,
+  and kills and faults aimed at their steps;
 - packfiles filling at the size limit, fan-outs through every level, and buckets too large to read
   in one piece;
 - both I/O backends, `psync` and `uring`;
 - crash windows reproduced exactly from snapshots taken at the store's test pause points;
 - several processes using one store directory in calls, some keeping their stores between calls
-  and some opening them for each, killed at random moments or at an exact file operation, in calls
-  or between them, with changes unflushed or with a fan-out commit half made, under faults on
-  either store's files, and dropping operations and flushes unfinished;
+  and some opening them for each, client and server shaped, killed at random moments or at an
+  exact file operation, in calls or between them, with changes unflushed or with a fan-out commit
+  half made, under faults on either store's files, and dropping operations, flushes, openings and
+  claims unfinished;
+- a process's stores claimed from several tasks at once, as a service's concurrent commands claim
+  them, as another process's write leaves them to reload;
 - operations run outside any span, each claiming the store for itself, and inside spans, as
-  commands run them.
+  commands run them, and flushes, puts and copies run in tasks that outlive their operations on
+  the claims those joined;
+- the store settings a service varies: how many groups a compaction step covers, and the shares
+  of their caps eviction and compaction reclaim down to.
 
 Every kill, fault and cancellation is counted against the store operations running when it
 landed and the step, the file operation and kind of file, it landed in. A kill that landed between
@@ -71,17 +86,26 @@ and faults at the operations' own steps that none has hit yet in the campaign.
     It also holds every read to what the run settled, as it goes: for the variants eviction may
     not take, it follows each key from the journal's expectations and each operation the run makes,
     and a read run with nothing else on its key must find the entry, the payload, or the tombstone
-    that settled. A read that fails for anything but the system refusing it fails the run, as does
-    a claim, and a claim the system refused is noted as `claim-refused-by-the-system`. With
-    `--cancel <share>`, it drops that share of operations unfinished. With `--liveness`, once the
-    run ends, it ends the shim's faults and checks that the store takes puts and flushes again in
-    the same process. With `--spans <n>`, each task runs its operations in spans of up to `n`
-    claimed with `hold_for_command`, as commands do, and the sampler that asks the store its
-    shapes, fragment count and availability every 250 ms claims a span for each sample. With
-    `--spawn-flushes <share>`, that share of flushes runs in tasks outliving their operation on the
-    claim it joined. Without `--spans`, each operation claims the store for itself. After a final
-    flush, it holds every bucket file to what the store holds in memory, where no simulated I/O
-    errors reach the store's files.
+    that settled. A read that fails for anything but the system refusing it fails the run. Without
+    simulated I/O errors, packfile write or sync failures in the mix, or `--environment-errors`,
+    which `disk-full` and `emfile` pass, any error but an operation dropped unfinished, an address
+    not found or a payload not found fails the run as `unexpected-error`, as does any claim that
+    fails; with them, a claim the system refused is noted as `claim-refused-by-the-system`. A store
+    repair it logs, see above, fails the run as it is logged. With `--cancel <share>`, it drops
+    that share of operations unfinished. With `--liveness`, once the run ends, it ends the shim's
+    faults and checks that the store takes puts and flushes again in the same process. With
+    `--spans <n>`, each task runs its operations in spans of up to `n` claimed with
+    `hold_for_command`, as commands do, and the sampler that asks the store its shapes, fragment
+    count and availability every 250 ms claims a span for each sample. With `--spawn-flushes
+    <share>` and `--spawn-ops <share>`, that share of flushes, and of puts and copies, runs in tasks
+    outliving their operation on the claim it joined, in spans or not; a panic in such a task is
+    classed apart, as `<panic> in a spawned task`. Without `--spans`, each operation claims the
+    store for itself. `--compaction-groups`, `--target-capacity` and
+    `--target-size` set the store's compaction parallel groups and target percentages, and
+    `--evictor-floor` lowers the periodic evictor's floor of a million fragments, so that its passes
+    evict from small stores. After a final flush, it holds every bucket file to what the store
+    holds in memory, where no simulated I/O errors reach the store's files and nothing in the
+    environment refuses file operations.
   - `calls <dir>` runs the same workload, with the mutable store's stores, loads, swaps and lists
     added, as one of several processes using `<dir>` at once, in calls as client processes make
     them: a call claims both stores, runs a random number of operations on a random number of
@@ -97,11 +121,18 @@ and faults at the operations' own steps that none has hit yet in the campaign.
     simulated I/O errors reach the store's files. A call that fails before it reads the journal
     leaves the loads of the next call's claims unchecked, since a store it claimed had loaded for
     writes the next call is the first to read. With `--gc-max-size` or `--gc-max-capacity`, a
-    process that keeps its stores collects the immutable store's garbage as a client does: a load
-    crossing a cap fires a pass, and with `--background-gc` the store's own passes run every
-    `--gc-delay-ms`, between calls and during them. The journal does not see those passes, so
-    another process's kept store may reload for them, and the generation ends only once they have
-    let its stores go. `--prefill-near-limit` fills the packfiles before
+    process collects the immutable store's garbage as a client does: a load crossing a cap fires a
+    pass, and with `--background-gc` the store's own passes run every `--gc-delay-ms`, between
+    calls and during them. The journal does not see those passes, so another process's kept store
+    may reload for them, and the generation ends only once they have let its stores go. With
+    `--flush-background`, the immutable store's durable writes schedule its delayed flush too, as a
+    service's do. With `--claimers <n>`, a call claims its stores from up to `n - 1` tasks besides
+    its own claim, all at once, each running a few operations once its claim is made: one claim
+    loads what another process wrote, and the rest must join it rather than load again.
+    `--sync-flushes <share>` syncs that share of the flushes ending calls, and the mix flushes the
+    mutable store amid its writes, with and without a sync. `--cancel` also gives up on openings
+    and claims, which fails the call. A call or a flush that fails where the store may not fail
+    one, as for `work`, fails the run. `--prefill-near-limit` fills the packfiles before
     the stores open, as for `work`, and `--liveness` runs the probe as a call of its own once the
     run ends, on the kept stores or on stores opened for it, the mutable store included: a store,
     a flush and a load of it must succeed as the immutable store's puts, flush and gets must.
@@ -114,9 +145,9 @@ and faults at the operations' own steps that none has hit yet in the campaign.
     and a load below what the journal settled or a swap that succeeds from it is a lost update. A
     call also holds the loads its claims made to the journal: a kept store reloads at its claim
     when another process acknowledged a write to it since, never more than once, and not at all
-    when no other process could have written, and stores opened afresh load once each. The
-    orchestrator appends `0 g dead pid=<pid>` once a process is gone, which ends what it left
-    running in the journal.
+    when no other process could have written, and stores opened afresh load once each. Every claim
+    is journaled from when it is made until just before it is let go. The orchestrator appends
+    `0 g dead pid=<pid>` once a process is gone, which ends what it left running in the journal.
   - `verify <dir> [--deep]` checks the store against the journal and against its own files.
     - It audits the files as the kill left them, before an open recovers anything.
     - It reopens the store and loads the whole index, then checks every entry: sort order, bucket
@@ -132,7 +163,12 @@ and faults at the operations' own steps that none has hit yet in the campaign.
     - Expectations come from the journal: an entry settles once a flush that started after its
       operation succeeded, and stays settled until an obliterate, or an eviction or compaction
       pass that may have taken it, ran after it.
-    - `--deep` then compacts every group, flushes with a sync, reopens, and checks again.
+    - `--deep` then compacts every group, flushes with a sync, reopens, and checks again; a
+      compaction that fails there is a violation.
+    - It holds the claims the journal records to the flock: a claim one process made while
+      another process held claims of the same store, which it showed by letting them go later, is
+      `claims-overlapped`.
+    - A repair the stores log while it opens and checks them is a violation, see above.
     - Where the journal records mutable operations, it holds each mutable key to the value the
       journal settled, or to one some process stored, and `list` to the loads. It holds each
       counter to the swaps: every swap a flush settled is in its value, no two settled swaps
@@ -203,15 +239,15 @@ The modes:
 
 | Mode | What it does |
 |---|---|
-| `kill-loop` | Random stores and workloads, client and server shaped, on either I/O backend, several generations per store directory, with operations in spans or outside them. Most generations are killed with SIGKILL at a random moment, some while the store opens, placed from the shim's state on `psync`; the rest end by flushing, syncing, exiting without a flush, or aborting. Each generation is verified on a copy, a quarter of them deeply, so that the next generation recovers what the kill left itself. |
-| `gc-storm` | As `kill-loop`, with compaction and eviction tasks running flat out, the store's own background evictor and compactor on, tiny size and capacity caps, and groups fanning out throughout, which interrupts compaction and size eviction. |
-| `crash-sweep` | Counts where a workload's file operations fall, by operation, file kind and running store operation, over a store that is empty, grown, or grown up to the packfile size limit; the workload is `work`, or one `calls` process, which uses both stores. Then kills copies of it before, after, or in the middle of operations picked evenly across those kinds. Verifies a copy, lets a second process recover the store, killing it during the recovery at times, and verifies deeply. |
-| `fault-sweep` | As `crash-sweep`, failing the picked operations instead, reads, stats and listings included, with an error each meets on its own, by index or at random, sometimes as a short read or write. Checks that the store takes writes again once the faults end, verifies a copy, runs again without faults, and verifies deeply. |
-| `disk-full` | Runs stores on a tmpfs of a few megabytes, in a container (`docker`, `--image` with the host's libc), until the disk fills, keeps writing, frees space, writes again, and verifies. |
-| `emfile` | Runs stores under a descriptor limit low enough that opens fail, then verifies with a normal limit. |
+| `kill-loop` | Random stores and workloads, client and server shaped, on either I/O backend, several generations per store directory, with operations in spans or outside them. Most generations are killed with SIGKILL at a random moment, some while the store opens, placed from the shim's state on `psync`; the rest end by flushing, syncing, exiting without a flush, or aborting. Runs on `psync` count where their file operations fall, and some are killed by the shim, or meet its faults, at a step of a store operation picked among those no kill or fault has reached in the campaign, now and then a kill once faults sent the store down its error paths. Each generation is verified on a copy, a quarter of them deeply, so that the next generation recovers what the kill left itself. |
+| `gc-storm` | As `kill-loop`, with compaction and eviction tasks running flat out, the store's own background evictor and compactor on, tiny size and capacity caps, and groups fanning out throughout, which interrupts compaction and size eviction. More of its runs are killed or faulted at a step picked that way, all of them in compaction or eviction, whether the workload runs it or the store's own passes. |
+| `crash-sweep` | Counts where a workload's file operations fall, by operation, file kind and running store operation, over a store that is empty, grown, or grown up to the packfile size limit; the workload is `work`, or one `calls` process, which uses both stores, now and then one left to the store's own collection passes. Then kills copies of it before, after, or in the middle of operations picked evenly across those kinds. Verifies a copy, lets a second process recover the store, as it opens or as a claim finds what the kill left, killing it before, after or in the middle of a file operation during the recovery at times, or failing file operations of a kind during it, and verifies deeply. The counting run is checked as a run of its own. |
+| `fault-sweep` | As `crash-sweep`, failing the picked operations instead, reads, stats and listings included, with an error each meets on its own, by index or at random, sometimes as a short read or write, and a quarter of those that change the disk followed by a kill at a later one. Most runs check that the store takes writes again once the faults end; the rest leave the faults on through the run's end and its store's shutdown. Verifies a copy, runs again without faults, and verifies deeply. |
+| `disk-full` | Runs stores on a tmpfs of a few megabytes, in a container (`docker`, `--image` with the host's libc), until the disk fills, keeps writing, frees space, writes again, and verifies. A run whose disk never filled is noted. |
+| `emfile` | Runs stores under a descriptor limit low enough that opens fail, in `work` or in one `calls` process, then verifies with a normal limit. |
 | `scenarios` | Every deterministic scenario, under both builds, and the production build again on `uring`. |
 | `retention` | Every retention script, under both builds, and the production build again on `uring`. |
-| `multi-process` | Rounds of up to `--processes` `calls` processes on one store directory, half, all or none of them keeping their stores, some for a keep-alive window, each killed with SIGKILL at random moments and started again, the store's options random, its fan-out threshold low, and now and then its packfiles filled near the size limit first. In some rounds the keeping processes collect the immutable store's garbage as clients do. Every process drops operations and flushes unfinished, and most run under the shim, which places each kill; some under its faults on either store's files, most of those checking once their calls end that their stores take a call again, some killed by it, or failed by it, at a file operation of a kind in a store operation picked among the steps no kill or fault has reached in the campaign, a claim's recovery of another process's half-made fan-out commit among them, and some with their file operations slowed past a keep-alive window. Each round is verified on a copy, a quarter of them deeply, and the next round carries on from what the last left. |
+| `multi-process` | Rounds of up to `--processes` `calls` processes on one store directory, half, all or none of them keeping their stores, some for a keep-alive window, each killed with SIGKILL at random moments and started again, the store's options random, client or now and then server shaped, its fan-out threshold low, and now and then its packfiles filled near the size limit first. In some rounds processes collect the immutable store's garbage as clients do. Processes claim their stores from several tasks at once, schedule delayed flushes of durable writes, sync the flushes ending calls and leave tasks running past calls, now and then. Every process drops operations, flushes, openings and claims unfinished, and most run under the shim, which places each kill; some under its faults on either store's files, most of those checking once their calls end that their stores take a call again, some killed by it, or failed by it, at a file operation of a kind in a store operation picked among the steps no kill or fault has reached in the campaign, a claim's recovery of another process's half-made fan-out commit among them, and some with their file operations slowed past a keep-alive window. Each round is verified on a copy, a quarter of them deeply, and the next round carries on from what the last left. |
 
 Useful options:
 
@@ -224,7 +260,9 @@ Useful options:
 
 `report [<results>]` merges every campaign under a results directory: violations, reports and
 harness failures with the campaigns that found them, coverage summed over all of them, and the
-gaps none reached. It exits non-zero when any campaign found a violation.
+gaps none reached. It exits non-zero when any campaign found a violation or a harness failure:
+a process that exited other than as its run allows, as a crash or a hang leaves, or a
+deterministic pass in which a case never reported.
 
 Results go to `target/store-stress/results/<mode>-<time>/`:
 

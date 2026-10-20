@@ -2543,7 +2543,7 @@ async fn a_successor_store_waits_for_a_dropped_store_s_writes(dir: PathBuf) -> O
             let first = keys(&config, 0..255, 64..4096, 2, &mut taken);
             let held_key = keys(&config, 0..255, 64..4096, 1, &mut taken)[0];
             let later = keys(&config, 0..255, 64..4096, 4, &mut taken);
-            let Ok((stores, claims)) = Stores::open(&run, &config, keeps, 3600).await else {
+            let Ok((stores, claims)) = Stores::open(&run, &config, keeps, 3600, false).await else {
                 return Outcome::Fail(format!("{case}: the stores did not open"));
             };
             for &key in &first {
@@ -2580,7 +2580,7 @@ async fn a_successor_store_waits_for_a_dropped_store_s_writes(dir: PathBuf) -> O
             let successor_dir = run.clone();
             let successor_config = config.clone();
             let mut opening = lore_base::lore_spawn!(async move {
-                Stores::open(&successor_dir, &successor_config, keeps, 3600).await
+                Stores::open(&successor_dir, &successor_config, keeps, 3600, false).await
             });
             let waited = tokio::time::timeout(Duration::from_secs(1), &mut opening)
                 .await
@@ -2649,7 +2649,7 @@ async fn a_store_opened_where_a_kept_store_s_directory_was_replaced_starts_anew(
         let [old, new] = keys(&config, 0..255, 64..4096, 2, &mut HashSet::new())[..] else {
             unreachable!()
         };
-        let Ok((kept, claims)) = Stores::open(&run, &config, true, 3600).await else {
+        let Ok((kept, claims)) = Stores::open(&run, &config, true, 3600, false).await else {
             return Outcome::Fail(format!("{case}: the stores did not open"));
         };
         put(&kept.immutable, &config, old, 0).await;
@@ -2661,7 +2661,7 @@ async fn a_store_opened_where_a_kept_store_s_directory_was_replaced_starts_anew(
         }
         let opened = tokio::time::timeout(
             Duration::from_secs(10),
-            Stores::open(&run, &config, true, 3600),
+            Stores::open(&run, &config, true, 3600, false),
         )
         .await;
         let (stores, claims) = match opened {
