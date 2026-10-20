@@ -7,7 +7,6 @@ use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_proto::RepositoryDeleteRequest;
 use lore_proto::RepositoryDeleteResponse;
-use lore_proto::rebac::DeleteResourceRequest;
 use lore_revision::branch;
 use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
@@ -15,7 +14,6 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_telemetry::InstrumentProvider;
 use tokio_stream::StreamExt;
-use tonic::Code;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -24,9 +22,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::repository_query::repository_query_id;
-use crate::authnz::common::create_request_with_authorization;
-use crate::authnz::rebac::RebacApiClient;
-use crate::authnz::rebac::grpc_get_rebac_client;
+use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
@@ -38,7 +34,7 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RepositoryDelete::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryDeleteRequest>,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     instrument_provider: &impl InstrumentProvider,
@@ -70,7 +66,7 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            repository_delete(repository, bypass_protection, auth_url, authorization)
+            repository_delete(repository, bypass_protection, registry, authorization)
                 .await
                 .inspect_err(|err| warn!("Repository delete failed: {err}"))?;
 
@@ -85,7 +81,7 @@ pub async fn handler(
 async fn repository_delete(
     repository: Arc<RepositoryContext>,
     force: bool,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
     authorization: Option<String>,
 ) -> Result<(), Status> {
     let Ok(data) = repository_query_id(
@@ -107,19 +103,15 @@ async fn repository_delete(
 
     let user_id = execution_context().user_id().await;
 
-    if let Some(auth_url) = auth_url {
-        // Use external auth service to authorize deletion
-        repository_delete_auth_resource(auth_url, authorization, repository.id).await?;
-    } else {
-        // If not using external auth service, check that the current user is the creator
-        if metadata.creator != user_id && !force {
-            info!(
-                "Repository delete refused, user {user_id} is not creator {}",
-                metadata.creator
-            );
-            return Err(Status::permission_denied("Not repository owner"));
-        }
+    // Unless the registry authorizes the delete, check that the current user is the creator
+    if !registry.authorizes_delete() && metadata.creator != user_id && !force {
+        info!(
+            "Repository delete refused, user {user_id} is not creator {}",
+            metadata.creator
+        );
+        return Err(Status::permission_denied("Not repository owner"));
     }
+    registry.remove(authorization, repository.id).await?;
 
     repository::store_name_to_id(
         repository.clone(),
@@ -183,33 +175,6 @@ async fn repository_delete(
         "Deleted repository {} with ID {}",
         metadata.name, repository.id
     );
-
-    Ok(())
-}
-
-pub(crate) async fn repository_delete_auth_resource(
-    auth_url: String,
-    authorization: Option<String>,
-    repository_id: RepositoryId,
-) -> Result<(), Status> {
-    info!("Repository delete auth resource for {}", repository_id,);
-
-    let mut client = grpc_get_rebac_client(auth_url).await?;
-    let request = create_request_with_authorization(
-        DeleteResourceRequest {
-            resource_id: format!("urc-{repository_id}"),
-        },
-        authorization,
-    )?;
-
-    client.delete_resource(request).await.warn_map_err(|err| {
-        if err.code() == Code::PermissionDenied {
-            return Status::permission_denied("Delete resource denied");
-        } else if err.code() == Code::Unauthenticated {
-            return Status::unauthenticated("Delete resource failed - unauthenticated");
-        }
-        Status::internal(format!("Failed to call auth delete_resource: {err}"))
-    })?;
 
     Ok(())
 }

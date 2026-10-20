@@ -149,6 +149,79 @@ impl ::prost::Name for PartitionListResponse {
         "/lore.user.v1.PartitionListResponse".into()
     }
 }
+/// Request to add a partition. The credential is the token of the caller
+/// creating the partition, forwarded by the Lore server. It cannot be scoped
+/// to the partition, which does not exist yet, so the directory must accept
+/// a token that is not.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionAddRequest {
+    /// The partition id.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub partition: ::prost::bytes::Bytes,
+    /// The repository name the partition is created under.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+}
+impl ::prost::Name for PartitionAddRequest {
+    const NAME: &'static str = "PartitionAddRequest";
+    const PACKAGE: &'static str = "lore.user.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.user.v1.PartitionAddRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.user.v1.PartitionAddRequest".into()
+    }
+}
+/// Response to a partition add. Adding a partition already listed under the
+/// same name succeeds, so a retried create does too. A partition listed under
+/// another name answers `ALREADY_EXISTS`, and the Lore server refuses the
+/// create.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionAddResponse {}
+impl ::prost::Name for PartitionAddResponse {
+    const NAME: &'static str = "PartitionAddResponse";
+    const PACKAGE: &'static str = "lore.user.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.user.v1.PartitionAddResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.user.v1.PartitionAddResponse".into()
+    }
+}
+/// Request to remove a partition. The credential is the token of the caller
+/// deleting the partition, forwarded by the Lore server. The directory must
+/// refuse a caller without permission to delete the partition with
+/// `PERMISSION_DENIED`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionRemoveRequest {
+    /// The partition id.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub partition: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for PartitionRemoveRequest {
+    const NAME: &'static str = "PartitionRemoveRequest";
+    const PACKAGE: &'static str = "lore.user.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.user.v1.PartitionRemoveRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.user.v1.PartitionRemoveRequest".into()
+    }
+}
+/// Response to a partition remove. Removing a partition that is not listed
+/// succeeds.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionRemoveResponse {}
+impl ::prost::Name for PartitionRemoveResponse {
+    const NAME: &'static str = "PartitionRemoveResponse";
+    const PACKAGE: &'static str = "lore.user.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.user.v1.PartitionRemoveResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.user.v1.PartitionRemoveResponse".into()
+    }
+}
 /// Generated client implementations.
 pub mod user_service_client {
     #![allow(
@@ -320,6 +393,60 @@ pub mod user_service_client {
                 .insert(GrpcMethod::new("lore.user.v1.UserService", "PartitionList"));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Add an entry for a partition the Lore server has created, so that
+        /// `PartitionList` can name it. The Lore server calls this before it stores
+        /// the partition and refuses the create when this fails.
+        pub async fn partition_add(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PartitionAddRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PartitionAddResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.user.v1.UserService/PartitionAdd",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("lore.user.v1.UserService", "PartitionAdd"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Remove the entry for a partition the Lore server is deleting. The Lore
+        /// server refuses the delete when this fails, so the directory authorizes
+        /// the delete.
+        pub async fn partition_remove(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PartitionRemoveRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PartitionRemoveResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.user.v1.UserService/PartitionRemove",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("lore.user.v1.UserService", "PartitionRemove"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -363,6 +490,26 @@ pub mod user_service_server {
             request: tonic::Request<super::PartitionListRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::PartitionListStream>,
+            tonic::Status,
+        >;
+        /// Add an entry for a partition the Lore server has created, so that
+        /// `PartitionList` can name it. The Lore server calls this before it stores
+        /// the partition and refuses the create when this fails.
+        async fn partition_add(
+            &self,
+            request: tonic::Request<super::PartitionAddRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PartitionAddResponse>,
+            tonic::Status,
+        >;
+        /// Remove the entry for a partition the Lore server is deleting. The Lore
+        /// server refuses the delete when this fails, so the directory authorizes
+        /// the delete.
+        async fn partition_remove(
+            &self,
+            request: tonic::Request<super::PartitionRemoveRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PartitionRemoveResponse>,
             tonic::Status,
         >;
     }
@@ -576,6 +723,96 @@ pub mod user_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.user.v1.UserService/PartitionAdd" => {
+                    #[allow(non_camel_case_types)]
+                    struct PartitionAddSvc<T: UserService>(pub Arc<T>);
+                    impl<
+                        T: UserService,
+                    > tonic::server::UnaryService<super::PartitionAddRequest>
+                    for PartitionAddSvc<T> {
+                        type Response = super::PartitionAddResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PartitionAddRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UserService>::partition_add(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PartitionAddSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.user.v1.UserService/PartitionRemove" => {
+                    #[allow(non_camel_case_types)]
+                    struct PartitionRemoveSvc<T: UserService>(pub Arc<T>);
+                    impl<
+                        T: UserService,
+                    > tonic::server::UnaryService<super::PartitionRemoveRequest>
+                    for PartitionRemoveSvc<T> {
+                        type Response = super::PartitionRemoveResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PartitionRemoveRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UserService>::partition_remove(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PartitionRemoveSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

@@ -207,7 +207,8 @@ def partition_list_response(*repository_ids: str) -> list[bytes]:
 
 
 def empty_response() -> bytes:
-    """An empty message: `CreateResource`/`DeleteResource` responses, or a
+    """An empty message: `CreateResource`/`DeleteResource` and
+    `PartitionAdd`/`PartitionRemove` responses, or a
     `GetAuthSession`/`RefreshAuthSession` answer carrying no token yet."""
     return b""
 
@@ -255,11 +256,19 @@ _REQUEST_FIELDS: dict[str, dict[str, tuple[int, str]]] = {
         "display_name": (3, _STRING),
     },
     "PartitionList": {},
+    "PartitionAdd": {"partition": (1, _BYTES), "name": (2, _STRING)},
+    "PartitionRemove": {"partition": (1, _BYTES)},
 }
 
 _REBAC_METHODS = ("CreateResource", "DeleteResource")
 
-_USER_METHODS = ("UserGet", "UserFind", "PartitionList")
+_USER_METHODS = (
+    "UserGet",
+    "UserFind",
+    "PartitionList",
+    "PartitionAdd",
+    "PartitionRemove",
+)
 
 # Server-streaming RPCs: a rule's response is the list of messages to stream.
 _STREAM_METHODS = ("PartitionList",)

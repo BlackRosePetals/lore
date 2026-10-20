@@ -10,6 +10,7 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::authnz::repository_registry::RepositoryRegistry;
 use lore_server::grpc::repository::v1::repository_delete::*;
 use lore_telemetry::InstrumentProvider;
 use rand::random;
@@ -83,7 +84,7 @@ async fn the_creator_check_compares_the_resolved_identity() {
         };
         let status = handler(
             delete_request(id, by_subject.clone()),
-            None,
+            &RepositoryRegistry::Unregistered,
             immutable_store.clone(),
             mutable_store.clone(),
             &TestInstrumentProvider,
@@ -98,13 +99,61 @@ async fn the_creator_check_compares_the_resolved_identity() {
         };
         handler(
             delete_request(id, by_username),
-            None,
+            &RepositoryRegistry::Unregistered,
             immutable_store,
             mutable_store,
             &TestInstrumentProvider,
         )
         .await
         .expect("the identity claim matches the recorded creator");
+    }))
+    .await;
+}
+
+/// With a `user_url` registry `PartitionRemove` authorizes the delete, so
+/// a non-creator's delete is not refused locally but asks the directory, and
+/// a failed `PartitionRemove` leaves the repository in place. Nothing listens
+/// at the directory's address.
+#[tokio::test]
+async fn the_user_service_registry_authorizes_the_delete() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let id = random::<RepositoryId>();
+        seed_repository(immutable_store.clone(), mutable_store.clone(), id, "alice").await;
+        let registry = RepositoryRegistry::UserService("http://127.0.0.1:1".to_string());
+        let by_non_creator = AuthorizationToken {
+            identity: Some("mallory".to_string()),
+            ..Default::default()
+        };
+
+        let status = handler(
+            delete_request(id, by_non_creator),
+            &registry,
+            immutable_store.clone(),
+            mutable_store.clone(),
+            &TestInstrumentProvider,
+        )
+        .await
+        .expect_err("the unreachable directory fails the delete");
+        assert_eq!(
+            status.code(),
+            tonic::Code::Internal,
+            "the directory, not the creator check, decides"
+        );
+
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable_store,
+            mutable_store,
+            id,
+        ));
+        assert_eq!(
+            repository::id_from_name(repository, "the-repository")
+                .await
+                .expect("the name mapping survives a failed delete"),
+            id
+        );
     }))
     .await;
 }

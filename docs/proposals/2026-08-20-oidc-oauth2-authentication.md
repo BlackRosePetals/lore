@@ -848,7 +848,14 @@ The directory's host must be under a domain that is found in one of the token's 
 The directory operations outlive the auth service, so they get a gRPC API of their own,
 `lore.user.v1.UserService`. It has `UserGet` (IDs to users), `UserFind` (a username or a display
 name to users) and `PartitionList` (the partitions the caller holds permissions on), in the
-vocabulary of the other `lore.*.v1` APIs.
+vocabulary of the other `lore.*.v1` APIs. `PartitionAdd` and `PartitionRemove` let the Lore server
+register the repositories it creates and deletes, which `RebacApi`'s `CreateResource` and
+`DeleteResource` at `auth_url` do on a `UrcAuthApi` deployment. The server picks the registry by
+the same rule: `user_url`, else `auth_url`, else no registration. The remove call authorizes the
+delete on both paths, as `DeleteResource` does today: the directory refuses a caller without
+permission to delete the partition. A repeated `PartitionAdd` under the same name succeeds, so
+`ALREADY_EXISTS` means the partition is listed under another name, and the server refuses the
+create.
 
 **The user identity is read from the token.** Lore records a user as one string, in `created_by`
 and wherever else an identity is compared. Client and server take that string from the token's

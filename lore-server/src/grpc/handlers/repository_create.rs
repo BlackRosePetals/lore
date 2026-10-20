@@ -7,7 +7,6 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
 use lore_proto::RepositoryCreateRequest;
 use lore_proto::RepositoryCreateResponse;
-use lore_proto::rebac::CreateResourceRequest;
 use lore_revision::branch;
 use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
@@ -16,7 +15,6 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
 use lore_telemetry::InstrumentProvider;
 use lore_transport::RepositoryData;
-use tonic::Code;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -26,9 +24,7 @@ use tracing::warn;
 
 use super::repository_query::repository_query_id;
 use super::repository_query::repository_query_name;
-use crate::authnz::common::create_request_with_authorization;
-use crate::authnz::rebac::RebacApiClient;
-use crate::authnz::rebac::grpc_get_rebac_client;
+use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
@@ -46,7 +42,7 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RepositoryCreate::handle", skip_all, fields(requested_repo_id))]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: &HookDispatcher,
@@ -90,7 +86,7 @@ pub async fn handler(
                 req.default_branch_name.as_str(),
                 req.creator.as_str(),
                 req.created,
-                auth_url,
+                registry,
                 authorization,
             )
             .await
@@ -156,7 +152,7 @@ async fn repository_create(
     default_branch_name: &str,
     creator: &str,
     created: u64,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
     authorization: Option<String>,
 ) -> Result<RepositoryData, Status> {
     validate_create_input(name, description, default_branch_name, creator)?;
@@ -246,10 +242,7 @@ async fn repository_create(
         };
     }
 
-    if let Some(auth_url) = auth_url {
-        let client = Box::new(grpc_get_rebac_client(auth_url).await?);
-        repository_create_auth_resource(client, authorization, repository.id, name).await?;
-    }
+    registry.add(authorization, repository.id, name).await?;
 
     // Set up the repository metadata
     let metadata = RepositoryMetadata {
@@ -328,70 +321,4 @@ async fn repository_create(
         name: name.to_string(),
         metadata,
     })
-}
-
-#[lore_macro::test_pub]
-pub(crate) async fn repository_create_auth_resource(
-    mut client: Box<dyn RebacApiClient + Send + Sync>,
-    authorization: Option<String>,
-    repository_id: RepositoryId,
-    name: &str,
-) -> Result<(), Status> {
-    info!(
-        "Repository create auth resource for {} with name {}",
-        repository_id, name
-    );
-
-    let request = create_request_with_authorization(
-        CreateResourceRequest {
-            resource_id: format!("urc-{repository_id}"),
-            resource_name: String::from(name),
-        },
-        authorization,
-    )?;
-
-    match client.create_resource(request).await {
-        Ok(_) => Ok(()),
-        Err(err) if err.code() == Code::AlreadyExists => {
-            info!(auth_error = ?err, requested_repo_id = %repository_id, "Auth resource for already exists, continuing");
-            Ok(())
-        }
-        Err(err) if err.code() == Code::PermissionDenied => {
-            info!(?err, "Create resource in auth failed - permission denied");
-            Err(Status::permission_denied(
-                "Failed to create repository, permission denied",
-            ))
-        }
-        Err(err) if err.code() == Code::Unauthenticated => {
-            info!(?err, "Create resource in auth failed - unauthenticated");
-            Err(Status::unauthenticated(
-                "Failed to create repository, reauthenticate",
-            ))
-        }
-        Err(err) if err.code() == Code::NotFound => {
-            // there is an issue with misbehaving clients who create external Auth resources but don't check
-            // for a success response before calling RepositoryCreate (which in turn depends on those external
-            // resources). Doing so results in Auth Service returning a NotFound error that should effectively be bubbled up
-            // to the client
-            info!(auth_error = ?err, "Repository Create create_resource failed because of Auth 'NotFound'");
-            Err(Status::failed_precondition(
-                "A required Auth entity was not found",
-            ))
-            // todo(plockhart): Once auth service supports Richer Error Model, change to look for an error code
-        }
-        Err(err)
-            if err.code() == Code::InvalidArgument
-                && err
-                    .message()
-                    .contains("Missing resource context in resourceName") =>
-        {
-            info!(auth_error = ?err, requested_name = name, "Repository Create create_resource failed - invalid name was provided");
-            Err(Status::invalid_argument(
-                "Invalid repository name - missing Organization context",
-            ))
-        }
-        Err(err) => Err(warn_error_to_status(&err, |err| {
-            Status::internal(format!("Failed to call auth create_resource: {err}"))
-        })),
-    }
 }

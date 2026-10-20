@@ -12,7 +12,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `[environment.endpoint] user_url` now names a `lore.user.v1.UserService` (`UserGet`, `UserFind`), replacing the
   `UrcAuthApi` `GetUserInfo` and `GetUserId` calls. Without `user_url`, clients ask `auth_url` over `UrcAuthApi` as
   before. With `user_url`, the server also lists repositories there (`PartitionList`) by default, through the new
-  `[server.auth] repository_catalog = "user_service"` mode
+  `[server.auth] repository_catalog = "user_service"` mode, and registers the repositories it creates and deletes there
+  (`PartitionAdd`, `PartitionRemove`) instead of calling `RebacApi` at `auth_url`
 - A client and the Lore service it relays to must come from the same build: the message protocol changed (version 2),
   and mismatched builds refuse each other's messages. Restart the service after upgrading
 - Data is verified by the trust of its source ([ADR-00023](developing/decisions/00023-data-verification-and-trust.md)):

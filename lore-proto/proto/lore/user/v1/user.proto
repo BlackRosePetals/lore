@@ -14,6 +14,14 @@ service UserService {
   // with the permissions held on each. The Lore server drives
   // `RepositoryList` from this.
   rpc PartitionList(PartitionListRequest) returns (stream PartitionListResponse);
+  // Add an entry for a partition the Lore server has created, so that
+  // `PartitionList` can name it. The Lore server calls this before it stores
+  // the partition and refuses the create when this fails.
+  rpc PartitionAdd(PartitionAddRequest) returns (PartitionAddResponse);
+  // Remove the entry for a partition the Lore server is deleting. The Lore
+  // server refuses the delete when this fails, so the directory authorizes
+  // the delete.
+  rpc PartitionRemove(PartitionRemoveRequest) returns (PartitionRemoveResponse);
 }
 
 // A user as the directory knows them.
@@ -76,3 +84,33 @@ message PartitionListResponse {
   // The permission names the bearer holds on the partition.
   repeated string permission = 2;
 }
+
+// Request to add a partition. The credential is the token of the caller
+// creating the partition, forwarded by the Lore server. It cannot be scoped
+// to the partition, which does not exist yet, so the directory must accept
+// a token that is not.
+message PartitionAddRequest {
+  // The partition id.
+  bytes partition = 1;
+  // The repository name the partition is created under.
+  string name = 2;
+}
+
+// Response to a partition add. Adding a partition already listed under the
+// same name succeeds, so a retried create does too. A partition listed under
+// another name answers `ALREADY_EXISTS`, and the Lore server refuses the
+// create.
+message PartitionAddResponse {}
+
+// Request to remove a partition. The credential is the token of the caller
+// deleting the partition, forwarded by the Lore server. The directory must
+// refuse a caller without permission to delete the partition with
+// `PERMISSION_DENIED`.
+message PartitionRemoveRequest {
+  // The partition id.
+  bytes partition = 1;
+}
+
+// Response to a partition remove. Removing a partition that is not listed
+// succeeds.
+message PartitionRemoveResponse {}

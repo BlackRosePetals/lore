@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Smoke test verifying `lore.user.v1` carries the 3 RPCs' request /
+//! Smoke test verifying `lore.user.v1` carries the 5 RPCs' request /
 //! response messages, with the partition listing as a server stream.
 
+use lore_proto::lore::user::v1::PartitionAddRequest;
+use lore_proto::lore::user::v1::PartitionAddResponse;
 use lore_proto::lore::user::v1::PartitionListRequest;
 use lore_proto::lore::user::v1::PartitionListResponse;
+use lore_proto::lore::user::v1::PartitionRemoveRequest;
+use lore_proto::lore::user::v1::PartitionRemoveResponse;
 use lore_proto::lore::user::v1::User;
 use lore_proto::lore::user::v1::UserFindRequest;
 use lore_proto::lore::user::v1::UserFindResponse;
@@ -25,6 +29,10 @@ fn v1_user_request_response_types_default() {
     let _ = UserFindResponse::default();
     let _ = PartitionListRequest::default();
     let _ = PartitionListResponse::default();
+    let _ = PartitionAddRequest::default();
+    let _ = PartitionAddResponse::default();
+    let _ = PartitionRemoveRequest::default();
+    let _ = PartitionRemoveResponse::default();
 }
 
 /// Field-shape regression net: destructuring each message asserts that every
@@ -54,6 +62,13 @@ fn v1_user_field_shapes() {
         partition: _,
         permission: _,
     } = PartitionListResponse::default();
+    let PartitionAddRequest {
+        partition: _,
+        name: _,
+    } = PartitionAddRequest::default();
+    let PartitionAddResponse {} = PartitionAddResponse::default();
+    let PartitionRemoveRequest { partition: _ } = PartitionRemoveRequest::default();
+    let PartitionRemoveResponse {} = PartitionRemoveResponse::default();
 }
 
 /// A partition is carried as the repository id bytes, as `Repository.id`
@@ -115,6 +130,20 @@ impl UserService for Unserved {
         &self,
         _: tonic::Request<PartitionListRequest>,
     ) -> Result<tonic::Response<Self::PartitionListStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not served"))
+    }
+
+    async fn partition_add(
+        &self,
+        _: tonic::Request<PartitionAddRequest>,
+    ) -> Result<tonic::Response<PartitionAddResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not served"))
+    }
+
+    async fn partition_remove(
+        &self,
+        _: tonic::Request<PartitionRemoveRequest>,
+    ) -> Result<tonic::Response<PartitionRemoveResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not served"))
     }
 }

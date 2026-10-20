@@ -12,8 +12,12 @@ use lore_base::types::RepositoryId;
 use lore_proto::auth::LookupUserPermissionsRequest;
 use lore_proto::auth::LookupUserPermissionsResponse;
 use lore_proto::auth::ResourcePermission;
+use lore_proto::lore::user::v1::PartitionAddRequest;
+use lore_proto::lore::user::v1::PartitionAddResponse;
 use lore_proto::lore::user::v1::PartitionListRequest;
 use lore_proto::lore::user::v1::PartitionListResponse;
+use lore_proto::lore::user::v1::PartitionRemoveRequest;
+use lore_proto::lore::user::v1::PartitionRemoveResponse;
 use lore_proto::lore::user::v1::UserFindRequest;
 use lore_proto::lore::user::v1::UserFindResponse;
 use lore_proto::lore::user::v1::UserGetRequest;
@@ -707,6 +711,20 @@ impl UserService for Directory {
             })
             .collect();
         Ok(tonic::Response::new(tokio_stream::iter(messages)))
+    }
+
+    async fn partition_add(
+        &self,
+        _request: tonic::Request<PartitionAddRequest>,
+    ) -> Result<tonic::Response<PartitionAddResponse>, Status> {
+        Err(Status::unimplemented("not under test"))
+    }
+
+    async fn partition_remove(
+        &self,
+        _request: tonic::Request<PartitionRemoveRequest>,
+    ) -> Result<tonic::Response<PartitionRemoveResponse>, Status> {
+        Err(Status::unimplemented("not under test"))
     }
 }
 

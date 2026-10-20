@@ -96,7 +96,7 @@ The `[server]` table and its sub-tables configure the network endpoints, gracefu
 | Field | Default | Description |
 | --- | --- | --- |
 | `auth_url` | none | The authentication service clients log in at and exchange tokens with. Setting it requires `[server.auth]`. If `auth_url` and `[server.auth]` are not set, starts the server unauthenticated. |
-| `user_url` | none | A user directory served over `lore.user.v1.UserService`, which clients use to resolve user IDs to display names, and back. If not set, clients speak the `UrcAuthApi` `GetUserInfo` and `GetUserId` RPCs to `auth_url` instead. If neither is set, clients fall back to an offline resolver that returns user IDs as names. When set, the server's repository catalog also lists partitions there by default (see `repository_catalog`). |
+| `user_url` | none | A user directory served over `lore.user.v1.UserService`, which clients use to resolve user IDs to display names, and back. If not set, clients speak the `UrcAuthApi` `GetUserInfo` and `GetUserId` RPCs to `auth_url` instead. If neither is set, clients fall back to an offline resolver that returns user IDs as names. When set, the server's repository catalog also lists partitions there by default (see `repository_catalog`), and the server registers the repositories it creates and deletes there with `PartitionAdd` and `PartitionRemove` instead of the `RebacApi` `CreateResource` and `DeleteResource` calls to `auth_url`. A refused `PartitionAdd` fails the create, and a refused `PartitionRemove` the delete. |
 
 ```toml
 [environment.endpoint]

@@ -9,6 +9,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::repository::v1::repository_create::repository_create_implementation;
 use crate::hooks::HookDispatcher;
@@ -19,7 +20,7 @@ use crate::hooks::HookDispatcher;
 #[tracing::instrument(name = "ForwardedRepository::v1::RepositoryCreate::Handler", skip_all)]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: &HookDispatcher,
@@ -30,7 +31,7 @@ pub async fn handler(
     repository_create_implementation(
         request.into_inner(),
         caller_context,
-        auth_url,
+        registry,
         immutable_store,
         mutable_store,
         hook_dispatcher,

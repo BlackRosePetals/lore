@@ -22,13 +22,13 @@ use tracing::info;
 
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
+use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
-use crate::grpc::handlers::repository_delete::repository_delete_auth_resource;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryDelete` handler.
@@ -40,7 +40,7 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RepositoryDelete::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryDeleteRequest>,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     instrument_provider: &impl InstrumentProvider,
@@ -76,15 +76,14 @@ pub async fn handler(
                 .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
 
             let user_id = execution_context().user_id().await;
-            if let Some(auth_url) = auth_url {
-                repository_delete_auth_resource(auth_url, authorization, id).await?;
-            } else if metadata.creator != user_id && !bypass_protection {
+            if !registry.authorizes_delete() && metadata.creator != user_id && !bypass_protection {
                 info!(
                     "Repository delete refused, user {user_id} is not creator {}",
                     metadata.creator
                 );
                 return Err(Status::permission_denied("Not repository owner"));
             }
+            registry.remove(authorization, id).await?;
 
             repository::store_name_to_id(
                 repository.clone(),
