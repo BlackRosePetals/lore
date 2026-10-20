@@ -3,12 +3,14 @@
 """Smoke tests for a user directory advertised apart from the auth service.
 
 `[environment.endpoint] user_url` defines where clients resolve user
-IDs to display names over `lore.user.v1.UserService`. Without it the
-client speaks the `UrcAuthApi` directory RPCs to `auth_url`, covered by
-`test_auth_online.py`.
+IDs to display names over `lore.user.v1.UserService`, and where the
+server's repository catalog lists partitions. Without it the client
+speaks the `UrcAuthApi` directory RPCs to `auth_url`, and the catalog
+`LookupUserPermissions`, covered by `test_auth_online.py`.
 """
 
 import logging
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -24,9 +26,15 @@ from mock_auth_server import (
     USER2,
     MockAuthServer,
     MockUser,
+    partition_list_response,
     user_list_response,
 )
-from test_auth_online import authz_resources, commit_file, provision_owner
+from test_auth_online import (
+    authz_resources,
+    commit_file,
+    provision_owner,
+    script_repository_lifecycle,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -292,3 +300,32 @@ def test_a_shared_display_name_finds_no_lock_owner(service_env, make_actor):
     output = lock_query_by_owner_name(service_env, make_actor, USER1.display_name)
 
     assert "locked.txt" not in output
+
+
+@pytest.mark.smoke
+def test_repository_list_is_the_directorys_answer(service_env, make_actor):
+    """`lore repository list` on a server advertising `user_url` asks the
+    directory's `PartitionList` once and lists exactly the partitions it
+    streams: a second repository the same user created but the directory
+    omits is not listed, and neither stub sees `LookupUserPermissions`."""
+    env = service_env
+    owner = provision_owner(env, make_actor(env), "lister", USER1)
+
+    unlisted_id = uuid.uuid4().hex
+    script_repository_lifecycle(env.mock, f"urc-{unlisted_id}")
+    unlisted = owner.actor.make_repo(repo_id=unlisted_id)
+    unlisted.repository_create(repo_id=unlisted_id, identity=USER1.user_id)
+
+    env.directory.on("PartitionList", bearer=owner.login_token).respond(
+        partition_list_response(owner.resource_id.removeprefix("urc-"))
+    )
+
+    listing = owner.repo.repository_list().splitlines()
+
+    assert f"{owner.repo.name} ({owner.repo.get_id()})" in listing
+    assert not any(unlisted.get_id() in line for line in listing), (
+        "a partition the directory did not stream must not be listed"
+    )
+    assert env.directory.calls["PartitionList"] == 1
+    assert env.mock.calls["LookupUserPermissions"] == 0
+    assert env.directory.calls["LookupUserPermissions"] == 0

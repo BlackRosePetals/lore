@@ -196,6 +196,16 @@ def user_list_response(*users: MockUser) -> bytes:
     )
 
 
+def partition_list_response(*repository_ids: str) -> list[bytes]:
+    """A `lore.user.v1` `PartitionList` answer: one message per repository id
+    (hex), each granting `read`."""
+    return [
+        encode_bytes_field(1, bytes.fromhex(repository_id))
+        + encode_string_field(2, "read")
+        for repository_id in repository_ids
+    ]
+
+
 def empty_response() -> bytes:
     """An empty message: `CreateResource`/`DeleteResource` responses, or a
     `GetAuthSession`/`RefreshAuthSession` answer carrying no token yet."""
@@ -244,11 +254,15 @@ _REQUEST_FIELDS: dict[str, dict[str, tuple[int, str]]] = {
         "username": (2, _STRING),
         "display_name": (3, _STRING),
     },
+    "PartitionList": {},
 }
 
 _REBAC_METHODS = ("CreateResource", "DeleteResource")
 
-_USER_METHODS = ("UserGet", "UserFind")
+_USER_METHODS = ("UserGet", "UserFind", "PartitionList")
+
+# Server-streaming RPCs: a rule's response is the list of messages to stream.
+_STREAM_METHODS = ("PartitionList",)
 
 # The status an unmatched request is refused with. Chosen to mirror how the
 # real service refuses the corresponding case: a token endpoint answers "who
@@ -289,10 +303,10 @@ class _Rule:
     def __init__(self, method: str, matchers: dict):
         self.method = method
         self.matchers = matchers
-        self.response: bytes | None = None
+        self.response: bytes | list[bytes] | None = None
         self.denial: tuple[grpc.StatusCode, str] | None = None
 
-    def respond(self, payload: bytes) -> "_Rule":
+    def respond(self, payload: bytes | list[bytes]) -> "_Rule":
         self.response = payload
         return self
 
@@ -465,7 +479,10 @@ class MockAuthServer:
             for name in _REQUEST_FIELDS
             if name not in _REBAC_METHODS + _USER_METHODS
         }
-        user_methods = {name: self._unary(name) for name in _USER_METHODS}
+        user_methods = {
+            name: self._stream(name) if name in _STREAM_METHODS else self._unary(name)
+            for name in _USER_METHODS
+        }
         rebac_methods = {name: self._unary(name) for name in _REBAC_METHODS}
         self._grpc_server.add_generic_rpc_handlers(
             (
@@ -592,7 +609,7 @@ class MockAuthServer:
     def _unary(self, method: str):
         def handler(request: bytes, context: grpc.ServicerContext) -> bytes:
             try:
-                return self._serve(method, request, context)
+                return cast(bytes, self._serve(method, request, context))
             except _AbortError as refusal:
                 context.abort(refusal.code, refusal.details)
                 raise  # unreachable; context.abort raises
@@ -607,9 +624,28 @@ class MockAuthServer:
             response_serializer=_identity_bytes,
         )
 
+    def _stream(self, method: str):
+        def handler(request: bytes, context: grpc.ServicerContext):
+            try:
+                messages = cast(list[bytes], self._serve(method, request, context))
+            except _AbortError as refusal:
+                context.abort(refusal.code, refusal.details)
+                raise  # unreachable; context.abort raises
+            except Exception:
+                logger.exception("mock auth: %s failed", method)
+                context.abort(grpc.StatusCode.INTERNAL, "mock auth internal error")
+                raise  # unreachable; context.abort raises
+            yield from messages
+
+        return grpc.unary_stream_rpc_method_handler(
+            handler,
+            request_deserializer=_identity_bytes,
+            response_serializer=_identity_bytes,
+        )
+
     def _serve(
         self, method: str, request: bytes, context: grpc.ServicerContext
-    ) -> bytes:
+    ) -> bytes | list[bytes]:
         decoded = _decode_request(method, request)
         decoded["bearer"] = self._credential(decoded, context)
         with self._lock:

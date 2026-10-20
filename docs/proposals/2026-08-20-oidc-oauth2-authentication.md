@@ -888,11 +888,17 @@ listing everything it holds, as a local server does today. That setting exists f
 alone and gates no access decision. A `UrcAuthApi` deployment gets an implementation that calls
 `LookupUserPermissions` and behaves exactly as today.
 
+A deployment advertising `user_url` gets an implementation that calls `PartitionList` on the
+`lore.user.v1.UserService` there. The answer is a stream of repository ids, which the catalog
+collects and pages itself as the baseline catalog pages the store.
+
 The choice is not bound to the authorizer. `repository_catalog` in `[server.auth]` names the
-catalog (`baseline` or `auth_service`) and `repository_catalog_url` the endpoint the auth-service
-catalog asks; absent, the catalog follows `auth_url`, set meaning the auth service and unset the
-baseline. So a Tier 1 or Tier 2 deployment whose auth service accepts its tokens keeps the
-`LookupUserPermissions` catalog, and a `UrcAuthApi` deployment can list from the store instead.
+catalog (`baseline`, `auth_service` or `user_service`) and `repository_catalog_url` the endpoint
+the auth-service catalog asks. Absent, the catalog follows the endpoints by the rule the client
+uses to pick its directory: `user_url` set means `user_service`, otherwise `auth_url` set means
+`auth_service`, and neither means the baseline. So a Tier 1 or Tier 2 deployment whose auth
+service accepts its tokens keeps the `LookupUserPermissions` catalog, and a `UrcAuthApi`
+deployment can list from the store instead.
 The catalog forwards the caller's own token, so the endpoint has to accept the tokens the server
 verifies. No client-side check is needed for that forwarding: the client's send-check (D5)
 already confines a token to servers under its `aud`, and the server it reaches holds the token
@@ -1051,7 +1057,7 @@ in `[server.auth]` but touches listing only:
 | `permission_claim` | Dotted path to the actions claim, for example `realm_access.roles` on Keycloak or `groups` on Dex. Claim values are action names. |
 | `resource_claim` | Present means Tier 2, and actions are scoped by the resource beside them. Absent means the `permission_claim` actions are global, which is Tier 1. |
 | `baseline_access` | What the default `RepositoryCatalog` (D7) lists when no custom implementation is configured. `denied`, the default, lists none. `reachable` lists every repository the server holds. It gates no access decision. |
-| `repository_catalog` | Which catalog (D7) answers the listing: `baseline`, per `baseline_access`, or `auth_service`, a `UrcAuthApi` service's `LookupUserPermissions`. Absent, `auth_service` when `auth_url` is set and `baseline` otherwise. |
+| `repository_catalog` | Which catalog (D7) answers the listing: `baseline`, per `baseline_access`; `auth_service`, a `UrcAuthApi` service's `LookupUserPermissions`; or `user_service`, `PartitionList` at `user_url`. Absent, `user_service` when `user_url` is set, else `auth_service` when `auth_url` is set, and `baseline` otherwise. |
 | `repository_catalog_url` | The endpoint the `auth_service` catalog asks, `auth_url` by default. It receives the caller's token, so it must accept the tokens this server verifies. |
 
 A deployment that configures `[server.auth]` but no `permission_claim` leaves every authenticated

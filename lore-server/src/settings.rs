@@ -187,11 +187,16 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
         .as_ref()
         .and_then(|environment| environment.endpoint.as_ref())
         .and_then(|endpoint| endpoint.auth_url.as_deref());
+    let user_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.user_url.as_deref());
     // Run the authorizer and catalog selection at load, so a refused pairing
     // bails here, before any initialization, instead of at server startup.
     let authorizer = select_repository_authorizer(auth, auth_url)
         .map_err(|err| config::ConfigError::Message(err.to_string()))?;
-    select_repository_catalog(auth, auth_url)
+    select_repository_catalog(auth, auth_url, user_url)
         .map_err(|err| config::ConfigError::Message(err.to_string()))?;
     let Some(auth) = auth else {
         return Ok(());
@@ -407,8 +412,9 @@ pub struct AuthSettings {
     /// access to the contents. Consulted by the `baseline` catalog only.
     #[serde(default)]
     pub baseline_access: BaselineAccess,
-    /// Which catalog answers the repository listing. Absent: `auth_service`
-    /// when `[environment.endpoint] auth_url` is set, `baseline` otherwise.
+    /// Which catalog answers the repository listing. Absent: `user_service`
+    /// when `[environment.endpoint] user_url` is set, else `auth_service`
+    /// when `auth_url` is set, `baseline` otherwise.
     pub repository_catalog: Option<RepositoryCatalogMode>,
     /// The `UrcAuthApi` endpoint the `auth_service` catalog asks. Absent:
     /// `[environment.endpoint] auth_url`.
@@ -479,6 +485,9 @@ pub enum RepositoryCatalogMode {
     /// Ask a `UrcAuthApi` service's `LookupUserPermissions`, forwarding the
     /// caller's token.
     AuthService,
+    /// Ask `PartitionList` on the `lore.user.v1.UserService` at
+    /// `[environment.endpoint] user_url`, forwarding the caller's token.
+    UserService,
 }
 
 #[derive(Clone, Debug, Deserialize)]

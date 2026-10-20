@@ -6,6 +6,7 @@ use lore_proto::auth::CheckUserPermissionResponse;
 use lore_proto::auth::LookupUserPermissionsRequest;
 use lore_proto::auth::LookupUserPermissionsResponse;
 use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
+use lore_proto::lore::user::v1::user_service_client::UserServiceClient;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
@@ -19,6 +20,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tonic::codegen::InterceptedService;
+use tonic::transport::Channel;
 use tonic::transport::ClientTlsConfig;
 
 use crate::grpc::ServerResultExt;
@@ -48,15 +50,19 @@ fn auth_endpoint(auth_url: &str) -> Result<tonic::transport::Endpoint, Status> {
     Ok(endpoint)
 }
 
+async fn connect(url: &str, service: &str) -> Result<Channel, Status> {
+    let endpoint = auth_endpoint(url)?;
+    // Connect from net so the hyper/h2 driver tasks this spawns bind there
+    // rather than to the core runtime the caller runs on.
+    lore_spawn_net!(async move { endpoint.connect().await })
+        .await
+        .warn_map_err(|_| Status::internal(format!("{service} connection task failed")))?
+        .warn_map_err(|_| Status::internal(format!("Failed to connect to {service}")))
+}
+
 impl LoreAuthClientHelper {
     async fn new(auth_url: String) -> Result<LoreAuthClientHelper, Status> {
-        let endpoint = auth_endpoint(&auth_url)?;
-        // Connect from net so the hyper/h2 driver tasks this spawns bind there
-        // rather than to the core runtime the caller runs on.
-        let channel = lore_spawn_net!(async move { endpoint.connect().await })
-            .await
-            .warn_map_err(|_| Status::internal("lore auth connection task failed"))?
-            .warn_map_err(|_| Status::internal("Failed to connect to lore auth service"))?;
+        let channel = connect(&auth_url, "lore auth service").await?;
         let client = UrcAuthApiClient::with_interceptor(channel, CorrelationInterceptor);
         Ok(LoreAuthClientHelper { client })
     }
@@ -88,6 +94,17 @@ impl LoreAuthClientHelper {
 
 pub async fn grpc_get_auth_client(auth_url: String) -> Result<LoreAuthClientHelper, Status> {
     LoreAuthClientHelper::new(auth_url).await
+}
+
+/// A `lore.user.v1.UserService` client for `user_url`, dialed like `auth_url`.
+pub async fn grpc_get_user_service_client(
+    user_url: &str,
+) -> Result<UserServiceClient<InterceptedService<Channel, CorrelationInterceptor>>, Status> {
+    let channel = connect(user_url, "user directory").await?;
+    Ok(UserServiceClient::with_interceptor(
+        channel,
+        CorrelationInterceptor,
+    ))
 }
 
 impl InstrumentProvider for LoreAuthClientHelper {

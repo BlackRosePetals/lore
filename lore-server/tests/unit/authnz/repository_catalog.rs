@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,6 +12,14 @@ use lore_base::types::RepositoryId;
 use lore_proto::auth::LookupUserPermissionsRequest;
 use lore_proto::auth::LookupUserPermissionsResponse;
 use lore_proto::auth::ResourcePermission;
+use lore_proto::lore::user::v1::PartitionListRequest;
+use lore_proto::lore::user::v1::PartitionListResponse;
+use lore_proto::lore::user::v1::UserFindRequest;
+use lore_proto::lore::user::v1::UserFindResponse;
+use lore_proto::lore::user::v1::UserGetRequest;
+use lore_proto::lore::user::v1::UserGetResponse;
+use lore_proto::lore::user::v1::user_service_server::UserService;
+use lore_proto::lore::user::v1::user_service_server::UserServiceServer;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_server::auth::jwt::AuthorizationToken;
@@ -22,6 +31,7 @@ use lore_server::settings::AuthSettings;
 use lore_server::settings::BaselineAccess;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Code;
 use tonic::Status;
 
@@ -479,7 +489,7 @@ fn selection_follows_the_authorizer_flowchart() {
     ];
     for (auth, auth_url, expected) in table {
         assert_eq!(
-            select_repository_catalog(auth.as_ref(), auth_url).unwrap(),
+            select_repository_catalog(auth.as_ref(), auth_url, None).unwrap(),
             expected,
             "auth: {auth:?}, auth_url: {auth_url:?}"
         );
@@ -492,15 +502,17 @@ fn selection_follows_the_authorizer_flowchart() {
 /// both settings that could supply one.
 #[test]
 fn refused_pairings_are_refused() {
-    select_repository_catalog(None, AUTH_URL).unwrap_err();
+    select_repository_catalog(None, AUTH_URL, None).unwrap_err();
     select_repository_catalog(
         Some(&auth_settings("resource_claim = \"resources\"")),
         AUTH_URL,
+        None,
     )
     .unwrap_err();
     let message = select_repository_catalog(
         Some(&auth_settings("repository_catalog = \"auth_service\"")),
         None,
+        USER_URL,
     )
     .unwrap_err()
     .to_string();
@@ -508,15 +520,108 @@ fn refused_pairings_are_refused() {
     assert!(message.contains("auth_url"), "{message}");
 }
 
+const USER_URL: Option<&str> = Some("https://directory.example.com");
+
+/// `user_url` picks the `user_service` catalog ahead of `auth_url`, and an
+/// explicit mode wins over either.
+#[test]
+fn user_url_selects_the_user_service_catalog() {
+    let user_service = CatalogSelection::UserService(USER_URL.unwrap().to_string());
+    let table = [
+        (auth_settings(""), AUTH_URL, USER_URL, user_service.clone()),
+        (auth_settings(""), None, USER_URL, user_service.clone()),
+        (
+            auth_settings("resource_claim = \"resources\""),
+            None,
+            USER_URL,
+            user_service.clone(),
+        ),
+        (
+            auth_settings("repository_catalog = \"user_service\""),
+            AUTH_URL,
+            USER_URL,
+            user_service.clone(),
+        ),
+        // `repository_catalog_url` belongs to `auth_service` alone.
+        (
+            auth_settings(
+                "repository_catalog = \"user_service\"\nrepository_catalog_url = \"https://catalog.example.com\"",
+            ),
+            AUTH_URL,
+            USER_URL,
+            user_service.clone(),
+        ),
+        (
+            auth_settings("repository_catalog = \"auth_service\""),
+            AUTH_URL,
+            USER_URL,
+            CatalogSelection::AuthClient(AUTH_URL.unwrap().to_string()),
+        ),
+        (
+            auth_settings("repository_catalog = \"baseline\""),
+            AUTH_URL,
+            USER_URL,
+            CatalogSelection::Baseline(BaselineAccess::Denied),
+        ),
+        // An empty `user_url` is unset, as clients read it.
+        (
+            auth_settings(""),
+            AUTH_URL,
+            Some(""),
+            CatalogSelection::AuthClient(AUTH_URL.unwrap().to_string()),
+        ),
+        (
+            auth_settings(""),
+            None,
+            Some(""),
+            CatalogSelection::Baseline(BaselineAccess::Denied),
+        ),
+    ];
+    for (auth, auth_url, user_url, expected) in table {
+        assert_eq!(
+            select_repository_catalog(Some(&auth), auth_url, user_url).unwrap(),
+            expected,
+            "auth: {auth:?}, auth_url: {auth_url:?}, user_url: {user_url:?}"
+        );
+    }
+    // A server with no `[server.auth]` has no token to forward.
+    assert_eq!(
+        select_repository_catalog(None, None, USER_URL).unwrap(),
+        CatalogSelection::Baseline(BaselineAccess::Reachable)
+    );
+}
+
+#[test]
+fn user_service_without_user_url_is_refused() {
+    for user_url in [None, Some("")] {
+        let message = select_repository_catalog(
+            Some(&auth_settings("repository_catalog = \"user_service\"")),
+            AUTH_URL,
+            user_url,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("user_url"), "{message}");
+    }
+}
+
 #[tokio::test]
 async fn construction_agrees_with_selection() {
     let (immutable, mutable) = stores_holding(&[]).await;
-    for (auth, auth_url) in [
-        (None, None),
-        (Some(auth_settings("")), AUTH_URL),
-        (Some(auth_settings("")), None),
+    for (auth, auth_url, user_url) in [
+        (None, None, None),
+        (Some(auth_settings("")), AUTH_URL, None),
+        (Some(auth_settings("")), None, None),
+        (Some(auth_settings("")), AUTH_URL, USER_URL),
     ] {
-        repository_catalog(auth.as_ref(), auth_url, immutable.clone(), mutable.clone()).unwrap();
+        repository_catalog(
+            auth.as_ref(),
+            auth_url,
+            user_url,
+            immutable.clone(),
+            mutable.clone(),
+        )
+        .unwrap();
     }
 }
 
@@ -533,5 +638,187 @@ fn selection_display_names_the_implementation() {
     assert_eq!(
         CatalogSelection::AuthClient("https://auth.example.com".to_string()).to_string(),
         "AuthClientRepositoryCatalog(https://auth.example.com)"
+    );
+    assert_eq!(
+        CatalogSelection::UserService("https://directory.example.com".to_string()).to_string(),
+        "UserServiceRepositoryCatalog(https://directory.example.com)"
+    );
+}
+
+#[test]
+fn partition_list_response_yields_the_partition_bytes() {
+    let partition = repository("0194b726b34e72b0b45550b88a967076");
+    let response = |partition: &[u8]| PartitionListResponse {
+        partition: partition.to_vec().into(),
+        permission: vec!["read".to_string()],
+    };
+    assert_eq!(
+        repository_from_response(response(partition.as_ref())),
+        Some(partition)
+    );
+    assert_eq!(repository_from_response(response(&[])), None);
+    assert_eq!(repository_from_response(response(&[7; 15])), None);
+    assert_eq!(repository_from_response(response(&[7; 17])), None);
+}
+
+/// Streams `partitions` from `PartitionList`, recording the
+/// `authorization` header of each call.
+struct Directory {
+    partitions: Vec<Vec<u8>>,
+    authorizations: Mutex<Vec<Option<String>>>,
+}
+
+#[tonic::async_trait]
+impl UserService for Directory {
+    async fn user_get(
+        &self,
+        _request: tonic::Request<UserGetRequest>,
+    ) -> Result<tonic::Response<UserGetResponse>, Status> {
+        Err(Status::unimplemented("not under test"))
+    }
+
+    async fn user_find(
+        &self,
+        _request: tonic::Request<UserFindRequest>,
+    ) -> Result<tonic::Response<UserFindResponse>, Status> {
+        Err(Status::unimplemented("not under test"))
+    }
+
+    type PartitionListStream =
+        tokio_stream::Iter<std::vec::IntoIter<Result<PartitionListResponse, Status>>>;
+
+    async fn partition_list(
+        &self,
+        request: tonic::Request<PartitionListRequest>,
+    ) -> Result<tonic::Response<Self::PartitionListStream>, Status> {
+        let authorization = request
+            .metadata()
+            .get("authorization")
+            .map(|value| value.to_str().unwrap().to_string());
+        self.authorizations.lock().unwrap().push(authorization);
+        let messages: Vec<_> = self
+            .partitions
+            .iter()
+            .map(|partition| {
+                Ok(PartitionListResponse {
+                    partition: partition.clone().into(),
+                    permission: vec!["read".to_string()],
+                })
+            })
+            .collect();
+        Ok(tonic::Response::new(tokio_stream::iter(messages)))
+    }
+}
+
+async fn serve(partitions: Vec<Vec<u8>>) -> (String, Arc<Directory>) {
+    let directory = Arc::new(Directory {
+        partitions,
+        authorizations: Mutex::new(Vec::new()),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = directory.clone();
+    lore_base::lore_spawn!(async move {
+        tonic::transport::Server::builder()
+            .add_service(UserServiceServer::from_arc(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+    (format!("http://{address}"), directory)
+}
+
+/// The stream is paged by the catalog: every streamed partition is listed
+/// once across the pages, a duplicate or malformed entry is not, and each
+/// page asks the directory with the caller's token.
+#[tokio::test]
+async fn user_service_catalog_pages_the_stream() {
+    let ids = identifiers(5);
+    let mut streamed: Vec<Vec<u8>> = ids.iter().map(|id| id.as_ref().to_vec()).collect();
+    streamed.push(ids[2].as_ref().to_vec());
+    streamed.push(vec![1, 2, 3]);
+    let (url, directory) = serve(streamed).await;
+    let catalog = UserServiceRepositoryCatalog::new(url);
+    let claims = AuthorizationToken::default();
+    let token = VerifiedToken {
+        raw: "raw.jwt",
+        claims: &claims,
+    };
+
+    let mut listed = Vec::new();
+    let mut page_token = None;
+    loop {
+        let (page, next) = catalog
+            .list_repositories(Some(&token), Some(2), page_token.as_deref())
+            .await
+            .unwrap();
+        assert!(page.len() <= 2);
+        listed.extend(page);
+        match next {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+
+    let mut expected = ids.clone();
+    expected.sort_unstable();
+    assert_eq!(listed, expected);
+    let authorizations = directory.authorizations.lock().unwrap();
+    assert_eq!(authorizations.len(), 3, "one call per page");
+    assert!(
+        authorizations
+            .iter()
+            .all(|header| header.as_deref() == Some("Bearer raw.jwt"))
+    );
+}
+
+#[tokio::test]
+async fn user_service_catalog_lists_everything_through_list_all() {
+    let ids = identifiers(3);
+    let (url, _) = serve(ids.iter().map(|id| id.as_ref().to_vec()).collect()).await;
+    let catalog: Arc<dyn RepositoryCatalog> = Arc::new(UserServiceRepositoryCatalog::new(url));
+    let mut expected = ids.clone();
+    expected.sort_unstable();
+    assert_eq!(catalog.list_all(None, BUDGET).await.unwrap(), expected);
+}
+
+/// A directory streaming more partitions than the limit fails the listing
+/// rather than growing it; exactly the limit is listed.
+#[tokio::test]
+async fn user_service_catalog_refuses_a_stream_over_the_limit() {
+    let ids = identifiers(4);
+    let (url, _) = serve(ids.iter().map(|id| id.as_ref().to_vec()).collect()).await;
+    let err = UserServiceRepositoryCatalog::with_limit(url.clone(), 3)
+        .list_repositories(None, None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::ResourceExhausted);
+
+    let (listed, _) = UserServiceRepositoryCatalog::with_limit(url, 4)
+        .list_repositories(None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 4);
+}
+
+/// Pages that add up to more than `MAX_LISTED_REPOSITORIES` fail the walk,
+/// so a paged upstream is bounded by count as well as by the budget.
+#[tokio::test]
+async fn list_all_refuses_more_than_the_maximum() {
+    let ids: Vec<RepositoryId> = (1..=MAX_LISTED_REPOSITORIES as u128 + 1)
+        .map(|n| RepositoryId::from(n.to_be_bytes()))
+        .collect();
+    let (within, over) = ids.split_at(MAX_LISTED_REPOSITORIES);
+
+    let full: Arc<dyn RepositoryCatalog> = Arc::new(Paged(vec![within.to_vec()]));
+    assert_eq!(
+        full.list_all(None, BUDGET).await.unwrap().len(),
+        MAX_LISTED_REPOSITORIES
+    );
+
+    let overfull: Arc<dyn RepositoryCatalog> =
+        Arc::new(Paged(vec![within.to_vec(), over.to_vec()]));
+    assert_eq!(
+        overfull.list_all(None, BUDGET).await.unwrap_err().code(),
+        Code::ResourceExhausted
     );
 }

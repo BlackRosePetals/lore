@@ -590,6 +590,34 @@ fn auth_with_issuer_and_audience_passes_validation() {
     validate_auth_config(&settings).expect("a complete [server.auth] must validate");
 }
 
+/// The loader reads `user_url` from `[environment.endpoint]` for the catalog
+/// selection, so `repository_catalog = "user_service"` loads with it and is
+/// refused without it.
+#[test]
+fn user_service_catalog_needs_user_url_at_load() {
+    let settings_with = |endpoint_keys: &str| {
+        settings_with_auth_keys(&format!(
+            r#"
+                jwt_issuer = "LEGACY_AUTH_KEYWORD"
+                jwt_audience = ["lore-service"]
+                repository_catalog = "user_service"
+
+                [environment.endpoint]
+                auth_url = "ucs-auth://auth.example.com"
+                {endpoint_keys}
+            "#
+        ))
+        .expect("settings must parse")
+    };
+    validate_auth_config(&settings_with(
+        r#"user_url = "ucs-auth://directory.example.com""#,
+    ))
+    .expect("the user_service catalog with user_url must validate");
+    let error = validate_auth_config(&settings_with(""))
+        .expect_err("the user_service catalog without user_url must fail validation");
+    assert!(error.to_string().contains("user_url"), "{error}");
+}
+
 /// No `[server.auth]` at all keeps starting: verification stays off and
 /// nothing is mandatory.
 #[test]
