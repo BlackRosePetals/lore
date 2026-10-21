@@ -76,8 +76,12 @@ pub enum PausePoint {
     /// anything to write.
     Scanning,
     /// A mutable store list has handed its stream back, and one of its producers, which read its
-    /// group's buckets into memory before, has sent none of their keys yet.
+    /// group's buckets into memory before, has sent none of their keys yet, and holds no lock of
+    /// its group.
     Listing,
+    /// A mutable store list producer walking its group under the group's layout has sent the keys
+    /// of a bucket and not yet read the next.
+    Walking,
     /// A measurement of the packstores' size holds the claim it runs on and has measured none
     /// yet.
     Measuring,

@@ -179,6 +179,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   written and index entries and local-only data were discarded. A listing of the local mutable store fails instead of
   missing entries, and after failing to open a new data file, the next write retries instead of every write failing with
   `No more packfiles`
+- A listing of the local mutable store no longer misses entries that a flush in the same process moves to other index
+  buckets meanwhile
 - A local store whose `version` file can't be read fails to open, where it was marked for migration again on every open,
   making every process using it reload it at each use. A store affected by this recovers at its next command connected
   to the remote; until then, commands without a connection fail with "Unable to upgrade local store to current client,

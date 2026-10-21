@@ -229,7 +229,7 @@ pub struct KeyValueStream {
 
 impl KeyValueStream {
     pub fn new() -> (Self, UnboundedSender<(Hash, Hash)>) {
-        // Unbounded to ensure not blocking while holding group bucket read lock
+        // Unbounded, so that a send never waits while the producer holds its group's layout.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (Self { channel: rx }, tx)
     }

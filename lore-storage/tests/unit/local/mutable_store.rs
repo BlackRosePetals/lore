@@ -483,6 +483,225 @@ async fn a_list_sends_nothing_before_it_returns() {
     );
 }
 
+/// **A list leaves out no key a fan-out moves.** A producer reads its group's bucket count once it
+/// holds the group's layout, so a flush that fanned the group out after the producer loaded it at
+/// the old layout leaves the walk reading the new one.
+#[tokio::test]
+async fn a_list_leaves_out_no_key_a_fan_out_moves() {
+    use lore_storage::mutable_store::MutableStore;
+    use lore_storage::test_util::PausePoint;
+    let dir = lore_base::test_util::TempDir::new("ms_list_fan_out_");
+    let local = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            MutableStoreSettings {
+                fan_out_threshold: 2,
+                flush_delay_seconds: 3600,
+                ..client_settings()
+            },
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store opens"),
+    );
+    let store: Arc<dyn MutableStore> = local.clone();
+    store_spread_keys(&store, 0..6).await;
+    let group = local.group[7].clone();
+    assert_eq!(group.bucket_count.load(atomic::Ordering::Relaxed), 1);
+
+    // Every producer waits to send once the list has returned; group 07's then fans out.
+    let sending: Vec<_> = (0..local.group.len())
+        .map(|_| lore_storage::test_util::pause_at(PausePoint::Listing))
+        .collect();
+    let stream = store
+        .clone()
+        .list(Partition::default(), KeyType::BranchMetadata)
+        .await
+        .expect("lists");
+    for pause in &sending {
+        pause.reached.notified().await;
+    }
+    store.clone().flush(false).await.expect("flush");
+    assert!(
+        group.bucket_count.load(atomic::Ordering::Relaxed) > 1,
+        "the flush fanned the group out"
+    );
+    for pause in &sending {
+        pause.resume.notify_one();
+    }
+    assert_eq!(
+        listed_keys(stream).await,
+        sorted_keys((0..6).map(spread_key)),
+        "the list sends every key of the group it loaded before the fan-out, once each"
+    );
+}
+
+/// **A list leaves out no key a fan-out moves while it walks a group.** The producer walks its
+/// group holding the group's layout, so a flush fanning the group out waits for the walk to end,
+/// and the walk sends every key at the layout it read.
+#[tokio::test]
+async fn a_list_leaves_out_no_key_a_fan_out_moves_while_it_walks() {
+    use lore_storage::mutable_store::MutableStore;
+    use lore_storage::test_util::PausePoint;
+    let dir = lore_base::test_util::TempDir::new("ms_list_walk_fan_out_");
+    let local = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            MutableStoreSettings {
+                fan_out_threshold: 2,
+                flush_delay_seconds: 3600,
+                ..client_settings()
+            },
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store opens"),
+    );
+    let store: Arc<dyn MutableStore> = local.clone();
+    store_spread_keys(&store, 0..6).await;
+    store.clone().flush(false).await.expect("flush");
+    let group = local.group[7].clone();
+    let walked_level = group.bucket_count.load(atomic::Ordering::Relaxed);
+    assert_eq!(walked_level, 32);
+    // Three more keys in bucket 0 at 32 buckets, which the next flush fans out.
+    let crowding: Vec<Hash> = (1..4u8)
+        .map(|byte| {
+            let mut key = spread_key(0);
+            key.data_mut()[1] = byte;
+            key
+        })
+        .collect();
+    for key in &crowding {
+        store
+            .clone()
+            .store(
+                Partition::default(),
+                *key,
+                Hash::from_u64(1),
+                KeyType::BranchMetadata,
+            )
+            .await
+            .expect("store succeeds");
+    }
+
+    let walking = lore_storage::test_util::pause_at(PausePoint::Walking);
+    let stream = store
+        .clone()
+        .list(Partition::default(), KeyType::BranchMetadata)
+        .await
+        .expect("lists");
+    walking.reached.notified().await;
+    let mut flushing = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { store.flush(false).await })
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut flushing)
+            .await
+            .is_err(),
+        "the flush waits for the walk"
+    );
+    walking.resume.notify_one();
+    assert_eq!(
+        listed_keys(stream).await,
+        sorted_keys((0..6).map(spread_key).chain(crowding)),
+        "the walk sends every key at the layout it read, once each"
+    );
+    flushing.await.expect("the flush ends").expect("flush");
+    assert!(
+        group.bucket_count.load(atomic::Ordering::Relaxed) > walked_level,
+        "the flush fanned the group out once the walk ended"
+    );
+}
+
+/// The keys `stream` sends, sorted.
+async fn listed_keys(stream: lore_storage::store_types::KeyValueStream) -> Vec<Hash> {
+    use futures::StreamExt;
+    sorted_keys(stream.map(|(key, _)| key).collect::<Vec<_>>().await)
+}
+
+/// `keys`, typed as branch metadata as the store keeps them, sorted.
+fn sorted_keys(keys: impl IntoIterator<Item = Hash>) -> Vec<Hash> {
+    let mut keys: Vec<Hash> = keys
+        .into_iter()
+        .map(|mut key| {
+            key.data_mut()[2] = KeyType::BranchMetadata as u8;
+            key
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// **A list whose stream is unread holds back no flush.** A producer sends into a stream that never
+/// waits, so a walk holding the group's layout ends however far behind its caller reads, and a
+/// flush fanning the group out then takes the layout.
+#[tokio::test]
+async fn a_list_whose_stream_is_unread_holds_back_no_flush() {
+    use lore_storage::mutable_store::MutableStore;
+    let dir = lore_base::test_util::TempDir::new("ms_list_unread_");
+    let local = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            MutableStoreSettings {
+                fan_out_threshold: 64,
+                flush_delay_seconds: 3600,
+                ..client_settings()
+            },
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("store opens"),
+    );
+    let store: Arc<dyn MutableStore> = local.clone();
+    let keys: Vec<Hash> = (0..512u32)
+        .map(|index| {
+            let mut key = Hash::default();
+            key.data_mut()[0] = 7;
+            key.data_mut()[4..8].copy_from_slice(&index.to_le_bytes());
+            key
+        })
+        .collect();
+    for (index, key) in keys.iter().enumerate() {
+        store
+            .clone()
+            .store(
+                Partition::default(),
+                *key,
+                Hash::from_u64(index as u64 + 1),
+                KeyType::BranchMetadata,
+            )
+            .await
+            .expect("store succeeds");
+    }
+    assert_eq!(
+        local.group[7].bucket_count.load(atomic::Ordering::Relaxed),
+        1
+    );
+
+    let stream = store
+        .clone()
+        .list(Partition::default(), KeyType::BranchMetadata)
+        .await
+        .expect("lists");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.clone().flush(false),
+    )
+    .await
+    .expect("no producer holds its group's layout while its stream is unread")
+    .expect("flush");
+    assert!(
+        local.group[7].bucket_count.load(atomic::Ordering::Relaxed) > 1,
+        "the flush fanned the group out"
+    );
+    assert_eq!(
+        listed_keys(stream).await,
+        sorted_keys(keys),
+        "the list sends every key once read"
+    );
+}
+
 /// A `version` file that cannot be read fails the open and is left as it is.
 #[tokio::test]
 async fn an_unreadable_version_file_fails_the_open_and_is_kept() {
