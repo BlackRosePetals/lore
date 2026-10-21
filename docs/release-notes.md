@@ -11,6 +11,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore repository verify` fails where it can't read part of the local store, where it passed over it, and checks and
+  heals every fragment a flush in the same process moves to other index buckets meanwhile
+
 ## v0.11.0 (Oct 21st 2026) [#1892]
 
 ### Breaking changes

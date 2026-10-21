@@ -88,6 +88,9 @@ pub enum PausePoint {
     /// A put that verifies its writes has stored its entry and not yet found it again to read its
     /// payload back.
     Verifying,
+    /// A verification of the immutable store holds a group's flush lock, has read the group's
+    /// bucket count, and has checked none of its buckets.
+    Checking,
 }
 
 /// A task the store runs of its own accord rather than for a caller, see [`count_store_tasks`].

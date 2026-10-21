@@ -5774,24 +5774,33 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         let _compact = self.compaction.acquire().await;
     }
 
+    /// Walks each group under its flush lock, which a fan-out holds as it moves the group's
+    /// entries between buckets, so the walk reads one layout and heals each failure in the bucket
+    /// it found it in. Holds the eviction and compaction permits for the whole walk: those passes
+    /// rewrite the entries and packfiles being read, so one running alongside would report
+    /// failures that are only the store moving underneath it. Fails, walking nothing, when a
+    /// bucket cannot be loaded.
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
         let _hold = self
             .hold(if heal { Intent::Write } else { Intent::Read })
             .await?;
-        // Held for the whole walk: eviction and compaction rewrite the very entries and
-        // packfiles being read, so a pass running alongside reports failures that are only
-        // the store moving underneath it.
         let evict_permit = self.eviction.acquire().await;
         let compact_permit = self.compaction.acquire().await;
 
-        let _ = self.deserialize_all_buckets().await;
+        self.deserialize_all_buckets()
+            .await
+            .forward::<StoreError>("Failed to load the store to verify")?;
 
-        let mut failed = vec![];
-
+        let mut failed_count = 0;
         let mut fragment_count = 0;
         let mut verified_count = 0;
         for (group_index, group) in self.group.iter().enumerate() {
+            let _flushes =
+                crate::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
             let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+            #[cfg(feature = "test-util")]
+            crate::test_util::pause_point(crate::test_util::PausePoint::Checking).await;
+            let mut failed = vec![];
             for bucket_index in 0..active_buckets {
                 let bucket = group.bucket(bucket_index).read().await;
 
@@ -5815,7 +5824,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                                     entry.data.pack_offset,
                                     entry.data.size_payload);
                         }) else {
-                        failed.push((group_index, bucket_index, entry.address.hash, entry.data));
+                        failed.push((bucket_index, entry.address.hash, entry.data));
                         continue;
                     };
 
@@ -5838,7 +5847,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                                 err);
                                 lore_base::lore_warn!("First 64 bytes {:?}", &buffer[..std::cmp::min(64, buffer.len())]);
                             }) else {
-                            failed.push((group_index, bucket_index, entry.address.hash, entry.data));
+                            failed.push((bucket_index, entry.address.hash, entry.data));
                             continue;
                         };
 
@@ -5852,12 +5861,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                                 entry.data.size_payload,
                                 buffer.len()
                             );
-                            failed.push((
-                                group_index,
-                                bucket_index,
-                                entry.address.hash,
-                                entry.data,
-                            ));
+                            failed.push((bucket_index, entry.address.hash, entry.data));
                             continue;
                         }
 
@@ -5871,12 +5875,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                                 entry.data.pack_offset,
                                 entry.data.size_payload
                             );
-                            failed.push((
-                                group_index,
-                                bucket_index,
-                                entry.address.hash,
-                                entry.data,
-                            ));
+                            failed.push((bucket_index, entry.address.hash, entry.data));
                             continue;
                         }
                     } else {
@@ -5894,12 +5893,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                                 "First 64 bytes {:?}",
                                 &buffer[..std::cmp::min(64, buffer.len())]
                             );
-                            failed.push((
-                                group_index,
-                                bucket_index,
-                                entry.address.hash,
-                                entry.data,
-                            ));
+                            failed.push((bucket_index, entry.address.hash, entry.data));
                             continue;
                         }
                     }
@@ -5907,17 +5901,8 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                     verified_count += 1;
                 }
             }
-        }
 
-        lore_base::lore_debug!(
-            "Verified {verified_count} fragments with payloads of {fragment_count} total fragments"
-        );
-        if !failed.is_empty() {
-            lore_base::lore_debug!("{} invalid fragments", failed.len());
-
-            for (group_index, failed_bucket_index, failed_hash, failed_data) in failed.iter() {
-                let group = &self.group[*group_index];
-                let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+            for (failed_bucket_index, failed_hash, failed_data) in failed.iter() {
                 for bucket_index in 0..active_buckets {
                     let bucket = group.bucket(bucket_index).read().await;
 
@@ -5977,7 +5962,14 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                     group.dirty[*failed_bucket_index].store(true, atomic::Ordering::Relaxed);
                 }
             }
+            failed_count += failed.len();
+        }
 
+        lore_base::lore_debug!(
+            "Verified {verified_count} fragments with payloads of {fragment_count} total fragments"
+        );
+        if failed_count > 0 {
+            lore_base::lore_debug!("{failed_count} invalid fragments");
             if heal {
                 drop(evict_permit);
                 drop(compact_permit);

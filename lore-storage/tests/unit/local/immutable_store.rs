@@ -4214,6 +4214,127 @@ async fn a_healing_verify_releases_the_store() {
     );
 }
 
+/// **A verify heals a payload a fan-out would move out of its walk.** It walks a group under the
+/// group's flush lock, so a flush fanning the group out waits for the walk, which reads one
+/// layout and finds every entry of the group at it.
+#[tokio::test]
+async fn a_verify_heals_a_corrupt_payload_a_fan_out_would_move_out_of_its_walk() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_verify_fan_out_");
+    let store = LocalImmutableStore::new(
+        Some(dir.path().to_path_buf()),
+        ImmutableStoreSettings {
+            fan_out_threshold: 4,
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        },
+    )
+    .await
+    .expect("store opens");
+    let partition = Partition::from([3u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(6);
+    let mut addresses = vec![];
+    for payload in &payloads[..4] {
+        addresses.push(put_payload(&store, partition, Context::default(), payload, false).await);
+    }
+    ImmutableStore::flush(store.clone(), false)
+        .await
+        .expect("flush at level 1");
+    let corrupt = *addresses
+        .iter()
+        .find(|address| lore_storage::local::fan_out::bucket_index_for(&address.hash, 32) != 0)
+        .expect("a payload a fan-out to 32 buckets moves out of bucket 0");
+    let found = store
+        .clone()
+        .find(partition, corrupt, Lookup::Read)
+        .await
+        .expect("the entry is there to corrupt");
+    store.group[group_index]
+        .packstore
+        .obliterate(
+            found.data.pack_file,
+            found.data.pack_offset,
+            found.data.size_payload,
+        )
+        .await
+        .expect("overwrite the payload");
+    for payload in &payloads[4..] {
+        put_payload(&store, partition, Context::default(), payload, false).await;
+    }
+
+    let checking: Vec<_> = (0..=group_index)
+        .map(|_| pause_at(PausePoint::Checking))
+        .collect();
+    let verifying = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { store.verify(true).await })
+    };
+    for pause in &checking[..group_index] {
+        pause.reached.notified().await;
+        pause.resume.notify_one();
+    }
+    checking[group_index].reached.notified().await;
+    let mut flushing = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { ImmutableStore::flush(store, false).await })
+    };
+    let flushed_meanwhile = tokio::time::timeout(Duration::from_millis(100), &mut flushing)
+        .await
+        .is_ok();
+    checking[group_index].resume.notify_one();
+    verifying.await.expect("the verify ends").expect("verifies");
+    let resolved = lore_storage::immutable_store::query_one(
+        &(store.clone() as Arc<dyn ImmutableStore>),
+        partition,
+        corrupt,
+    )
+    .await
+    .expect("query answers");
+    assert_eq!(
+        resolved.match_made,
+        StoreMatch::MatchNone,
+        "the verify healed the payload that no longer verifies"
+    );
+    assert!(!flushed_meanwhile, "the flush waits for the walk");
+    flushing.await.expect("the flush ends").expect("flush");
+    assert!(
+        store.group[group_index]
+            .bucket_count
+            .load(atomic::Ordering::Relaxed)
+            > 1,
+        "the group fanned out once the walk ended"
+    );
+}
+
+/// **A verify fails when a bucket cannot be loaded**, rather than passing over the entries the
+/// bucket holds.
+#[tokio::test]
+async fn a_verify_fails_when_a_bucket_cannot_be_loaded() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_verify_unloaded_");
+    let partition = Partition::from([3u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+    {
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), quiet_settings())
+            .await
+            .expect("store opens");
+        put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+        ImmutableStore::flush(store.clone(), false)
+            .await
+            .expect("flush");
+    }
+    let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), quiet_settings())
+        .await
+        .expect("store reopens");
+    block_bucket_file(&store, group_index, 0);
+    assert!(
+        store.verify(false).await.is_err(),
+        "a verify that could not load a bucket passed"
+    );
+}
+
 /// **A flush settles a bucket it has nothing to write for.** An emptied bucket above
 /// the committed level has no file to write and none to overwrite; its flags left
 /// set would keep the store claimed after the flush.
