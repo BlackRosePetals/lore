@@ -34,6 +34,7 @@ pub struct DiscoveryDocument {
     pub device_authorization_endpoint: Option<String>,
     pub revocation_endpoint: Option<String>,
     pub end_session_endpoint: Option<String>,
+    pub token_endpoint_auth_methods_supported: Option<Vec<String>>,
 }
 
 /// Why a discovery document was not fetched or not accepted.

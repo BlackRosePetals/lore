@@ -153,7 +153,8 @@ pub extern "C" fn lore_auth_user_info_async(
 
 pub type LoreAuthLoginWithTokenArgs = crate::auth::LoreAuthLoginWithTokenArgs;
 
-/// Authenticate using an existing bearer token.
+/// Authenticate using an existing bearer token, or, when `client_id` is set, as the
+/// registered client it names with `client_secret`.
 ///
 /// # Events
 ///

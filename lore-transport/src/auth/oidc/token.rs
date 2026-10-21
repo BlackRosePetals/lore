@@ -68,13 +68,27 @@ pub(super) async fn request<T>(
 where
     T: for<'de> Deserialize<'de> + Send + 'static,
 {
+    request_authorized(what, endpoint, form, None).await
+}
+
+/// [`request`] with `authorization` as the `Authorization` header, for a client that
+/// authenticates with HTTP Basic (RFC 6749 §2.3.1).
+pub(super) async fn request_authorized<T>(
+    what: &'static str,
+    endpoint: &str,
+    form: Vec<(&'static str, String)>,
+    authorization: Option<String>,
+) -> Result<Outcome<T>, ProtocolError>
+where
+    T: for<'de> Deserialize<'de> + Send + 'static,
+{
     let endpoint = endpoint.to_owned();
     on_net_runtime(async move {
         let form: Vec<(&str, &str)> = form
             .iter()
             .map(|(name, value)| (*name, value.as_str()))
             .collect();
-        let response = post_form(what, &endpoint, &form).await?;
+        let response = post_form(what, &endpoint, &form, authorization.as_deref()).await?;
         parse(what, &response)
     })
     .await

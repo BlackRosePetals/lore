@@ -96,6 +96,18 @@ mod tests {
             }))
         }
 
+        async fn authenticate_client(
+            &self,
+            _auth_url: &str,
+            _client_id: &str,
+            _client_secret: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "authenticate_client".into(),
+            }))
+        }
+
         async fn refresh_authentication(
             &self,
             _auth_url: &str,

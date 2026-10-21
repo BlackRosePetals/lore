@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 //! Authentication against an `OpenID` Connect provider.
 
+pub mod client_credentials;
 pub mod device;
 pub mod discovery;
 pub mod exchange;
@@ -151,16 +152,24 @@ impl FormResponse {
     }
 }
 
-/// POSTs `form` to `url` as `application/x-www-form-urlencoded` (RFC 6749 §4.1.3) and
-/// reads the answer. A request that never reaches the provider is [`Disconnected`]; a body
-/// over [`MAX_RESPONSE_BYTES`] is refused.
+/// POSTs `form` to `url` as `application/x-www-form-urlencoded` (RFC 6749 §4.1.3), with
+/// `authorization` as the `Authorization` header when given, and reads the answer. A request
+/// that never reaches the provider is [`Disconnected`]; a body over [`MAX_RESPONSE_BYTES`]
+/// is refused.
 async fn post_form(
     what: &'static str,
     url: &str,
     form: &[(&str, &str)],
+    authorization: Option<&str>,
 ) -> Result<FormResponse, ProtocolError> {
     let request = match http_client() {
-        Ok(client) => client.post(url).form(form).send().await,
+        Ok(client) => {
+            let mut request = client.post(url).form(form);
+            if let Some(authorization) = authorization {
+                request = request.header(http::header::AUTHORIZATION, authorization);
+            }
+            request.send().await
+        }
         Err(source) => Err(source),
     };
     let mut response = match request {
@@ -209,8 +218,9 @@ pub fn issuer(endpoint: &str) -> &str {
 /// names the issuer and not the client.
 ///
 /// The interactive login is the device authorization grant (RFC 8628), a login with an
-/// external credential the token exchange (RFC 8693), and authorization for a partition the
-/// token exchange when the server advertises a template. The refresh grant is not
+/// external credential the token exchange (RFC 8693), a login as a registered confidential
+/// client the client credentials grant (RFC 6749 §4.4), and authorization for a partition
+/// the token exchange when the server advertises a template. The refresh grant is not
 /// implemented yet, and fails with [`NotSupported`].
 pub struct OidcAuthentication {
     oidc: Oidc,
@@ -313,6 +323,17 @@ impl Authentication for OidcAuthentication {
     ) -> Result<AuthenticationToken, ProtocolError> {
         let document = self.discover(auth_url).await?;
         exchange::login(&self.oidc, &document, token, token_type).await
+    }
+
+    async fn authenticate_client(
+        &self,
+        auth_url: &str,
+        client_id: &str,
+        client_secret: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        let document = self.discover(auth_url).await?;
+        client_credentials::login(&document, client_id, client_secret).await
     }
 
     async fn refresh_authentication(

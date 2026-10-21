@@ -425,6 +425,16 @@ pub trait Authentication: Send + Sync {
         correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError>;
 
+    /// Obtains an authentication token for a confidential client registered with
+    /// the auth backend, which authenticates with its own ID and secret.
+    async fn authenticate_client(
+        &self,
+        auth_url: &str,
+        client_id: &str,
+        client_secret: &str,
+        correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError>;
+
     /// Refreshes the authentication token using a one-time-use refresh token.
     async fn refresh_authentication(
         &self,

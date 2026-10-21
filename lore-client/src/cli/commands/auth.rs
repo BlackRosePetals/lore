@@ -33,6 +33,7 @@ struct CollectedIdentity {
 use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
 use crate::cli::output_formatter;
+use crate::cli::secret_from_flag_or_env;
 use crate::println;
 use crate::styling::CommonStyles;
 use crate::util;
@@ -48,9 +49,24 @@ pub struct AuthLoginArgs {
     /// Token type for non-interactive login (e.g. "api-key", "eg1", "lore")
     #[clap(long = "token-type")]
     token_type: Option<String>,
-    /// Token value for non-interactive login (requires --token-type)
+    /// Token value for non-interactive login (requires --token-type). Read from
+    /// `LORE_TOKEN` when omitted. Unsafe: a value given here is visible to other users
+    /// in the process table and is kept in the shell history
     #[clap(long = "token")]
     token: Option<String>,
+    /// Log in as this confidential client registered with the identity provider,
+    /// authenticating with its client secret
+    #[clap(
+        long = "client-id",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        conflicts_with_all = ["token_type", "token"]
+    )]
+    client_id: Option<String>,
+    /// Client secret for --client-id. Read from `LORE_CLIENT_SECRET` when omitted.
+    /// Unsafe: a value given here is visible to other users in the process table and
+    /// is kept in the shell history
+    #[clap(long = "client-secret", requires = "client_id")]
+    client_secret: Option<String>,
     /// Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`).
     /// Required when logging in with `--token` outside a repository without a remote-url.
     #[clap(long = "auth-url")]
@@ -114,6 +130,9 @@ pub enum AuthCommands {
     Clear,
 }
 
+pub const TOKEN_VAR: &str = "LORE_TOKEN";
+pub const CLIENT_SECRET_VAR: &str = "LORE_CLIENT_SECRET";
+
 pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8 {
     let remote_url = LoreString::from(&args.remote_url);
 
@@ -145,16 +164,42 @@ pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8
             .with_defaults(),
     ));
 
-    if let (Some(token_type), Some(token)) = (args.token_type.as_deref(), args.token.as_deref()) {
+    if let Some(client_id) = args.client_id.as_deref() {
+        let Some(client_secret) = secret_from_flag_or_env(
+            "--client-secret",
+            args.client_secret.as_deref(),
+            CLIENT_SECRET_VAR,
+        ) else {
+            crate::eprintln!(
+                "--client-id requires a client secret: set {CLIENT_SECRET_VAR}, or pass --client-secret"
+            );
+            return 1;
+        };
+        let args = LoreAuthLoginWithTokenArgs {
+            remote_url,
+            token: LoreString::default(),
+            token_type: LoreString::default(),
+            auth_url: args.auth_url.as_deref().into(),
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+        };
+        run_command(globals, args.into(), callback) as u8
+    } else if let Some(token_type) = args.token_type.as_deref()
+        && let Some(token) = secret_from_flag_or_env("--token", args.token.as_deref(), TOKEN_VAR)
+    {
         let args = LoreAuthLoginWithTokenArgs {
             remote_url,
             token: token.into(),
             token_type: LoreString::from(token_type),
             auth_url: args.auth_url.as_deref().into(),
+            client_id: LoreString::default(),
+            client_secret: LoreString::default(),
         };
         run_command(globals, args.into(), callback) as u8
     } else if args.token_type.is_some() || args.token.is_some() {
-        crate::eprintln!("Both --token-type and --token are required for non-interactive login");
+        crate::eprintln!(
+            "Both --token-type and --token (or {TOKEN_VAR}) are required for non-interactive login"
+        );
         1
     } else {
         let args = LoreAuthLoginInteractiveArgs {

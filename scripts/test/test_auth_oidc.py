@@ -34,9 +34,11 @@ from lore_server import (
 from mock_oidc_provider import (
     ACCESS_TOKEN_TYPE,
     API_KEY_TOKEN_TYPE,
+    CLIENT_CREDENTIALS_GRANT,
     DEVICE_CODE_GRANT,
     KEY_USER,
     PAIRWISE_USER,
+    SERVICE_ACCOUNT,
     TOKEN_EXCHANGE_GRANT,
     MockOidcProvider,
     OidcUser,
@@ -284,6 +286,121 @@ def test_a_lore_token_is_stored_without_an_exchange(oidc_env, make_repo):
     assert "Authentication successful" in output
     assert not provider.requests
     assert KEY_USER.user_id in repo.run(urc_args=["auth", "list"])
+
+
+CLIENT_ID = "ci-bot"
+CLIENT_SECRET = "ci-secret-do-not-log"
+LITERAL_WARNING = "is visible to other users in the process table"
+
+
+def login_as_client(repo: Lore, remote_url: str, *args: str, **kwargs) -> str:
+    return repo.run(
+        urc_args=["auth", "login", remote_url, "--client-id", CLIENT_ID, *args],
+        **kwargs,
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "methods", [None, ["client_secret_post"]], ids=["basic", "post"]
+)
+def test_a_client_login_takes_the_secret_from_the_environment(
+    oidc_env, make_repo, methods
+):
+    """`--client-id` with the secret in `LORE_CLIENT_SECRET` sends the
+    client credentials grant, with the credentials where the discovery
+    document's auth methods name, Basic when it names none. The token of the
+    user the client logs in as is stored, and the secret reaches neither the
+    output nor the server log, even at trace level."""
+    provider = oidc_env.provider
+    provider.clients[CLIENT_ID] = (CLIENT_SECRET, SERVICE_ACCOUNT)
+    provider.token_endpoint_auth_methods = methods
+    repo = make_repo(LORE_CLIENT_SECRET=CLIENT_SECRET)
+
+    output = login_as_client(repo, oidc_env.remote_url, level="trace")
+
+    assert "Authentication successful" in output
+    assert LITERAL_WARNING not in output
+    assert CLIENT_SECRET not in output
+    assert CLIENT_SECRET not in Path(oidc_env.server_log).read_text(errors="replace")
+    assert not provider.requests_to("/device")
+    [request] = provider.requests_to("/token")
+    if methods is None:
+        assert request.form == {"grant_type": CLIENT_CREDENTIALS_GRANT}
+        assert request.headers["authorization"].startswith("Basic ")
+    else:
+        assert request.form == {
+            "grant_type": CLIENT_CREDENTIALS_GRANT,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        }
+        assert "authorization" not in request.headers
+    listing = repo.run(urc_args=["auth", "list"])
+    assert f"oidc+{provider.issuer}" in listing
+    assert SERVICE_ACCOUNT.user_id in listing
+
+
+@pytest.mark.smoke
+def test_a_client_secret_on_the_command_line_warns(oidc_env, make_repo):
+    """A literal `--client-secret` still logs in, and warns that the secret
+    is exposed."""
+    oidc_env.provider.clients[CLIENT_ID] = (CLIENT_SECRET, SERVICE_ACCOUNT)
+    repo = make_repo()
+
+    output = login_as_client(
+        repo, oidc_env.remote_url, "--client-secret", CLIENT_SECRET
+    )
+
+    assert "Authentication successful" in output
+    assert LITERAL_WARNING in output
+    assert "LORE_CLIENT_SECRET" in output
+
+
+@pytest.mark.smoke
+def test_a_wrong_client_secret_is_refused(oidc_env, make_repo):
+    """The provider's `invalid_client` fails the login as `NotAuthenticated`,
+    and nothing is stored."""
+    oidc_env.provider.clients[CLIENT_ID] = (CLIENT_SECRET, SERVICE_ACCOUNT)
+    repo = make_repo(LORE_CLIENT_SECRET="not-the-secret")
+
+    with pytest.raises(NotAuthenticatedError):
+        login_as_client(repo, oidc_env.remote_url)
+
+    assert len(oidc_env.provider.requests_to("/token")) == 1
+    assert "oidc+" not in repo.run(urc_args=["auth", "list"])
+
+
+@pytest.mark.smoke
+def test_a_client_login_without_a_secret_asks_nothing(oidc_env, make_repo):
+    """With no secret from either source the login fails before any request,
+    naming where the secret goes."""
+    repo = make_repo()
+
+    with pytest.raises(LoreException) as failure:
+        login_as_client(repo, oidc_env.remote_url)
+
+    assert "LORE_CLIENT_SECRET" in str(failure.value)
+    assert not oidc_env.provider.requests
+
+
+@pytest.mark.smoke
+def test_a_login_token_from_the_environment_does_not_warn(oidc_env, make_repo):
+    """`--token-type` takes the token from `LORE_TOKEN` when `--token` is
+    absent, without the warning a literal `--token` prints."""
+    provider = oidc_env.provider
+    provider.api_keys["oidc-api-key"] = KEY_USER
+    repo = make_repo(LORE_TOKEN="oidc-api-key")
+
+    output = repo.run(
+        urc_args=["auth", "login", oidc_env.remote_url, "--token-type", "api-key"]
+    )
+
+    assert "Authentication successful" in output
+    assert LITERAL_WARNING not in output
+    assert provider.requests_to("/token")[0].form["subject_token"] == "oidc-api-key"
+
+    literal = login_with_token(repo, oidc_env.remote_url, "api-key", "oidc-api-key")
+    assert LITERAL_WARNING in literal
 
 
 @pytest.mark.smoke

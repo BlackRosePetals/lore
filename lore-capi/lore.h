@@ -4268,6 +4268,12 @@ typedef struct lore_auth_login_with_token_args_t {
   // Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`); used
   // directly when non-empty, required when no remote URL is available
   struct lore_string_t auth_url;
+  // Client ID of a confidential client registered with the auth service. When
+  // non-empty, logs in as that client with `client_secret`, and `token` and
+  // `token_type` must be empty
+  struct lore_string_t client_id;
+  // Secret of the client `client_id` names
+  struct lore_string_t client_secret;
 } lore_auth_login_with_token_args_t;
 
 // Arguments for listing all stored authentication identities across endpoints.
@@ -6380,7 +6386,8 @@ void lore_auth_user_info_async(const struct lore_global_args_t *globals,
                                const struct lore_auth_user_info_args_t *args,
                                struct lore_event_callback_config_t callback);
 
-// Authenticate using an existing bearer token.
+// Authenticate using an existing bearer token, or, when `client_id` is set, as the
+// registered client it names with `client_secret`.
 //
 // # Events
 //

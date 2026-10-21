@@ -101,6 +101,18 @@ impl Authentication for StubAuthentication {
         ))
     }
 
+    async fn authenticate_client(
+        &self,
+        _auth_url: &str,
+        _client_id: &str,
+        _client_secret: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        Err(ProtocolError::internal(
+            "the stub only serves authorization exchanges",
+        ))
+    }
+
     async fn refresh_authentication(
         &self,
         _auth_url: &str,

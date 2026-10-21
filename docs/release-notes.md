@@ -31,6 +31,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   only
 - C API: `lore_branch_merge_start_args_t` gains `link_paths` and `link_messages`, changing its size; rebuild against the
   new `lore.h`. A zero-initialized struct keeps today's behavior
+- C API: `lore_auth_login_with_token_args_t` gains `client_id` and `client_secret`, changing its size; rebuild against
+  the new `lore.h`. A zero-initialized struct keeps today's behavior
 - The server refuses to start if `[server.auth] resource_id_template` or `[server.auth.oidc]`
   `resource_template`/`scope_template` lacks `{id}`, as such a template let one grant match every partition. The error
   names the setting
@@ -55,7 +57,15 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   to the issuer verbatim. Partition operations, repository metadata get/set and repository delete send the access token,
   or a per-partition token from token exchange when the server advertises `resource_template` or `scope_template`. A
   token exchange issuer on another host gets the login token only if the token's `root_domains` claim, or else `aud`,
-  names that host. ID tokens are never stored or sent. Refresh and client credentials grants aren't implemented yet
+  names that host. ID tokens are never stored or sent. The refresh grant isn't implemented yet
+- `lore auth login --client-id <ID>` against a server with an OIDC issuer logs in as a confidential client registered
+  at the provider, with the OAuth 2.0 client credentials grant (RFC 6749 §4.4), for CI. The secret comes from
+  `LORE_CLIENT_SECRET`, or from `--client-secret`. The client authenticates with HTTP Basic, or in the form when the
+  provider's discovery document lists only `client_secret_post`. No scope is requested. The C API takes the same login
+  through `client_id` and `client_secret` on `lore_auth_login_with_token_args_t`
+- `--token`, `--identity-token` and `--access-token` fall back to `LORE_TOKEN`, `LORE_IDENTITY_TOKEN` and
+  `LORE_ACCESS_TOKEN` when not given. A secret passed as a flag value, these three or `--client-secret`, now prints a
+  warning, since other users can read it in the process table and the shell history keeps it
 - The user identity is read from the token by the same rule on client and server: the `identity` claim (or
   `https://lore.org/claims/identity`), else `sub`. An issuer whose `sub` isn't a usable identity maps one into
   `identity`, such as Entra's `oid`. Tokens with an empty or non-string identity are refused. The

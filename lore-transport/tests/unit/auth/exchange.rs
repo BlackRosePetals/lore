@@ -590,6 +590,16 @@ async fn a_refusal_of_the_login_token_stays_not_authenticated() {
             Err(unused())
         }
 
+        async fn authenticate_client(
+            &self,
+            _auth_url: &str,
+            _client_id: &str,
+            _client_secret: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(unused())
+        }
+
         async fn refresh_authentication(
             &self,
             _auth_url: &str,

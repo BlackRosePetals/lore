@@ -217,6 +217,18 @@ impl Authentication for UcsAuthentication {
         })
     }
 
+    async fn authenticate_client(
+        &self,
+        _auth_url: &str,
+        _client_id: &str,
+        _client_secret: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        Err(ProtocolError::from(NotSupported {
+            operation: "client credentials login against the gRPC auth service".to_string(),
+        }))
+    }
+
     async fn refresh_authentication(
         &self,
         _auth_url: &str,

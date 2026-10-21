@@ -234,9 +234,16 @@ pub struct LoreAuthLoginWithTokenArgs {
     /// Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`); used
     /// directly when non-empty, required when no remote URL is available
     pub auth_url: LoreString,
+    /// Client ID of a confidential client registered with the auth service. When
+    /// non-empty, logs in as that client with `client_secret`, and `token` and
+    /// `token_type` must be empty
+    pub client_id: LoreString,
+    /// Secret of the client `client_id` names
+    pub client_secret: LoreString,
 }
 
-/// Authenticates against a remote URL using a provided token.
+/// Authenticates against a remote URL using a provided token, or as a registered client
+/// with its ID and secret.
 ///
 /// # Events
 ///
@@ -277,18 +284,27 @@ async fn login_with_token_local(
 
     let execution = setup_execution(globals, callback);
 
-    let auth_url: Option<String> = args.auth_url.into();
+    let auth_url: Option<String> = args.auth_url.clone().into();
 
     LORE_CONTEXT
         .scope(execution, async move {
             let result = async move {
-                login_with_token_impl(
-                    remote_url.as_str(),
-                    args.token.as_str(),
-                    args.token_type.as_str(),
-                    auth_url.as_deref(),
-                )
-                .await
+                if args.client_id.is_empty() {
+                    login_with_token_impl(
+                        remote_url.as_str(),
+                        args.token.as_str(),
+                        args.token_type.as_str(),
+                        auth_url.as_deref(),
+                    )
+                    .await
+                } else {
+                    login_with_client_credentials_impl(
+                        remote_url.as_str(),
+                        &args,
+                        auth_url.as_deref(),
+                    )
+                    .await
+                }
             }
             .await;
             execution_context().dispatcher.complete_result(result).await
@@ -311,6 +327,27 @@ async fn login_with_token_impl(
         }
         Err(err) => Err(err),
     }
+}
+
+async fn login_with_client_credentials_impl(
+    remote_url: &str,
+    args: &LoreAuthLoginWithTokenArgs,
+    auth_url: Option<&str>,
+) -> Result<(), LoginError> {
+    if !args.token.is_empty() || !args.token_type.is_empty() {
+        return Err(LoginError::internal(
+            "Login takes either a token or client credentials, not both",
+        ));
+    }
+    let user_info = lore_revision::auth::login::with_client_credentials_boxed(
+        remote_url,
+        args.client_id.as_str(),
+        args.client_secret.as_str(),
+        auth_url,
+    )
+    .await?;
+    send_user_info(user_info);
+    Ok(())
 }
 
 /// Arguments for authenticating interactively via browser-based login flow.

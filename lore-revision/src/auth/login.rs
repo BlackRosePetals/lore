@@ -124,6 +124,13 @@ const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 /// loop.
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+fn correlation_id() -> String {
+    crate::lore::execution_context()
+        .globals()
+        .correlation_id
+        .to_string()
+}
+
 /// Exchanges an external token for a URC authentication token via the
 /// endpoint's `Authentication` implementation.
 async fn exchange_token(
@@ -136,51 +143,90 @@ async fn exchange_token(
         url: auth_url,
         auth: auth_impl,
     } = auth_endpoint;
-    let correlation_id = crate::lore::execution_context()
-        .globals()
-        .correlation_id
-        .to_string();
 
     lore_debug!("Start auth exchange request");
     let authn = auth_impl
-        .exchange_external_token(&auth_url, token, token_type, &correlation_id)
+        .exchange_external_token(&auth_url, token, token_type, &correlation_id())
         .await
         .forward::<LoginError>("exchanging external token")?;
+    let user_info = store_authentication(&auth_url, authn, recipient_url).await?;
+    lore_debug!(
+        "Auth with {token_type} successful, identity {}",
+        user_info.id
+    );
+    Ok(user_info)
+}
 
-    if let Some(user_info) = lore_credential::user_info_from_token(authn.token.clone()) {
-        lore_debug!(
-            "Auth with {token_type} successful, identity {}",
-            user_info.id
-        );
+/// Checks that `authn` may be sent to `recipient_url` and stores it, with its refresh
+/// token if it has one, under `auth_url`.
+async fn store_authentication(
+    auth_url: &str,
+    authn: AuthenticationToken,
+    recipient_url: &Url,
+) -> Result<UserInfo, LoginError> {
+    let Some(user_info) = lore_credential::user_info_from_token(authn.token.clone()) else {
+        return Err(LoginError::internal("Invalid token"));
+    };
 
-        let decoded_token = insecure_decode_token(&authn.token).internal("decoding token")?;
-        verify_jwt_usage_for_remote(
-            &decoded_token.claims,
-            &domain_from_url_or_url(recipient_url),
-        )
-        .forward::<LoginError>("verifying JWT usage for remote")?;
+    let decoded_token = insecure_decode_token(&authn.token).internal("decoding token")?;
+    verify_jwt_usage_for_remote(
+        &decoded_token.claims,
+        &domain_from_url_or_url(recipient_url),
+    )
+    .forward::<LoginError>("verifying JWT usage for remote")?;
 
-        token_store::store_user_token(
-            auth_url.as_str(),
-            user_info.id.as_str(),
-            &authn.token,
-            decoded_token.claims.acceptable_root_domains(),
-        )
-        .await
-        .forward::<LoginError>("storing user token")?;
+    token_store::store_user_token(
+        auth_url,
+        user_info.id.as_str(),
+        &authn.token,
+        decoded_token.claims.acceptable_root_domains(),
+    )
+    .await
+    .forward::<LoginError>("storing user token")?;
 
-        // Store refresh token if issued
-        if let Some(ref refresh) = authn.refresh_token
-            && let Err(e) =
-                token_store::store_refresh_token(&auth_url, &user_info.id, refresh).await
-        {
-            lore_debug!("Failed to store refresh token for {}: {e}", user_info.id);
-        }
-
-        Ok(user_info)
-    } else {
-        Err(LoginError::internal("Invalid token"))
+    // Store refresh token if issued
+    if let Some(ref refresh) = authn.refresh_token
+        && let Err(e) = token_store::store_refresh_token(auth_url, &user_info.id, refresh).await
+    {
+        lore_debug!("Failed to store refresh token for {}: {e}", user_info.id);
     }
+
+    Ok(user_info)
+}
+
+/// The auth endpoint to log in at, and the URL the token must be usable for: `explicit_auth_url`
+/// and its own URL when given, else the endpoint the server at `remote_url` advertises and
+/// `remote_url`.
+async fn resolve_auth_endpoint(
+    remote_url: &str,
+    explicit_auth_url: Option<&str>,
+) -> Result<(AuthEndpoint, Url), LoginError> {
+    if let Some(url) = explicit_auth_url {
+        // Auth URL provided directly (e.g. via --auth-url), skip environment resolution.
+        // Use the auth URL's domain for JWT validation when no remote URL is available.
+        lore_debug!("Using explicit auth URL: {url}");
+        let parsed = url::Url::parse(url).internal("parsing explicit auth URL")?;
+        let endpoint =
+            AuthEndpoint::resolve(url).forward::<LoginError>("resolving the auth URL")?;
+        return Ok((endpoint, parsed));
+    }
+
+    let (parsed_remote, protocol) =
+        lore_transport::parse(remote_url).forward::<LoginError>("parsing remote URL")?;
+
+    let environment = protocol
+        .environment(Weak::default(), parsed_remote.as_str())
+        .await
+        .forward::<LoginError>("fetching environment")?;
+    let environment = environment
+        .get()
+        .await
+        .forward::<LoginError>("getting environment config")?;
+    lore_debug!("Server environment config: {:?}", environment);
+
+    let selected = select_auth_path(&environment)
+        .forward::<LoginError>("selecting the authentication path")?;
+    Ok((selected.endpoint, parsed_remote))
 }
 
 pub(crate) async fn with_token(
@@ -191,32 +237,7 @@ pub(crate) async fn with_token(
 ) -> Result<UserInfo, LoginError> {
     lore_debug!("Authenticating using remote {remote_url}");
 
-    let (auth_endpoint, remote_url) = if let Some(url) = explicit_auth_url {
-        // Auth URL provided directly (e.g. via --auth-url), skip environment resolution.
-        // Use the auth URL's domain for JWT validation when no remote URL is available.
-        lore_debug!("Using explicit auth URL: {url}");
-        let parsed = url::Url::parse(url).internal("parsing explicit auth URL")?;
-        let endpoint =
-            AuthEndpoint::resolve(url).forward::<LoginError>("resolving the auth URL")?;
-        (endpoint, parsed)
-    } else {
-        let (parsed_remote, protocol) =
-            lore_transport::parse(remote_url).forward::<LoginError>("parsing remote URL")?;
-
-        let environment = protocol
-            .environment(Weak::default(), parsed_remote.as_str())
-            .await
-            .forward::<LoginError>("fetching environment")?;
-        let environment = environment
-            .get()
-            .await
-            .forward::<LoginError>("getting environment config")?;
-        lore_debug!("Server environment config: {:?}", environment);
-
-        let selected = select_auth_path(&environment)
-            .forward::<LoginError>("selecting the authentication path")?;
-        (selected.endpoint, parsed_remote)
-    };
+    let (auth_endpoint, remote_url) = resolve_auth_endpoint(remote_url, explicit_auth_url).await?;
     let auth_url = auth_endpoint.url.clone();
 
     let user_info = if token_type == "lore" {
@@ -254,6 +275,43 @@ pub fn with_token_boxed<'a>(
     explicit_auth_url: Option<&'a str>,
 ) -> crate::BoxFuture<'a, Result<UserInfo, LoginError>> {
     Box::pin(with_token(remote_url, token, token_type, explicit_auth_url))
+}
+
+/// Logs in as the confidential client `client_id` names, registered with the auth backend,
+/// and stores the token it is issued.
+pub(crate) async fn with_client_credentials(
+    remote_url: &str,
+    client_id: &str,
+    client_secret: &str,
+    explicit_auth_url: Option<&str>,
+) -> Result<UserInfo, LoginError> {
+    lore_debug!("Authenticating client {client_id} using remote {remote_url}");
+
+    let (auth_endpoint, remote_url) = resolve_auth_endpoint(remote_url, explicit_auth_url).await?;
+    let AuthEndpoint {
+        url: auth_url,
+        auth: auth_impl,
+    } = auth_endpoint;
+    let authn = auth_impl
+        .authenticate_client(&auth_url, client_id, client_secret, &correlation_id())
+        .await
+        .forward::<LoginError>("authenticating the client")?;
+    store_authentication(&auth_url, authn, &remote_url).await
+}
+
+/// Boxed version of [`with_client_credentials`] for cross-crate use.
+pub fn with_client_credentials_boxed<'a>(
+    remote_url: &'a str,
+    client_id: &'a str,
+    client_secret: &'a str,
+    explicit_auth_url: Option<&'a str>,
+) -> crate::BoxFuture<'a, Result<UserInfo, LoginError>> {
+    Box::pin(with_client_credentials(
+        remote_url,
+        client_id,
+        client_secret,
+        explicit_auth_url,
+    ))
 }
 
 /// Authenticates interactively via a browser-based login flow.
@@ -298,10 +356,7 @@ pub async fn interactive(
     } = select_auth_path(&environment)
         .forward::<InteractiveLoginError>("selecting the authentication path")?;
     lore_debug!("Login over the {path:?} path");
-    let correlation_id = crate::lore::execution_context()
-        .globals()
-        .correlation_id
-        .to_string();
+    let correlation_id = correlation_id();
 
     lore_debug!("Login on web with auth {auth_url} no_browser {no_browser}");
 

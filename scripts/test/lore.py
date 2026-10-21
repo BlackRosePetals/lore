@@ -339,8 +339,6 @@ class Lore:
             + (["--local"] if local else [])
             + (["--cache"] if cache else [])
             + (["--identity", identity] if identity else [])
-            + (["--identity-token", identity_token] if identity_token else [])
-            + (["--access-token", access_token] if access_token else [])
             + (["--max-connections", str(max_connections)] if max_connections else [])
             + (
                 ["--file-count-limit", str(file_count_limit)]
@@ -379,6 +377,12 @@ class Lore:
         while True:
             try:
                 env = self._subprocess_env()
+                # Supplied tokens go through the environment, as the CLI recommends,
+                # so they stay off the command line and out of the logged command.
+                if identity_token:
+                    env["LORE_IDENTITY_TOKEN"] = identity_token
+                if access_token:
+                    env["LORE_ACCESS_TOKEN"] = access_token
                 output = subprocess.run(
                     command_args,
                     capture_output=True,

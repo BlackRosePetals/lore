@@ -17,6 +17,13 @@ short name `api-key` as UCS Auth accepts, logs in the user `api_keys` binds
 the key to, answering as the device grant does, or answers `invalid_grant`
 for a key `api_keys` does not name.
 
+The client credentials grant (RFC 6749 §4.4) logs in the user `clients` binds
+a registered client to. The client authenticates with HTTP Basic or in the
+form, whichever `token_endpoint_auth_methods` lists; with no list the
+discovery document leaves the field out and Basic is the RFC 8414 default.
+Wrong credentials, or credentials in a place the list does not name, answer
+`invalid_client` with HTTP 401.
+
 The token endpoint answers from a script the test sets: a list of RFC 8628
 §3.5 error codes answered in order, then the token. An empty script hands out
 the token on the first poll.
@@ -34,7 +41,7 @@ import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, unquote_plus
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -42,6 +49,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 logger = logging.getLogger(__name__)
 
 DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+CLIENT_CREDENTIALS_GRANT = "client_credentials"
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 API_KEY_TOKEN_TYPE = "urn:lore:params:oauth:token-type:api-key"
@@ -65,6 +73,7 @@ class OidcUser:
 
 USER = OidcUser("oidc-user-1", "OIDC User One", "oidcuser1")
 KEY_USER = OidcUser("oidc-key-user", "OIDC Key User", "oidckeyuser")
+SERVICE_ACCOUNT = OidcUser("service-account-ci", "", "service-account-ci-bot")
 PAIRWISE_USER = OidcUser(
     "pairwise-sub-1", "Pairwise User", "pairwiseuser", identity="stable-oid-1"
 )
@@ -105,7 +114,7 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/device":
             self._json(*provider.device_authorization(form))
         elif self.path == "/token":
-            self._json(*provider.token(form))
+            self._json(*provider.token(form, self.headers.get("Authorization")))
         else:
             self._respond(404, b"not found")
 
@@ -178,6 +187,10 @@ class MockOidcProvider:
         self.grants: dict[str, list[str]] = {}
         # API key to the user an exchange of it logs in.
         self.api_keys: dict[str, OidcUser] = {}
+        # Registered client id to its secret and the user it logs in as.
+        self.clients: dict[str, tuple[str, OidcUser]] = {}
+        # `token_endpoint_auth_methods_supported`; `None` leaves it out.
+        self.token_endpoint_auth_methods: list[str] | None = None
         self._minted: set[str] = set()
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
@@ -207,6 +220,8 @@ class MockOidcProvider:
             self.requests.clear()
             self.grants.clear()
             self.api_keys.clear()
+            self.clients.clear()
+            self.token_endpoint_auth_methods = None
 
     def reset_requests(self) -> None:
         with self._lock:
@@ -240,13 +255,18 @@ class MockOidcProvider:
         return f"{self.issuer}/activate?user_code={self.user_code}"
 
     def discovery_document(self) -> dict:
-        return {
+        document = {
             "issuer": self.issuer,
             "token_endpoint": f"{self.issuer}/token",
             "jwks_uri": f"{self.issuer}/jwks",
             "device_authorization_endpoint": f"{self.issuer}/device",
             "scopes_supported": ["openid", "offline_access"],
         }
+        if self.token_endpoint_auth_methods is not None:
+            document["token_endpoint_auth_methods_supported"] = (
+                self.token_endpoint_auth_methods
+            )
+        return document
 
     def device_authorization(self, form: dict[str, str]) -> tuple[int, dict]:
         if form.get("client_id") != self.client_id:
@@ -260,9 +280,13 @@ class MockOidcProvider:
             "interval": self.interval,
         }
 
-    def token(self, form: dict[str, str]) -> tuple[int, dict]:
+    def token(
+        self, form: dict[str, str], authorization: str | None
+    ) -> tuple[int, dict]:
         if form.get("grant_type") == TOKEN_EXCHANGE_GRANT:
             return self.token_exchange(form)
+        if form.get("grant_type") == CLIENT_CREDENTIALS_GRANT:
+            return self.client_credentials(form, authorization)
         if form.get("grant_type") != DEVICE_CODE_GRANT:
             return 400, {"error": "unsupported_grant_type"}
         if form.get("client_id") != self.client_id:
@@ -305,6 +329,37 @@ class MockOidcProvider:
         return 200, {
             "access_token": self.mint_token(self.user, resources=resources),
             "issued_token_type": ACCESS_TOKEN_TYPE,
+            "token_type": "Bearer",
+            "expires_in": DEFAULT_TOKEN_LIFETIME_SECONDS,
+        }
+
+    def client_credentials(
+        self, form: dict[str, str], authorization: str | None
+    ) -> tuple[int, dict]:
+        """RFC 6749 §4.4.2, with the client authenticated as §2.3.1 allows
+        and the discovery document names."""
+        methods = self.token_endpoint_auth_methods or ["client_secret_basic"]
+        if authorization is not None and authorization.startswith("Basic "):
+            if "client_secret_basic" not in methods:
+                return 401, {"error": "invalid_client"}
+            decoded = base64.b64decode(authorization.removeprefix("Basic ")).decode()
+            client_id, _, client_secret = decoded.partition(":")
+            client_id, client_secret = (
+                unquote_plus(client_id),
+                unquote_plus(client_secret),
+            )
+        elif "client_secret" in form:
+            if "client_secret_post" not in methods:
+                return 401, {"error": "invalid_client"}
+            client_id, client_secret = form.get("client_id", ""), form["client_secret"]
+        else:
+            return 401, {"error": "invalid_client"}
+        with self._lock:
+            registered = self.clients.get(client_id)
+        if registered is None or registered[0] != client_secret:
+            return 401, {"error": "invalid_client"}
+        return 200, {
+            "access_token": self.mint_token(registered[1]),
             "token_type": "Bearer",
             "expires_in": DEFAULT_TOKEN_LIFETIME_SECONDS,
         }

@@ -229,8 +229,11 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--local` — Use local data
 * `--identity <IDENTITY>` — Use given identity
 * `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity
-  the token was issued to
-* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service
+  the token was issued to. Read from `LORE_IDENTITY_TOKEN` when omitted. Unsafe: a value given here is visible to other
+  users in the process table and is kept in the shell history
+* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service.
+  Read from `LORE_ACCESS_TOKEN` when omitted. Unsafe: a value given here is visible to other users in the process table
+  and is kept in the shell history
 * `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10)
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
@@ -1890,7 +1893,12 @@ Authenticate the CLI
 ###### **Options:**
 
 * `--token-type <TOKEN_TYPE>` — Token type for non-interactive login (e.g. "api-key", "eg1", "lore")
-* `--token <TOKEN>` — Token value for non-interactive login (requires --token-type)
+* `--token <TOKEN>` — Token value for non-interactive login (requires --token-type). Read from `LORE_TOKEN` when omitted.
+  Unsafe: a value given here is visible to other users in the process table and is kept in the shell history
+* `--client-id <CLIENT_ID>` — Log in as this confidential client registered with the identity provider, authenticating
+  with its client secret
+* `--client-secret <CLIENT_SECRET>` — Client secret for --client-id. Read from `LORE_CLIENT_SECRET` when omitted. Unsafe:
+  a value given here is visible to other users in the process table and is kept in the shell history
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in
   with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
@@ -2017,7 +2025,12 @@ Authenticate the CLI
 ###### **Options:**
 
 * `--token-type <TOKEN_TYPE>` — Token type for non-interactive login (e.g. "api-key", "eg1", "lore")
-* `--token <TOKEN>` — Token value for non-interactive login (requires --token-type)
+* `--token <TOKEN>` — Token value for non-interactive login (requires --token-type). Read from `LORE_TOKEN` when omitted.
+  Unsafe: a value given here is visible to other users in the process table and is kept in the shell history
+* `--client-id <CLIENT_ID>` — Log in as this confidential client registered with the identity provider, authenticating
+  with its client secret
+* `--client-secret <CLIENT_SECRET>` — Client secret for --client-id. Read from `LORE_CLIENT_SECRET` when omitted. Unsafe:
+  a value given here is visible to other users in the process table and is kept in the shell history
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in
   with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
