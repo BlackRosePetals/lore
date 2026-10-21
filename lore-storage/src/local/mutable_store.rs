@@ -263,7 +263,8 @@ impl MutableStoreGroup {
     ///
     /// # Requirements
     ///
-    /// The caller must hold the store's flock with nothing else in flight.
+    /// As for [`crate::local::immutable_store::ImmutableStoreGroup::invalidate`]: the caller must
+    /// hold the store's flock with nothing else in flight on this store.
     pub async fn invalidate(&self, count: usize, committed: usize, serialize_version: u32) {
         for slot in 0..BUCKET_COUNT {
             if let Some(bucket) = self.try_bucket(slot) {

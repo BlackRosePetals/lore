@@ -525,9 +525,13 @@ impl ImmutableStoreGroup {
     ///
     /// # Requirements
     ///
-    /// The caller must hold the store's flock with nothing else in flight — that is,
-    /// on the transition into the first operation. Concurrent readers would otherwise
-    /// see buckets emptied under them.
+    /// The caller must hold the store's flock with nothing else in flight on this store, so that
+    /// no walk, read or flush finds buckets emptied under it. A reload's caller does: a guard is
+    /// stale only where it takes the flock afresh, with nothing of this process running on the
+    /// directory, for a store that has adopted no epoch, which has nothing in flight, or after
+    /// another store object on the directory advanced the epoch. `lore-revision` opens its disk
+    /// stores through a cache that keeps one store object per directory in a process; only the
+    /// creation of a shared store opens others, while it runs.
     pub async fn invalidate(&self, count: usize, committed: usize, serialize_version: u32) {
         for slot in 0..BUCKET_COUNT {
             if let Some(bucket) = self.try_bucket(slot) {
