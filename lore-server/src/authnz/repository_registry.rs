@@ -52,13 +52,6 @@ impl RepositoryRegistry {
         )
     }
 
-    /// Whether [`remove`](Self::remove) is the delete's authorization: the
-    /// registry refuses a caller without permission to delete. Without a
-    /// registry, the handler authorizes the delete itself.
-    pub fn authorizes_delete(&self) -> bool {
-        !matches!(self, Self::Unregistered)
-    }
-
     /// Registers a repository the server is about to create. Called before
     /// the repository is stored, so a refusal leaves no repository behind.
     pub async fn add(

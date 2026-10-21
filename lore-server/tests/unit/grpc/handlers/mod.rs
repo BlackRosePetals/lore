@@ -13,6 +13,7 @@ mod branch_revision_list;
 mod obliterate;
 mod path_diff;
 mod repository_create;
+mod repository_delete;
 mod repository_metadata_get;
 mod repository_metadata_set;
 mod repository_query;

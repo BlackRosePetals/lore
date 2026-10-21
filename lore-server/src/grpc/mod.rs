@@ -328,6 +328,37 @@ pub(crate) fn log_server_error(status: &Status) {
     }
 }
 
+/// Whether `user_id` may delete `repository`, recorded as created by
+/// `creator`. The creator may while the authorizer still lets them reach the
+/// repository, and so may a caller holding `owner` or `admin` on it. Without
+/// a verifier the authorizer allows every action, so only the creator may.
+pub async fn may_delete_repository(
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    extensions: &Extensions,
+    repository: RepositoryId,
+    creator: &str,
+    user_id: &str,
+) -> bool {
+    let token = get_verified_token(extensions);
+    if creator == user_id {
+        return authorizer
+            .check_repository_access(token.as_ref(), repository, None)
+            .await
+            .is_ok();
+    }
+    let Some(token) = token else {
+        return false;
+    };
+    match authorizer.granted_actions(Some(&token), repository).await {
+        Ok(Some(grants)) => grants.permits("owner") || grants.permits("admin"),
+        Ok(None) => {
+            authorizer.permits(extensions, repository, "owner").await
+                || authorizer.permits(extensions, repository, "admin").await
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn is_owner_or_admin(extensions: &Extensions, repository: RepositoryId) -> bool {
     let user_permissions = user_permissions(extensions, repository);
     user_permissions.contains(&"owner".to_string())

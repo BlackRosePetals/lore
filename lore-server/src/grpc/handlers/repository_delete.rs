@@ -14,6 +14,7 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_telemetry::InstrumentProvider;
 use tokio_stream::StreamExt;
+use tonic::Extensions;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -22,38 +23,29 @@ use tracing::info;
 use tracing::warn;
 
 use super::repository_query::repository_query_id;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
+use crate::grpc::may_delete_repository;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "RepositoryDelete::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryDeleteRequest>,
     registry: &RepositoryRegistry,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<RepositoryDeleteResponse>, Status> {
-    let user_info = get_authorization(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
-    let req = request.into_inner();
-
-    // TODO(mjansson): Once we have authz permission model with read/write/admin
-    // this should be upgraded to check for the correct permission rather than
-    // hardwired to service accounts. For now used to protect while allowing mirroring
-    let mut bypass_protection = false;
-    if let Ok(user_info) = user_info
-        && user_info.is_service_account.unwrap_or_default()
-    {
-        bypass_protection = true;
-    }
+    let (_metadata, extensions, req) = request.into_parts();
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
@@ -66,7 +58,7 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            repository_delete(repository, bypass_protection, registry, authorization)
+            repository_delete(repository, registry, authorizer, &extensions, authorization)
                 .await
                 .inspect_err(|err| warn!("Repository delete failed: {err}"))?;
 
@@ -80,8 +72,9 @@ pub async fn handler(
 
 async fn repository_delete(
     repository: Arc<RepositoryContext>,
-    force: bool,
     registry: &RepositoryRegistry,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    extensions: &Extensions,
     authorization: Option<String>,
 ) -> Result<(), Status> {
     let Ok(data) = repository_query_id(
@@ -103,10 +96,17 @@ async fn repository_delete(
 
     let user_id = execution_context().user_id().await;
 
-    // Unless the registry authorizes the delete, check that the current user is the creator
-    if !registry.authorizes_delete() && metadata.creator != user_id && !force {
+    if !may_delete_repository(
+        authorizer,
+        extensions,
+        repository.id,
+        &metadata.creator,
+        &user_id,
+    )
+    .await
+    {
         info!(
-            "Repository delete refused, user {user_id} is not creator {}",
+            "Repository delete refused for user {user_id}, creator {}",
             metadata.creator
         );
         return Err(Status::permission_denied("Not repository owner"));

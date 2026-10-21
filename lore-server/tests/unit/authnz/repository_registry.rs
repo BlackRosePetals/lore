@@ -79,13 +79,6 @@ fn selection_reads_the_environment_endpoint() {
 }
 
 #[test]
-fn a_registry_authorizes_a_delete() {
-    assert!(RepositoryRegistry::AuthService(AUTH_URL.to_string()).authorizes_delete());
-    assert!(RepositoryRegistry::UserService(USER_URL.to_string()).authorizes_delete());
-    assert!(!RepositoryRegistry::Unregistered.authorizes_delete());
-}
-
-#[test]
 fn display_names_the_registry() {
     assert_eq!(RepositoryRegistry::Unregistered.to_string(), "none");
     assert_eq!(

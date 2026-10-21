@@ -594,6 +594,118 @@ fn no_grant_denies_every_action_check() {
     assert!(!can_admin_lock(&extensions, test_repository_context));
 }
 
+mod may_delete {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use lore_server::authnz::repository_authorizer::Grants;
+
+    use super::*;
+
+    /// Grants a fixed action set and records the questions asked of it.
+    /// `enumerates: false` models an authorizer that answers only
+    /// per-action questions.
+    struct Recording {
+        enumerates: bool,
+        actions: HashSet<String>,
+        asked: Mutex<Vec<Option<String>>>,
+        enumerated: Mutex<usize>,
+    }
+
+    impl Recording {
+        fn new(enumerates: bool, actions: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                enumerates,
+                actions: actions.iter().map(ToString::to_string).collect(),
+                asked: Mutex::new(Vec::new()),
+                enumerated: Mutex::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RepositoryAuthorizer for Recording {
+        async fn check_repository_access(
+            &self,
+            _token: Option<&VerifiedToken<'_>>,
+            _repository_id: RepositoryId,
+            action: Option<&str>,
+        ) -> Result<(), Status> {
+            self.asked.lock().unwrap().push(action.map(str::to_string));
+            match action {
+                Some(action) if !self.actions.contains(action) => {
+                    Err(Status::permission_denied("not granted"))
+                }
+                _ => Ok(()),
+            }
+        }
+
+        async fn granted_actions(
+            &self,
+            _token: Option<&VerifiedToken<'_>>,
+            _repository_id: RepositoryId,
+        ) -> Result<Option<Grants>, Status> {
+            if !self.enumerates {
+                return Ok(None);
+            }
+            *self.enumerated.lock().unwrap() += 1;
+            Ok(Some(Grants::Actions(self.actions.clone())))
+        }
+    }
+
+    fn extensions_with_token() -> Extensions {
+        let mut extensions = Extensions::new();
+        extensions.insert(AuthorizationToken::default());
+        extensions.insert(RawToken("raw.jwt".to_string()));
+        extensions
+    }
+
+    /// An enumerating authorizer answers `owner` and `admin` from one
+    /// enumeration, with no per-action question.
+    #[tokio::test]
+    async fn one_enumeration_answers_owner_and_admin() {
+        for (actions, permitted) in [(&["admin"][..], true), (&["write"][..], false)] {
+            let recording = Recording::new(true, actions);
+            let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
+            assert_eq!(
+                may_delete_repository(
+                    &authorizer,
+                    &extensions_with_token(),
+                    RepositoryId::default(),
+                    "alice",
+                    "mallory",
+                )
+                .await,
+                permitted,
+                "{actions:?}"
+            );
+            assert_eq!(*recording.enumerated.lock().unwrap(), 1);
+            assert!(recording.asked.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_enumerating_authorizer_is_asked_per_action() {
+        let recording = Recording::new(false, &["admin"]);
+        let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
+        assert!(
+            may_delete_repository(
+                &authorizer,
+                &extensions_with_token(),
+                RepositoryId::default(),
+                "alice",
+                "mallory",
+            )
+            .await
+        );
+        assert_eq!(
+            *recording.asked.lock().unwrap(),
+            [Some("owner".to_string()), Some("admin".to_string())]
+        );
+    }
+}
+
 mod timeout_grpc_tests {
     use std::time::Duration;
 
