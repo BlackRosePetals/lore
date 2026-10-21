@@ -7,6 +7,14 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+### Features
+
+### Fixes & Improvements
+
+## v0.11.0 (Oct 21st 2026) [#1892]
+
+### Breaking changes
+
 - C API: the new `LORE_EVENT_FILE_AUDIT` event adds a member to `lore_event_t`, so C consumers must rebuild against the
   new `lore.h`
 - `[environment.endpoint] user_url` now names a `lore.user.v1.UserService` (`UserGet`, `UserFind`), replacing the
