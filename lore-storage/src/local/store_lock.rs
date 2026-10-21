@@ -324,23 +324,28 @@ impl LockState {
             .all(|store| store.release_files())
     }
 
-    /// Publishes what an operation needs to know into `live`: nothing while no span is
-    /// active, else the generation and whether the epoch was advanced in this hold.
+    /// Publishes what an operation needs to know into `lock`'s [`PathLock::live`]: nothing
+    /// while no span is active, else the generation and whether the epoch was advanced in
+    /// this hold. Test builds publish the same into [`PathLock::held_live`] whether or not a
+    /// span is active.
     ///
     /// A flock kept by operations' own guards, or past the last guard for unflushed
     /// buckets, is not published: it is held, but no span covers it, so an operation then
     /// claims for itself. Called at the end of every section that changes [`Self::held`],
     /// [`Self::spans`] between zero and one, [`Self::advanced`] or [`Self::generation`],
     /// under the state lock, so the word never runs ahead of the state it describes.
-    fn publish(&self, live: &AtomicU64) {
-        let word = if self.held.is_none() || self.spans == 0 {
+    fn publish(&self, lock: &PathLock) {
+        let held = if self.held.is_none() {
             NOT_HELD
         } else if self.advanced {
             self.generation | ADVANCED
         } else {
             self.generation
         };
-        live.store(word, Ordering::Release);
+        let live = if self.spans == 0 { NOT_HELD } else { held };
+        lock.live.store(live, Ordering::Release);
+        #[cfg(feature = "test-util")]
+        lock.held_live.store(held, Ordering::Release);
     }
 }
 
@@ -371,12 +376,17 @@ struct PathLock {
     /// The bookkeeping shared by every store on this directory.
     state: Mutex<LockState>,
     /// What [`LockState`] last published for operations inside a hold: [`NOT_HELD`]
-    /// while no guard is active, else the generation, with [`ADVANCED`] set once the
+    /// while no span is active, else the generation, with [`ADVANCED`] set once the
     /// epoch moved in this hold.
     ///
     /// Read with no lock by [`StoreLock::covers`] on every operation, so the hot paths
     /// touch nothing that contends. Written only under [`Self::state`].
     live: AtomicU64,
+    /// [`Self::live`] as it reads while a span is active, whether or not one is: [`NOT_HELD`]
+    /// only while the flock is not held. What [`StoreLock::still_covers`] reads. Test builds
+    /// only.
+    #[cfg(feature = "test-util")]
+    held_live: AtomicU64,
     /// Serialises the transitions that touch the filesystem — taking the flock,
     /// reading the epoch, advancing it — and is held across a caller's reload, so
     /// only one task per process does any of them. An advance keeps it until the epoch
@@ -495,6 +505,8 @@ impl StoreLock {
                         generation: 0,
                     }),
                     live: AtomicU64::new(NOT_HELD),
+                    #[cfg(feature = "test-util")]
+                    held_live: AtomicU64::new(NOT_HELD),
                     gate: Arc::new(tokio::sync::Mutex::new(())),
                     #[cfg(feature = "test-util")]
                     covered: AtomicUsize::new(0),
@@ -670,7 +682,7 @@ impl StoreLock {
                 }
             }
             state.count_in();
-            state.publish(&self.shared.live);
+            state.publish(&self.shared);
         }
         let mut guard = self.counted_guard();
         if stale {
@@ -730,7 +742,7 @@ impl StoreLock {
         if !stale {
             self.adopt(&state);
         }
-        state.publish(&self.shared.live);
+        state.publish(&self.shared);
         Ok(gate)
     }
 
@@ -774,11 +786,12 @@ impl StoreLock {
     /// The claim of an operation with `intent` that [`Self::covers`] covers: nothing, or in
     /// test builds a claim that counts the operation on the directory until it ends.
     ///
-    /// A test build counts the operation, then fails it if the span no longer covers it: the
-    /// span ended between the check and the count, and a release that read the count before
-    /// the operation counted itself would not have seen it. The release publishes the flock
-    /// as not held before it reads the count, and a fence on each side orders the two, so one
-    /// of them sees the other. The re-check is [`Self::still_covers`].
+    /// A test build counts the operation, then fails it if the flock was released between the
+    /// check and the count: the release read the count before the operation counted itself,
+    /// so did not see it. The release publishes the flock as not held before it reads the
+    /// count, and a fence on each side orders the two, so one of them sees the other. A span
+    /// that ended while a guard keeps the flock, as one of work spawned to outlive an
+    /// operation does, fails nothing. The re-check is [`Self::still_covers`].
     #[inline]
     #[must_use]
     pub fn covered(&self, intent: Intent) -> Option<Claim> {
@@ -791,7 +804,7 @@ impl StoreLock {
             std::sync::atomic::fence(Ordering::SeqCst);
             assert!(
                 self.still_covers(intent),
-                "an operation was counted as covered after the span it relied on ended"
+                "an operation was counted as covered after the flock it relied on was released"
             );
             Some(claim)
         }
@@ -802,15 +815,16 @@ impl StoreLock {
         }
     }
 
-    /// Whether the span that admitted an operation with `intent` through [`Self::covers`] still
-    /// covers it: as [`Self::covers`], except that this store may hold the generation after the
-    /// word's. A write's advance of the epoch in the span adopts the new generation before
-    /// [`LockState::publish`] carries it into the word, see [`Self::acquire_at_gate`]. Each is
-    /// loaded once: a word loaded before that publication pairs with either generation, and one
-    /// loaded after it with the adoption it follows. Test builds only.
+    /// Whether the flock a span admitted an operation with `intent` on through [`Self::covers`]
+    /// is still held for it: as [`Self::covers`], but over [`PathLock::held_live`], whether or
+    /// not a span is still active, and this store may hold the generation after the word's. A
+    /// write's advance of the epoch adopts the new generation before [`LockState::publish`]
+    /// carries it into the word, see [`Self::acquire_at_gate`]. Each is loaded once: a word
+    /// loaded before that publication pairs with either generation, and one loaded after it with
+    /// the adoption it follows. Test builds only.
     #[cfg(feature = "test-util")]
     fn still_covers(&self, intent: Intent) -> bool {
-        let live = self.shared.live.load(Ordering::Acquire);
+        let live = self.shared.held_live.load(Ordering::Acquire);
         if live == NOT_HELD {
             return false;
         }
@@ -1026,7 +1040,7 @@ impl PathLock {
                 state.advanced = false;
             }
         }
-        state.publish(&self.live);
+        state.publish(self);
         released
     }
 
@@ -1035,11 +1049,11 @@ impl PathLock {
     ///
     /// A panic rather than a record, so that the test ending the span fails where it ends it.
     /// Not while unwinding, where a second panic would abort the process. The flock is
-    /// published as not held before the count is read, for the reason [`StoreLock::covered`]
-    /// gives. Test builds only.
+    /// published as not held in [`Self::held_live`] before the count is read, for the reason
+    /// [`StoreLock::covered`] gives. Test builds only.
     #[cfg(feature = "test-util")]
     fn assert_uncovered(&self, state: &LockState) {
-        self.live.store(NOT_HELD, Ordering::Release);
+        self.held_live.store(NOT_HELD, Ordering::Release);
         std::sync::atomic::fence(Ordering::SeqCst);
         let covered = self.covered.load(Ordering::Relaxed);
         assert!(
@@ -1400,7 +1414,7 @@ impl StoreGuard {
     pub(crate) fn into_span(mut self) -> Self {
         let mut state = self.lock.shared.state.lock();
         state.spans = state.spans.saturating_add(1);
-        state.publish(&self.lock.shared.live);
+        state.publish(&self.lock.shared);
         drop(state);
         self.span = true;
         self

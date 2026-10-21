@@ -29,11 +29,7 @@ REPO = HERE.parent.parent
 
 # Classes the verifier reports for defects already known, kept apart from new findings: class name
 # to the defect. Empty while none is open.
-KNOWN = {
-    "panic: lore-storage/src/local/store_lock.rs:792:13: in a spawned task":
-        "an operation of work spawned on a joined claim ran on the cover of a span that ended first, "
-        "which test builds fail though the work's claim keeps the flock: open, ADR-00024's rule",
-}
+KNOWN = {}
 
 
 # Coverage events of the store repairing what only a machine losing writes or a damaged file

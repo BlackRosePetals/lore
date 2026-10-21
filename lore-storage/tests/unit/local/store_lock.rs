@@ -491,11 +491,11 @@ async fn releasing_the_flock_under_a_covered_operation_fails_a_test_build() {
     drop(span);
 }
 
-/// **Test builds fail an operation counted as covered after its span ended**, which the release
-/// of the flock, having read the count before the operation counted itself, cannot see.
+/// **Test builds fail an operation counted as covered after its flock was released**, which the
+/// release, having read the count before the operation counted itself, cannot see.
 #[tokio::test]
-#[should_panic(expected = "after the span it relied on ended")]
-async fn an_operation_counted_after_its_span_ended_fails_a_test_build() {
+#[should_panic(expected = "after the flock it relied on was released")]
+async fn an_operation_counted_after_its_flock_was_released_fails_a_test_build() {
     let dir = dir("covered-late");
     let lock = store_lock(dir.path());
     let mut span = lock
@@ -507,6 +507,28 @@ async fn an_operation_counted_after_its_span_ended_fails_a_test_build() {
     assert!(lock.covers(Intent::Read), "the span covers a read");
     drop(span);
     let _operation = lock.covered(Intent::Read);
+}
+
+/// **An operation counted as covered after its span ended runs on a guard keeping the flock**,
+/// as one of work spawned on a guard its operation joined does.
+#[tokio::test]
+async fn an_operation_counted_after_its_span_ended_runs_on_a_guard_keeping_the_flock() {
+    let dir = dir("covered-kept");
+    let lock = store_lock(dir.path());
+    let mut span = lock
+        .acquire(Intent::Read)
+        .await
+        .expect("acquires")
+        .into_span();
+    span.note_refreshed();
+    let work = lock.acquire(Intent::Read).await.expect("joins");
+    assert!(lock.covers(Intent::Read), "the span covers a read");
+    drop(span);
+    let operation = lock.covered(Intent::Read);
+    assert!(lock.is_held(), "the work's guard keeps the flock");
+    drop(operation);
+    drop(work);
+    assert!(!lock.is_held(), "the flock goes with the work's guard");
 }
 
 /// **A store that adopted an advance in its span before the word carries it is still covered.**
