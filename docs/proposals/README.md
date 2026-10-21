@@ -25,7 +25,7 @@ Copy [`lep-template.md`](lep-template.md) to `YYYY-MM-DD-<your-slug>.md` in this
 These apply across every section.
 
 - **Active voice.** Write "this proposal rejects approach X", not "approach X was rejected"; "Lore writes the new version", not "the new version is written by Lore". Past-participle adjectives ("the upgraded client", "the proposed design") are fine.
-- **Public citations.** LEPs are public. Support every factual claim either with a public link (RFC, code path in the Lore tree, a public ADR, an upstream project doc) or by capturing the relevant detail inline. Internal-only resources (CRs, JIRA tickets, Slack threads, internal wikis) belong in the `discussion` frontmatter field — they don't substitute for support in the body.
+- **Public citations.** LEPs are public. Support every factual claim either with a public link (RFC, code path in the Lore tree, a public ADR, an upstream project doc) or by capturing the relevant detail inline. Internal-only resources (CRs, JIRA tickets, Slack threads, internal wikis) can't be shared externally and shouldn't be included in the LEP — they don't substitute for support in the body.
 - **Ground every claim.** If you can't back something up with research, prior discussion, or the proposal itself, leave it out rather than filling space.
 
 ### Summary

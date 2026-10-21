@@ -6,7 +6,7 @@ authors:
 status: Draft  # Draft → Accepted or Rejected. Set on merge of the discussion CR.
 created: YYYY-MM-DD
 updated: YYYY-MM-DD
-discussion: <link to the CR, JIRA ticket, or other review venue>
+discussion: <link to the review venue>
 # replaces: LEP id this proposal supersedes
 # superseded-by: LEP id that has replaced this proposal
 ---
